@@ -26,6 +26,45 @@ use crate::{
 	txn::next_record,
 };
 
+mod trace;
+
+/// One disposable test database: configuration, server, and open handle.
+///
+/// The `test = ["fresh", "cleanup"]` knobs give every constructor call an
+/// empty database and remove it when the server drops.
+pub(crate) struct TestDb {
+	pub(crate) database: Arc<Database>,
+	pub(crate) _server: Arc<Server>,
+}
+
+/// Opens a fresh throwaway database under the platform temp directory.
+///
+/// `tag` distinguishes concurrent tests; the process id distinguishes
+/// concurrent runs.
+pub(crate) async fn new_test_database(tag: &str) -> Result<TestDb> {
+	let root = var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+	let path = format!("{root}/tuwunel-{tag}-{}", process_id());
+	let raw_config = Figment::new()
+		.merge(("server_name", "localhost"))
+		.merge(("database_path", &path))
+		.merge(("test", ["fresh", "cleanup"]));
+
+	let config = Config::new(&raw_config)?;
+	let runtime = Handle::current();
+	let logging = Logging {
+		subscriber: Arc::new(NoSubscriber::new()),
+		reload: LogLevelReloadHandles::default(),
+		capture: Arc::new(State::new()),
+	};
+
+	let metrics = Metrics::new(Some(&runtime));
+	let server =
+		Arc::new(Server::new(config, Sources::default(), Some(&runtime), logging, metrics));
+	let database = Database::open(&server).await?;
+
+	Ok(TestDb { database, _server: server })
+}
+
 #[test]
 #[cfg_attr(
 	debug_assertions,
