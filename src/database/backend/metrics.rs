@@ -115,6 +115,8 @@ pub(crate) fn snapshot() -> serde_json::Value {
 
 /// Writes the snapshot to `TUWUNEL_DB_METRICS_FILE` if set.
 ///
+/// Called from the facade's drop and from the router's shutdown sequence,
+/// because a shutdown with dangling references never runs the drop.
 /// Failures are logged and swallowed: metrics must never take down a
 /// shutdown path.
 pub(crate) fn dump_on_close() {

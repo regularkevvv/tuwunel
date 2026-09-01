@@ -116,6 +116,10 @@ pub(crate) async fn stop(services: Arc<Services>) -> Result {
 	// unload and explode.
 	services.stop().await;
 
+	// Dangling references below can keep Database alive past process exit, so
+	// flush the backend operation metrics explicitly rather than from drop.
+	services.db.dump_operation_metrics();
+
 	// Check that Services and Database will drop as expected, The complex of Arc's
 	// used for various components can easily lead to references being held
 	// somewhere improperly; this can hang shutdowns.
