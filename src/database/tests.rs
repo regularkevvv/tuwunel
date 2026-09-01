@@ -26,6 +26,7 @@ use crate::{
 	txn::next_record,
 };
 
+#[path = "tests_trace.rs"]
 mod trace;
 
 /// One disposable test database: configuration, server, and open handle.

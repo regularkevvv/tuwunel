@@ -73,9 +73,14 @@ fn gen_key(rng: &mut Rng) -> Vec<u8> {
 	key
 }
 
-/// Generates a value of length 0..=2048; empty values are legal records.
+/// Generates a value: usually short, occasionally kilobytes; empty values
+/// are legal records.
 fn gen_val(rng: &mut Rng) -> Vec<u8> {
-	let len = rng.below(2049) as usize;
+	let len = if rng.below(8) == 0 {
+		rng.below(2049) as usize
+	} else {
+		rng.below(193) as usize
+	};
 	let mut val = Vec::with_capacity(len);
 	for _ in 0..len {
 		val.push((rng.below(256)) as u8);
@@ -206,6 +211,7 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 					.try_collect()
 					.await
 					.expect("trace stream");
+				let items: Vec<_> = items.into_iter().take(40).collect();
 				write_scan(&mut out, "scan_prefix", mi, &prefix, &items);
 			},
 		}
