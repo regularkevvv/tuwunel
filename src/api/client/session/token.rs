@@ -55,7 +55,7 @@ pub(crate) async fn login_token_route(
 		.create_login_token(&sender_user, &login_token);
 
 	Ok(get_login_token::v1::Response {
-		expires_in: Duration::from_millis(expires_in),
+		expires_in: Duration::from_millis(expires_in.await),
 		login_token,
 	})
 }

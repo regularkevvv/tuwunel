@@ -27,9 +27,8 @@ pub async fn clear(self: &Arc<Self>) -> Result {
 #[implement(super::Map)]
 #[tracing::instrument(level = "trace")]
 pub fn for_clear(self: &Arc<Self>) -> impl Stream<Item = Result<Key<'_>>> + Send {
-	self.raw_keys()
-		.and_then(async move |key| {
-			self.remove(&key).await?;
-			Ok(key)
-		})
+	self.raw_keys().and_then(async move |key| {
+		self.remove(&key).await?;
+		Ok(key)
+	})
 }

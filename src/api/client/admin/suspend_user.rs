@@ -21,11 +21,14 @@ pub(crate) async fn suspend_user_route(
 
 	let action = match body.suspended {
 		| true => {
-			services.users.set_suspended(user_id, sender_user);
+			services
+				.users
+				.set_suspended(user_id, sender_user)
+				.await?;
 			"suspended"
 		},
 		| false => {
-			services.users.clear_suspended(user_id);
+			services.users.clear_suspended(user_id).await?;
 			"unsuspended"
 		},
 	};

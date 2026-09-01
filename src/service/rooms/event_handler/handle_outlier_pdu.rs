@@ -151,7 +151,8 @@ pub(super) async fn handle_outlier_pdu(
 	// 7. Persist the event as an outlier.
 	self.services
 		.timeline
-		.add_pdu_outlier(event.event_id(), &pdu_json);
+		.add_pdu_outlier(event.event_id(), &pdu_json)
+		.await?;
 
 	trace!("Added pdu as outlier.");
 

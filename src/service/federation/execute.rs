@@ -106,7 +106,7 @@ where
 		| Ok(_) => self.record_success(dest).await,
 		| Err(error) =>
 			if let Some(class) = classify_error(error) {
-				self.record_failure(dest, class);
+				self.record_failure(dest, class).await?;
 			},
 	}
 
@@ -137,7 +137,7 @@ where
 		| Ok(_) => self.record_success(dest).await,
 		| Err(error) =>
 			if let Some(class) = classify_error(error) {
-				self.record_failure(dest, class);
+				self.record_failure(dest, class).await?;
 			},
 	}
 
@@ -242,11 +242,18 @@ where
 	let limit = self.services.server.config.max_response_size;
 
 	match client.execute(request).await {
-		| Ok(response) => handle_response::<T>(actual, dest, &method, &url, response, limit)
-			.await
-			.inspect_err(|error| self.evict_misrouted(dest, actual, error)),
+		| Ok(response) => {
+			let result = handle_response::<T>(actual, dest, &method, &url, response, limit).await;
+			if let Err(error) = &result {
+				self.evict_misrouted(dest, actual, error)
+					.await
+					.expect("database remove error");
+			}
+			result
+		},
 		| Err(error) => Err(self
 			.handle_error(dest, actual, &method, &url, error)
+			.await
 			.expect_err("always returns error")),
 	}
 }
@@ -345,7 +352,7 @@ async fn into_http_response(
 }
 
 #[implement(super::Service)]
-fn handle_error(
+async fn handle_error(
 	&self,
 	dest: &ServerName,
 	actual: &ActualDest,
@@ -369,7 +376,7 @@ fn handle_error(
 		debug_error!("{e:?}");
 	}
 
-	self.evict_route(dest, actual);
+	self.evict_route(dest, actual).await?;
 
 	Err(e.into())
 }
@@ -377,25 +384,32 @@ fn handle_error(
 // A non-JSON federation response means a proxy or CDN answered, not the
 // homeserver, so the cached route is stale; evict it as transport errors do.
 #[implement(super::Service)]
-fn evict_misrouted(&self, dest: &ServerName, actual: &ActualDest, error: &Error) {
+async fn evict_misrouted(&self, dest: &ServerName, actual: &ActualDest, error: &Error) -> Result {
 	let Error::Federation(_, response) = error else {
-		return;
+		return Ok(());
 	};
 
 	if matches!(response.body, ErrorBody::NotJson { .. }) {
-		self.evict_route(dest, actual);
+		self.evict_route(dest, actual).await?;
 	}
+
+	Ok(())
 }
 
 // Overrides are keyed by the resolved (delegated/SRV) hostname, so evict under
 // the key resolution wrote (`actual.dest.hostname()`), not the origin name.
 #[implement(super::Service)]
-fn evict_route(&self, dest: &ServerName, actual: &ActualDest) {
-	self.services.resolver.cache.del_destination(dest);
+async fn evict_route(&self, dest: &ServerName, actual: &ActualDest) -> Result {
 	self.services
 		.resolver
 		.cache
-		.del_override(&actual.dest.hostname());
+		.del_destination(dest)
+		.await?;
+	self.services
+		.resolver
+		.cache
+		.del_override(&actual.dest.hostname())
+		.await
 }
 
 #[implement(super::Service)]

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{
-	Stream, TryStreamExt,
+	Stream, StreamExt, TryStreamExt,
 	future::{join, try_join},
 };
 use ruma::{
@@ -131,7 +131,12 @@ impl Data {
 			return false;
 		}
 
-		let count = self.services.globals.next_count();
+		let count = self
+			.services
+			.globals
+			.next_count()
+			.await
+			.expect("failed to obtain next sequence number");
 		let latest_id = (room_id, *count, user_id, thread_kind);
 
 		let mut txn = superseded
@@ -142,7 +147,7 @@ impl Data {
 			});
 
 		txn.put(&self.readreceiptid_readreceipt, latest_id, Json(event));
-		txn.execute();
+		txn.execute().await.expect("database write error");
 
 		true
 	}
@@ -284,7 +289,17 @@ impl Data {
 		}
 
 		// The permit retires the sequence number on drop, so it outlives execute().
-		let next_count = announce.then(|| self.services.globals.next_count());
+		let next_count = if announce {
+			match self.services.globals.next_count().await {
+				| Ok(permit) => Some(permit),
+				| Err(error) => {
+					error!(?error, "Failed to obtain next sequence number.");
+					return false;
+				},
+			}
+		} else {
+			None
+		};
 		let ts = u64::from(ts.get());
 
 		if let Some(next_count) = next_count.as_deref() {
@@ -307,7 +322,7 @@ impl Data {
 			),
 		}
 
-		txn.execute();
+		txn.execute().await.expect("database write error");
 
 		true
 	}
@@ -473,36 +488,48 @@ impl Data {
 		self.roomuserid_privateread
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| {
+			.for_each(|key| async move {
 				trace!("Removing key: {key:?}");
-				self.roomuserid_privateread.remove(key);
+				self.roomuserid_privateread
+					.remove(key)
+					.await
+					.expect("database write error");
 			})
 			.await;
 
 		self.roomuserid_lastprivatereadupdate
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| {
+			.for_each(|key| async move {
 				trace!("Removing key: {key:?}");
-				self.roomuserid_lastprivatereadupdate.remove(key);
+				self.roomuserid_lastprivatereadupdate
+					.remove(key)
+					.await
+					.expect("database write error");
 			})
 			.await;
 
 		self.roomuserid_privatereadsync
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| {
+			.for_each(|key| async move {
 				trace!("Removing key: {key:?}");
-				self.roomuserid_privatereadsync.remove(key);
+				self.roomuserid_privatereadsync
+					.remove(key)
+					.await
+					.expect("database write error");
 			})
 			.await;
 
 		self.readreceiptid_readreceipt
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| {
+			.for_each(|key| async move {
 				trace!("Removing key: {key:?}");
-				self.readreceiptid_readreceipt.remove(key);
+				self.readreceiptid_readreceipt
+					.remove(key)
+					.await
+					.expect("database write error");
 			})
 			.await;
 

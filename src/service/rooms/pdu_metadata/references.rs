@@ -73,15 +73,17 @@ fn referenced_children(&self, parent_id: PduId) -> impl Stream<Item = OwnedEvent
 
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "debug")]
-pub fn mark_as_referenced<'a, I>(&self, room_id: &RoomId, event_ids: I)
+pub async fn mark_as_referenced<'a, I>(&self, room_id: &RoomId, event_ids: I) -> Result
 where
 	I: Iterator<Item = &'a EventId>,
 {
 	for event_id in event_ids {
 		let key = (room_id, event_id);
 
-		self.db.referencedevents.put_raw(key, []);
+		self.db.referencedevents.put_raw(key, []).await?;
 	}
+
+	Ok(())
 }
 
 #[implement(Service)]
@@ -94,8 +96,11 @@ pub async fn is_event_referenced(&self, room_id: &RoomId, event_id: &EventId) ->
 
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-pub fn mark_event_soft_failed(&self, event_id: &EventId) {
-	self.db.softfailedeventids.insert(event_id, []);
+pub async fn mark_event_soft_failed(&self, event_id: &EventId) -> Result {
+	self.db
+		.softfailedeventids
+		.insert(event_id, [])
+		.await
 }
 
 #[implement(Service)]
@@ -124,8 +129,8 @@ pub fn soft_failed_event_ids(&self) -> impl Stream<Item = OwnedEventId> + Send +
 ///
 /// A later processing attempt can evaluate the event again.
 #[implement(Service)]
-pub fn clear_event_soft_failed(&self, event_id: &EventId) {
-	self.db.softfailedeventids.remove(event_id);
+pub async fn clear_event_soft_failed(&self, event_id: &EventId) -> Result {
+	self.db.softfailedeventids.remove(event_id).await
 }
 
 #[implement(Service)]
@@ -137,9 +142,13 @@ pub async fn delete_all_referenced_for_room(&self, room_id: &RoomId) -> Result {
 		.referencedevents
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| {
+		.for_each(|key| async move {
 			trace!(?key, "Removing key");
-			self.db.referencedevents.remove(key);
+			self.db
+				.referencedevents
+				.remove(key)
+				.await
+				.expect("database write error");
 		})
 		.await;
 

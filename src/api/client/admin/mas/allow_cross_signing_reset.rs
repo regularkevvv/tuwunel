@@ -15,7 +15,8 @@ pub(crate) async fn allow_cross_signing_reset_route(
 
 	services
 		.users
-		.allow_cross_signing_replacement(&user_id);
+		.allow_cross_signing_replacement(&user_id)
+		.await;
 
 	Ok(Response::new())
 }

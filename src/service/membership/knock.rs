@@ -255,7 +255,7 @@ async fn finalize_knock_membership(
 		.map_err(|e| err!(BadServerResponse("Invalid knock event PDU: {e:?}")))?;
 
 	info!("Updating membership locally to knock state with provided stripped state events");
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	let membership_event = parsed_knock_pdu
 		.get_content::<RoomMemberEventContent>()
 		.expect("we just created this");
@@ -354,7 +354,7 @@ async fn knock_room_helper_remote(
 		.await?;
 
 	info!("Updating membership locally to knock state with provided stripped state events");
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	let membership_event = parsed_knock_pdu
 		.get_content::<RoomMemberEventContent>()
 		.expect("we just created this");
@@ -395,7 +395,8 @@ async fn knock_room_helper_remote(
 	// in time where events in the current room state do not exist
 	self.services
 		.state
-		.set_room_state(room_id, statehash_after_knock, state_lock);
+		.set_room_state(room_id, statehash_after_knock, state_lock)
+		.await?;
 
 	Ok(())
 }
@@ -578,7 +579,8 @@ async fn ingest_send_knock_state(
 
 		self.services
 			.timeline
-			.add_pdu_outlier(&event_id, &event);
+			.add_pdu_outlier(&event_id, &event)
+			.await?;
 
 		state_map.insert(shortstatekey, event_id.clone());
 	}

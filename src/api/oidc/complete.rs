@@ -237,10 +237,11 @@ async fn release_code(
 ) -> Result<Response> {
 	let oidc = services.oauth.get_server()?;
 
-	oidc.remove_auth_request(&params.oidc_req_id);
+	oidc.remove_auth_request(&params.oidc_req_id)
+		.await?;
 
 	let user_id = consume_login_token(services, Some(&params.login_token)).await?;
-	let code = oidc.create_auth_code(auth_req, user_id);
+	let code = oidc.create_auth_code(auth_req, user_id).await;
 	let redirect_url = Url::parse(&auth_req.redirect_uri)
 		.map_err(|_| err!(Request(InvalidParam("Invalid redirect_uri"))))
 		.map(|mut url| {
@@ -285,7 +286,8 @@ async fn refuse_code(services: &Services, params: &CompleteParams) -> Result<Res
 	services
 		.oauth
 		.get_server()?
-		.remove_auth_request(&params.oidc_req_id);
+		.remove_auth_request(&params.oidc_req_id)
+		.await?;
 
 	consume_login_token(services, Some(&params.login_token))
 		.await

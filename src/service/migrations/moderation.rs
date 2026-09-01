@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
+use futures::StreamExt;
 use ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, UserId};
 use serde::Deserialize;
-use tuwunel_core::{
-	Result, debug_warn, err,
-	utils::{ReadyExt, stream::TryIgnore},
-	warn,
-};
+use tuwunel_core::{Result, debug_warn, err, utils::stream::TryIgnore, warn};
 use tuwunel_database::{Json, Map};
 
 use crate::{Services, users::Moderation};
@@ -51,8 +48,8 @@ async fn copy_moderation(
 	let (copied, skipped) = source
 		.raw_stream()
 		.ignore_err()
-		.ready_fold((0_usize, 0_usize), |acc, (key, value)| {
-			tally(acc, copy_one(target, server_user, key, value))
+		.fold((0_usize, 0_usize), |acc, (key, value)| async move {
+			tally(acc, copy_one(target, server_user, key, value).await)
 		})
 		.await;
 
@@ -78,7 +75,12 @@ fn tally((copied, skipped): (usize, usize), result: Result<bool>) -> (usize, usi
 
 /// Writes one `Moderation` into the target column. A `false` return is a
 /// cleared entry (`suspended == false`), which has no tuwunel representation.
-fn copy_one(target: &Arc<Map>, server_user: &UserId, key: &[u8], value: &[u8]) -> Result<bool> {
+async fn copy_one(
+	target: &Arc<Map>,
+	server_user: &UserId,
+	key: &[u8],
+	value: &[u8],
+) -> Result<bool> {
 	let entry: ForeignModeration = serde_json::from_slice(value)
 		.map_err(|e| err!(Database("moderation entry is not JSON: {e}")))?;
 
@@ -88,7 +90,7 @@ fn copy_one(target: &Arc<Map>, server_user: &UserId, key: &[u8], value: &[u8]) -
 
 	let moderation = to_moderation(entry, server_user);
 
-	target.raw_put(key, Json(moderation));
+	target.raw_put(key, Json(moderation)).await?;
 
 	Ok(true)
 }

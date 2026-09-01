@@ -336,7 +336,7 @@ async fn record_local_invite(
 		);
 	}
 
-	let count = services.globals.next_count();
+	let count = services.globals.next_count().await?;
 	services
 		.state_cache
 		.update_membership(MembershipUpdate {

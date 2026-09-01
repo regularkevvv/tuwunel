@@ -72,7 +72,12 @@ async fn lookup_actual_dest_with_policy(
 	self.validate_dest_address(server_name)?;
 
 	self.resolve_actual_dest_unchecked(server_name, true)
-		.inspect_ok(|result| self.cache.set_destination(server_name, result))
+		.and_then(async |result| {
+			self.cache
+				.set_destination(server_name, &result)
+				.await?;
+			Ok(result)
+		})
 		.map_ok(|result| (result, false))
 		.boxed()
 		.await
@@ -356,7 +361,8 @@ async fn query_and_cache_override(
 					overriding: (hostname != untername)
 						.then_some(hostname.into())
 						.inspect(|_| debug_info!("{untername:?} overridden by {hostname:?}")),
-				});
+				})
+				.await?;
 
 			Ok(())
 		},

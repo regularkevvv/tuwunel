@@ -1,13 +1,10 @@
 use std::{sync::Arc, time::SystemTime};
 
-use futures::Stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, err,
-	utils::{
-		self,
-		stream::{ReadyExt, TryIgnore},
-	},
+	utils::{self, stream::TryIgnore},
 };
 use tuwunel_database::{Database, Deserialized, Json, Map};
 
@@ -121,7 +118,8 @@ impl Data {
 			let info = DatabaseTokenInfo::new(expires);
 
 			self.registrationtoken_info
-				.raw_put(token, Json(&info));
+				.raw_put(token, Json(&info))
+				.await?;
 
 			Ok(info)
 		} else {
@@ -137,7 +135,7 @@ impl Data {
 			.await
 			.is_ok()
 		{
-			self.registrationtoken_info.remove(token);
+			self.registrationtoken_info.remove(token).await?;
 
 			Ok(())
 		} else {
@@ -154,26 +152,35 @@ impl Data {
 			.deserialized::<DatabaseTokenInfo>()
 			.ok();
 
-		info.map(|mut info| {
-			if !info.is_valid() {
-				self.registrationtoken_info.remove(token);
-				return false;
+		let Some(mut info) = info else {
+			return false;
+		};
+
+		if !info.is_valid() {
+			self.registrationtoken_info
+				.remove(token)
+				.await
+				.expect("database remove error");
+			return false;
+		}
+
+		if consume {
+			info.uses = info.uses.saturating_add(1);
+
+			if info.is_valid() {
+				self.registrationtoken_info
+					.raw_put(token, Json(info))
+					.await
+					.expect("database insert error");
+			} else {
+				self.registrationtoken_info
+					.remove(token)
+					.await
+					.expect("database remove error");
 			}
+		}
 
-			if consume {
-				info.uses = info.uses.saturating_add(1);
-
-				if info.is_valid() {
-					self.registrationtoken_info
-						.raw_put(token, Json(info));
-				} else {
-					self.registrationtoken_info.remove(token);
-				}
-			}
-
-			true
-		})
-		.unwrap_or(false)
+		true
 	}
 
 	/// Look up a token's stored metadata, returning `None` when it is absent.
@@ -196,25 +203,33 @@ impl Data {
 		let info = DatabaseTokenInfo { uses: current.uses, expires };
 
 		self.registrationtoken_info
-			.raw_put(token, Json(&info));
+			.raw_put(token, Json(&info))
+			.await?;
 
 		Ok(info)
 	}
 
-	/// Iterate over all valid tokens and delete expired ones.
-	pub(super) fn iterate_and_clean_tokens(
+	/// Collect all valid tokens, deleting expired ones on the way.
+	pub(super) async fn iterate_and_clean_tokens(
 		&self,
-	) -> impl Stream<Item = (&str, DatabaseTokenInfo)> + Send + '_ {
-		self.registrationtoken_info
+	) -> Result<Vec<(String, DatabaseTokenInfo)>> {
+		let all: Vec<(String, DatabaseTokenInfo)> = self
+			.registrationtoken_info
 			.stream()
 			.ignore_err()
-			.ready_filter_map(|(token, info): (&str, DatabaseTokenInfo)| {
-				if info.is_valid() {
-					Some((token, info))
-				} else {
-					self.registrationtoken_info.remove(token);
-					None
-				}
-			})
+			.map(|(token, info): (&str, DatabaseTokenInfo)| (token.to_owned(), info))
+			.collect()
+			.await;
+
+		let mut valid = Vec::new();
+		for (token, info) in all {
+			if info.is_valid() {
+				valid.push((token, info));
+			} else {
+				self.registrationtoken_info.remove(&token).await?;
+			}
+		}
+
+		Ok(valid)
 	}
 }

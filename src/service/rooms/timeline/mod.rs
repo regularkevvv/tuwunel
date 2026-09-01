@@ -34,7 +34,6 @@ use tuwunel_core::{
 		result::{LogErr, NotFound},
 		stream::TryReadyExt,
 	},
-	warn,
 };
 use tuwunel_database::{Database, Deserialized, Json, Map};
 
@@ -118,17 +117,23 @@ pub async fn replace_pdu(&self, pdu_id: &RawPduId, pdu_json: &CanonicalJsonObjec
 		return Err!(Request(NotFound("PDU does not exist.")));
 	}
 
-	self.db.pduid_pdu.raw_put(pdu_id, Json(pdu_json));
+	self.db
+		.pduid_pdu
+		.raw_put(pdu_id, Json(pdu_json))
+		.await?;
 
 	Ok(())
 }
 
 #[implement(Service)]
 #[tracing::instrument(skip(self, pdu), level = "debug")]
-pub fn add_pdu_outlier(&self, event_id: &EventId, pdu: &CanonicalJsonObject) {
+pub async fn add_pdu_outlier(&self, event_id: &EventId, pdu: &CanonicalJsonObject) -> Result {
 	self.db
 		.eventid_outlierpdu
-		.raw_put(event_id, Json(pdu));
+		.raw_put(event_id, Json(pdu))
+		.await?;
+
+	Ok(())
 }
 
 #[implement(Service)]

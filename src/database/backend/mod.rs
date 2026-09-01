@@ -5,29 +5,29 @@
 //! backend implements so the facade's observable semantics do not depend on
 //! RocksDB:
 //!
-//! - **Maps** are addressed by stable numeric [`MapId`]s ([`ids`]); names are
-//!   a facade convenience. Foreign column families opened outside the catalog
+//! - **Maps** are addressed by stable numeric [`MapId`]s ([`ids`]); names are a
+//!   facade convenience. Foreign column families opened outside the catalog
 //!   carry no id and exist only on the RocksDB backend.
-//! - **Values** are owned or pinned byte sequences behind [`crate::Handle`];
-//!   no backend-specific pin type crosses the facade.
+//! - **Values** are owned or pinned byte sequences behind [`crate::Handle`]; no
+//!   backend-specific pin type crosses the facade.
 //! - **Reads** are point or multi-point lookups plus forward/reverse
-//!   lexicographic byte-order scans with snapshot-at-creation visibility:
-//!   a scan observes exactly the committed state at its creation and never a
-//!   later write. Missing keys are the facade's not-found error, distinct
-//!   from transport failures.
+//!   lexicographic byte-order scans with snapshot-at-creation visibility: a
+//!   scan observes exactly the committed state at its creation and never a
+//!   later write. Missing keys are the facade's not-found error, distinct from
+//!   transport failures.
 //! - **Mutations** are queued as neutral [`Op`]s and committed as one atomic
 //!   multi-map batch through [`Txn`](crate::Txn). Partial application is
-//!   forbidden. Single-key writes are the degenerate one-op batch and share
-//!   the same durability rules.
+//!   forbidden. Single-key writes are the degenerate one-op batch and share the
+//!   same durability rules.
 //! - **Acknowledgement** means durably committed for the backend's configured
 //!   durability level; watcher notification happens strictly after it.
 //! - **Failure** is returned, never panicked, and never silently retried when
-//!   the outcome of a commit is ambiguous. (The remote backend adds
-//!   idempotency keys for ambiguous retries in phase 2; the contract reserves
-//!   the concept here.)
-//! - **Administration** (compaction, checkpoints, physical properties,
-//!   backups, WAL control) is a per-backend capability, not part of this
-//!   contract. Callers must tolerate `Unsupported`.
+//!   the outcome of a commit is ambiguous. (The remote backend adds idempotency
+//!   keys for ambiguous retries in phase 2; the contract reserves the concept
+//!   here.)
+//! - **Administration** (compaction, checkpoints, physical properties, backups,
+//!   WAL control) is a per-backend capability, not part of this contract.
+//!   Callers must tolerate `Unsupported`.
 //!
 //! Two implementations exist in phase 1: the production RocksDB engine
 //! (`crate::engine`, reached through the `Rocks` arms below) and the
@@ -46,7 +46,10 @@ mod tests;
 
 use std::sync::Arc;
 
-use crate::{Engine, keyval::{KeyBuf, ValBuf}};
+use crate::{
+	Engine,
+	keyval::{KeyBuf, ValBuf},
+};
 
 /// Stable numeric identity of one logical map.
 ///
@@ -61,6 +64,10 @@ pub struct MapId(pub u16);
 /// Keys and values are already encoded by the facade codec; the backend
 /// treats them as opaque ordered bytes.
 #[derive(Debug)]
+#[expect(
+	clippy::large_enum_variant,
+	reason = "puts dominate real batches; boxing the inline value buffer would defeat it"
+)]
 pub enum Op {
 	/// Insert or replace one key with one value.
 	Put {

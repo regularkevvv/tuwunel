@@ -56,7 +56,12 @@ impl crate::Service for Service {
 }
 
 #[implement(Service)]
-pub fn index_pdu(&self, shortroomid: ShortRoomId, pdu_id: &RawPduId, message_body: &str) {
+pub async fn index_pdu(
+	&self,
+	shortroomid: ShortRoomId,
+	pdu_id: &RawPduId,
+	message_body: &str,
+) -> Result {
 	let items = tokenize(message_body).map(|word| {
 		let mut key = shortroomid.to_be_bytes().to_vec();
 		key.extend_from_slice(word.as_bytes());
@@ -66,11 +71,18 @@ pub fn index_pdu(&self, shortroomid: ShortRoomId, pdu_id: &RawPduId, message_bod
 		(key, [])
 	});
 
-	Txn::insert(&self.db.tokenids, items).execute();
+	Txn::insert(&self.db.tokenids, items)
+		.execute()
+		.await
 }
 
 #[implement(Service)]
-pub fn deindex_pdu(&self, shortroomid: ShortRoomId, pdu_id: &RawPduId, message_body: &str) {
+pub async fn deindex_pdu(
+	&self,
+	shortroomid: ShortRoomId,
+	pdu_id: &RawPduId,
+	message_body: &str,
+) -> Result {
 	let batch = tokenize(message_body).map(|word| {
 		let mut key = shortroomid.to_be_bytes().to_vec();
 		key.extend_from_slice(word.as_bytes());
@@ -80,8 +92,10 @@ pub fn deindex_pdu(&self, shortroomid: ShortRoomId, pdu_id: &RawPduId, message_b
 	});
 
 	for token in batch {
-		self.db.tokenids.remove(&token);
+		self.db.tokenids.remove(&token).await?;
 	}
+
+	Ok(())
 }
 
 #[implement(Service)]
@@ -209,7 +223,7 @@ pub async fn delete_all_search_tokenids_for_room(&self, room_id: &RoomId) -> Res
 		})
 		.await;
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }

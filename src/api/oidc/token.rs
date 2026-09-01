@@ -250,7 +250,8 @@ async fn issue_tokens(services: &Services, grant: ApprovedGrant<'_>) -> Result<R
 	if let Some(idp_id) = idp_id.filter(|idp| !idp.is_empty()) {
 		services
 			.users
-			.mark_oidc_device(user_id, &device_id, &idp_id);
+			.mark_oidc_device(user_id, &device_id, &idp_id)
+			.await?;
 	}
 
 	info!("{user_id} logged in via OIDC on {device_id} ({device_display_name})");

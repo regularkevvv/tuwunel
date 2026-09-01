@@ -5,11 +5,7 @@ use ruma::{
 	OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId, RoomOrAliasId, UserId,
 	api::federation::query::get_room_information::v1::Request, events::StateEventType,
 };
-use tuwunel_core::{
-	Err, Result, err,
-	matrix::Event,
-	utils::{ReadyExt, stream::TryIgnore},
-};
+use tuwunel_core::{Err, Result, err, matrix::Event, utils::stream::TryIgnore};
 use tuwunel_database::{Deserialized, Ignore, Interfix, Map};
 
 use crate::appservice::RegistrationInfo;
@@ -41,14 +37,15 @@ impl crate::Service for Service {
 }
 
 impl Service {
-	pub fn set_alias(&self, alias: &RoomAliasId, room_id: &RoomId) -> Result {
+	pub async fn set_alias(&self, alias: &RoomAliasId, room_id: &RoomId) -> Result {
 		self.check_alias_local(alias)?;
 
 		self.set_alias_by(alias, room_id, &self.services.globals.server_user)
+			.await
 	}
 
 	#[tracing::instrument(skip(self))]
-	pub fn set_alias_by(
+	pub async fn set_alias_by(
 		&self,
 		alias: &RoomAliasId,
 		room_id: &RoomId,
@@ -62,18 +59,25 @@ impl Service {
 			return Err!(Request(Forbidden("Only the server user can set this alias")));
 		}
 
-		let count = self.services.globals.next_count();
+		let count = self.services.globals.next_count().await?;
 
 		let localpart = alias.alias();
 
 		// Comes first as we don't want a stuck alias
-		self.db.alias_userid.insert(localpart, user_id);
+		self.db
+			.alias_userid
+			.insert(localpart, user_id)
+			.await?;
 
-		self.db.alias_roomid.insert(localpart, room_id);
+		self.db
+			.alias_roomid
+			.insert(localpart, room_id)
+			.await?;
 
 		self.db
 			.aliasid_alias
-			.put_raw((room_id, *count), alias);
+			.put_raw((room_id, *count), alias)
+			.await?;
 
 		Ok(())
 	}
@@ -98,11 +102,23 @@ impl Service {
 			.aliasid_alias
 			.keys_prefix_raw(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| self.db.aliasid_alias.remove(key))
+			.for_each(|key| async move {
+				self.db
+					.aliasid_alias
+					.remove(key)
+					.await
+					.expect("database remove error");
+			})
 			.await;
 
-		self.db.alias_roomid.remove(alias.as_bytes());
-		self.db.alias_userid.remove(alias.as_bytes());
+		self.db
+			.alias_roomid
+			.remove(alias.as_bytes())
+			.await?;
+		self.db
+			.alias_userid
+			.remove(alias.as_bytes())
+			.await?;
 
 		Ok(())
 	}

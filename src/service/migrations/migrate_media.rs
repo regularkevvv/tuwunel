@@ -26,7 +26,9 @@ pub(super) async fn migrate_media(services: &Services) -> Result {
 			.is_some()
 	{
 		migrate_conduit_media(services).await?;
-		db["global"].insert(b"feat_sha256_media", []);
+		db["global"]
+			.insert(b"feat_sha256_media", [])
+			.await?;
 		return Ok(());
 	}
 

@@ -58,7 +58,13 @@ impl crate::Service for Service {
 		}))
 	}
 
-	async fn clear_cache(&self) { self.db.authchainkey_authchain.clear().await; }
+	async fn clear_cache(&self) {
+		self.db
+			.authchainkey_authchain
+			.clear()
+			.await
+			.expect("database clear error");
+	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
@@ -291,7 +297,10 @@ where
 			.await;
 
 		match event_complete.load(Ordering::Relaxed) {
-			| true => self.put_cached_auth_chain(once(shortid), auth_chain.as_slice()),
+			| true => self
+				.put_cached_auth_chain(once(shortid), auth_chain.as_slice())
+				.await
+				.expect("database insert error"),
 			| false => {
 				chunk_complete.store(false, Ordering::Relaxed);
 				complete.store(false, Ordering::Relaxed);
@@ -325,7 +334,9 @@ where
 			"Incomplete chunk not cached",
 		),
 		| true => {
-			self.put_cached_auth_chain(starting_events.map(at!(0)), chunk_chain.as_slice());
+			self.put_cached_auth_chain(starting_events.map(at!(0)), chunk_chain.as_slice())
+				.await
+				.expect("database write error");
 
 			debug!(
 				chunk_chain_length = ?chunk_chain.len(),
@@ -444,7 +455,7 @@ fn get_event_auth_chain_ids<'a>(
 		chain_len = auth_chain.len(),
 	)
 )]
-fn put_cached_auth_chain<I>(&self, key: I, auth_chain: &[ShortEventId])
+async fn put_cached_auth_chain<I>(&self, key: I, auth_chain: &[ShortEventId]) -> Result
 where
 	I: Iterator<Item = ShortEventId> + Clone + Send,
 {
@@ -454,7 +465,10 @@ where
 
 	self.db
 		.authchainkey_authchain
-		.put(key.as_slice(), auth_chain);
+		.put(key.as_slice(), auth_chain)
+		.await?;
+
+	Ok(())
 }
 
 #[implement(Service)]

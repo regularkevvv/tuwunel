@@ -207,17 +207,20 @@ async fn append_pdu_for_user(
 		if matches!(id.count, Count::Normal(_)) {
 			self.db
 				.useridcount_notification
-				.put((user, id.count.into_unsigned()), Json(notified));
+				.put((user, id.count.into_unsigned()), Json(notified))
+				.await
+				.expect("database write error");
 		}
 	}
 
 	if notify || highlight || self.services.config.push_everything {
 		self.get_pushkeys(user)
 			.map(ToOwned::to_owned)
-			.ready_for_each(|push_key| {
+			.for_each(|push_key| async move {
 				self.services
 					.sending
 					.send_pdu_push(pdu_id, user, push_key)
+					.await
 					.log_err(Level::TRACE)
 					.ok();
 			})
@@ -274,11 +277,15 @@ async fn increment_thread_highlightcount(
 async fn increment(db: &Arc<Map>, key: (&UserId, &RoomId)) {
 	let old: u64 = db.qry(&key).await.deserialized().unwrap_or(0);
 	let new = old.saturating_add(1);
-	db.put(key, new);
+	db.put(key, new)
+		.await
+		.expect("database write error");
 }
 
 async fn increment_thread(db: &Arc<Map>, key: (&UserId, &RoomId, &EventId)) {
 	let old: u64 = db.qry(&key).await.deserialized().unwrap_or(0);
 	let new = old.saturating_add(1);
-	db.put(key, new);
+	db.put(key, new)
+		.await
+		.expect("database write error");
 }

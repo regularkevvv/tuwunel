@@ -18,7 +18,6 @@ use tuwunel_core::{
 	Result, implement, is_not_empty,
 	matrix::PduCount,
 	utils::{ReadyExt, result::LogErr},
-	warn,
 };
 use tuwunel_database::{Json, serialize_key, serialize_val};
 
@@ -118,7 +117,7 @@ pub async fn update_membership(
 			}
 
 			self.mark_as_invited(user_id, room_id, count, last_state, invite_via)
-				.await;
+				.await?;
 		},
 		| MembershipState::Leave | MembershipState::Ban => {
 			self.handle_leave(room_id, user_id, count).await;
@@ -134,7 +133,8 @@ pub async fn update_membership(
 			}
 		},
 		| MembershipState::Knock => {
-			self.mark_as_knocked(user_id, room_id, count, last_state);
+			self.mark_as_knocked(user_id, room_id, count, last_state)
+				.await?;
 		},
 		| _ => {},
 	}
@@ -215,7 +215,9 @@ pub async fn update_joined_count(&self, room_id: &RoomId) {
 		txn.insert_raw(&self.db.serverroomids, serverroom_id, []);
 	}
 
-	txn.execute();
+	txn.execute()
+		.await
+		.expect("database transaction execute error");
 
 	self.appservice_in_room_cache
 		.write()
@@ -228,7 +230,12 @@ pub async fn update_joined_count(&self, room_id: &RoomId) {
 /// `update_membership` instead
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-pub(crate) fn mark_as_joined(&self, user_id: &UserId, room_id: &RoomId, count: PduCount) {
+pub(crate) async fn mark_as_joined(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	count: PduCount,
+) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -246,7 +253,7 @@ pub(crate) fn mark_as_joined(&self, user_id: &UserId, room_id: &RoomId, count: P
 	txn.del_raw(&self.db.roomuserid_leftcount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_knockedstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_knockedcount, &roomuser_id);
-	txn.execute();
+	txn.execute().await
 }
 
 /// Direct DB function to directly mark a user as left. It is not
@@ -254,7 +261,12 @@ pub(crate) fn mark_as_joined(&self, user_id: &UserId, room_id: &RoomId, count: P
 /// `update_membership` instead
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-pub(crate) fn mark_as_left(&self, user_id: &UserId, room_id: &RoomId, count: PduCount) {
+pub(crate) async fn mark_as_left(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	count: PduCount,
+) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -275,7 +287,7 @@ pub(crate) fn mark_as_left(&self, user_id: &UserId, room_id: &RoomId, count: Pdu
 	txn.del_raw(&self.db.roomuserid_invitecount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_knockedstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_knockedcount, &roomuser_id);
-	txn.execute();
+	txn.execute().await
 }
 
 /// Direct DB function to directly mark a user as knocked. It is not
@@ -283,13 +295,13 @@ pub(crate) fn mark_as_left(&self, user_id: &UserId, room_id: &RoomId, count: Pdu
 /// `update_membership` instead
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-pub(crate) fn mark_as_knocked(
+pub(crate) async fn mark_as_knocked(
 	&self,
 	user_id: &UserId,
 	room_id: &RoomId,
 	count: PduCount,
 	knocked_state: StrippedRoomState,
-) {
+) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -310,31 +322,31 @@ pub(crate) fn mark_as_knocked(
 	txn.del_raw(&self.db.roomuserid_invitecount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_leftstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_leftcount, &roomuser_id);
-	txn.execute();
+	txn.execute().await
 }
 
 /// Makes a user forget a room.
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-pub fn forget(&self, room_id: &RoomId, user_id: &UserId) {
+pub async fn forget(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 	let userroom_id = (user_id, room_id);
 	let roomuser_id = (room_id, user_id);
 	let mut txn = self.services.db.txn();
 
 	txn.del(&self.db.userroomid_leftstate, userroom_id);
 	txn.del(&self.db.roomuserid_leftcount, roomuser_id);
-	txn.execute();
+	txn.execute().await
 }
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-fn mark_as_once_joined(&self, user_id: &UserId, room_id: &RoomId) {
+async fn mark_as_once_joined(&self, user_id: &UserId, room_id: &RoomId) -> Result {
 	let key = (user_id, room_id);
 	let key = serialize_key(key).expect("failed to serialize roomuseroncejoinedid");
 	let mut txn = self.services.db.txn();
 
 	txn.insert_raw(&self.db.roomuseroncejoinedids, key, []);
-	txn.execute();
+	txn.execute().await
 }
 
 #[implement(super::Service)]
@@ -346,7 +358,7 @@ pub(crate) async fn mark_as_invited(
 	count: PduCount,
 	last_state: StrippedRoomState,
 	invite_via: Option<Vec<OwnedServerName>>,
-) {
+) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -373,7 +385,7 @@ pub(crate) async fn mark_as_invited(
 			.await;
 	}
 
-	txn.execute();
+	txn.execute().await
 }
 
 #[implement(super::Service)]
@@ -392,12 +404,13 @@ async fn ensure_remote_user(&self, user_id: &UserId) -> Result {
 #[implement(super::Service)]
 async fn handle_join(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) -> Result {
 	if !self.once_joined(user_id, room_id).await {
-		self.mark_as_once_joined(user_id, room_id);
+		self.mark_as_once_joined(user_id, room_id).await?;
 		self.copy_predecessor_data(room_id, user_id)
 			.await?;
 	}
 
-	self.mark_as_joined(user_id, room_id, count);
+	self.mark_as_joined(user_id, room_id, count)
+		.await?;
 
 	Ok(())
 }
@@ -495,13 +508,17 @@ async fn copy_predecessor_direct(
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) {
-	self.mark_as_left(user_id, room_id, count);
+	self.mark_as_left(user_id, room_id, count)
+		.await
+		.expect("database write error");
 
 	if self.services.globals.user_is_local(user_id)
 		&& (self.services.config.forget_forced_upon_leave
 			|| self.services.metadata.is_banned(room_id).await
 			|| self.services.metadata.is_disabled(room_id).await)
 	{
-		self.forget(room_id, user_id);
+		self.forget(room_id, user_id)
+			.await
+			.expect("database write error");
 	}
 }

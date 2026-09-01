@@ -145,12 +145,10 @@ pub(crate) async fn send_message_event_route(
 		)
 		.await?;
 
-	services.transaction_ids.add_txnid(
-		sender_user,
-		sender_device,
-		&body.txn_id,
-		event_id.as_bytes(),
-	);
+	services
+		.transaction_ids
+		.add_txnid(sender_user, sender_device, &body.txn_id, event_id.as_bytes())
+		.await?;
 
 	drop(state_lock);
 

@@ -5,7 +5,7 @@ use ruma::{
 	events::{reaction::ReactionEventContent, relation::RelationType},
 };
 use tuwunel_core::{
-	PduId,
+	PduId, Result,
 	arrayvec::ArrayVec,
 	implement, is_equal_to,
 	matrix::{Event, Pdu, PduCount, RawPduId, event::RelationTypeEqual},
@@ -22,7 +22,7 @@ type StartKey = ArrayVec<u8, 16>;
 
 #[implement(Service)]
 #[tracing::instrument(skip(self, from, to), level = "debug")]
-pub fn add_relation(&self, from: PduCount, to: PduCount) {
+pub async fn add_relation(&self, from: PduCount, to: PduCount) -> Result {
 	const BUFSIZE: usize = size_of::<u64>() * 2;
 
 	match (from, to) {
@@ -31,10 +31,13 @@ pub fn add_relation(&self, from: PduCount, to: PduCount) {
 
 			self.db
 				.tofrom_relation
-				.aput_raw::<BUFSIZE, _, _>(key, []);
+				.aput_raw::<BUFSIZE, _, _>(key, [])
+				.await?;
 		},
 		| _ => {}, // TODO: Relations with backfilled pdus
 	}
+
+	Ok(())
 }
 
 /// Query relations of an event to determine if matching any of the trailing

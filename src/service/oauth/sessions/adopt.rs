@@ -175,7 +175,7 @@ async fn adopt_foreign_subject(
 	txn.raw_put(&self.db.oauthid_session, sess_id, Cbor(&session));
 	txn.insert_raw(&self.db.oauthuniqid_oauthid, &unique_id, sess_id);
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(Adoption::Adopted)
 }

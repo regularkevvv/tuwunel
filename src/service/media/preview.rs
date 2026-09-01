@@ -300,7 +300,9 @@ pub async fn request_url_preview(&self, url: &Url) -> Result<UrlPreviewData> {
 	let ttl = Duration::from_secs(self.services.config.url_preview_cache_ttl);
 	let cached = CachedPreview::new(ttl, data)?;
 
-	self.db.set_url_preview(url.as_str(), &cached)?;
+	self.db
+		.set_url_preview(url.as_str(), &cached)
+		.await?;
 
 	Ok(cached.preview)
 }
@@ -594,7 +596,7 @@ pub async fn download_image(&self, response: reqwest::Response) -> Result<UrlPre
 		&image,
 	);
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(UrlPreviewData {
 		image: Some(mxc),
@@ -687,12 +689,12 @@ fn require_media_type(response: &reqwest::Response, class: &str) -> Result {
 /// underlying file size while routing clients through this server.
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
-fn register_lazy_media(&self, url: &str) -> String {
+async fn register_lazy_media(&self, url: &str) -> Result<String> {
 	let mxc = self.mint_lazy_media();
 
-	self.db.insert_lazy_media(&mxc, url);
+	self.db.insert_lazy_media(&mxc, url).await?;
 
-	mxc
+	Ok(mxc)
 }
 
 #[cfg(feature = "url_preview")]
@@ -717,13 +719,15 @@ fn mint_lazy_media(&self) -> String {
 
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
-#[expect(clippy::unused_async)]
 pub async fn download_video(&self, response: reqwest::Response) -> Result<UrlPreviewData> {
 	let video_size =
 		checked_media_size(&response, self.services.config.url_preview_max_media_size)?;
 
 	Ok(UrlPreviewData {
-		video: Some(self.register_lazy_media(response.url().as_str())),
+		video: Some(
+			self.register_lazy_media(response.url().as_str())
+				.await?,
+		),
 		video_size,
 		..Default::default()
 	})
@@ -738,13 +742,15 @@ pub async fn download_video(&self, _response: reqwest::Response) -> Result<UrlPr
 
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
-#[expect(clippy::unused_async)]
 pub async fn download_audio(&self, response: reqwest::Response) -> Result<UrlPreviewData> {
 	let audio_size =
 		checked_media_size(&response, self.services.config.url_preview_max_media_size)?;
 
 	Ok(UrlPreviewData {
-		audio: Some(self.register_lazy_media(response.url().as_str())),
+		audio: Some(
+			self.register_lazy_media(response.url().as_str())
+				.await?,
+		),
 		audio_size,
 		..Default::default()
 	})
@@ -838,13 +844,13 @@ async fn download_html(&self, url: &Url, response: reqwest::Response) -> Result<
 			.get("height")
 			.and_then(|h| h.parse().ok());
 
-		data.video = self.lazy_media(url, obj, "video/");
+		data.video = self.lazy_media(url, obj, "video/").await;
 	}
 
 	if let Some(obj) = html.opengraph.audios.first()
 		&& !obj.url.is_empty()
 	{
-		data.audio = self.lazy_media(url, obj, "audio/");
+		data.audio = self.lazy_media(url, obj, "audio/").await;
 	}
 
 	let props = html.opengraph.properties;
@@ -950,13 +956,17 @@ fn reserve_capped(bytes: &mut Vec<u8>, want: usize, limit: usize) {
 /// guaranteed to refuse.
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
-fn lazy_media(&self, page: &Url, obj: &OpengraphObject, class: &str) -> Option<String> {
-	declares_media_type(obj, class)
+async fn lazy_media(&self, page: &Url, obj: &OpengraphObject, class: &str) -> Option<String> {
+	let url = declares_media_type(obj, class)
 		.then(|| page.join(&obj.url).ok())
 		.flatten()
 		.filter(|url| ["http", "https"].contains(&url.scheme()))
-		.filter(|url| self.check_url_host(url).is_ok())
-		.map(|url| self.register_lazy_media(url.as_str()))
+		.filter(|url| self.check_url_host(url).is_ok())?;
+
+	self.register_lazy_media(url.as_str())
+		.await
+		.inspect_err(|e| tuwunel_core::debug_error!("Failed to register lazy media: {e}"))
+		.ok()
 }
 
 /// Whether an OpenGraph media object's declared type belongs to `class`.

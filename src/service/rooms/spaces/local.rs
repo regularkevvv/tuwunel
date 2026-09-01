@@ -65,8 +65,10 @@ pub(super) async fn get_summary_and_children_local(
 		.await;
 
 	match summary {
-		| Ok(Inaccessible) => self.cache_put(current_room, None),
-		| Ok(Accessible(ref summary)) => self.cache_put(current_room, Some(summary)),
+		| Ok(Inaccessible) => self.cache_put(current_room, None).await?,
+		| Ok(Accessible(ref summary)) =>
+			self.cache_put(current_room, Some(summary))
+				.await?,
 		| _ => (),
 	}
 

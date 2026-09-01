@@ -10,7 +10,7 @@ pub(super) async fn raw_del(&self, map: String, key: String) -> Result {
 	let timer = Instant::now();
 
 	let key = decode(&key);
-	map.remove(&key);
+	map.remove(&key).await?;
 
 	let query_time = timer.elapsed();
 	write!(self, "Operation completed in {query_time:?}").await

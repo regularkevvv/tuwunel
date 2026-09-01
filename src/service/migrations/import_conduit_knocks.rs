@@ -19,7 +19,9 @@ pub(super) async fn import_conduit_knocks(services: &Services) -> Result {
 
 	if pending && db.open_cf("roomuserid_knockcount")?.is_some() {
 		migrate_conduit_knocks(services).await?;
-		db["global"].insert(b"imported_conduit_knocks", []);
+		db["global"]
+			.insert(b"imported_conduit_knocks", [])
+			.await?;
 	}
 
 	Ok(())

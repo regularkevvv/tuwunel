@@ -20,7 +20,7 @@ use tuwunel_core::{
 	Err, Error, Result, debug_warn, err, error, info,
 	itertools::Itertools,
 	utils,
-	utils::{ReadyExt, content_disposition::make_content_disposition, stream::TryIgnore},
+	utils::{content_disposition::make_content_disposition, stream::TryIgnore},
 	warn,
 };
 use tuwunel_database::{Map, SEP};
@@ -424,8 +424,8 @@ pub(super) async fn migrate_conduit_pdus(services: &Services) -> Result {
 	let timeline = pduid_pdu
 		.raw_stream()
 		.ignore_err()
-		.ready_fold((0_usize, 0_usize), |acc, (key, value)| {
-			tally(acc, inject_room_id(pduid_pdu, key, value, |_| pduid_room(&rooms, key)))
+		.fold((0_usize, 0_usize), async |acc, (key, value)| {
+			tally(acc, inject_room_id(pduid_pdu, key, value, |_| pduid_room(&rooms, key)).await)
 		})
 		.await;
 
@@ -433,8 +433,8 @@ pub(super) async fn migrate_conduit_pdus(services: &Services) -> Result {
 	let outliers = outlier
 		.raw_stream()
 		.ignore_err()
-		.ready_fold((0_usize, 0_usize), |acc, (key, value)| {
-			tally(acc, inject_room_id(outlier, key, value, |pdu| outlier_room(key, pdu)))
+		.fold((0_usize, 0_usize), async |acc, (key, value)| {
+			tally(acc, inject_room_id(outlier, key, value, |pdu| outlier_room(key, pdu)).await)
 		})
 		.await;
 
@@ -466,7 +466,7 @@ fn tally((fixed, skipped): (usize, usize), result: Result<bool>) -> (usize, usiz
 /// `resolve`. Returns whether the value was rewritten; `false` means it already
 /// carried a `room_id`. A cheap `HasRoomId` probe short-circuits that common
 /// case, so only the rewritten PDUs pay the full parse and re-serialize.
-fn inject_room_id(
+async fn inject_room_id(
 	map: &Arc<Map>,
 	key: &[u8],
 	value: &[u8],
@@ -488,7 +488,7 @@ fn inject_room_id(
 	let bytes = serde_json::to_vec(&pdu)
 		.map_err(|e| err!(Database("re-serializing reconciled Conduit PDU: {e}")))?;
 
-	map.insert(key, bytes);
+	map.insert(key, bytes).await?;
 
 	Ok(true)
 }
@@ -571,10 +571,16 @@ pub(super) async fn migrate_conduit_highlight_split(services: &Services) -> Resu
 	let moved = highlight
 		.raw_stream()
 		.ignore_err()
-		.ready_fold(0_usize, |moved, (key, value)| {
+		.fold(0_usize, async |moved, (key, value)| {
 			if key.first() == Some(&b'!') {
-				lastread.insert(key, value);
-				highlight.remove(key);
+				lastread
+					.insert(key, value)
+					.await
+					.expect("database insert error");
+				highlight
+					.remove(key)
+					.await
+					.expect("database remove error");
 				moved.saturating_add(1)
 			} else {
 				moved
@@ -608,8 +614,11 @@ async fn copy_cf(
 	let copied = source
 		.raw_stream()
 		.ignore_err()
-		.ready_fold(0_usize, |copied, (key, value)| {
-			target.insert(key, value);
+		.fold(0_usize, async |copied, (key, value)| {
+			target
+				.insert(key, value)
+				.await
+				.expect("database insert error");
 			copied.saturating_add(1)
 		})
 		.await;

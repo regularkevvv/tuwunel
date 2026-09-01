@@ -27,12 +27,13 @@ use crate::{
 #[inline]
 pub async fn put<K, V>(&self, key: K, val: V) -> Result
 where
-	K: Serialize + Debug,
-	V: Serialize,
+	K: Serialize + Debug + Send,
+	V: Serialize + Send,
 {
 	let mut key_buf = KeyBuf::new();
 	let mut val_buf = ValBuf::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
+	self.bput(key, val, (&mut key_buf, &mut val_buf))
+		.await
 }
 
 /// Stores a serialized key and raw value using an owned key buffer.
@@ -48,8 +49,8 @@ where
 #[inline]
 pub async fn put_raw<K, V>(&self, key: K, val: V) -> Result
 where
-	K: Serialize + Debug,
-	V: AsRef<[u8]>,
+	K: Serialize + Debug + Send,
+	V: AsRef<[u8]> + Send,
 {
 	let mut key_buf = KeyBuf::new();
 	self.bput_raw(key, val, &mut key_buf).await
@@ -68,8 +69,8 @@ where
 #[inline]
 pub async fn raw_put<K, V>(&self, key: K, val: V) -> Result
 where
-	K: AsRef<[u8]>,
-	V: Serialize,
+	K: AsRef<[u8]> + Send + Sync,
+	V: Serialize + Send,
 {
 	let mut val_buf = ValBuf::new();
 	self.raw_bput(key, val, &mut val_buf).await
@@ -89,12 +90,13 @@ where
 #[inline]
 pub async fn put_aput<const VMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
-	K: Serialize + Debug,
-	V: Serialize,
+	K: Serialize + Debug + Send,
+	V: Serialize + Send,
 {
 	let mut key_buf = KeyBuf::new();
 	let mut val_buf = ArrayVec::<u8, VMAX>::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
+	self.bput(key, val, (&mut key_buf, &mut val_buf))
+		.await
 }
 
 /// Stores a serialized key and value with fixed-capacity key storage.
@@ -111,12 +113,13 @@ where
 #[inline]
 pub async fn aput_put<const KMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
-	K: Serialize + Debug,
-	V: Serialize,
+	K: Serialize + Debug + Send,
+	V: Serialize + Send,
 {
 	let mut key_buf = ArrayVec::<u8, KMAX>::new();
 	let mut val_buf = ValBuf::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
+	self.bput(key, val, (&mut key_buf, &mut val_buf))
+		.await
 }
 
 /// Stores a serialized key and value using fixed-capacity buffers.
@@ -132,12 +135,13 @@ where
 #[inline]
 pub async fn aput<const KMAX: usize, const VMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
-	K: Serialize + Debug,
-	V: Serialize,
+	K: Serialize + Debug + Send,
+	V: Serialize + Send,
 {
 	let mut key_buf = ArrayVec::<u8, KMAX>::new();
 	let mut val_buf = ArrayVec::<u8, VMAX>::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
+	self.bput(key, val, (&mut key_buf, &mut val_buf))
+		.await
 }
 
 /// Stores a serialized key and raw value with fixed-capacity key storage.
@@ -153,8 +157,8 @@ where
 #[inline]
 pub async fn aput_raw<const KMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
-	K: Serialize + Debug,
-	V: AsRef<[u8]>,
+	K: Serialize + Debug + Send,
+	V: AsRef<[u8]> + Send,
 {
 	let mut key_buf = ArrayVec::<u8, KMAX>::new();
 	self.bput_raw(key, val, &mut key_buf).await
@@ -173,8 +177,8 @@ where
 #[inline]
 pub async fn raw_aput<const VMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
-	K: AsRef<[u8]>,
-	V: Serialize,
+	K: AsRef<[u8]> + Send + Sync,
+	V: Serialize + Send,
 {
 	let mut val_buf = ArrayVec::<u8, VMAX>::new();
 	self.raw_bput(key, val, &mut val_buf).await
@@ -193,10 +197,10 @@ where
 #[implement(super::Map)]
 pub async fn bput<K, V, Bk, Bv>(&self, key: K, val: V, mut buf: (Bk, Bv)) -> Result
 where
-	K: Serialize + Debug,
-	V: Serialize,
-	Bk: Write + AsRef<[u8]>,
-	Bv: Write + AsRef<[u8]>,
+	K: Serialize + Debug + Send,
+	V: Serialize + Send,
+	Bk: Write + AsRef<[u8]> + Send,
+	Bv: Write + AsRef<[u8]> + Send,
 {
 	let val = ser::serialize(&mut buf.1, val).expect("failed to serialize insertion val");
 	self.bput_raw(key, val, &mut buf.0).await
@@ -216,9 +220,9 @@ where
 #[tracing::instrument(skip(self, val, buf), level = "trace")]
 pub async fn bput_raw<K, V, Bk>(&self, key: K, val: V, mut buf: Bk) -> Result
 where
-	K: Serialize + Debug,
-	V: AsRef<[u8]>,
-	Bk: Write + AsRef<[u8]>,
+	K: Serialize + Debug + Send,
+	V: AsRef<[u8]> + Send,
+	Bk: Write + AsRef<[u8]> + Send,
 {
 	let key = ser::serialize(&mut buf, key).expect("failed to serialize insertion key");
 	self.insert(&key, val).await
@@ -237,9 +241,9 @@ where
 #[implement(super::Map)]
 pub async fn raw_bput<K, V, Bv>(&self, key: K, val: V, mut buf: Bv) -> Result
 where
-	K: AsRef<[u8]>,
-	V: Serialize,
-	Bv: Write + AsRef<[u8]>,
+	K: AsRef<[u8]> + Send + Sync,
+	V: Serialize + Send,
+	Bv: Write + AsRef<[u8]> + Send,
 {
 	let val = ser::serialize(&mut buf, val).expect("failed to serialize insertion val");
 	self.insert(&key, val).await

@@ -316,7 +316,7 @@ async fn handle_rescinded_invite(
 			err!(Request(InvalidParam("Invite rescission signature is invalid: {e}")))
 		})?;
 
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	self.services
 		.state_cache
 		.update_membership(MembershipUpdate {
@@ -394,7 +394,7 @@ async fn handle_prev_events(
 		.into_iter()
 		.try_stream()
 		.map_ok(|prev_id| (eventid_info.remove(&prev_id), prev_id))
-		.try_for_each(async |(info, prev_id)| {
+		.try_for_each(|(info, prev_id)| async move {
 			self.upgrade_prev_event(
 				origin,
 				room_id,
@@ -457,7 +457,8 @@ async fn upgrade_prev_event(
 			Ok((prev_id, handled))
 		},
 		| Err(e) => {
-			self.record_outcome(Context::Upgrade, &prev_id, Disposition::Transient);
+			self.record_outcome(Context::Upgrade, &prev_id, Disposition::Transient)
+				.await?;
 			warn!(?prev_id, ?event_id, ?room_id, "Prev event processing failed: {e}");
 
 			Ok((prev_id, None))

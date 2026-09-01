@@ -46,28 +46,33 @@ impl Cache {
 }
 
 #[implement(Cache)]
-pub async fn clear(&self) { join(self.clear_destinations(), self.clear_overrides()).await; }
-
-#[implement(Cache)]
-pub async fn clear_destinations(&self) { self.destinations.clear().await; }
-
-#[implement(Cache)]
-pub async fn clear_overrides(&self) { self.overrides.clear().await; }
-
-#[implement(Cache)]
-pub fn del_destination(&self, name: &ServerName) { self.destinations.remove(name); }
-
-#[implement(Cache)]
-pub fn del_override(&self, name: &str) { self.overrides.remove(name); }
-
-#[implement(Cache)]
-pub fn set_destination(&self, name: &ServerName, dest: &CachedDest) {
-	self.destinations.raw_put(name, Cbor(dest));
+pub async fn clear(&self) -> Result {
+	let (a, b) = join(self.clear_destinations(), self.clear_overrides()).await;
+	a.and(b)
 }
 
 #[implement(Cache)]
-pub fn set_override(&self, name: &str, over: &CachedOverride) {
-	self.overrides.raw_put(name, Cbor(over));
+pub async fn clear_destinations(&self) -> Result { self.destinations.clear().await }
+
+#[implement(Cache)]
+pub async fn clear_overrides(&self) -> Result { self.overrides.clear().await }
+
+#[implement(Cache)]
+pub async fn del_destination(&self, name: &ServerName) -> Result {
+	self.destinations.remove(name).await
+}
+
+#[implement(Cache)]
+pub async fn del_override(&self, name: &str) -> Result { self.overrides.remove(name).await }
+
+#[implement(Cache)]
+pub async fn set_destination(&self, name: &ServerName, dest: &CachedDest) -> Result {
+	self.destinations.raw_put(name, Cbor(dest)).await
+}
+
+#[implement(Cache)]
+pub async fn set_override(&self, name: &str, over: &CachedOverride) -> Result {
+	self.overrides.raw_put(name, Cbor(over)).await
 }
 
 #[implement(Cache)]

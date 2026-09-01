@@ -27,7 +27,8 @@ pub(crate) async fn create_openid_token_route(
 	let access_token = utils::random_string(TOKEN_LENGTH);
 	let expires_in = services
 		.users
-		.create_openid_token(&body.user_id, &access_token)?;
+		.create_openid_token(&body.user_id, &access_token)
+		.await?;
 
 	Ok(account::request_openid_token::v3::Response {
 		access_token,

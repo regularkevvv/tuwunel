@@ -19,7 +19,10 @@ pub(super) async fn directory_unpublish(&self, room: OwnedRoomOrAliasId) -> Resu
 		return Err!("Room is not published");
 	}
 
-	self.services.directory.set_not_public(&room_id);
+	self.services
+		.directory
+		.set_not_public(&room_id)
+		.await?;
 
 	self.write_str("Room unpublished").await
 }

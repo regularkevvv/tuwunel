@@ -128,16 +128,19 @@ impl Data {
 			status_msg,
 		};
 
-		let count = self.services.globals.next_count();
+		let count = self.services.globals.next_count().await?;
 		let key = presenceid_key(*count, user_id);
 
-		self.userid_presenceid.raw_put(user_id, *count);
+		self.userid_presenceid
+			.raw_put(user_id, *count)
+			.await?;
 		self.presenceid_presence
-			.raw_put(key, Json(presence));
+			.raw_put(key, Json(presence))
+			.await?;
 
 		if let Ok((last_count, _)) = last_presence {
 			let key = presenceid_key(last_count, user_id);
-			self.presenceid_presence.remove(&key);
+			self.presenceid_presence.remove(&key).await?;
 		}
 
 		Ok(Some(*count))
@@ -155,8 +158,14 @@ impl Data {
 		};
 
 		let key = presenceid_key(count, user_id);
-		self.presenceid_presence.remove(&key);
-		self.userid_presenceid.remove(user_id);
+		self.presenceid_presence
+			.remove(&key)
+			.await
+			.expect("database write error");
+		self.userid_presenceid
+			.remove(user_id)
+			.await
+			.expect("database write error");
 	}
 
 	#[inline]

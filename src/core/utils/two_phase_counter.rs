@@ -3,10 +3,26 @@
 use std::{
 	collections::VecDeque,
 	ops::{Deref, Range},
+	pin::Pin,
 	sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use crate::{Result, checked, error, is_equal_to};
+
+/// Persists a dispatched sequence number before it is handed out.
+///
+/// Asynchronous and fallible by the storage contract: the commit is a
+/// database write, and a remote backend performs it over a network.
+pub type CommitFn =
+	Box<dyn Fn(u64) -> Pin<Box<dyn Future<Output = Result> + Send>> + Send + Sync>;
+
+/// Notifies retirement-frontier advancement.
+///
+/// Runs from a permit destructor and must remain synchronous and
+/// non-blocking; it only signals in-process state.
+pub type ReleaseFn = Box<dyn Fn(u64) -> Result + Send + Sync>;
 
 /// Two-Phase Counter.
 ///
@@ -22,20 +38,25 @@ use crate::{Result, checked, error, is_equal_to};
 /// value, but that value has no Pdu found because its write has not been
 /// completed with global visibility. Client-sync will then move on to the next
 /// counter value having missed the data from the current one.
-pub struct Counter<F: Fn(u64) -> Result + Send + Sync> {
-	/// Self is intended to be `Arc<Counter>` with inner state mutable via Lock.
-	inner: RwLock<State<F>>,
-}
+pub struct Counter {
+	/// Serializes dispatch so sequence numbers are drawn, persisted, and
+	/// recorded in one strict order even though persistence awaits.
+	dispatch_gate: AsyncMutex<()>,
 
-/// Inner protected state for Two-Phase Counter.
-pub struct State<F: Fn(u64) -> Result + Send + Sync> {
-	/// Monotonic counter. The next sequence number is drawn by adding one to
-	/// this value. That number will be persisted and added to `pending`.
-	dispatched: u64,
+	/// Self is intended to be `Arc<Counter>` with inner state mutable via
+	/// Lock.
+	inner: RwLock<State>,
 
 	/// Callback to persist the next sequence number drawn from `dispatched`.
 	/// This prevents pending numbers from being reused after server restart.
-	commit: F,
+	commit: CommitFn,
+}
+
+/// Inner protected state for Two-Phase Counter.
+struct State {
+	/// Monotonic counter. The next sequence number is drawn by adding one to
+	/// this value. That number will be persisted and added to `pending`.
+	dispatched: u64,
 
 	/// List of pending sequence numbers. One less than the minimum value in
 	/// this list is the "retirement" sequence number where all writes have
@@ -44,7 +65,7 @@ pub struct State<F: Fn(u64) -> Result + Send + Sync> {
 
 	/// Callback to notify updates of the retirement value. This is likely
 	/// called from the destructor of a permit/guard; try not to panic.
-	release: F,
+	release: ReleaseFn,
 }
 
 #[clippy::has_significant_drop]
@@ -53,9 +74,9 @@ pub struct State<F: Fn(u64) -> Result + Send + Sync> {
 /// The permit dereferences to its unique sequence number and records the
 /// retirement frontier sampled at dispatch. Dropping it retires the sequence
 /// through the shared counter so the retirement frontier advances in order.
-pub struct Permit<F: Fn(u64) -> Result + Send + Sync> {
+pub struct Permit {
 	/// Link back to the shared-state.
-	state: Arc<Counter<F>>,
+	state: Arc<Counter>,
 
 	/// The retirement value computed as a courtesy when this permit was
 	/// created.
@@ -65,21 +86,48 @@ pub struct Permit<F: Fn(u64) -> Result + Send + Sync> {
 	id: u64,
 }
 
-impl<F: Fn(u64) -> Result + Send + Sync> Counter<F> {
+impl Counter {
 	/// Construct a new Two-Phase counter state. The value of `init` is
 	/// considered retired, and the next sequence number dispatched will be one
 	/// greater.
-	pub fn new(init: u64, commit: F, release: F) -> Arc<Self> {
+	#[must_use]
+	pub fn new(init: u64, commit: CommitFn, release: ReleaseFn) -> Arc<Self> {
 		Arc::new(Self {
-			inner: State::new(init, commit, release).into(),
+			dispatch_gate: AsyncMutex::new(()),
+			inner: State::new(init, release).into(),
+			commit,
 		})
 	}
 
 	/// Obtain a sequence number to conduct write operations for the scope.
-	pub fn next(self: &Arc<Self>) -> Result<Permit<F>> {
-		let (retired, id) = self.write().dispatch()?;
+	///
+	/// The number is durably persisted through the commit callback before it
+	/// is returned; a failed commit dispatches nothing. Dispatch order equals
+	/// persist order because both happen under the dispatch gate.
+	pub async fn next(self: &Arc<Self>) -> Result<Permit> {
+		let _order = self.dispatch_gate.lock().await;
 
-		Ok(Permit::<F> { state: self.clone(), retired, id })
+		let (prev, retired) = {
+			let inner = self.read();
+			(inner.dispatched, inner.retired())
+		};
+
+		let id = checked!(prev + 1)?;
+
+		debug_assert!(
+			!self.read().check_pending(id),
+			"sequence number cannot already be pending",
+		);
+
+		(self.commit)(id).await?;
+
+		{
+			let mut inner = self.write();
+			inner.pending.push_back(id);
+			inner.dispatched = id;
+		};
+
+		Ok(Permit { state: self.clone(), retired, id })
 	}
 
 	/// Load the current and dispatched values simultaneously
@@ -105,12 +153,13 @@ impl<F: Fn(u64) -> Result + Send + Sync> Counter<F> {
 
 	/// Borrow the state for reading, tolerating a poisoned lock.
 	///
-	/// Poisoning carries no information here: `commit` runs before any mutation
-	/// and `release` after all of them, so an unwind through either callback
-	/// leaves the state consistent. Honoring the flag instead turns a single
-	/// failed write into a permanent outage of every sequence number.
+	/// Poisoning carries no information here: the pending list and dispatch
+	/// value are only mutated after a successful commit, and `release` runs
+	/// after all mutation, so an unwind through either callback leaves the
+	/// state consistent. Honoring the flag instead turns a single failed
+	/// write into a permanent outage of every sequence number.
 	#[inline]
-	fn read(&self) -> RwLockReadGuard<'_, State<F>> {
+	fn read(&self) -> RwLockReadGuard<'_, State> {
 		self.inner
 			.read()
 			.unwrap_or_else(PoisonError::into_inner)
@@ -120,41 +169,22 @@ impl<F: Fn(u64) -> Result + Send + Sync> Counter<F> {
 	///
 	/// The reasoning is the same as [`Self::read`].
 	#[inline]
-	fn write(&self) -> RwLockWriteGuard<'_, State<F>> {
+	fn write(&self) -> RwLockWriteGuard<'_, State> {
 		self.inner
 			.write()
 			.unwrap_or_else(PoisonError::into_inner)
 	}
 }
 
-impl<F: Fn(u64) -> Result + Send + Sync> State<F> {
+impl State {
 	/// Create new state, starting from `init`. The next sequence number
 	/// dispatched will be one greater than `init`.
-	fn new(dispatched: u64, commit: F, release: F) -> Self {
+	fn new(dispatched: u64, release: ReleaseFn) -> Self {
 		Self {
 			dispatched,
-			commit,
 			pending: VecDeque::new(),
 			release,
 		}
-	}
-
-	/// Dispatch the next sequence number as pending. The retired value is
-	/// calculated as a courtesy while the state is under lock.
-	fn dispatch(&mut self) -> Result<(u64, u64)> {
-		let prev = self.dispatched;
-		let retired = self.retired();
-		let dispatched = checked!(prev + 1)?;
-		debug_assert!(
-			!self.check_pending(dispatched),
-			"sequence number cannot already be pending",
-		);
-
-		(self.commit)(dispatched)?;
-		self.pending.push_back(dispatched);
-		self.dispatched = dispatched;
-
-		Ok((retired, dispatched))
 	}
 
 	/// Retire the sequence number `id`.
@@ -219,7 +249,7 @@ impl<F: Fn(u64) -> Result + Send + Sync> State<F> {
 	fn check_pending(&self, id: u64) -> bool { self.pending.iter().any(is_equal_to!(&id)) }
 }
 
-impl<F: Fn(u64) -> Result + Send + Sync> Permit<F> {
+impl Permit {
 	/// Access the retired sequence number sampled at this permit's creation.
 	/// This may be outdated prior to access. Obtained as a courtesy under lock.
 	#[inline]
@@ -232,13 +262,13 @@ impl<F: Fn(u64) -> Result + Send + Sync> Permit<F> {
 	pub fn id(&self) -> &u64 { &self.id }
 }
 
-impl<F: Fn(u64) -> Result + Send + Sync> Deref for Permit<F> {
+impl Deref for Permit {
 	type Target = u64;
 
 	#[inline]
 	fn deref(&self) -> &Self::Target { self.id() }
 }
 
-impl<F: Fn(u64) -> Result + Send + Sync> Drop for Permit<F> {
+impl Drop for Permit {
 	fn drop(&mut self) { self.state.write().retire(self.id); }
 }

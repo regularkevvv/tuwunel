@@ -18,7 +18,7 @@ use crate::{keyval::KeyBuf, ser};
 #[inline]
 pub async fn del<K>(&self, key: K) -> Result
 where
-	K: Serialize + Debug,
+	K: Serialize + Debug + Send,
 {
 	let mut buf = KeyBuf::new();
 	self.bdel(key, &mut buf).await
@@ -37,7 +37,7 @@ where
 #[inline]
 pub async fn adel<const MAX: usize, K>(&self, key: K) -> Result
 where
-	K: Serialize + Debug,
+	K: Serialize + Debug + Send,
 {
 	let mut buf = ArrayVec::<u8, MAX>::new();
 	self.bdel(key, &mut buf).await
@@ -57,8 +57,8 @@ where
 #[tracing::instrument(skip(self, buf), level = "trace")]
 pub async fn bdel<K, B>(&self, key: K, buf: &mut B) -> Result
 where
-	K: Serialize + Debug,
-	B: Write + AsRef<[u8]>,
+	K: Serialize + Debug + Send,
+	B: Write + AsRef<[u8]> + Send,
 {
 	let key = ser::serialize(buf, key).expect("failed to serialize deletion key");
 	self.remove(key).await

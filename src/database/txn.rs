@@ -37,6 +37,9 @@ const HEADER: usize = 12;
 /// Worst-case per-record overhead retained from the RocksDB batch encoding.
 const PER_OP: usize = 16;
 
+/// Assumed mean encoded operation size for capacity reservations.
+const OP_SIZE_ESTIMATE: usize = PER_OP * 4;
+
 /// Creates an empty transaction for one database engine.
 ///
 /// Operations can be appended through the typed or raw queueing methods. The
@@ -64,7 +67,11 @@ pub(crate) fn new_with_sink(sink: Sink) -> Self { Self { ops: Vec::new(), sink }
 #[implement(Txn)]
 pub fn with_capacity_bytes(engine: &Arc<Engine>, capacity_bytes: usize) -> Self {
 	Self {
-		ops: Vec::with_capacity(capacity_bytes.saturating_div(PER_OP.saturating_mul(4)).max(1)),
+		ops: Vec::with_capacity(
+			capacity_bytes
+				.saturating_div(OP_SIZE_ESTIMATE)
+				.max(1),
+		),
 		sink: Sink::Rocks(engine.clone()),
 	}
 }
@@ -356,9 +363,7 @@ pub async fn execute(self) -> Result {
 	}
 
 	STATS.txn_ops.record(self.len());
-	STATS
-		.txn_bytes
-		.record(self.size_in_bytes());
+	STATS.txn_bytes.record(self.size_in_bytes());
 
 	match &self.sink {
 		| Sink::Rocks(engine) => {
@@ -382,7 +387,8 @@ pub async fn execute(self) -> Result {
 		| Sink::Mem(store) => {
 			store.commit(self.ops.iter().map(|(map, op)| {
 				(
-					map.id().expect("model-backend maps have catalog ids"),
+					map.id()
+						.expect("model-backend maps have catalog ids"),
 					match op {
 						| Op::Put { key, val } => Op::Put { key: key.clone(), val: val.clone() },
 						| Op::Delete { key } => Op::Delete { key: key.clone() },
@@ -450,13 +456,11 @@ pub fn is_empty(&self) -> bool { self.ops.is_empty() }
 #[inline]
 #[must_use]
 pub fn size_in_bytes(&self) -> usize {
-	self.ops
-		.iter()
-		.fold(HEADER, |bytes, (_, op)| {
-			bytes
-				.saturating_add(PER_OP)
-				.saturating_add(op.size())
-		})
+	self.ops.iter().fold(HEADER, |bytes, (_, op)| {
+		bytes
+			.saturating_add(PER_OP)
+			.saturating_add(op.size())
+	})
 }
 
 /// Removes every queued operation from the transaction.
@@ -484,10 +488,7 @@ fn push(&mut self, map: &Map, op: Op) { self.ops.push((map.cloned_arc(), op)); }
 #[implement(Txn)]
 #[inline]
 fn assert_map(&self, map: &Map) {
-	assert!(
-		self.sink.same(&map.sink()),
-		"transaction map belongs to a different database"
-	);
+	assert!(self.sink.same(&map.sink()), "transaction map belongs to a different database");
 }
 
 /// Extends this transaction with raw insertions across maps.

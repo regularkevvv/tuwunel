@@ -636,7 +636,8 @@ async fn handle_uiaa(
 		// Grant 10-minute bypass for cross-signing key replacement (like Synapse).
 		services
 			.users
-			.allow_cross_signing_replacement(&user_id);
+			.allow_cross_signing_replacement(&user_id)
+			.await;
 
 		uiaainfo.completed.push(AuthType::OAuth);
 	}
@@ -653,7 +654,8 @@ async fn handle_uiaa(
 
 	services
 		.uiaa
-		.update_uiaa_session(&user_id, &device_id, uiaa_session_id, Some(&uiaainfo));
+		.update_uiaa_session(&user_id, &device_id, uiaa_session_id, Some(&uiaainfo))
+		.await?;
 
 	// Redirect back to the fallback page to render the success HTML
 	let location =

@@ -221,7 +221,7 @@ pub fn state_type_pdus<'a>(
 ) -> impl Stream<Item = impl Event> + Send + 'a {
 	self.state_keys_with_ids(shortstatehash, event_type)
 		.map(at!(1))
-		.broad_filter_map(async |event_id: OwnedEventId| {
+		.broad_filter_map(move |event_id: OwnedEventId| async move {
 			self.services
 				.timeline
 				.get_pdu(&event_id)
@@ -350,7 +350,7 @@ pub fn state_full_pdus(
 		.short
 		.multi_get_eventid_from_short(short_ids)
 		.ready_filter_map(Result::ok)
-		.broad_filter_map(async |event_id: OwnedEventId| {
+		.broad_filter_map(move |event_id: OwnedEventId| async move {
 			self.services
 				.timeline
 				.get_pdu(&event_id)

@@ -59,7 +59,7 @@ impl Service {
 		fields(pending = ?self.pending_count()),
 	)]
 	#[must_use]
-	pub fn next_count(&self) -> data::Permit { self.db.next_count() }
+	pub async fn next_count(&self) -> Result<data::Permit> { self.db.next_count().await }
 
 	#[must_use]
 	pub fn current_count(&self) -> u64 { self.db.current_count() }

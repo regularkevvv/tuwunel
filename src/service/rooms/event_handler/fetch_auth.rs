@@ -107,7 +107,9 @@ where
 						}
 						self.record_success(Context::Auth, &next_id).await;
 					} else {
-						self.record_outcome(Context::Auth, &next_id, Disposition::Transient);
+						self.record_outcome(Context::Auth, &next_id, Disposition::Transient)
+							.await
+							.expect("database write error");
 					}
 
 					pdus
@@ -189,12 +191,16 @@ async fn fetch_auth_chain(
 			.await
 		else {
 			debug_warn!("Backing off from {next_id}");
-			self.record_outcome(Context::Fetch, &next_id, Disposition::Transient);
+			self.record_outcome(Context::Fetch, &next_id, Disposition::Transient)
+				.await
+				.expect("database write error");
 			continue;
 		};
 
 		let Ok(value) = serde_json::from_slice::<CanonicalJsonObject>(&outcome.bytes) else {
-			self.record_outcome(Context::Fetch, &next_id, Disposition::Transient);
+			self.record_outcome(Context::Fetch, &next_id, Disposition::Transient)
+				.await
+				.expect("database write error");
 			continue;
 		};
 

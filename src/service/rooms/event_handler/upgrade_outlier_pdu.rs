@@ -222,9 +222,11 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	if soft_fail {
 		self.services
 			.pdu_metadata
-			.mark_event_soft_failed(incoming_pdu.event_id());
+			.mark_event_soft_failed(incoming_pdu.event_id())
+			.await?;
 
-		self.record_outcome(Context::Upgrade, incoming_pdu.event_id(), Disposition::Transient);
+		self.record_outcome(Context::Upgrade, incoming_pdu.event_id(), Disposition::Transient)
+			.await?;
 
 		drop(state_lock);
 		warn!(
@@ -243,7 +245,8 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	if cleared {
 		self.services
 			.pdu_metadata
-			.clear_event_soft_failed(incoming_pdu.event_id());
+			.clear_event_soft_failed(incoming_pdu.event_id())
+			.await?;
 
 		self.record_success(Context::Upgrade, incoming_pdu.event_id())
 			.await;
@@ -375,7 +378,8 @@ async fn soft_fail_standing(
 		.compute_soft_fail(incoming_pdu, room_rules, pdu_json)
 		.await?
 	{
-		self.record_outcome(Context::Upgrade, event_id, Disposition::Transient);
+		self.record_outcome(Context::Upgrade, event_id, Disposition::Transient)
+			.await?;
 
 		debug!(%event_id, "Still soft failed.");
 		return Ok(Standing::Withheld);
@@ -584,7 +588,7 @@ async fn compute_remaining_extremities(
 				.any(is_equal_to!(event_id))
 		})
 		.map(ToOwned::to_owned)
-		.broad_filter_map(async |event_id| {
+		.broad_filter_map(|event_id| async move {
 			// Only keep those extremities were not referenced yet
 			self.services
 				.pdu_metadata

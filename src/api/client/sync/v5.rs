@@ -150,7 +150,7 @@ pub(crate) async fn sync_events_v5_route(
 
 	if since == 0 {
 		*conn = Connection::default();
-		conn.store(&services.sync, &conn_key);
+		conn.store(&services.sync, &conn_key).await?;
 		debug_warn!(?conn_key, "Client cleared cache and reloaded.");
 	}
 
@@ -175,7 +175,7 @@ pub(crate) async fn sync_events_v5_route(
 
 	if config_change_needs_position(config_changed, advancing, caught_up, since) {
 		// The permit publishes the reserved position when it retires on drop.
-		drop(services.globals.next_count());
+		drop(services.globals.next_count().await?);
 	}
 
 	conn.update_rooms_prologue(retarding.then_some(since));
@@ -237,7 +237,7 @@ pub(crate) async fn sync_events_v5_route(
 			if !is_empty_response(&response) {
 				response.pos = conn.next_batch.to_string().into();
 				trace!(conn.globalsince, conn.next_batch, "response {response:?}");
-				conn.store(&services.sync, &conn_key);
+				conn.store(&services.sync, &conn_key).await?;
 				return Ok(response);
 			}
 		}
@@ -252,7 +252,7 @@ pub(crate) async fn sync_events_v5_route(
 		if timeout == 0 || services.server.is_stopping() || waiter().boxed().await {
 			response.pos = conn.next_batch.to_string().into();
 			trace!(conn.globalsince, conn.next_batch, "empty response {response:?}");
-			conn.store(&services.sync, &conn_key);
+			conn.store(&services.sync, &conn_key).await?;
 			return Ok(response);
 		}
 

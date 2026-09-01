@@ -30,9 +30,15 @@ pub async fn put_binding(
 
 	self.db
 		.userid_email
-		.put((user_id, email_canon), Cbor(binding));
+		.put((user_id, email_canon), Cbor(binding))
+		.await
+		.expect("database write error");
 
-	self.db.email_userid.insert(email_canon, user_id);
+	self.db
+		.email_userid
+		.insert(email_canon, user_id)
+		.await
+		.expect("database write error");
 }
 
 /// All third-party identifiers bound to `user_id`, lazily decoded from the
@@ -78,7 +84,11 @@ pub fn get_bindings<'a>(
 	),
 )]
 pub async fn del_binding(&self, user_id: &UserId, email_canon: &str) {
-	self.db.userid_email.del((user_id, email_canon));
+	self.db
+		.userid_email
+		.del((user_id, email_canon))
+		.await
+		.expect("database write error");
 
 	if self
 		.user_id_for_email(email_canon)
@@ -87,7 +97,11 @@ pub async fn del_binding(&self, user_id: &UserId, email_canon: &str) {
 		.flatten()
 		.is_some_and(|bound| bound == user_id)
 	{
-		self.db.email_userid.remove(email_canon);
+		self.db
+			.email_userid
+			.remove(email_canon)
+			.await
+			.expect("database write error");
 	}
 }
 

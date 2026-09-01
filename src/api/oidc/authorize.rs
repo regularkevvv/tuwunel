@@ -121,7 +121,8 @@ pub(crate) async fn authorize_route(
 			.unwrap_or(now),
 	};
 
-	oidc.store_auth_request(&req_id, &auth_req);
+	oidc.store_auth_request(&req_id, &auth_req)
+		.await?;
 
 	let Some(idp_id) = idp_id else {
 		let view = match params.prompt.as_deref() {

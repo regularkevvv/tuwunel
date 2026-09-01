@@ -20,7 +20,8 @@ pub(super) async fn directory_publish(&self, room: OwnedRoomOrAliasId, force: bo
 
 	self.services
 		.directory
-		.set_public(&room_id, alias);
+		.set_public(&room_id, alias)
+		.await?;
 
 	let out = match alias {
 		| None => Cow::Borrowed("Room published"),

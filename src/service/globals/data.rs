@@ -4,7 +4,9 @@ use futures::TryFutureExt;
 use tokio::sync::watch::Sender;
 use tuwunel_core::{
 	Result, err, utils,
-	utils::two_phase_counter::{Counter as TwoPhaseCounter, Permit as TwoPhasePermit},
+	utils::two_phase_counter::{
+		CommitFn, Counter as TwoPhaseCounter, Permit as TwoPhasePermit, ReleaseFn,
+	},
 };
 use tuwunel_database::{Database, Deserialized, Map};
 
@@ -15,26 +17,28 @@ pub struct Data {
 	pub(super) db: Arc<Database>,
 }
 
-pub(super) type Permit = TwoPhasePermit<Callback>;
-type Counter = TwoPhaseCounter<Callback>;
-type Callback = Box<dyn Fn(u64) -> Result + Send + Sync>;
+pub(super) type Permit = TwoPhasePermit;
+type Counter = TwoPhaseCounter;
 
 const COUNTER: &[u8] = b"c";
 
 impl Data {
 	pub(super) fn new(args: &crate::Args<'_>) -> Self {
 		let db = args.db.clone();
+		let global = args.db["global"].clone();
 		let count = Self::stored_count(&args.db["global"]).expect("initialize global counter");
 		let retires = Sender::new(count);
+		let commit: CommitFn = Box::new(move |count| {
+			let db = db.clone();
+			let global = global.clone();
+			Box::pin(async move { Self::store_count(&db, &global, count).await })
+		});
+		let release: ReleaseFn = Box::new(move |count| Self::handle_retire(&retires, count));
 		Self {
 			db: args.db.clone(),
 			global: args.db["global"].clone(),
-			retires: retires.clone(),
-			counter: Counter::new(
-				count,
-				Box::new(move |count| Self::store_count(&db, &db["global"], count)),
-				Box::new(move |count| Self::handle_retire(&retires, count)),
-			),
+			retires: Sender::new(count),
+			counter: Counter::new(count, commit, release),
 		}
 	}
 
@@ -60,11 +64,7 @@ impl Data {
 	}
 
 	#[inline]
-	pub(super) fn next_count(&self) -> Permit {
-		self.counter
-			.next()
-			.expect("failed to obtain next sequence number")
-	}
+	pub(super) async fn next_count(&self) -> Result<Permit> { self.counter.next().await }
 
 	#[inline]
 	pub(super) fn current_count(&self) -> u64 { self.counter.current() }
@@ -80,11 +80,9 @@ impl Data {
 	}
 
 	#[tracing::instrument(name = "dispatch", level = "debug", skip(db, global))]
-	fn store_count(db: &Arc<Database>, global: &Arc<Map>, count: u64) -> Result {
+	async fn store_count(db: &Arc<Database>, global: &Arc<Map>, count: u64) -> Result {
 		let _cork = db.cork();
-		global.insert(COUNTER, count.to_be_bytes());
-
-		Ok(())
+		global.insert(COUNTER, count.to_be_bytes()).await
 	}
 
 	fn stored_count(global: &Arc<Map>) -> Result<u64> {
@@ -96,8 +94,8 @@ impl Data {
 }
 
 impl Data {
-	pub fn bump_database_version(&self, new_version: u64) {
-		self.global.raw_put(b"version", new_version);
+	pub async fn bump_database_version(&self, new_version: u64) -> Result {
+		self.global.raw_put(b"version", new_version).await
 	}
 
 	pub async fn database_version(&self) -> u64 {

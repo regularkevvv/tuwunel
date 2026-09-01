@@ -19,7 +19,7 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use tuwunel_core::{Result, at, debug, err, implement, is_equal_to, utils::stream::TryIgnore};
-use tuwunel_database::{Cbor, Deserialized, Map};
+use tuwunel_database::{Cbor, Deserialized, Map, serialize_key};
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -108,6 +108,7 @@ pub async fn clear_connections(
 	device_id: Option<&DeviceId>,
 	conn_id: Option<&ConnectionId>,
 ) {
+	let mut doomed = Vec::new();
 	self.connections
 		.lock()
 		.await
@@ -117,13 +118,20 @@ pub async fn clear_connections(
 				&& (conn_id.is_none() || conn_id == conn_conn_id.as_ref());
 
 			if !retain {
-				self.db
-					.userdeviceconnid_conn
-					.del((conn_user_id, conn_device_id, conn_conn_id));
+				let key = (conn_user_id, conn_device_id, conn_conn_id);
+				doomed.push(serialize_key(key).expect("failed to serialize connection key"));
 			}
 
 			retain
 		});
+
+	for key in doomed {
+		self.db
+			.userdeviceconnid_conn
+			.remove(&key)
+			.await
+			.expect("database remove error");
+	}
 }
 
 #[implement(Service)]
@@ -131,7 +139,11 @@ pub async fn clear_connections(
 pub async fn drop_connection(&self, key: &ConnectionKey) {
 	let mut cache = self.connections.lock().await;
 
-	self.db.userdeviceconnid_conn.del(key);
+	self.db
+		.userdeviceconnid_conn
+		.del(key)
+		.await
+		.expect("database write error");
 	cache.remove(key);
 }
 
@@ -236,17 +248,20 @@ where
 
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip(self, service))]
-pub fn store(&self, service: &Service, key: &ConnectionKey) {
+pub async fn store(&self, service: &Service, key: &ConnectionKey) -> Result {
 	service
 		.db
 		.userdeviceconnid_conn
-		.put(key, Cbor(self));
+		.put(key, Cbor(self))
+		.await?;
 
 	debug!(
 		since = %self.globalsince,
 		next_batch = %self.next_batch,
 		"Persisted connection state"
 	);
+
+	Ok(())
 }
 
 #[implement(Connection)]

@@ -26,10 +26,16 @@ pub(crate) async fn admin_suspend_route(
 
 	if services.users.is_suspended(&body.user_id).await != body.suspend {
 		match body.suspend {
-			| true => services
-				.users
-				.set_suspended(&body.user_id, sender_user),
-			| false => services.users.clear_suspended(&body.user_id),
+			| true =>
+				services
+					.users
+					.set_suspended(&body.user_id, sender_user)
+					.await?,
+			| false =>
+				services
+					.users
+					.clear_suspended(&body.user_id)
+					.await?,
 		}
 	}
 

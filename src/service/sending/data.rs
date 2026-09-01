@@ -38,8 +38,8 @@ impl Data {
 	}
 
 	#[inline]
-	pub(super) fn delete_active_request(&self, key: &[u8]) {
-		self.servercurrentevent_data.remove(key);
+	pub(super) async fn delete_active_request(&self, key: &[u8]) -> Result {
+		self.servercurrentevent_data.remove(key).await
 	}
 
 	pub(super) async fn delete_all_active_requests_for(&self, destination: &Destination) {
@@ -47,7 +47,12 @@ impl Data {
 		self.servercurrentevent_data
 			.raw_keys_prefix(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| self.servercurrentevent_data.remove(key))
+			.for_each(|key| async move {
+				self.servercurrentevent_data
+					.remove(key)
+					.await
+					.expect("database remove error");
+			})
 			.await;
 	}
 
@@ -56,17 +61,27 @@ impl Data {
 		self.servercurrentevent_data
 			.raw_keys_prefix(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| self.servercurrentevent_data.remove(key))
+			.for_each(|key| async move {
+				self.servercurrentevent_data
+					.remove(key)
+					.await
+					.expect("database remove error");
+			})
 			.await;
 
 		self.servernameevent_data
 			.raw_keys_prefix(&prefix)
 			.ignore_err()
-			.ready_for_each(|key| self.servernameevent_data.remove(key))
+			.for_each(|key| async move {
+				self.servernameevent_data
+					.remove(key)
+					.await
+					.expect("database remove error");
+			})
 			.await;
 	}
 
-	pub(super) fn mark_as_active<'a, I>(&self, events: I)
+	pub(super) async fn mark_as_active<'a, I>(&self, events: I) -> Result
 	where
 		I: Iterator<Item = &'a QueueItem>,
 	{
@@ -77,24 +92,31 @@ impl Data {
 				txn.del_raw(&self.servernameevent_data, key);
 				txn
 			})
-			.execute();
+			.execute()
+			.await
 	}
 
 	/// Write composed EDUs straight into the active set, keyed by fresh counts;
 	/// unlike `mark_as_active` there is no queue row to delete.
-	pub(super) fn persist_active_edus(&self, server: &ServerName, edus: &[EduBuf]) {
+	pub(super) async fn persist_active_edus(
+		&self,
+		server: &ServerName,
+		edus: &[EduBuf],
+	) -> Result {
 		let prefix = Destination::Federation(server.to_owned()).get_prefix();
 
-		let items = edus.iter().map(|edu| {
+		let mut txn = self.db.txn();
+		for edu in edus {
 			let mut key = prefix.clone();
-			let count = self.services.globals.next_count();
-			let count = count.to_be_bytes();
-			key.extend(&count);
+			// The permit retires at the end of this iteration, before the
+			// batch executes; EDU counts never gate reader visibility.
+			let count = self.services.globals.next_count().await?;
+			key.extend(&count.to_be_bytes());
 
-			(key, edu.as_slice())
-		});
+			txn.insert_raw(&self.servercurrentevent_data, key, edu.as_slice());
+		}
 
-		Txn::insert(&self.servercurrentevent_data, items).execute();
+		txn.execute().await
 	}
 
 	#[inline]
@@ -128,16 +150,16 @@ impl Data {
 			})
 	}
 
-	pub(super) fn queue_requests<'a, I>(&self, requests: I) -> Vec<Vec<u8>>
+	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>
 	where
 		I: Iterator<Item = (&'a SendingEvent, &'a Destination)> + Clone + Debug + Send,
 	{
-		let keys: Vec<_> = requests
-			.clone()
-			.map(|(event, dest)| match event {
+		let mut keys: Vec<Vec<u8>> = Vec::new();
+		for (event, dest) in requests.clone() {
+			keys.push(match event {
 				| SendingEvent::Pdu(pdu_id) => dest.event_key(pdu_id),
 				| _ => {
-					let count = self.services.globals.next_count();
+					let count = self.services.globals.next_count().await?;
 					let count = count.to_be_bytes();
 					let mut key = dest.get_prefix_with_capacity(count.len());
 
@@ -145,8 +167,8 @@ impl Data {
 
 					key
 				},
-			})
-			.collect();
+			});
+		}
 
 		let items = keys
 			.iter()
@@ -154,9 +176,11 @@ impl Data {
 			.zip(requests.map(at!(0)))
 			.map(|(key, event)| (key, event.value_bytes()));
 
-		Txn::insert(&self.servernameevent_data, items).execute();
+		Txn::insert(&self.servernameevent_data, items)
+			.execute()
+			.await?;
 
-		keys
+		Ok(keys)
 	}
 
 	/// Yields only pending queue items.
@@ -220,9 +244,16 @@ impl Data {
 			})
 	}
 
-	pub(super) fn set_latest_educount(&self, server_name: &ServerName, last_count: u64) {
+	pub(super) async fn set_latest_educount(
+		&self,
+		server_name: &ServerName,
+		last_count: u64,
+	) -> Result {
 		self.servername_educount
-			.raw_put(server_name, last_count);
+			.raw_put(server_name, last_count)
+			.await?;
+
+		Ok(())
 	}
 
 	pub async fn get_latest_educount(&self, server_name: &ServerName) -> u64 {

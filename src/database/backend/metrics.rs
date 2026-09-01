@@ -26,11 +26,14 @@ pub(crate) struct OpStat {
 impl OpStat {
 	pub(crate) fn record(&self, size: usize) {
 		self.count.fetch_add(1, Relaxed);
-		self.bytes.fetch_add(size as u64, Relaxed);
-		let bucket = (usize::BITS - size.leading_zeros())
+		self.bytes
+			.fetch_add(u64::try_from(size).unwrap_or(u64::MAX), Relaxed);
+		let bucket: usize = usize::BITS
+			.saturating_sub(size.leading_zeros())
 			.saturating_sub(1)
-			.min(BUCKETS as u32 - 1) as usize;
-		self.hist[bucket].fetch_add(1, Relaxed);
+			.try_into()
+			.unwrap_or(usize::MAX);
+		self.hist[bucket.min(BUCKETS.saturating_sub(1))].fetch_add(1, Relaxed);
 	}
 
 	fn json(&self) -> serde_json::Value {
@@ -39,7 +42,10 @@ impl OpStat {
 			.iter()
 			.map(|b| b.load(Relaxed))
 			.collect();
-		let top = hist.iter().rposition(|&v| v > 0).map_or(0, |i| i + 1);
+		let top = hist
+			.iter()
+			.rposition(|&v| v > 0)
+			.map_or(0, |i| i.saturating_add(1));
 		serde_json::json!({
 			"count": self.count.load(Relaxed),
 			"bytes": self.bytes.load(Relaxed),

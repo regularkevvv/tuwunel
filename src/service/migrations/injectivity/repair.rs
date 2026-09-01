@@ -65,7 +65,7 @@ struct Patched {
 /// a loser, so `delete_losers` would remove the reverse row the promotion
 /// just completed.
 #[tracing::instrument(level = "debug", skip_all)]
-pub(super) fn heal(services: &Services, scan: &Scan) -> bool {
+pub(super) async fn heal(services: &Services, scan: &Scan) -> bool {
 	if scan.unverifiable || !scan.healable() {
 		return false;
 	}
@@ -89,7 +89,9 @@ pub(super) fn heal(services: &Services, scan: &Scan) -> bool {
 		"Completing torn short id writes; rescanning to re-measure what they explain."
 	);
 
-	txn.execute();
+	txn.execute()
+		.await
+		.expect("database transaction execute error");
 
 	true
 }
@@ -221,7 +223,7 @@ pub(super) async fn repair(
 
 	patch_statediffs(services, scan).await?;
 	move_keys(services, scan).await?;
-	delete_losers(services, scan);
+	delete_losers(services, scan).await;
 
 	Ok(Verdict::Settled)
 }
@@ -334,7 +336,7 @@ async fn patch_state(services: &Services, scan: &Scan, digests: &Digests, state:
 		.flatten()
 		.for_each(|digest| txn.del_raw(statehashes, digest));
 
-	txn.execute();
+	txn.execute().await?;
 
 	info!(
 		%state,
@@ -455,7 +457,7 @@ async fn move_keys(services: &Services, scan: &Scan) -> Result {
 		"Rewrote loser-keyed and loser-valued rows."
 	);
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -486,7 +488,7 @@ async fn move_state_row(states: &Arc<Map>, txn: &mut Txn, loser: u64, winner: u6
 /// Last on purpose: uncorked, each removal would flush the write-ahead log
 /// per key, and any earlier placement would destroy the resolver an
 /// interrupted repair needs to resume.
-fn delete_losers(services: &Services, scan: &Scan) {
+async fn delete_losers(services: &Services, scan: &Scan) {
 	info!(
 		stale_events = scan.events.losers.len(),
 		stale_statekeys = scan.statekeys.losers.len(),
@@ -498,13 +500,19 @@ fn delete_losers(services: &Services, scan: &Scan) {
 	let events = &services.db["shorteventid_eventid"];
 
 	for loser in &scan.events.losers {
-		events.remove(&loser.to_be_bytes());
+		events
+			.remove(&loser.to_be_bytes())
+			.await
+			.expect("database remove error");
 	}
 
 	let statekeys = &services.db["shortstatekey_statekey"];
 
 	for loser in &scan.statekeys.losers {
-		statekeys.remove(&loser.to_be_bytes());
+		statekeys
+			.remove(&loser.to_be_bytes())
+			.await
+			.expect("database remove error");
 	}
 }
 

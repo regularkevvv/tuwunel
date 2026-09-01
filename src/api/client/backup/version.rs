@@ -17,7 +17,8 @@ pub(crate) async fn create_backup_version_route(
 
 	let version = services
 		.key_backups
-		.create_backup(body.sender_user(), &body.algorithm)?;
+		.create_backup(body.sender_user(), &body.algorithm)
+		.await?;
 
 	Ok(create_backup_version::v3::Response { version })
 }

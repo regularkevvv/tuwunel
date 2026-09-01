@@ -133,8 +133,20 @@ async fn contract_point_ops_and_ordering() -> Result {
 
 	// Missing keys are the not-found error on both backends.
 	let missing: &[u8] = b"\xFF\xFF\xFF\xFF-missing";
-	assert!(pair.rocks.get(&missing).await.unwrap_err().is_not_found());
-	assert!(pair.mem.get(&missing).await.unwrap_err().is_not_found());
+	assert!(
+		pair.rocks
+			.get(&missing)
+			.await
+			.unwrap_err()
+			.is_not_found()
+	);
+	assert!(
+		pair.mem
+			.get(&missing)
+			.await
+			.unwrap_err()
+			.is_not_found()
+	);
 	assert!(!pair.rocks.contains(&missing).await);
 	assert!(!pair.mem.contains(&missing).await);
 
@@ -144,8 +156,20 @@ async fn contract_point_ops_and_ordering() -> Result {
 	let victim = edge_keys().swap_remove(3);
 	pair.rocks.remove(&victim).await?;
 	pair.mem.remove(&victim).await?;
-	assert!(pair.rocks.get(&victim).await.unwrap_err().is_not_found());
-	assert!(pair.mem.get(&victim).await.unwrap_err().is_not_found());
+	assert!(
+		pair.rocks
+			.get(&victim)
+			.await
+			.unwrap_err()
+			.is_not_found()
+	);
+	assert!(
+		pair.mem
+			.get(&victim)
+			.await
+			.unwrap_err()
+			.is_not_found()
+	);
 
 	assert_maps_equal(pair, "after deletes").await?;
 
@@ -169,15 +193,9 @@ async fn contract_prefix_and_seek_boundaries() -> Result {
 		pair.mem.insert(&key, &key).await?;
 	}
 
-	for prefix in [
-		&b"p"[..],
-		b"prefix",
-		b"\xFF",
-		b"\xFF\xFF",
-		b"\x00",
-		b"p\xFF",
-		b"absent-prefix",
-	] {
+	for prefix in
+		[&b"p"[..], b"prefix", b"\xFF", b"\xFF\xFF", b"\x00", b"p\xFF", b"absent-prefix"]
+	{
 		let rocks: Vec<Vec<u8>> = pair
 			.rocks
 			.raw_keys_prefix(&prefix)
@@ -351,7 +369,9 @@ fn map_id_table_is_a_catalog_bijection() {
 	for i in 0..ids::MAP_IDS.len() {
 		let (name, _) = ids::MAP_IDS[i];
 		assert_eq!(
-			ids::map_id(name).expect("catalog name must have an id").0 as usize,
+			ids::map_id(name)
+				.expect("catalog name must have an id")
+				.0 as usize,
 			i,
 			"table order and id diverge for {name}"
 		);

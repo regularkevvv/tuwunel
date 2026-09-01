@@ -195,7 +195,8 @@ impl Service {
 		}
 
 		self.db
-			.insert_pending_mxc(mxc, user, unused_expires_at);
+			.insert_pending_mxc(mxc, user, unused_expires_at)
+			.await?;
 
 		Ok(())
 	}
@@ -230,7 +231,7 @@ impl Service {
 		self.create(mxc, Some(user), content_disposition, content_type, file)
 			.await?;
 
-		self.db.remove_pending_mxc(mxc);
+		self.db.remove_pending_mxc(mxc).await?;
 
 		let mxc_uri: OwnedMxcUri = mxc.to_string().into();
 		let notifier = self.mxc_state.notifiers.lock()?.remove(&mxc_uri);
@@ -252,13 +253,10 @@ impl Service {
 		file: &[u8],
 	) -> Result {
 		// Width, Height = 0 if it's not a thumbnail
-		let key = self.db.create_file_metadata(
-			mxc,
-			user,
-			&Dim::default(),
-			content_disposition,
-			content_type,
-		)?;
+		let key = self
+			.db
+			.create_file_metadata(mxc, user, &Dim::default(), content_disposition, content_type)
+			.await?;
 
 		//TODO: Dangling metadata in database if creation fails
 		self.create_media_file(&key, file).await
@@ -276,7 +274,7 @@ impl Service {
 
 			self.db.remove_lazy_media(&mut txn, &key);
 			self.db.remove_lazy_content(&mut txn, &key);
-			txn.execute();
+			txn.execute().await?;
 		}
 
 		match self.db.search_mxc_metadata_prefix(mxc).await {
@@ -509,7 +507,7 @@ impl Service {
 
 		self.db.remove_lazy_media(&mut txn, &key);
 		self.db.remove_lazy_content(&mut txn, &key);
-		txn.execute();
+		txn.execute().await?;
 
 		Ok(media)
 	}
@@ -646,7 +644,7 @@ impl Service {
 	pub fn upload_stats(&self) -> impl Stream<Item = UploadStat> + Send + '_ {
 		self.db
 			.all_uploads()
-			.broad_filter_map(async |(mxc, user_id)| {
+			.broad_filter_map(move |(mxc, user_id)| async move {
 				let parts = mxc.parts().ok()?;
 				let Metadata { key, .. } = self.get_metadata(&parts).await?;
 				let object = self.head_meta(&key).await?;
@@ -682,7 +680,7 @@ impl Service {
 			.into_iter()
 			.stream()
 			.ready_filter(|mxc| self.is_local(mxc) && !spared.contains(mxc))
-			.broad_filter_map(async |mxc| {
+			.broad_filter_map(|mxc| async move {
 				let parts = mxc.parts().ok()?;
 				let Metadata { key, .. } = self.get_metadata(&parts).await?;
 				let object = self.head_meta(&key).await?;
@@ -716,7 +714,7 @@ impl Service {
 			.metadata
 			.iter_ids()
 			.map(ToOwned::to_owned)
-			.broad_filter_map(async |room_id| {
+			.broad_filter_map(|room_id| async move {
 				self.services
 					.state_accessor
 					.get_avatar(&room_id)

@@ -276,7 +276,7 @@ pub async fn clear_cache(&self) {
 
 	self.services()
 		.stream()
-		.for_each(async |service| {
+		.for_each(|service| async move {
 			service.clear_cache().await;
 		})
 		.await;

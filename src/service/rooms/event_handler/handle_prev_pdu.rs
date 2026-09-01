@@ -59,7 +59,8 @@ pub(super) async fn handle_prev_pdu(
 		return Ok(None);
 	}
 
-	self.record_attempt(Context::Upgrade, prev_id);
+	self.record_attempt(Context::Upgrade, prev_id)
+		.await?;
 
 	self.upgrade_outlier_to_timeline_pdu(
 		origin,

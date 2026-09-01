@@ -161,7 +161,7 @@ pub async fn delete_user_sessions(&self, user_id: &UserId) {
 	self.user_sessions(user_id)
 		.ready_filter_map(Result::ok)
 		.ready_filter_map(|(_, session)| session.sess_id)
-		.for_each(async |sess_id| {
+		.for_each(|sess_id| async move {
 			self.sessions.delete(&sess_id).await;
 		})
 		.await;
@@ -173,7 +173,7 @@ pub async fn delete_user_sessions(&self, user_id: &UserId) {
 pub async fn revoke_user_tokens(&self, user_id: &UserId) {
 	self.user_sessions(user_id)
 		.ready_filter_map(Result::ok)
-		.for_each(async |(provider, session)| {
+		.for_each(|(provider, session)| async move {
 			self.revoke_token((&provider, &session))
 				.await
 				.log_err()

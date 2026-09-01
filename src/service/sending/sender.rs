@@ -418,7 +418,10 @@ impl Service {
 			.await;
 
 		if !new_events.is_empty() {
-			self.db.mark_as_active(new_events.iter());
+			self.db
+				.mark_as_active(new_events.iter())
+				.await
+				.expect("database write error");
 		}
 
 		let mut events: Vec<SendingEvent> = new_events
@@ -643,7 +646,10 @@ impl Service {
 			let entry = txns.entry(dest.clone()).or_default();
 			if self.server.config.startup_netburst_keep >= 0 && entry.len() >= keep {
 				warn!("Dropping unsent event {dest:?} {:?}", String::from_utf8_lossy(&key));
-				self.db.delete_active_request(&key);
+				self.db
+					.delete_active_request(&key)
+					.await
+					.expect("database write error");
 			} else {
 				entry.push(event);
 			}
@@ -728,15 +734,19 @@ impl Service {
 
 		// Compose the next transaction
 		let _cork = self.db.db.cork();
-		self.db
-			.retain_queued(new_events)
-			.ready_for_each(|item| {
-				self.db.mark_as_active(once(&item));
+		let queued = self.db.retain_queued(new_events);
+		futures::pin_mut!(queued);
+		while let Some(item) = queued.next().await {
+			{
+				self.db
+					.mark_as_active(once(&item))
+					.await
+					.expect("database transaction execute error");
 				if !matches!(&item.1, SendingEvent::Flush) {
 					events.push(item.1);
 				}
-			})
-			.await;
+			}
+		}
 
 		// Add EDU's into the transaction
 		if let Destination::Federation(server_name) = dest {
@@ -881,20 +891,23 @@ impl Service {
 		if !overflow.is_empty() {
 			let dest = Destination::Federation(server_name.to_owned());
 			self.db
-				.queue_requests(overflow.iter().map(|event| (event, &dest)));
+				.queue_requests(overflow.iter().map(|event| (event, &dest)))
+				.await?;
 		}
 
 		// Persist the durable prefix so a failed or restarted transaction
 		// replays it; the ACK deletes these active rows.
 		if durable_len > 0 {
 			self.db
-				.persist_active_edus(server_name, &events[..durable_len]);
+				.persist_active_edus(server_name, &events[..durable_len])
+				.await?;
 		}
 
 		let last_count = max_edu_count.load(Ordering::Acquire);
 		if last_count > since {
 			self.db
-				.set_latest_educount(server_name, last_count);
+				.set_latest_educount(server_name, last_count)
+				.await?;
 		}
 
 		Ok(events)
@@ -990,14 +1003,15 @@ impl Service {
 		events_len: &AtomicUsize,
 	) -> Selected {
 		let num = AtomicUsize::new(0);
+		let num = &num;
 		let by_room: RoomReceipts = self
 			.services
 			.state_cache
 			.server_rooms(server_name)
 			.map(ToOwned::to_owned)
-			.broad_filter_map(async |room_id| {
+			.broad_filter_map(|room_id| async move {
 				let ranked = self
-					.select_edus_receipts_room(&room_id, since, max_edu_count, &num)
+					.select_edus_receipts_room(&room_id, since, max_edu_count, num)
 					.await;
 
 				ranked
@@ -1620,14 +1634,16 @@ impl Service {
 
 		let dest = Destination::Push(user_id, pushkey);
 
-		events
+		for pdu_id in events
 			.iter()
 			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
 			.filter(|pdu_id| !ids.contains(*pdu_id))
-			.for_each(|pdu_id| {
-				self.db
-					.delete_active_request(&dest.event_key(pdu_id));
-			});
+		{
+			self.db
+				.delete_active_request(&dest.event_key(pdu_id))
+				.await
+				.expect("database remove error");
+		}
 
 		Err((dest, error))
 	}

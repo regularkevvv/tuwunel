@@ -26,14 +26,19 @@ impl crate::Service for Service {
 }
 
 #[implement(Service)]
-pub fn set_public(&self, room_id: &RoomId, alias: Option<&RoomAliasId>) {
+pub async fn set_public(&self, room_id: &RoomId, alias: Option<&RoomAliasId>) -> Result {
 	self.db
 		.publicroomids
-		.insert(room_id, alias.map_or("", RoomAliasId::as_str));
+		.insert(room_id, alias.map_or("", RoomAliasId::as_str))
+		.await?;
+
+	Ok(())
 }
 
 #[implement(Service)]
-pub fn set_not_public(&self, room_id: &RoomId) { self.db.publicroomids.remove(room_id); }
+pub async fn set_not_public(&self, room_id: &RoomId) -> Result {
+	self.db.publicroomids.remove(room_id).await
+}
 
 /// Alias the room was published under; empty values from rooms published
 /// without one fail the alias parse and land as Err.

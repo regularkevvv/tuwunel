@@ -61,7 +61,9 @@ impl Server {
 			oidcreqid_authrequest: args.db["oidcreqid_authrequest"].clone(),
 		};
 
-		let key = init_signing_key(&db)?;
+		let key = tokio::task::block_in_place(|| {
+			tokio::runtime::Handle::current().block_on(init_signing_key(&db))
+		})?;
 		debug_info!(
 			key = ?key.key_id,
 			"Initializing OIDC server for next-gen auth (MSC2965)"

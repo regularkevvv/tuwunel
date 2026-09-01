@@ -134,7 +134,11 @@ impl Service {
 		}
 
 		debug!("Removing/unpublishing room from our room directory");
-		self.services.directory.set_not_public(room_id);
+		self.services
+			.directory
+			.set_not_public(room_id)
+			.await
+			.expect("database write error");
 
 		ShutdownRoom {
 			kicked_users,
@@ -215,6 +219,7 @@ impl Service {
 		self.services
 			.state
 			.delete_room_shortstatehash(room_id, state_lock)
+			.await
 			.log_err()
 			.ok();
 

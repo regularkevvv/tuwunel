@@ -19,6 +19,9 @@ use std::{
 
 use super::MapId;
 
+/// One stored key-value pair, both owned.
+pub(crate) type Entry = (Box<[u8]>, Box<[u8]>);
+
 /// Byte-ordered contents of one logical map.
 type Tree = BTreeMap<Box<[u8]>, Box<[u8]>>;
 
@@ -73,21 +76,15 @@ impl Store {
 	/// first key not less than `from`; reverse scans start at the last key
 	/// not greater than `from` (`seek_for_prev`). `None` starts at the
 	/// corresponding end of the map.
-	pub(crate) fn snapshot(
-		&self,
-		map: MapId,
-		reverse: bool,
-		from: Option<&[u8]>,
-	) -> Vec<(Box<[u8]>, Box<[u8]>)> {
+	pub(crate) fn snapshot(&self, map: MapId, reverse: bool, from: Option<&[u8]>) -> Vec<Entry> {
 		let trees = self.read();
 		let Some(tree) = trees.get(&map.0) else {
 			return Vec::new();
 		};
 
-		let pairs: Vec<(Box<[u8]>, Box<[u8]>)> = if reverse {
+		let pairs: Vec<Entry> = if reverse {
 			let range = match from {
-				| Some(from) =>
-					tree.range::<[u8], _>((Bound::Unbounded, Bound::Included(from))),
+				| Some(from) => tree.range::<[u8], _>((Bound::Unbounded, Bound::Included(from))),
 				| None => tree.range::<[u8], _>(..),
 			};
 			let mut pairs: Vec<_> = range
@@ -97,11 +94,12 @@ impl Store {
 			pairs
 		} else {
 			let range = match from {
-				| Some(from) =>
-					tree.range::<[u8], _>((Bound::Included(from), Bound::Unbounded)),
+				| Some(from) => tree.range::<[u8], _>((Bound::Included(from), Bound::Unbounded)),
 				| None => tree.range::<[u8], _>(..),
 			};
-			range.map(|(k, v)| (k.clone(), v.clone())).collect()
+			range
+				.map(|(k, v)| (k.clone(), v.clone()))
+				.collect()
 		};
 
 		pairs

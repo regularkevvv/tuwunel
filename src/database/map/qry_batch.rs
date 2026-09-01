@@ -73,19 +73,22 @@ where
 		);
 	}
 
-	futures::future::Either::Right(keys.ready_chunks(automatic_amplification())
-		.widen_then(automatic_width(), |chunk| {
-			let keys = chunk
-				.iter()
-				.map(ser::serialize_to::<KeyBuf, _>)
-				.map(|result| result.expect("failed to serialize query key"))
-				.collect();
+	futures::future::Either::Right(
+		keys.ready_chunks(automatic_amplification())
+			.widen_then(automatic_width(), |chunk| {
+				let keys = chunk
+					.iter()
+					.map(ser::serialize_to::<KeyBuf, _>)
+					.map(|result| result.expect("failed to serialize query key"))
+					.collect();
 
-			self.rocks()
-				.engine
-				.pool
-				.execute_get(Get { map: self.clone(), key: keys, res: None })
-		})
-		.map_ok(|results| results.into_iter().stream())
-		.try_flatten())
+				self.rocks().engine.pool.execute_get(Get {
+					map: self.clone(),
+					key: keys,
+					res: None,
+				})
+			})
+			.map_ok(|results| results.into_iter().stream())
+			.try_flatten(),
+	)
 }

@@ -29,6 +29,7 @@ pub(super) async fn alias_set(
 			self.services
 				.alias
 				.set_alias(&room_alias, &room_id)
+				.await
 				.map_err(|err| err!("Failed to remove alias: {err}"))?;
 
 			write!(self, "Successfully overwrote alias (formerly {id})").await
@@ -37,6 +38,7 @@ pub(super) async fn alias_set(
 			self.services
 				.alias
 				.set_alias(&room_alias, &room_id)
+				.await
 				.map_err(|err| err!("Failed to remove alias: {err}"))?;
 
 			self.write_str("Successfully set alias").await

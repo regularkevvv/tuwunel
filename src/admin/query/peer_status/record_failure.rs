@@ -16,7 +16,8 @@ pub(super) async fn peer_status_record_failure(
 
 	self.services
 		.federation
-		.record_failure(&server_name, classification);
+		.record_failure(&server_name, classification)
+		.await?;
 
 	write!(self, "Recorded {classification:?} failure for {server_name} in current bucket.").await
 }

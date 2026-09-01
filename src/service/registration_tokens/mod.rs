@@ -180,10 +180,11 @@ impl Service {
 		let db_tokens = self
 			.db
 			.iterate_and_clean_tokens()
-			.map(|(token, info)| ValidToken {
-				token: token.to_owned(),
-				info: TokenInfo::Database(info),
-			});
+			.await
+			.expect("database token cleanup error")
+			.into_iter()
+			.map(|(token, info)| ValidToken { token, info: TokenInfo::Database(info) })
+			.stream();
 
 		config_tokens.chain(db_tokens)
 	}

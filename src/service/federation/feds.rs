@@ -209,10 +209,14 @@ where
 		},
 		opts,
 	)
-	.inspect(move |outcome| {
+	.then(move |outcome| async move {
 		if record == Record::Contribute && matches!(&outcome.result, Err(Fault::Elapsed)) {
-			self.record_failure(&outcome.origin, Classification::Transient);
+			self.record_failure(&outcome.origin, Classification::Transient)
+				.await
+				.expect("database write error");
 		}
+
+		outcome
 	})
 }
 

@@ -81,7 +81,7 @@ impl Data {
 		}
 	}
 
-	pub(super) fn create_file_metadata(
+	pub(super) async fn create_file_metadata(
 		&self,
 		mxc: &Mxc<'_>,
 		user: Option<&UserId>,
@@ -101,28 +101,33 @@ impl Data {
 			txn.put_raw(&self.mediaid_user, key, user);
 		}
 
-		txn.execute();
+		txn.execute().await?;
 
 		Ok(key.to_vec())
 	}
 
 	/// Insert a pending MXC URI into the database
-	pub(super) fn insert_pending_mxc(
+	pub(super) async fn insert_pending_mxc(
 		&self,
 		mxc: &Mxc<'_>,
 		user: &UserId,
 		unused_expires_at: u64,
-	) {
+	) -> Result {
 		let value = (unused_expires_at, user);
 		debug!(?mxc, ?user, ?unused_expires_at, "Inserting pending");
 
 		self.mediaid_pending
-			.raw_put(mxc.to_string(), value);
+			.raw_put(mxc.to_string(), value)
+			.await?;
+
+		Ok(())
 	}
 
 	/// Remove a pending MXC URI from the database
-	pub(super) fn remove_pending_mxc(&self, mxc: &Mxc<'_>) {
-		self.mediaid_pending.remove(&mxc.to_string());
+	pub(super) async fn remove_pending_mxc(&self, mxc: &Mxc<'_>) -> Result {
+		self.mediaid_pending
+			.remove(&mxc.to_string())
+			.await
 	}
 
 	/// Count the number of pending MXC URIs for a specific user
@@ -158,10 +163,12 @@ impl Data {
 	/// Map a minted mxc:// URI to the external URL it resolves to on first
 	/// download (see `Service::fetch_lazy_media`).
 	#[cfg(feature = "url_preview")]
-	pub(super) fn insert_lazy_media(&self, mxc: &str, url: &str) {
+	pub(super) async fn insert_lazy_media(&self, mxc: &str, url: &str) -> Result {
 		debug!(?mxc, ?url, "Registering lazy media");
 
-		self.mediaid_lazy.insert(mxc, url.as_bytes());
+		self.mediaid_lazy
+			.insert(mxc, url.as_bytes())
+			.await
 	}
 
 	#[cfg(feature = "url_preview")]
@@ -253,7 +260,7 @@ impl Data {
 			})
 			.await;
 
-		txn.execute();
+		txn.execute().await.expect("database write error");
 	}
 
 	/// Searches for all files with the given MXC
@@ -371,10 +378,8 @@ impl Data {
 			.await
 	}
 
-	pub(super) fn set_url_preview(&self, url: &str, cached: &CachedPreview) -> Result {
-		self.url_preview.raw_put(url, Cbor(cached));
-
-		Ok(())
+	pub(super) async fn set_url_preview(&self, url: &str, cached: &CachedPreview) -> Result {
+		self.url_preview.raw_put(url, Cbor(cached)).await
 	}
 
 	pub(super) async fn get_url_preview(&self, url: &str) -> Result<CachedPreview> {

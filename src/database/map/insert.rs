@@ -24,12 +24,14 @@ use crate::{
 #[tracing::instrument(skip_all, fields(%self), level = "trace")]
 pub async fn insert<K, V>(&self, key: &K, val: V) -> Result
 where
-	K: AsRef<[u8]> + ?Sized,
-	V: AsRef<[u8]>,
+	K: AsRef<[u8]> + ?Sized + Sync,
+	V: AsRef<[u8]> + Send,
 {
-	STATS
-		.write
-		.record(key.as_ref().len().saturating_add(val.as_ref().len()));
+	STATS.write.record(
+		key.as_ref()
+			.len()
+			.saturating_add(val.as_ref().len()),
+	);
 
 	match self.inner() {
 		| Inner::Rocks(rocks) => {
@@ -45,7 +47,8 @@ where
 		},
 		| Inner::Mem(mem) => {
 			mem.store.commit(std::iter::once((
-				self.id().expect("model-backend maps are catalog maps"),
+				self.id()
+					.expect("model-backend maps are catalog maps"),
 				Op::Put {
 					key: key.as_ref().into(),
 					val: val.as_ref().into(),
@@ -58,4 +61,3 @@ where
 
 	Ok(())
 }
-

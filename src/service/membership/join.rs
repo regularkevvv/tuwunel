@@ -393,7 +393,8 @@ async fn join_remote(
 	// in time where events in the current room state do not exist
 	self.services
 		.state
-		.set_room_state(room_id, statehash_after_join, &state_lock);
+		.set_room_state(room_id, statehash_after_join, &state_lock)
+		.await?;
 
 	info!(
 		statehash = %statehash_after_join,
@@ -642,7 +643,9 @@ async fn ingest_send_join_state(
 		.fold(HashMap::new(), async |mut state, (event_id, pdu, value)| {
 			self.services
 				.timeline
-				.add_pdu_outlier(&event_id, &value);
+				.add_pdu_outlier(&event_id, &value)
+				.await
+				.expect("database write error");
 
 			if let Some(state_key) = &pdu.state_key {
 				let shortstatekey = self
@@ -682,7 +685,7 @@ async fn ingest_send_join_auth_chain(
 		})
 		.inspect_err(|e| debug_error!("Invalid send_join auth_chain event: {e:?}"))
 		.ready_filter_map(Result::ok)
-		.ready_for_each(|(event_id, mut value)| {
+		.for_each(|(event_id, mut value)| async move {
 			if !room_version_rules
 				.event_format
 				.require_room_create_room_id
@@ -694,7 +697,9 @@ async fn ingest_send_join_auth_chain(
 
 			self.services
 				.timeline
-				.add_pdu_outlier(&event_id, &value);
+				.add_pdu_outlier(&event_id, &value)
+				.await
+				.expect("database insert error");
 		})
 		.await;
 

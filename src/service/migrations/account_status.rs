@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use ruma::{OwnedUserId, UserId};
 use tuwunel_core::{
 	Result, err, info,
@@ -53,7 +53,7 @@ async fn adopt_deactivations(services: &Services, deactivated: &Arc<Map>) -> Res
 	let (adopted, unreadable) = deactivated
 		.keys::<&UserId>()
 		.map_ok(ToOwned::to_owned)
-		.broad_filter_map(async |account: Result<OwnedUserId>| {
+		.broad_filter_map(|account: Result<OwnedUserId>| async move {
 			let user_id = match account {
 				| Ok(user_id) => user_id,
 				| Err(e) => return Some(Err(e)),
@@ -65,8 +65,8 @@ async fn adopt_deactivations(services: &Services, deactivated: &Arc<Map>) -> Res
 				| Err(e) => Some(Err(e)),
 			}
 		})
-		.ready_fold((0_usize, 0_usize), |counts, account| {
-			write_password(userid_password, PASSWORD_DISABLED, counts, account)
+		.fold((0_usize, 0_usize), async move |counts, account| {
+			write_password(userid_password, PASSWORD_DISABLED, counts, account).await
 		})
 		.await;
 
@@ -108,7 +108,7 @@ async fn adopt_passwordless(
 			| Ok((_, localpart)) => local_user_id(localpart, server_name).map(Ok),
 			| Err(e) => Some(Err(e)),
 		})
-		.broad_filter_map(async |account: Result<OwnedUserId>| {
+		.broad_filter_map(|account: Result<OwnedUserId>| async move {
 			let user_id = match account {
 				| Ok(user_id) => user_id,
 				| Err(e) => return Some(Err(e)),
@@ -120,8 +120,8 @@ async fn adopt_passwordless(
 				| Err(e) => Some(Err(e)),
 			}
 		})
-		.ready_fold((0_usize, 0_usize), |counts, account| {
-			write_password(userid_password, PASSWORD_SENTINEL, counts, account)
+		.fold((0_usize, 0_usize), async move |counts, account| {
+			write_password(userid_password, PASSWORD_SENTINEL, counts, account).await
 		})
 		.await;
 
@@ -183,7 +183,7 @@ async fn hash_empty(userid_password: &Arc<Map>, user_id: &UserId) -> Result<Opti
 
 /// Writes one adopted account, tallying it against the rows that could not be
 /// read.
-fn write_password(
+async fn write_password(
 	userid_password: &Arc<Map>,
 	password: &str,
 	(adopted, unreadable): (usize, usize),
@@ -191,7 +191,10 @@ fn write_password(
 ) -> (usize, usize) {
 	match account {
 		| Ok(user_id) => {
-			userid_password.insert(&user_id, password);
+			userid_password
+				.insert(&user_id, password)
+				.await
+				.expect("database insert error");
 
 			(adopted.saturating_add(1), unreadable)
 		},

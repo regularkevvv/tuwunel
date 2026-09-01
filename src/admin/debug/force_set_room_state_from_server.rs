@@ -100,7 +100,8 @@ pub(super) async fn force_set_room_state_from_server(
 
 		self.services
 			.timeline
-			.add_pdu_outlier(&event_id, &value);
+			.add_pdu_outlier(&event_id, &value)
+			.await?;
 
 		if let Some(state_key) = &pdu.state_key {
 			let shortstatekey = self
@@ -128,7 +129,8 @@ pub(super) async fn force_set_room_state_from_server(
 
 		self.services
 			.timeline
-			.add_pdu_outlier(&event_id, &value);
+			.add_pdu_outlier(&event_id, &value)
+			.await?;
 	}
 
 	let new_room_state = self

@@ -116,7 +116,8 @@ pub async fn build_and_append_pdu(
 	// in time where events in the current room state do not exist
 	self.services
 		.state
-		.set_room_state(pdu.room_id(), statehashid, state_lock);
+		.set_room_state(pdu.room_id(), statehashid, state_lock)
+		.await?;
 
 	let mut servers: HashSet<OwnedServerName> = self
 		.services

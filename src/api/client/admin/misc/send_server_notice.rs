@@ -89,12 +89,10 @@ pub(crate) async fn admin_send_server_notice_txn_route(
 	)
 	.await?;
 
-	services.transaction_ids.add_txnid(
-		&sender_user,
-		sender_device.as_deref(),
-		&request.txn_id,
-		event_id.as_bytes(),
-	);
+	services
+		.transaction_ids
+		.add_txnid(&sender_user, sender_device.as_deref(), &request.txn_id, event_id.as_bytes())
+		.await?;
 
 	Ok(Response::new(event_id))
 }

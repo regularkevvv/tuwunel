@@ -366,7 +366,8 @@ async fn enforce_uiaa(
 
 			services
 				.uiaa
-				.update_uiaa_session(&claim.0, &claim.1, &claim.2, None);
+				.update_uiaa_session(&claim.0, &claim.1, &claim.2, None)
+				.await?;
 
 			Ok(association)
 		},
@@ -376,7 +377,8 @@ async fn enforce_uiaa(
 				uiaainfo.session = Some(utils::random_string(SESSION_ID_LENGTH));
 				services
 					.uiaa
-					.create(&server_user, server_device, &uiaainfo, json);
+					.create(&server_user, server_device, &uiaainfo, json)
+					.await;
 
 				Err(Error::Uiaa(uiaainfo))
 			},

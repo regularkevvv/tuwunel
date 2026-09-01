@@ -95,7 +95,7 @@ pub(crate) async fn upload_signing_keys_route(
 
 	// First attempt from OIDC device: issue m.oauth flow.
 	if is_oidc && body.auth.is_none() {
-		return Err(Error::Uiaa(create_oauth_uiaa(&services, sender_user, &body)?));
+		return Err(Error::Uiaa(create_oauth_uiaa(&services, sender_user, &body).await?));
 	}
 
 	let authed_user = auth_uiaa(&services, &body).await?;
@@ -122,7 +122,7 @@ async fn persist_signing_keys(
 	Ok(upload_signing_keys::v3::Response {})
 }
 
-fn create_oauth_uiaa(
+async fn create_oauth_uiaa(
 	services: &Services,
 	sender_user: &UserId,
 	body: &Ruma<upload_signing_keys::v3::Request>,
@@ -139,14 +139,17 @@ fn create_oauth_uiaa(
 		..Default::default()
 	};
 
-	services.uiaa.create(
-		sender_user,
-		body.sender_device()?,
-		&uiaainfo,
-		body.json_body
-			.as_ref()
-			.ok_or_else(|| err!(Request(NotJson("JSON body is not valid"))))?,
-	);
+	services
+		.uiaa
+		.create(
+			sender_user,
+			body.sender_device()?,
+			&uiaainfo,
+			body.json_body
+				.as_ref()
+				.ok_or_else(|| err!(Request(NotJson("JSON body is not valid"))))?,
+		)
+		.await;
 
 	Ok(uiaainfo)
 }

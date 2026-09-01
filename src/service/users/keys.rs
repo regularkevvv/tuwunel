@@ -93,7 +93,7 @@ pub async fn add_one_time_keys(
 		txn.raw_put(&self.db.userid_lastonetimekeyupdate, user_id, count);
 	}
 
-	txn.execute();
+	txn.execute().await?;
 	drop(oldest_count);
 
 	Ok(())
@@ -146,7 +146,7 @@ pub async fn add_one_time_key(
 		return Ok(None);
 	}
 
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 
 	// MSC4225: RocksDB iterates the (user, device) prefix in count_be ascending
 	// order, so /keys/claim issues one-time keys in the order they were uploaded.
@@ -191,7 +191,7 @@ where
 		txn.raw_put(&self.db.userid_lastonetimekeyupdate, user_id, count);
 	}
 
-	txn.execute();
+	txn.execute().await?;
 	drop(oldest_count);
 
 	Ok(())
@@ -234,7 +234,7 @@ pub async fn add_fallback_key(
 	};
 
 	let key = (user_id, device_id, one_time_key_key.algorithm());
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 
 	txn.put(&self.db.userdeviceidalgorithm_fallback, key, Json(&entry));
 
@@ -261,7 +261,8 @@ pub async fn take_fallback_key(
 	let updated = FallbackEntry { used: true, ..entry };
 	self.db
 		.userdeviceidalgorithm_fallback
-		.put(key, Json(&updated));
+		.put(key, Json(&updated))
+		.await?;
 
 	Ok((updated.key_id, updated.key))
 }
@@ -305,10 +306,11 @@ pub async fn take_one_time_key(
 		return Err!(Request(NotFound("No one-time-key found")));
 	};
 
-	let update_count = self.services.globals.next_count();
+	let update_count = self.services.globals.next_count().await?;
 	self.db
 		.userid_lastonetimekeyupdate
-		.insert(user_id, update_count.to_be_bytes());
+		.insert(user_id, update_count.to_be_bytes())
+		.await?;
 
 	let prefix = (user_id, device_id, Interfix);
 	let one_time_keys = otk
@@ -322,7 +324,7 @@ pub async fn take_one_time_key(
 		.await
 		.ok_or_else(|| err!(Request(NotFound("No one-time-key found"))))?;
 
-	otk.del((user_id, device_id, count, id));
+	otk.del((user_id, device_id, count, id)).await?;
 
 	Ok((id.into(), serde_json::from_slice(val)?))
 }
@@ -394,8 +396,8 @@ pub async fn prune_one_time_keys(&self, user_id: &UserId, device_id: &DeviceId, 
 	otk.keys_prefix(&prefix)
 		.ignore_err()
 		.take(excess)
-		.ready_for_each(|row: OtkRowKey<'_>| {
-			otk.del(row);
+		.for_each(|row: OtkRowKey<'_>| async move {
+			otk.del(row).await.expect("database write error");
 		})
 		.await;
 }
@@ -409,7 +411,11 @@ pub async fn add_device_keys(
 ) {
 	let key = (user_id, device_id);
 
-	self.db.keyid_key.put(key, Json(device_keys));
+	self.db
+		.keyid_key
+		.put(key, Json(device_keys))
+		.await
+		.expect("database write error");
 	self.mark_device_key_update(user_id).await;
 }
 
@@ -483,7 +489,7 @@ pub async fn add_cross_signing_keys(
 			txn.raw_put(&self.db.userid_usersigningkeyid, user_id, user_signing_key_key);
 		}
 
-		txn.execute();
+		txn.execute().await?;
 	};
 
 	if notify {
@@ -604,7 +610,10 @@ pub async fn sign_key(
 	}
 
 	let key = (target_id, key_id);
-	self.db.keyid_key.put(key, Json(target_key));
+	self.db
+		.keyid_key
+		.put(key, Json(target_key))
+		.await?;
 
 	self.mark_device_key_update(target_id).await;
 
@@ -918,22 +927,32 @@ pub async fn mark_device_key_update(&self, user_id: &UserId) {
 				.await
 	};
 
-	let count = self.services.globals.next_count();
-	let user_key = (user_id, *count);
+	let count = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
+	let seq: u64 = *count;
+	let user_key = (user_id, seq);
 
 	self.db
 		.keychangeid_userid
-		.put_raw(user_key, user_id);
+		.put_raw(user_key, user_id)
+		.await
+		.expect("database insert error");
 
 	self.services
 		.state_cache
 		.rooms_joined(user_id)
 		.filter(|room_id| all_or_is_encrypted(*room_id))
-		.ready_for_each(|room_id| {
-			let room_key = (room_id, *count);
+		.for_each(|room_id| async move {
+			let room_key = (room_id, seq);
 			self.db
 				.keychangeid_userid
-				.put_raw(room_key, user_id);
+				.put_raw(room_key, user_id)
+				.await
+				.expect("database insert error");
 		})
 		.await;
 

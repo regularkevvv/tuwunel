@@ -12,7 +12,8 @@
 mod repair;
 mod scan;
 
-use tuwunel_core::{Result, result::LogErr, utils::TryReadyExt, warn};
+use futures::TryStreamExt;
+use tuwunel_core::{Result, result::LogErr, warn};
 
 use self::{
 	repair::{heal, repair},
@@ -112,13 +113,16 @@ pub(super) async fn fix(services: &Services) -> Result {
 
 		// The last pass evaluates rather than heals, bounding a residue whose
 		// heals never settle.
-		if pass < PASSES && heal(services, &residue) {
+		if pass < PASSES && heal(services, &residue).await {
 			continue;
 		}
 
 		match repair(services, &residue, chains_cleared_this_boot).await? {
-			| Verdict::Settled => global.insert(MARKER, []),
-			| Verdict::Declined(reason) => global.raw_put(MARKER, residue.decline_record(reason)),
+			| Verdict::Settled => global.insert(MARKER, []).await?,
+			| Verdict::Declined(reason) =>
+				global
+					.raw_put(MARKER, residue.decline_record(reason))
+					.await?,
 		}
 
 		break;
@@ -139,7 +143,7 @@ async fn clear_chain_cache(services: &Services) -> Result {
 	warn!("Discarding cached auth chains; entries from earlier releases may be truncated.");
 
 	clear_chains(services).await?;
-	global.insert(CLEAR_MARKER, []);
+	global.insert(CLEAR_MARKER, []).await?;
 
 	Ok(())
 }
@@ -154,7 +158,7 @@ pub(super) async fn clear_chains(services: &Services) -> Result {
 
 	services.db["authchainkey_authchain"]
 		.for_clear()
-		.ready_try_for_each(|_| Ok(()))
+		.try_for_each(async move |_| Ok(()))
 		.await
 }
 
@@ -163,9 +167,9 @@ pub(super) async fn clear_chains(services: &Services) -> Result {
 /// A fresh database never ran the unserialized allocator and holds no
 /// cached chains, so it has neither residue to scan for nor a cache to
 /// discard.
-pub(super) fn mark_clean(services: &Services) {
+pub(super) async fn mark_clean(services: &Services) -> Result {
 	let global = &services.db["global"];
 
-	global.insert(MARKER, []);
-	global.insert(CLEAR_MARKER, []);
+	global.insert(MARKER, []).await?;
+	global.insert(CLEAR_MARKER, []).await
 }

@@ -219,7 +219,7 @@ pub async fn delete(&self, sess_id: &str) {
 	}
 
 	txn.del_raw(&self.db.oauthid_session, sess_id);
-	txn.execute();
+	txn.execute().await.expect("database write error");
 }
 
 /// Create or overwrite database state for the session.
@@ -319,7 +319,7 @@ async fn put_locked(&self, session: &Session, unique_id: Option<&str>) {
 		txn.raw_put(&self.db.userid_oauthid, user_id, sess_ids);
 	}
 
-	txn.execute();
+	txn.execute().await.expect("database write error");
 }
 
 /// Fetch database state for a session from its associated `(iss,sub)`, in case

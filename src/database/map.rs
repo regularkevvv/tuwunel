@@ -72,6 +72,10 @@ pub struct Map {
 }
 
 /// Backend-specific per-map storage state.
+#[expect(
+	clippy::large_enum_variant,
+	reason = "one Inner exists per opened map; the RocksDB arm's prepared options are the point"
+)]
 pub(crate) enum Inner {
 	/// One RocksDB column family plus its prepared options.
 	Rocks(RocksMap),
@@ -125,7 +129,14 @@ impl Map {
 	///
 	/// Panics when `name` is not a catalog map: the model backend addresses
 	/// storage by stable [`MapId`] only.
-	#[cfg_attr(not(test), expect(dead_code, reason = "contract-suite constructor until a runtime backend selector lands in phase 2"))]
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "contract-suite constructor until a runtime backend selector lands in \
+			          phase 2"
+		)
+	)]
 	pub(crate) fn open_mem(store: &Arc<mem::Store>, name: &'static str) -> Arc<Self> {
 		Arc::new_cyclic(|selfref| Self {
 			name,

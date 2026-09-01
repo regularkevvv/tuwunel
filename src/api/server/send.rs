@@ -701,7 +701,9 @@ async fn handle_edu_direct_to_device(
 	// Save transaction id with empty data
 	services
 		.transaction_ids
-		.add_txnid(sender, None, message_id, &[]);
+		.add_txnid(sender, None, message_id, &[])
+		.await
+		.expect("database insert error");
 }
 
 /// A local account we store or forward to-device events for: one that is
@@ -749,13 +751,10 @@ async fn handle_edu_direct_to_device_event(
 ) {
 	match target_device_id_maybe {
 		| DeviceIdOrAllDevices::DeviceId(ref target_device_id) => {
-			let count = services.users.add_to_device_event(
-				sender,
-				target_user_id,
-				target_device_id,
-				ev_type,
-				&event,
-			);
+			let count = services
+				.users
+				.add_to_device_event(sender, target_user_id, target_device_id, ev_type, &event)
+				.await;
 
 			services
 				.sending
@@ -777,22 +776,26 @@ async fn handle_edu_direct_to_device_event(
 				.is_interested_in_user(target_user_id)
 				.await;
 
+			let event = &event;
 			let deliveries: Deliveries = services
 				.users
 				.all_device_ids(target_user_id)
-				.map(|target_device_id| {
-					let count = services.users.add_to_device_event(
-						sender,
-						target_user_id,
-						target_device_id,
-						ev_type,
-						&event,
-					);
+				.then(move |target_device_id| async move {
+					let count = services
+						.users
+						.add_to_device_event(
+							sender,
+							target_user_id,
+							target_device_id,
+							ev_type,
+							event,
+						)
+						.await;
 
-					(target_device_id, count)
+					(target_device_id.to_owned(), count)
 				})
 				.ready_filter_map(|(target_device_id, count)| {
-					interested.then(|| (target_device_id.to_owned(), count))
+					interested.then_some((target_device_id, count))
 				})
 				.collect()
 				.await;
@@ -805,9 +808,9 @@ async fn handle_edu_direct_to_device_event(
 						target_user_id,
 						deliveries
 							.iter()
-							.map(|(device_id, count)| (&**device_id, *count)),
+							.map(|(device_id, count)| (device_id.as_ref(), *count)),
 						ev_type,
-						&event,
+						event,
 					)
 					.await
 					.log_err()

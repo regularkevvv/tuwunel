@@ -47,7 +47,11 @@ pub(crate) enum RoomModerationCommand {
 }
 
 async fn do_ban_room(services: &Services, room_id: &RoomId) {
-	services.metadata.ban_room(room_id);
+	services
+		.metadata
+		.ban_room(room_id)
+		.await
+		.expect("database write error");
 
 	debug!("Banned {room_id} successfully");
 
@@ -77,7 +81,11 @@ async fn do_ban_room(services: &Services, room_id: &RoomId) {
 
 		drop(state_lock);
 
-		services.state_cache.forget(room_id, user_id);
+		services
+			.state_cache
+			.forget(room_id, user_id)
+			.await
+			.expect("database write error");
 	}
 
 	// remove any local aliases, ignore errors
@@ -93,7 +101,15 @@ async fn do_ban_room(services: &Services, room_id: &RoomId) {
 		.await;
 
 	// unpublish from room directory, ignore errors
-	services.directory.set_not_public(room_id);
+	services
+		.directory
+		.set_not_public(room_id)
+		.await
+		.expect("database write error");
 
-	services.metadata.disable_room(room_id);
+	services
+		.metadata
+		.disable_room(room_id)
+		.await
+		.expect("database write error");
 }

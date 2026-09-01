@@ -14,13 +14,7 @@ pub(super) async fn raw_clear(&self, map: String, confirm: bool) -> Result {
 
 	let timer = Instant::now();
 	let cork = self.services.db.cork();
-	let count = map
-		.raw_keys()
-		.ignore_err()
-		.map(|key| map.remove(&key))
-		.count()
-		.boxed()
-		.await;
+	let count = map.for_clear().ignore_err().count().boxed().await;
 
 	drop(cork);
 	let query_time = timer.elapsed();

@@ -182,17 +182,25 @@ impl crate::Service for Service {
 
 impl Service {
 	#[tracing::instrument(skip(self, pdu_id, user, pushkey), level = "debug")]
-	pub fn send_pdu_push(&self, pdu_id: &RawPduId, user: &UserId, pushkey: String) -> Result {
+	pub async fn send_pdu_push(
+		&self,
+		pdu_id: &RawPduId,
+		user: &UserId,
+		pushkey: String,
+	) -> Result {
 		let dest = Destination::Push(user.to_owned(), pushkey);
 		let event = SendingEvent::Pdu(*pdu_id);
 		let _cork = self.db.db.cork();
 
-		self.queue_and_dispatch(dest, event)
+		self.queue_and_dispatch(dest, event).await
 	}
 
 	/// Queue one event for delivery to `dest` and wake a sender.
-	fn queue_and_dispatch(&self, dest: Destination, event: SendingEvent) -> Result {
-		let keys = self.db.queue_requests(once((&event, &dest)));
+	async fn queue_and_dispatch(&self, dest: Destination, event: SendingEvent) -> Result {
+		let keys = self
+			.db
+			.queue_requests(once((&event, &dest)))
+			.await?;
 
 		self.dispatch(Msg {
 			dest,
@@ -209,25 +217,31 @@ impl Service {
 	/// Rows are durable, coalesced, and recomputed at send time.
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn refresh_push_badge(&self, user_id: &UserId) -> Result {
-		self.services
+		let pushkeys: Vec<String> = self
+			.services
 			.pusher
 			.get_pushkeys(user_id)
-			.map(Ok)
-			.ready_try_for_each(|pushkey| {
-				let dest = Destination::Push(user_id.to_owned(), pushkey.to_owned());
+			.map(ToOwned::to_owned)
+			.collect()
+			.await;
 
-				self.queue_and_dispatch(dest, SendingEvent::BadgeRefresh)
-			})
-			.await
+		for pushkey in pushkeys {
+			let dest = Destination::Push(user_id.to_owned(), pushkey);
+
+			self.queue_and_dispatch(dest, SendingEvent::BadgeRefresh)
+				.await?;
+		}
+
+		Ok(())
 	}
 
 	#[tracing::instrument(skip(self), level = "debug")]
-	pub fn send_pdu_appservice(&self, appservice_id: String, pdu_id: RawPduId) -> Result {
+	pub async fn send_pdu_appservice(&self, appservice_id: String, pdu_id: RawPduId) -> Result {
 		let dest = Destination::Appservice(appservice_id);
 		let event = SendingEvent::Pdu(pdu_id);
 		let _cork = self.db.db.cork();
 
-		self.queue_and_dispatch(dest, event)
+		self.queue_and_dispatch(dest, event).await
 	}
 
 	#[tracing::instrument(skip(self, room_id, pdu_id), level = "debug")]
@@ -256,7 +270,8 @@ impl Service {
 		let _cork = self.db.db.cork();
 		let keys = self
 			.db
-			.queue_requests(requests.iter().map(|(o, e)| (e, o)));
+			.queue_requests(requests.iter().map(|(o, e)| (e, o)))
+			.await?;
 
 		for ((dest, event), queue_id) in requests.into_iter().zip(keys) {
 			self.dispatch(Msg { dest, event, queue_id })?;
@@ -266,12 +281,12 @@ impl Service {
 	}
 
 	#[tracing::instrument(skip(self, server, serialized), level = "debug")]
-	pub fn send_edu_server(&self, server: &ServerName, serialized: EduBuf) -> Result {
+	pub async fn send_edu_server(&self, server: &ServerName, serialized: EduBuf) -> Result {
 		let dest = Destination::Federation(server.to_owned());
 		let event = SendingEvent::Edu(serialized);
 		let _cork = self.db.db.cork();
 
-		self.queue_and_dispatch(dest, event)
+		self.queue_and_dispatch(dest, event).await
 	}
 
 	#[tracing::instrument(skip(self, room_id, serialized), level = "debug")]
@@ -287,12 +302,12 @@ impl Service {
 
 	/// Queue an EDU for delivery to a specific appservice.
 	#[tracing::instrument(skip(self, serialized), level = "debug")]
-	pub fn send_edu_appservice(&self, appservice_id: String, serialized: EduBuf) -> Result {
+	pub async fn send_edu_appservice(&self, appservice_id: String, serialized: EduBuf) -> Result {
 		let dest = Destination::Appservice(appservice_id);
 		let event = SendingEvent::Edu(serialized);
 		let _cork = self.db.db.cork();
 
-		self.queue_and_dispatch(dest, event)
+		self.queue_and_dispatch(dest, event).await
 	}
 
 	/// Sends an EDU to all appservices interested in a room.
@@ -311,7 +326,8 @@ impl Service {
 		F: Fn(&mut dyn Write) -> Result + Send + 'a,
 		&'a F: Send + Sync,
 	{
-		self.services
+		let appservice_ids = self
+			.services
 			.appservice
 			.read()
 			.await
@@ -341,18 +357,21 @@ impl Service {
 					.or(pin!(matching_aliases))
 					.await
 			})
-			.map(Ok)
-			.ready_try_for_each(|appservice| {
-				let mut buf = EduBuf::new();
+			.map(|appservice| appservice.registration.id.clone())
+			.collect::<Vec<_>>()
+			.await;
 
-				serializer(&mut buf)?;
-				self.send_edu_appservice(appservice.registration.id.clone(), buf)
-					.log_err()
-					.ok();
+		for appservice_id in appservice_ids {
+			let mut buf = EduBuf::new();
 
-				Ok(())
-			})
-			.await
+			serializer(&mut buf)?;
+			self.send_edu_appservice(appservice_id, buf)
+				.await
+				.log_err()
+				.ok();
+		}
+
+		Ok(())
 	}
 
 	/// Queue stored to-device events for delivery to interested appservices
@@ -394,7 +413,7 @@ impl Service {
 				let dest = Destination::Appservice(info.registration.id.clone());
 				let event = SendingEvent::ToDevice(buf.clone());
 
-				self.queue_and_dispatch(dest, event)?;
+				self.queue_and_dispatch(dest, event).await?;
 			}
 		}
 
@@ -441,7 +460,7 @@ impl Service {
 			let dest = Destination::Appservice(info.registration.id.clone());
 			let event = SendingEvent::DeviceListChanged(payload.clone());
 
-			self.queue_and_dispatch(dest, event)?;
+			self.queue_and_dispatch(dest, event).await?;
 		}
 
 		Ok(())
@@ -493,7 +512,8 @@ impl Service {
 		let _cork = self.db.db.cork();
 		let keys = self
 			.db
-			.queue_requests(requests.iter().map(|(o, e)| (e, o)));
+			.queue_requests(requests.iter().map(|(o, e)| (e, o)))
+			.await?;
 
 		for ((dest, event), queue_id) in requests.into_iter().zip(keys) {
 			self.dispatch(Msg { dest, event, queue_id })?;

@@ -6,7 +6,7 @@ use futures::{Stream, StreamExt, pin_mut};
 use ruma::{DeviceId, OwnedUserId, RoomId, UserId, api::client::filter::LazyLoadOptions};
 use tuwunel_core::{
 	Result, implement,
-	utils::{IterStream, ReadyExt, stream::TryIgnore},
+	utils::{IterStream, stream::TryIgnore},
 };
 use tuwunel_database::{Database, Deserialized, Handle, Interfix, Map, Qry};
 
@@ -71,7 +71,13 @@ pub async fn reset(&self, ctx: &Context<'_>) {
 		.lazyloadedids
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.lazyloadedids.remove(key))
+		.for_each(|key| async move {
+			self.db
+				.lazyloadedids
+				.remove(key)
+				.await
+				.expect("database remove error");
+		})
 		.await;
 }
 
@@ -131,9 +137,11 @@ where
 		.qry(&self.db.lazyloadedids)
 		.map(into_status)
 		.zip(senders.stream())
-		.map(move |(status, sender)| {
+		.then(move |(status, sender)| async move {
 			if matches!(ctx.mode, Mode::Update) {
-				self.update(ctx, &status, sender);
+				self.update(ctx, &status, sender)
+					.await
+					.expect("database write error");
 			}
 
 			status
@@ -141,16 +149,20 @@ where
 }
 
 #[implement(Service)]
-fn update(&self, ctx: &Context<'_>, status: &Status, sender: &UserId) {
+async fn update(&self, ctx: &Context<'_>, status: &Status, sender: &UserId) -> Result {
 	if matches!(status, Status::Unseen) {
 		self.db
 			.lazyloadedids
-			.put_aput::<8, _, _>(make_key(ctx, sender), 0_u64);
+			.put_aput::<8, _, _>(make_key(ctx, sender), 0_u64)
+			.await?;
 	} else if matches!(status, Status::Seen(0)) {
 		self.db
 			.lazyloadedids
-			.put_aput::<8, _, _>(make_key(ctx, sender), ctx.token.unwrap_or(0_u64));
+			.put_aput::<8, _, _>(make_key(ctx, sender), ctx.token.unwrap_or(0_u64))
+			.await?;
 	}
+
+	Ok(())
 }
 
 fn into_status(result: Result<Handle<'_>>) -> Status {

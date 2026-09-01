@@ -25,7 +25,7 @@ pub(crate) async fn admin_deactivate_account_route(
 		.await?;
 
 	if body.erase {
-		services.users.set_erased(&body.user_id);
+		services.users.set_erased(&body.user_id).await?;
 	}
 
 	Ok(deactivate_account::Response::new("success".to_owned()))

@@ -19,7 +19,9 @@ pub(super) async fn split_conduit_highlight_counts(services: &Services) -> Resul
 		.is_not_found()
 	{
 		migrate_conduit_highlight_split(services).await?;
-		db["global"].insert(b"split_conduit_highlight", []);
+		db["global"]
+			.insert(b"split_conduit_highlight", [])
+			.await?;
 	}
 
 	Ok(())

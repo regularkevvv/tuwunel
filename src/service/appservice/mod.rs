@@ -161,7 +161,8 @@ impl Service {
 
 		self.db
 			.id_appserviceregistrations
-			.insert(&id, appservice_yaml);
+			.insert(&id, appservice_yaml)
+			.await?;
 
 		Ok(())
 	}
@@ -193,7 +194,8 @@ impl Service {
 		// remove the appservice from the database
 		self.db
 			.id_appserviceregistrations
-			.remove(appservice_id);
+			.remove(appservice_id)
+			.await?;
 
 		// deletes all active requests for the appservice if there are any so we stop
 		// sending to the URL

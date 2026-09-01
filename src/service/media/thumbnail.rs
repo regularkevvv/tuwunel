@@ -59,9 +59,10 @@ impl super::Service {
 		dim: &Dim,
 		file: &[u8],
 	) -> Result {
-		let key =
-			self.db
-				.create_file_metadata(mxc, None, dim, content_disposition, content_type)?;
+		let key = self
+			.db
+			.create_file_metadata(mxc, None, dim, content_disposition, content_type)
+			.await?;
 
 		//TODO: Dangling metadata in database if creation fails
 		self.create_media_file(&key, file).await?;
@@ -289,13 +290,16 @@ async fn get_thumbnail_generate(
 	};
 
 	// Save thumbnail in database so we don't have to generate it again next time
-	let thumbnail_key = self.db.create_file_metadata(
-		mxc,
-		None,
-		dim,
-		data.content_disposition.as_ref(),
-		data.content_type.as_deref(),
-	)?;
+	let thumbnail_key = self
+		.db
+		.create_file_metadata(
+			mxc,
+			None,
+			dim,
+			data.content_disposition.as_ref(),
+			data.content_type.as_deref(),
+		)
+		.await?;
 
 	self.create_media_file(&thumbnail_key, &thumbnail_bytes)
 		.await?;

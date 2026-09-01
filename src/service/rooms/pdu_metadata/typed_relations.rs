@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, RoomId, events::relation::RelationType,
 };
@@ -6,10 +7,7 @@ use tuwunel_core::{
 	arrayvec::ArrayVec,
 	implement,
 	matrix::{Event, PduCount, RawPduId},
-	utils::{
-		stream::{ReadyExt, TryIgnore},
-		u64_from_u8,
-	},
+	utils::{stream::TryIgnore, u64_from_u8},
 };
 
 use super::Service;
@@ -88,7 +86,9 @@ pub async fn add_typed_relation<E: Event>(
 
 	self.db
 		.relatesto_typed
-		.aput_raw::<KEY_LEN, _, _>(key.as_slice(), child_short.to_be_bytes());
+		.aput_raw::<KEY_LEN, _, _>(key.as_slice(), child_short.to_be_bytes())
+		.await
+		.expect("database write error");
 }
 
 fn tag(rel_type: &RelationType) -> Option<Tag> {
@@ -175,7 +175,11 @@ pub async fn delete_typed_relation(&self, child_id: &RawPduId, child: &Canonical
 
 	let key = key(shortroomid, parent_count, tag, child_ts, child_count);
 
-	self.db.relatesto_typed.remove(key.as_slice());
+	self.db
+		.relatesto_typed
+		.remove(key.as_slice())
+		.await
+		.expect("database write error");
 }
 
 #[implement(Service)]
@@ -189,8 +193,12 @@ pub async fn delete_all_relatesto_typed_for_room(&self, room_id: &RoomId) -> Res
 		.relatesto_typed
 		.keys_prefix_raw(&shortroomid)
 		.ignore_err()
-		.ready_for_each(|key| {
-			self.db.relatesto_typed.remove(key);
+		.for_each(|key| async move {
+			self.db
+				.relatesto_typed
+				.remove(key)
+				.await
+				.expect("database write error");
 		})
 		.await;
 

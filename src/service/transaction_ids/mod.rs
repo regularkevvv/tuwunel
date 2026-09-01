@@ -25,13 +25,13 @@ impl crate::Service for Service {
 }
 
 #[implement(Service)]
-pub fn add_txnid(
+pub async fn add_txnid(
 	&self,
 	user_id: &UserId,
 	device_id: Option<&DeviceId>,
 	txn_id: &TransactionId,
 	data: &[u8],
-) {
+) -> Result {
 	let mut key = user_id.as_bytes().to_vec();
 	key.push(0xFF);
 	key.extend_from_slice(
@@ -44,7 +44,10 @@ pub fn add_txnid(
 
 	self.db
 		.userdevicetxnid_response
-		.insert(&key, data);
+		.insert(&key, data)
+		.await?;
+
+	Ok(())
 }
 
 // If there's no entry, this is a new transaction

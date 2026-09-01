@@ -88,7 +88,7 @@ async fn device_authorization(services: &Services, body: &DeviceAuthRequest) -> 
 	}
 
 	let scope = body.scope.as_deref().unwrap_or_default();
-	let grant = server.create_device_grant(client_id, scope);
+	let grant = server.create_device_grant(client_id, scope).await;
 	let user_code = format_user_code(&grant.user_code);
 
 	let issuer = server.issuer_url()?;

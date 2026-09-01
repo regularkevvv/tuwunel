@@ -11,8 +11,10 @@ pub(super) async fn clear_servername_status(services: &Services) -> Result {
 	let servername_status = db["servername_status"].clone();
 
 	warn!("Clearing federation peer-status reachability rows");
-	servername_status.clear().await;
+	servername_status.clear().await?;
 
-	db["global"].insert(b"clear_servername_status", []);
+	db["global"]
+		.insert(b"clear_servername_status", [])
+		.await?;
 	servername_status.sort()
 }

@@ -137,24 +137,33 @@ fn into_stable(
 ///
 /// A later validation can contact the policy server again.
 #[implement(super::Service)]
-pub fn clear_policy_signature_state(&self, event_id: &EventId) {
-	self.db.eventid_policysigstate.remove(event_id);
+pub async fn clear_policy_signature_state(&self, event_id: &EventId) -> Result {
+	self.db
+		.eventid_policysigstate
+		.remove(event_id)
+		.await
 }
 
 #[implement(super::Service)]
-fn cache_policy_refused(&self, event_id: &EventId) {
+async fn cache_policy_refused(&self, event_id: &EventId) -> Result {
 	let until_secs = now_secs().saturating_add(POLICY_REFUSAL_TTL.as_secs());
 
 	self.db
 		.eventid_policysigstate
-		.raw_put(event_id.as_str(), Cbor(&PolicySigState::Refused { until_secs }));
+		.raw_put(event_id.as_str(), Cbor(&PolicySigState::Refused { until_secs }))
+		.await?;
+
+	Ok(())
 }
 
 #[implement(super::Service)]
-fn cache_policy_backoff(&self, event_id: &EventId, until_secs: u64) {
+async fn cache_policy_backoff(&self, event_id: &EventId, until_secs: u64) -> Result {
 	self.db
 		.eventid_policysigstate
-		.raw_put(event_id.as_str(), Cbor(&PolicySigState::BackoffUntil { until_secs }));
+		.raw_put(event_id.as_str(), Cbor(&PolicySigState::BackoffUntil { until_secs }))
+		.await?;
+
+	Ok(())
 }
 
 #[implement(super::Service)]
@@ -275,11 +284,12 @@ where
 				"policy server refused to sign outbound PDU"
 			);
 
-			self.cache_policy_refused(event_id);
+			self.cache_policy_refused(event_id).await?;
 			return Err!(Request(Forbidden("Event was rejected by the room's policy server.")));
 		},
 		| FetchOutcome::RateLimited { until_secs } => {
-			self.cache_policy_backoff(event_id, until_secs);
+			self.cache_policy_backoff(event_id, until_secs)
+				.await?;
 		},
 		| FetchOutcome::FailOpen => {},
 	}
@@ -501,11 +511,15 @@ where
 				"policy server refused to sign inbound PDU; soft-failing"
 			);
 
-			self.cache_policy_refused(event_id);
+			self.cache_policy_refused(event_id)
+				.await
+				.expect("database write error");
 			PolicyCheck::Invalid
 		},
 		| FetchOutcome::RateLimited { until_secs } => {
-			self.cache_policy_backoff(event_id, until_secs);
+			self.cache_policy_backoff(event_id, until_secs)
+				.await
+				.expect("database write error");
 			PolicyCheck::Pass
 		},
 		| FetchOutcome::FailOpen => PolicyCheck::Pass,

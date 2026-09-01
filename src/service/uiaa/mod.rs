@@ -58,7 +58,7 @@ impl crate::Service for Service {
 
 /// Creates a new Uiaa session. Make sure the session token is unique.
 #[implement(Service)]
-pub fn create(
+pub async fn create(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
@@ -74,7 +74,9 @@ pub fn create(
 
 	self.set_uiaa_request(user_id, device_id, session, json_body);
 
-	self.update_uiaa_session(user_id, device_id, session, Some(uiaainfo));
+	self.update_uiaa_session(user_id, device_id, session, Some(uiaainfo))
+		.await
+		.expect("database write error");
 }
 
 /// Authenticate one stage without taking ownership of an email proof.
@@ -259,14 +261,16 @@ async fn try_auth_inner(
 				message: "Email address has not been validated.".to_owned(),
 			}));
 
-			self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo));
+			self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo))
+				.await?;
 
 			return Ok((false, uiaainfo));
 		}
 	}
 
 	if !completed {
-		self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo));
+		self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo))
+			.await?;
 
 		return Ok((false, uiaainfo));
 	}
@@ -277,7 +281,8 @@ async fn try_auth_inner(
 			.completed
 			.contains(&AuthType::EmailIdentity);
 
-	self.update_uiaa_session(user_id, device_id, session, retain_session.then_some(&uiaainfo));
+	self.update_uiaa_session(user_id, device_id, session, retain_session.then_some(&uiaainfo))
+		.await?;
 
 	Ok((true, uiaainfo))
 }
@@ -415,21 +420,25 @@ pub fn get_uiaa_request(
 }
 
 #[implement(Service)]
-pub fn update_uiaa_session(
+pub async fn update_uiaa_session(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
 	session: &str,
 	uiaainfo: Option<&UiaaInfo>,
-) {
+) -> Result {
 	let key = (user_id, device_id, session);
 
 	if let Some(uiaainfo) = uiaainfo {
 		self.db
 			.userdevicesessionid_uiaainfo
-			.put(key, Json(uiaainfo));
+			.put(key, Json(uiaainfo))
+			.await
 	} else {
-		self.db.userdevicesessionid_uiaainfo.del(key);
+		self.db
+			.userdevicesessionid_uiaainfo
+			.del(key)
+			.await
 	}
 }
 

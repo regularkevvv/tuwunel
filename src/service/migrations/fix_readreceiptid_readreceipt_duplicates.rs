@@ -1,11 +1,6 @@
+use futures::StreamExt;
 use ruma::{RoomId, UserId, identifiers_validation::ID_MAX_BYTES};
-use tuwunel_core::{
-	Result,
-	arrayvec::ArrayString,
-	info,
-	utils::{ReadyExt, stream::TryExpect},
-	warn,
-};
+use tuwunel_core::{Result, arrayvec::ArrayString, info, utils::stream::TryExpect, warn};
 
 use crate::Services;
 
@@ -23,10 +18,11 @@ pub(super) async fn fix_readreceiptid_readreceipt_duplicates(services: &Services
 	let mut cur_user: Option<ArrayId> = None;
 	let (mut total, mut fixed): (usize, usize) = (0, 0);
 
-	readreceiptid_readreceipt
-		.keys()
-		.expect_ok()
-		.ready_for_each(|key: Key<'_>| {
+	{
+		let stream = readreceiptid_readreceipt.keys().expect_ok();
+		futures::pin_mut!(stream);
+		while let Some(key) = stream.next().await {
+			let key: Key<'_> = key;
 			let (room_id, _, user_id) = key;
 			let last_room = cur_room.replace(
 				room_id
@@ -44,17 +40,19 @@ pub(super) async fn fix_readreceiptid_readreceipt_duplicates(services: &Services
 
 			let is_dup = cur_room == last_room && cur_user == last_user;
 			if is_dup {
-				readreceiptid_readreceipt.del(key);
+				readreceiptid_readreceipt.del(key).await?;
 			}
 
 			fixed = fixed.saturating_add(is_dup.into());
 			total = total.saturating_add(1);
-		})
-		.await;
+		}
+	}
 
 	drop(cork);
 	info!(?total, ?fixed, "Fixed undeleted entries in readreceiptid_readreceipt.");
 
-	db["global"].insert(b"fix_readreceiptid_readreceipt_duplicates", []);
+	db["global"]
+		.insert(b"fix_readreceiptid_readreceipt_duplicates", [])
+		.await?;
 	readreceiptid_readreceipt.sort()
 }

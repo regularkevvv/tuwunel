@@ -62,12 +62,12 @@ pub(super) async fn get_summary_and_children_federation(
 		.map(|(_, response)| response);
 
 	let Some(Response { room, children, inaccessible_children }) = response else {
-		self.cache_put(current_room, None);
+		self.cache_put(current_room, None).await?;
 		return Err!(Request(NotFound("Space room not found over federation.")));
 	};
 
 	for room_id in &inaccessible_children {
-		self.cache_put(room_id, None);
+		self.cache_put(room_id, None).await?;
 	}
 
 	for summary in children
@@ -80,10 +80,10 @@ pub(super) async fn get_summary_and_children_federation(
 			children_state: Default::default(),
 		};
 
-		self.cache_put(&room_id, Some(&summary));
+		self.cache_put(&room_id, Some(&summary)).await?;
 	}
 
-	self.cache_put(current_room, Some(&room));
+	self.cache_put(current_room, Some(&room)).await?;
 
 	self.is_accessible_child(current_room, &room.summary.join_rule.clone(), sender)
 		.await

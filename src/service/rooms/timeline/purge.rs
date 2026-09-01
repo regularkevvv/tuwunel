@@ -67,14 +67,15 @@ pub async fn purge_history(
 			let room_id_ts_id = (room_id, ts, bias_count(raw_id.count()));
 			txn.del(&self.db.roomid_tscount_pducount, room_id_ts_id);
 
-			txn.execute();
+			txn.execute().await?;
 
 			if pdu.kind == TimelineEventType::RoomMessage
 				&& let Ok(ExtractBody { body: Some(body) }) = pdu.get_content()
 			{
 				self.services
 					.search
-					.deindex_pdu(shortroomid, &raw_id, &body);
+					.deindex_pdu(shortroomid, &raw_id, &body)
+					.await?;
 			}
 
 			self.services
@@ -82,7 +83,10 @@ pub async fn purge_history(
 				.purge_event_relations(shortroomid, count, room_id, &event_id)
 				.await;
 
-			self.services.retention.purge_original(&event_id);
+			self.services
+				.retention
+				.purge_original(&event_id)
+				.await?;
 
 			trace!(?event_id, ?room_id, "Purged");
 

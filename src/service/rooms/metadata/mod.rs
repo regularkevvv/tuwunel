@@ -95,26 +95,37 @@ pub async fn is_public(&self, room_id: &RoomId) -> bool {
 
 #[implement(Service)]
 #[inline]
-pub fn disable_room(&self, room_id: &RoomId) { self.db.disabledroomids.insert(room_id, []); }
+pub async fn disable_room(&self, room_id: &RoomId) -> Result {
+	self.db.disabledroomids.insert(room_id, []).await
+}
 
 #[implement(Service)]
 #[inline]
-pub fn enable_room(&self, room_id: &RoomId) { self.db.disabledroomids.remove(room_id); }
+pub async fn enable_room(&self, room_id: &RoomId) -> Result {
+	self.db.disabledroomids.remove(room_id).await
+}
 
 #[implement(Service)]
 #[inline]
-pub fn ban_room(&self, room_id: &RoomId) { self.db.bannedroomids.insert(room_id, []); }
+pub async fn ban_room(&self, room_id: &RoomId) -> Result {
+	self.db.bannedroomids.insert(room_id, []).await
+}
 
 #[implement(Service)]
 #[inline]
-pub fn unban_room(&self, room_id: &RoomId) { self.db.bannedroomids.remove(room_id); }
+pub async fn unban_room(&self, room_id: &RoomId) -> Result {
+	self.db.bannedroomids.remove(room_id).await
+}
 
 #[implement(Service)]
 #[inline]
-pub fn block_room(&self, room_id: &RoomId, blocker: &UserId) {
+pub async fn block_room(&self, room_id: &RoomId, blocker: &UserId) -> Result {
 	self.db
 		.bannedroomids
-		.insert(room_id, blocker.as_bytes());
+		.insert(room_id, blocker.as_bytes())
+		.await?;
+
+	Ok(())
 }
 
 #[implement(Service)]

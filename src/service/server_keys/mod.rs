@@ -43,7 +43,9 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		let minimum_valid = Duration::from_hours(1);
 
-		let (keypair, verify_keys) = keypair::init(args.db)?;
+		let (keypair, verify_keys) = tokio::task::block_in_place(|| {
+			tokio::runtime::Handle::current().block_on(keypair::init(args.db))
+		})?;
 		debug_assert!(verify_keys.len() == 1, "only one active verify_key supported");
 
 		Ok(Arc::new(Self {
@@ -104,7 +106,9 @@ async fn add_signing_keys(&self, new_keys: ServerSigningKeys) {
 
 	self.db
 		.server_signingkeys
-		.raw_put(origin, Json(&keys));
+		.raw_put(origin, Json(&keys))
+		.await
+		.expect("database write error");
 }
 
 #[implement(Service)]

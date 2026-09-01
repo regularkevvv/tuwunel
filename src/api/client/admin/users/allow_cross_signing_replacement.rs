@@ -23,7 +23,7 @@ pub(crate) async fn admin_allow_cross_signing_replacement_route(
 		.users
 		.allow_cross_signing_replacement(&body.user_id);
 
-	let deadline = MilliSecondsSinceUnixEpoch::from_system_time(deadline)
+	let deadline = MilliSecondsSinceUnixEpoch::from_system_time(deadline.await)
 		.ok_or_else(|| err!(Request(InvalidParam("Deadline out of range"))))?;
 
 	Ok(allow_cross_signing_replacement::Response::new(deadline))

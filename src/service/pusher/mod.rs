@@ -139,7 +139,8 @@ pub async fn set_pusher(
 			self.set_pusher_delete(sender, ids.pushkey.as_str())
 				.await,
 		| PusherAction::Post(data) =>
-			self.set_pusher_post(sender, sender_device, pusher, &data.pusher)?,
+			self.set_pusher_post(sender, sender_device, pusher, &data.pusher)
+				.await?,
 	}
 
 	Ok(())
@@ -151,7 +152,7 @@ async fn set_pusher_delete(&self, sender: &UserId, pushkey: &str) {
 }
 
 #[implement(Service)]
-fn set_pusher_post(
+async fn set_pusher_post(
 	&self,
 	sender: &UserId,
 	sender_device: &DeviceId,
@@ -178,10 +179,14 @@ fn set_pusher_post(
 	}
 
 	let key = (sender, pushkey);
-	self.db.senderkey_pusher.put(key, Json(action));
+	self.db
+		.senderkey_pusher
+		.put(key, Json(action))
+		.await?;
 	self.db
 		.pushkey_deviceid
-		.insert(pushkey, sender_device);
+		.insert(pushkey, sender_device)
+		.await?;
 
 	self.forget_sent_badge(sender, pushkey);
 
@@ -217,8 +222,16 @@ fn check_http_pusher_url(&self, url: &Url) -> Result {
 #[implement(Service)]
 pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
 	let key = (sender, pushkey);
-	self.db.senderkey_pusher.del(key);
-	self.db.pushkey_deviceid.remove(pushkey);
+	self.db
+		.senderkey_pusher
+		.del(key)
+		.await
+		.expect("database write error");
+	self.db
+		.pushkey_deviceid
+		.remove(pushkey)
+		.await
+		.expect("database write error");
 	self.clear_suppressed_pushkey(sender, pushkey);
 	self.forget_sent_badge(sender, pushkey);
 
@@ -233,7 +246,7 @@ pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
 pub async fn get_device_pushkeys(&self, sender: &UserId, device_id: &DeviceId) -> Vec<String> {
 	self.get_pushkeys(sender)
 		.map(ToOwned::to_owned)
-		.broad_filter_map(async |pushkey| {
+		.broad_filter_map(|pushkey| async move {
 			self.get_pusher_device(&pushkey)
 				.await
 				.ok()

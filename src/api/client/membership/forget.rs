@@ -43,7 +43,10 @@ pub(crate) async fn forget_room_route(
 
 	pin_mut!(left, left_or_banned);
 	if left.or(left_or_banned).await {
-		services.state_cache.forget(room_id, user_id);
+		services
+			.state_cache
+			.forget(room_id, user_id)
+			.await?;
 	}
 
 	Ok(forget_room::v3::Response::new())

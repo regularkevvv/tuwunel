@@ -101,7 +101,8 @@ pub async fn register_client(&self, request: DcrRequest) -> Result<ClientRegistr
 
 	self.db
 		.oidcclientid_registration
-		.raw_put(&*registration.client_id, Cbor(&registration));
+		.raw_put(&*registration.client_id, Cbor(&registration))
+		.await?;
 
 	Ok(registration)
 }

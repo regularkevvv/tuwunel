@@ -39,13 +39,13 @@ impl crate::Service for Service {
 }
 
 #[implement(Service)]
-pub fn create_backup(
+pub async fn create_backup(
 	&self,
 	user_id: &UserId,
 	backup_metadata: &Raw<BackupAlgorithm>,
 ) -> Result<String> {
-	let version = self.services.globals.next_count();
-	let count = self.services.globals.next_count();
+	let version = self.services.globals.next_count().await?;
+	let count = self.services.globals.next_count().await?;
 
 	let version_string = version.to_string();
 	let key = (user_id, &version_string);
@@ -53,7 +53,7 @@ pub fn create_backup(
 
 	txn.put(&self.db.backupid_algorithm, key, Json(backup_metadata));
 	txn.put(&self.db.backupid_etag, key, *count);
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(version_string)
 }
@@ -61,16 +61,28 @@ pub fn create_backup(
 #[implement(Service)]
 pub async fn delete_backup(&self, user_id: &UserId, version: &str) {
 	let key = (user_id, version);
-	self.db.backupid_algorithm.del(key);
-	self.db.backupid_etag.del(key);
+	self.db
+		.backupid_algorithm
+		.del(key)
+		.await
+		.expect("database write error");
+	self.db
+		.backupid_etag
+		.del(key)
+		.await
+		.expect("database write error");
 
 	let key = (user_id, version, Interfix);
 	self.db
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
 		.ignore_err()
-		.ready_for_each(|outdated_key| {
-			self.db.backupkeyid_backup.remove(outdated_key);
+		.for_each(|outdated_key| async move {
+			self.db
+				.backupkeyid_backup
+				.remove(outdated_key)
+				.await
+				.expect("database write error");
 		})
 		.await;
 }
@@ -93,12 +105,12 @@ pub async fn update_backup<'a>(
 		return Err!(Request(NotFound("Tried to update nonexistent backup.")));
 	}
 
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	let mut txn = self.services.db.txn();
 
 	txn.put(&self.db.backupid_etag, key, *count);
 	txn.put_raw(&self.db.backupid_algorithm, key, backup_metadata.json().get());
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(version)
 }
@@ -186,7 +198,7 @@ pub async fn add_key(
 		return Ok(());
 	}
 
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	let mut txn = self.services.db.txn();
 
 	txn.put(&self.db.backupid_etag, key, *count);
@@ -194,7 +206,7 @@ pub async fn add_key(
 	let key = (user_id, version, room_id, session_id);
 
 	txn.put_raw(&self.db.backupkeyid_backup, key, key_data.json().get());
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -336,7 +348,13 @@ pub async fn delete_all_keys(&self, user_id: &UserId, version: &str) {
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
 		.ignore_err()
-		.ready_for_each(|outdated_key| self.db.backupkeyid_backup.remove(outdated_key))
+		.for_each(|outdated_key| async move {
+			self.db
+				.backupkeyid_backup
+				.remove(outdated_key)
+				.await
+				.expect("database remove error");
+		})
 		.await;
 }
 
@@ -347,8 +365,12 @@ pub async fn delete_room_keys(&self, user_id: &UserId, version: &str, room_id: &
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
 		.ignore_err()
-		.ready_for_each(|outdated_key| {
-			self.db.backupkeyid_backup.remove(outdated_key);
+		.for_each(|outdated_key| async move {
+			self.db
+				.backupkeyid_backup
+				.remove(outdated_key)
+				.await
+				.expect("database write error");
 		})
 		.await;
 }
@@ -366,8 +388,12 @@ pub async fn delete_room_key(
 		.backupkeyid_backup
 		.keys_prefix_raw(&key)
 		.ignore_err()
-		.ready_for_each(|outdated_key| {
-			self.db.backupkeyid_backup.remove(outdated_key);
+		.for_each(|outdated_key| async move {
+			self.db
+				.backupkeyid_backup
+				.remove(outdated_key)
+				.await
+				.expect("database write error");
 		})
 		.await;
 }

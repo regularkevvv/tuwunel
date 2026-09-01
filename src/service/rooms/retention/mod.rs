@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use ruma::{CanonicalJsonObject, EventId};
 use tuwunel_core::{
 	Result, debug_info, expected, implement,
@@ -36,20 +36,25 @@ impl crate::Service for Service {
 				debug_info!("Cleaning up retained events");
 
 				let now = now().as_secs();
-				let count = self
-					.timeredacted_eventid
-					.keys::<(u64, &EventId)>()
-					.ready_try_take_while(|(time_redacted, _)| {
-						let time_redacted = *time_redacted;
-						Ok(expected!(time_redacted + retention_seconds) < now)
-					})
-					.ready_try_fold_default(|count: usize, (time_redacted, event_id)| {
-						self.eventid_originalpdu.remove(event_id);
+				let mut count = 0_usize;
+				{
+					let stream = self
+						.timeredacted_eventid
+						.keys::<(u64, &EventId)>()
+						.ready_try_take_while(|(time_redacted, _)| {
+							let time_redacted = *time_redacted;
+							Ok(expected!(time_redacted + retention_seconds) < now)
+						});
+					futures::pin_mut!(stream);
+					while let Some(item) = stream.next().await {
+						let (time_redacted, event_id): (u64, &EventId) = item?;
+						self.eventid_originalpdu.remove(event_id).await?;
 						self.timeredacted_eventid
-							.del((time_redacted, event_id));
-						Ok(count.saturating_add(1))
-					})
-					.await?;
+							.del((time_redacted, event_id))
+							.await?;
+						count = count.saturating_add(1);
+					}
+				}
 
 				debug_info!(?count, "Finished cleaning up retained events");
 			}
@@ -103,10 +108,14 @@ pub async fn save_original_pdu(
 	let now = now().as_secs();
 
 	self.eventid_originalpdu
-		.raw_put(event_id, Json(pdu));
+		.raw_put(event_id, Json(pdu))
+		.await
+		.expect("database write error");
 
 	self.timeredacted_eventid
-		.put_raw((now, event_id), []);
+		.put_raw((now, event_id), [])
+		.await
+		.expect("database write error");
 }
 
 #[implement(Service)]
@@ -120,4 +129,6 @@ pub fn retained_pdus_raw(&self) -> impl Stream<Item = Result<&[u8]>> + Send {
 /// `timeredacted_eventid` index entry is left for the retention worker to reap
 /// at its scheduled time.
 #[implement(Service)]
-pub fn purge_original(&self, event_id: &EventId) { self.eventid_originalpdu.remove(event_id); }
+pub async fn purge_original(&self, event_id: &EventId) -> Result {
+	self.eventid_originalpdu.remove(event_id).await
+}

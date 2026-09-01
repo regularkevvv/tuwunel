@@ -1,7 +1,10 @@
-use std::{pin::Pin, sync::Arc, task::{Context, Poll}};
+use std::{
+	pin::Pin,
+	sync::Arc,
+	task::{Context, Poll},
+};
 
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::Either};
-
 use rocksdb::Direction;
 use tuwunel_core::Result;
 
@@ -115,6 +118,8 @@ impl<S: Stream> Stream for Metered<S> {
 		// `self`, and `Metered`'s `Drop` only reads the `items` counter.
 		// `items` itself is `Unpin` plain data.
 		let this = unsafe { self.get_unchecked_mut() };
+		// SAFETY: re-pinning the structurally pinned `inner` field of the
+		// pinned `Metered` we just projected; it is never moved afterward.
 		let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
 		let polled = inner.poll_next(ctx);
 		if matches!(polled, Poll::Ready(Some(_))) {

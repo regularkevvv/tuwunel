@@ -40,6 +40,10 @@ pub async fn create_server_user(services: &Services) -> Result {
 ///
 /// Users in this room are considered admins by tuwunel, and the room can be
 /// used to issue admin commands by talking to the server user inside it.
+#[expect(
+	clippy::too_many_lines,
+	reason = "single linear room-bootstrap script"
+)]
 pub async fn create_admin_room(services: &Services) -> Result {
 	let room_id = RoomId::new_v1(services.globals.server_name());
 	let room_version_id = RoomVersionId::V11;
@@ -203,7 +207,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 		.boxed()
 		.await?;
 
-	services.alias.set_alias(alias, &room_id)?;
+	services.alias.set_alias(alias, &room_id).await?;
 
 	// 7. (ad-hoc) Disable room URL previews for everyone by default
 	services

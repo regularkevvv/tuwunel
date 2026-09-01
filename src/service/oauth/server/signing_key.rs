@@ -13,7 +13,7 @@ pub(super) struct SigningKey {
 
 const SIGNING_KEY_DB_KEY: &str = "oidc_signing_key";
 
-pub(super) fn init_signing_key(db: &Data) -> Result<SigningKey> {
+pub(super) async fn init_signing_key(db: &Data) -> Result<SigningKey> {
 	if let Ok(signing_key_data) = db
 		.oidc_signingkey
 		.get_blocking(SIGNING_KEY_DB_KEY)
@@ -31,7 +31,8 @@ pub(super) fn init_signing_key(db: &Data) -> Result<SigningKey> {
 	let signing_key_data = generate_signing_key()?;
 
 	db.oidc_signingkey
-		.raw_put(SIGNING_KEY_DB_KEY, Cbor(&signing_key_data));
+		.raw_put(SIGNING_KEY_DB_KEY, Cbor(&signing_key_data))
+		.await?;
 
 	info!(
 		key_id = ?signing_key_data.key_id,

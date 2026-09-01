@@ -30,7 +30,8 @@ pub(super) async fn cross_signing_reset_execute_html(
 ) -> Result<String> {
 	services
 		.users
-		.allow_cross_signing_replacement(user_id);
+		.allow_cross_signing_replacement(user_id)
+		.await;
 
 	info!(?user_id, "Cross-signing reset approved via account management page");
 

@@ -116,7 +116,7 @@ pub async fn create_or_reuse_pending(
 		use_state: PendingUse::Available,
 	};
 
-	self.persist_pending(&sid, &pending);
+	self.persist_pending(&sid, &pending).await?;
 
 	Ok(PendingOutcome { sid, freshly_minted_token: Some(token) })
 }
@@ -161,14 +161,17 @@ pub async fn validate_pending_token(
 		let attempts = pending.attempts.saturating_add(1);
 		match attempts >= MAX_VERIFY_ATTEMPTS {
 			| true => self.delete_pending_state(sid, &pending).await?,
-			| false => self.persist_pending(sid, &Pending { attempts, ..pending }),
+			| false =>
+				self.persist_pending(sid, &Pending { attempts, ..pending })
+					.await?,
 		}
 
 		return Err!(Request(ThreepidAuthFailed("Invalid verification token")));
 	}
 
 	let validated_at = Some(SystemTime::now());
-	self.persist_pending(sid, &Pending { validated_at, ..pending });
+	self.persist_pending(sid, &Pending { validated_at, ..pending })
+		.await?;
 
 	Ok(())
 }
@@ -234,7 +237,7 @@ pub async fn claim_validated(
 	};
 
 	txn.raw_put(&self.db.threepidsid_pending, sid, Cbor(&pending));
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(true)
 }
@@ -260,7 +263,7 @@ pub async fn refresh_claim(&self, claim: &UiaaKey) -> Result<bool> {
 	let pending = match self.get_pending(&sid).await {
 		| Ok(pending) => pending,
 		| Err(error) if error.is_not_found() => {
-			self.delete_claim_index(claim);
+			self.delete_claim_index(claim).await?;
 
 			return Ok(false);
 		},
@@ -268,13 +271,14 @@ pub async fn refresh_claim(&self, claim: &UiaaKey) -> Result<bool> {
 	};
 
 	if expired(&pending) {
-		self.delete_pending_rows(&sid, Some(claim));
+		self.delete_pending_rows(&sid, Some(claim))
+			.await?;
 
 		return Ok(false);
 	}
 
 	if !matches!(&pending.use_state, PendingUse::Claimed(owner) if owner.as_ref() == claim) {
-		self.delete_claim_index(claim);
+		self.delete_claim_index(claim).await?;
 
 		return Ok(false);
 	}
@@ -285,7 +289,7 @@ pub async fn refresh_claim(&self, claim: &UiaaKey) -> Result<bool> {
 
 	txn.raw_put(&self.db.threepidsid_pending, &sid, Cbor(&pending));
 	txn.put_raw(&self.db.userdevicesessionid_threepid, claim, &sid);
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(true)
 }
@@ -320,7 +324,7 @@ pub async fn redeem_claim(&self, claim: &UiaaKey) -> Result<Association> {
 	let pending = match self.get_pending(&sid).await {
 		| Ok(pending) => pending,
 		| Err(error) if error.is_not_found() => {
-			self.delete_claim_index(claim);
+			self.delete_claim_index(claim).await?;
 
 			return Err(error);
 		},
@@ -328,13 +332,14 @@ pub async fn redeem_claim(&self, claim: &UiaaKey) -> Result<Association> {
 	};
 
 	if expired(&pending) {
-		self.delete_pending_rows(&sid, Some(claim));
+		self.delete_pending_rows(&sid, Some(claim))
+			.await?;
 
 		return Err!(Request(NotFound("The verification session has expired")));
 	}
 
 	if !matches!(&pending.use_state, PendingUse::Claimed(owner) if owner.as_ref() == claim) {
-		self.delete_claim_index(claim);
+		self.delete_claim_index(claim).await?;
 
 		return Err!(Request(ThreepidAuthFailed(
 			"The verification session is not owned by this transaction"
@@ -351,7 +356,7 @@ pub async fn redeem_claim(&self, claim: &UiaaKey) -> Result<Association> {
 
 	txn.raw_put(&self.db.threepidsid_pending, &sid, Cbor(&pending));
 	txn.del(&self.db.userdevicesessionid_threepid, claim);
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(association)
 }
@@ -391,7 +396,8 @@ pub async fn redeem_validated(&self, sid: &str, client_secret: &str) -> Result<A
 		address: pending.address.clone(),
 	};
 
-	self.persist_pending(sid, &Pending { use_state: PendingUse::Spent, ..pending });
+	self.persist_pending(sid, &Pending { use_state: PendingUse::Spent, ..pending })
+		.await?;
 
 	Ok(association)
 }
@@ -414,16 +420,19 @@ pub async fn session_validated(&self, sid: &str, client_secret: &str) -> bool {
 }
 
 #[implement(super::Service)]
-fn persist_pending(&self, sid: &str, pending: &Pending) {
+async fn persist_pending(&self, sid: &str, pending: &Pending) -> Result {
 	self.db
 		.threepidsid_pending
-		.raw_put(sid, Cbor(pending));
+		.raw_put(sid, Cbor(pending))
+		.await?;
+
+	Ok(())
 }
 
 #[implement(super::Service)]
 async fn delete_pending_state(&self, sid: &str, pending: &Pending) -> Result<()> {
 	let PendingUse::Claimed(claim) = &pending.use_state else {
-		self.delete_pending_rows(sid, None);
+		self.delete_pending_rows(sid, None).await?;
 
 		return Ok(());
 	};
@@ -437,13 +446,13 @@ async fn delete_pending_state(&self, sid: &str, pending: &Pending) -> Result<()>
 		.is_some_and(|claimed_sid| claimed_sid == sid)
 		.then_some(claim);
 
-	self.delete_pending_rows(sid, claim);
+	self.delete_pending_rows(sid, claim).await?;
 
 	Ok(())
 }
 
 #[implement(super::Service)]
-fn delete_pending_rows(&self, sid: &str, claim: Option<&UiaaKey>) {
+async fn delete_pending_rows(&self, sid: &str, claim: Option<&UiaaKey>) -> Result {
 	let mut txn = self.db.database.txn();
 	txn.del_raw(&self.db.threepidsid_pending, sid);
 
@@ -451,11 +460,16 @@ fn delete_pending_rows(&self, sid: &str, claim: Option<&UiaaKey>) {
 		txn.del(&self.db.userdevicesessionid_threepid, claim);
 	}
 
-	txn.execute();
+	txn.execute().await
 }
 
 #[implement(super::Service)]
-fn delete_claim_index(&self, claim: &UiaaKey) { self.db.userdevicesessionid_threepid.del(claim); }
+async fn delete_claim_index(&self, claim: &UiaaKey) -> Result {
+	self.db
+		.userdevicesessionid_threepid
+		.del(claim)
+		.await
+}
 
 #[implement(super::Service)]
 async fn claim_sid(&self, claim: &UiaaKey) -> Result<Option<ClaimSid>> {

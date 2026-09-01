@@ -42,7 +42,8 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 	if let Some(body) = body {
 		self.services
 			.search
-			.deindex_pdu(shortroomid, &pdu_id, body);
+			.deindex_pdu(shortroomid, &pdu_id, body)
+			.await?;
 	}
 
 	let room_id: &RoomId = pdu.get("room_id").try_into()?;

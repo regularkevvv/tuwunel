@@ -105,12 +105,13 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 
 		let pdus: Vec<Box<RawJsonValue>> = serde_json::from_slice(&outcome.bytes)?;
 		let batch_size = pdus.len();
+		let origin = &outcome.origin;
 		let prepended = pdus
 			.into_iter()
 			.stream()
-			.fold(0_usize, async |prepended, pdu| {
+			.fold(0_usize, move |prepended, pdu| async move {
 				let inserted = self
-					.backfill_pdu(room_id, &outcome.origin, pdu)
+					.backfill_pdu(room_id, origin, pdu)
 					.await
 					.inspect_err(|e| debug_warn!(%room_id, %e, "Failed to add backfilled pdu"))
 					.unwrap_or(false);
@@ -310,10 +311,11 @@ async fn backfill_event(
 
 	let pdus: Vec<Box<RawJsonValue>> = serde_json::from_slice(&outcome.bytes)?;
 
+	let origin = &outcome.origin;
 	pdus.into_iter()
 		.stream()
-		.for_each(async |pdu| {
-			self.backfill_pdu(room_id, &outcome.origin, pdu)
+		.for_each(move |pdu| async move {
+			self.backfill_pdu(room_id, origin, pdu)
 				.await
 				.inspect_err(|e| debug_warn!(%room_id, "Failed to add backfilled pdu: {e}"))
 				.ok();
@@ -392,7 +394,7 @@ pub async fn backfill_pdu(
 
 	// A pdu_id is not returned from handle_incoming_pdu() when accepting a new
 	// event on this codepath. The pdu_id is instead created here in ℤ−
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	let count: i64 = (*count).try_into()?;
 	let pdu_id: RawPduId = PduId {
 		shortroomid,
@@ -407,7 +409,8 @@ pub async fn backfill_pdu(
 		&event_id,
 		u64::from(pdu.origin_server_ts),
 		&value,
-	);
+	)
+	.await?;
 	drop(insert_lock);
 
 	match pdu.kind {
@@ -415,14 +418,16 @@ pub async fn backfill_pdu(
 			if let Ok(ExtractBody { body: Some(body) }) = pdu.get_content() {
 				self.services
 					.search
-					.index_pdu(shortroomid, &pdu_id, &body);
+					.index_pdu(shortroomid, &pdu_id, &body)
+					.await?;
 			}
 		},
 		| TimelineEventType::RoomTopic =>
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
 				self.services
 					.search
-					.index_pdu(shortroomid, &pdu_id, &topic);
+					.index_pdu(shortroomid, &pdu_id, &topic)
+					.await?;
 			},
 		| _ => {},
 	}
@@ -434,14 +439,14 @@ pub async fn backfill_pdu(
 }
 
 #[implement(super::Service)]
-fn prepend_backfill_pdu(
+async fn prepend_backfill_pdu(
 	&self,
 	pdu_id: &RawPduId,
 	room_id: &RoomId,
 	event_id: &EventId,
 	origin_server_ts: u64,
 	json: &CanonicalJsonObject,
-) {
+) -> Result {
 	let mut txn = self.db.db.txn();
 
 	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
@@ -452,5 +457,5 @@ fn prepend_backfill_pdu(
 	let key = (room_id, origin_server_ts, count_key);
 	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
 
-	txn.execute();
+	txn.execute().await
 }

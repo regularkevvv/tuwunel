@@ -11,7 +11,7 @@ pub(super) async fn raw_put(&self, map: String, key: String, value: String) -> R
 
 	let key = decode(&key);
 	let value = decode(&value);
-	map.insert(&key, &value);
+	map.insert(&key, &value).await?;
 
 	let query_time = timer.elapsed();
 	write!(self, "Operation completed in {query_time:?}").await

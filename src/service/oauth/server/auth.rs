@@ -69,7 +69,7 @@ const AUTH_CODE_LENGTH: usize = 64;
 
 #[implement(super::Server)]
 #[must_use]
-pub fn create_auth_code(&self, auth_req: &AuthRequest, user_id: OwnedUserId) -> String {
+pub async fn create_auth_code(&self, auth_req: &AuthRequest, user_id: OwnedUserId) -> String {
 	let now = SystemTime::now();
 	let code = utils::random_string(AUTH_CODE_LENGTH);
 	let session = AuthCodeSession {
@@ -89,16 +89,21 @@ pub fn create_auth_code(&self, auth_req: &AuthRequest, user_id: OwnedUserId) -> 
 
 	self.db
 		.oidccode_authsession
-		.raw_put(&*code, Cbor(&session));
+		.raw_put(&*code, Cbor(&session))
+		.await
+		.expect("database write error");
 
 	code
 }
 
 #[implement(super::Server)]
-pub fn store_auth_request(&self, req_id: &str, request: &AuthRequest) {
+pub async fn store_auth_request(&self, req_id: &str, request: &AuthRequest) -> Result {
 	self.db
 		.oidcreqid_authrequest
-		.raw_put(req_id, Cbor(request));
+		.raw_put(req_id, Cbor(request))
+		.await?;
+
+	Ok(())
 }
 
 /// Read an authorization request without consuming it.
@@ -119,7 +124,7 @@ pub async fn peek_auth_request(&self, req_id: &str) -> Result<AuthRequest> {
 		.map_err(|_| err!(Request(NotFound("Unknown or expired authorization request"))))?;
 
 	if SystemTime::now() > request.expires_at {
-		self.remove_auth_request(req_id);
+		self.remove_auth_request(req_id).await?;
 
 		return Err!(Request(NotFound("Authorization request has expired")));
 	}
@@ -132,7 +137,9 @@ pub async fn peek_auth_request(&self, req_id: &str) -> Result<AuthRequest> {
 /// The request is single-use, so a flow removes it before minting anything
 /// against it. Removing a key that is already gone is a no-op.
 #[implement(super::Server)]
-pub fn remove_auth_request(&self, req_id: &str) { self.db.oidcreqid_authrequest.remove(req_id); }
+pub async fn remove_auth_request(&self, req_id: &str) -> Result {
+	self.db.oidcreqid_authrequest.remove(req_id).await
+}
 
 #[implement(super::Server)]
 pub async fn exchange_auth_code(
@@ -152,7 +159,7 @@ pub async fn exchange_auth_code(
 		.map(|cbor: Cbor<AuthCodeSession>| cbor.0)
 		.map_err(|_| err!(Request(Forbidden("Invalid or expired authorization code"))))?;
 
-	self.db.oidccode_authsession.remove(code);
+	self.db.oidccode_authsession.remove(code).await?;
 
 	if SystemTime::now() > session.expires_at {
 		return Err!(Request(Forbidden("Authorization code has expired")));

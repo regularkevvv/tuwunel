@@ -19,7 +19,7 @@ use crate::{
 #[tracing::instrument(skip(self, key), fields(%self), level = "trace")]
 pub async fn remove<K>(&self, key: &K) -> Result
 where
-	K: AsRef<[u8]> + ?Sized + Debug,
+	K: AsRef<[u8]> + ?Sized + Debug + Sync,
 {
 	STATS.write.record(key.as_ref().len());
 
@@ -37,7 +37,8 @@ where
 		},
 		| Inner::Mem(mem) => {
 			mem.store.commit(std::iter::once((
-				self.id().expect("model-backend maps are catalog maps"),
+				self.id()
+					.expect("model-backend maps are catalog maps"),
 				Op::Delete { key: key.as_ref().into() },
 			)));
 		},

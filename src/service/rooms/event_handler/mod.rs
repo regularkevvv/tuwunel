@@ -72,8 +72,16 @@ impl crate::Service for Service {
 	}
 
 	async fn clear_cache(&self) {
-		self.db.eventid_backoff.clear().await;
-		self.db.eventid_resolvedstate.clear().await;
+		self.db
+			.eventid_backoff
+			.clear()
+			.await
+			.expect("database clear error");
+		self.db
+			.eventid_resolvedstate
+			.clear()
+			.await
+			.expect("database clear error");
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }

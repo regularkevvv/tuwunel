@@ -195,7 +195,9 @@ async fn backfill_server_name(services: &Services) -> Result {
 			))
 		})?;
 
-	services.db["global"].insert(SERVER_NAME_KEY, server_name.as_str());
+	services.db["global"]
+		.insert(SERVER_NAME_KEY, server_name.as_str())
+		.await?;
 	info!(%server_name, "Stamped server_name marker on upgraded database");
 
 	Ok(())
@@ -207,26 +209,61 @@ async fn fresh(services: &Services) -> Result {
 	services
 		.globals
 		.db
-		.bump_database_version(DATABASE_VERSION);
+		.bump_database_version(DATABASE_VERSION)
+		.await?;
 
-	db["global"].insert(SERVER_NAME_KEY, services.server.name.as_str());
-	db["global"].insert(b"feat_sha256_media", []);
-	db["global"].insert(b"fix_pdu_missing_room_id", []);
-	db["global"].insert(b"fix_bad_double_separator_in_state_cache", []);
-	db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
-	db["global"].insert(b"fix_referencedevents_missing_sep", []);
-	db["global"].insert(b"fix_readreceiptid_readreceipt_duplicates", []);
-	db["global"].insert(b"fix_hashed_sentinel_passwords", []);
-	db["global"].insert(b"upgrade_legacy_mediaid_user", []);
-	db["global"].insert(b"remove_remote_media_userid", []);
-	db["global"].insert(b"rebuild_roomid_tscount_pducount", []);
-	db["global"].insert(b"rebuild_relatesto_typed", []);
-	db["global"].insert(b"migrate_profile_keys_to_useridprofilekey", []);
-	db["global"].insert(b"rebuild_thread_activity", []);
-	db["global"].insert(b"clear_servername_status", []);
-	db["global"].insert(b"adopt_foreign_account_status", []);
-	db["global"].insert(b"adopt_foreign_email_bindings", []);
-	mark_clean_injectivity(services);
+	db["global"]
+		.insert(SERVER_NAME_KEY, services.server.name.as_str())
+		.await?;
+	db["global"]
+		.insert(b"feat_sha256_media", [])
+		.await?;
+	db["global"]
+		.insert(b"fix_pdu_missing_room_id", [])
+		.await?;
+	db["global"]
+		.insert(b"fix_bad_double_separator_in_state_cache", [])
+		.await?;
+	db["global"]
+		.insert(b"retroactively_fix_bad_data_from_roomuserid_joined", [])
+		.await?;
+	db["global"]
+		.insert(b"fix_referencedevents_missing_sep", [])
+		.await?;
+	db["global"]
+		.insert(b"fix_readreceiptid_readreceipt_duplicates", [])
+		.await?;
+	db["global"]
+		.insert(b"fix_hashed_sentinel_passwords", [])
+		.await?;
+	db["global"]
+		.insert(b"upgrade_legacy_mediaid_user", [])
+		.await?;
+	db["global"]
+		.insert(b"remove_remote_media_userid", [])
+		.await?;
+	db["global"]
+		.insert(b"rebuild_roomid_tscount_pducount", [])
+		.await?;
+	db["global"]
+		.insert(b"rebuild_relatesto_typed", [])
+		.await?;
+	db["global"]
+		.insert(b"migrate_profile_keys_to_useridprofilekey", [])
+		.await?;
+	db["global"]
+		.insert(b"rebuild_thread_activity", [])
+		.await?;
+	db["global"]
+		.insert(b"clear_servername_status", [])
+		.await?;
+	db["global"]
+		.insert(b"adopt_foreign_account_status", [])
+		.await?;
+	db["global"]
+		.insert(b"adopt_foreign_email_bindings", [])
+		.await?;
+	mark_clean_injectivity(services).await?;
 
 	// Create the admin room and server user on first run
 	if services.config.create_admin_room {
@@ -258,7 +295,8 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		services
 			.globals
 			.db
-			.bump_database_version(target_version);
+			.bump_database_version(target_version)
+			.await?;
 	}
 
 	migrate_media(services).await?;
@@ -269,7 +307,9 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		.is_not_found()
 	{
 		conduit::migrate_conduit_pdus(services).await?;
-		db["global"].insert(b"fix_pdu_missing_room_id", []);
+		db["global"]
+			.insert(b"fix_pdu_missing_room_id", [])
+			.await?;
 	}
 
 	import_conduit_knocks(services).await?;
@@ -281,8 +321,12 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		.open_cf("servernamemediaid_metadata")?
 		.is_some()
 	{
-		db["global"].insert(b"fix_bad_double_separator_in_state_cache", []);
-		db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
+		db["global"]
+			.insert(b"fix_bad_double_separator_in_state_cache", [])
+			.await?;
+		db["global"]
+			.insert(b"retroactively_fix_bad_data_from_roomuserid_joined", [])
+			.await?;
 	}
 
 	if db["global"]
@@ -359,7 +403,9 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 			.rebuild_typed_relations()
 			.await?;
 
-		db["global"].insert(b"rebuild_relatesto_typed", []);
+		db["global"]
+			.insert(b"rebuild_relatesto_typed", [])
+			.await?;
 	}
 
 	if db["global"]
@@ -377,7 +423,9 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 	{
 		services.threads.rebuild_thread_activity().await?;
 
-		db["global"].insert(b"rebuild_thread_activity", []);
+		db["global"]
+			.insert(b"rebuild_thread_activity", [])
+			.await?;
 	}
 
 	if db["global"]
@@ -400,7 +448,9 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 	{
 		migrate_account_status(services).await?;
 
-		db["global"].insert(b"adopt_foreign_account_status", []);
+		db["global"]
+			.insert(b"adopt_foreign_account_status", [])
+			.await?;
 	}
 
 	if db["global"]
@@ -410,7 +460,9 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 	{
 		migrate_email_bindings(services).await?;
 
-		db["global"].insert(b"adopt_foreign_email_bindings", []);
+		db["global"]
+			.insert(b"adopt_foreign_email_bindings", [])
+			.await?;
 	}
 
 	// A newer same-lineage database was already refused; stamping ours is safe. A
@@ -419,7 +471,8 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 	services
 		.globals
 		.db
-		.bump_database_version(target_version);
+		.bump_database_version(target_version)
+		.await?;
 
 	match discovered.cmp(&target_version) {
 		| Ordering::Less =>

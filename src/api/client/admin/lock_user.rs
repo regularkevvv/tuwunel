@@ -21,11 +21,14 @@ pub(crate) async fn lock_user_route(
 
 	let action = match body.locked {
 		| true => {
-			services.users.set_locked(user_id, sender_user);
+			services
+				.users
+				.set_locked(user_id, sender_user)
+				.await?;
 			"locked"
 		},
 		| false => {
-			services.users.clear_locked(user_id);
+			services.users.clear_locked(user_id).await?;
 			"unlocked"
 		},
 	};

@@ -91,7 +91,7 @@ pub async fn update(
 		return Err!(Request(InvalidParam("Account data doesn't have all required fields.")));
 	}
 
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	let roomuserdataid = (room_id, user_id, *count, &event_type);
 	let key = (room_id, user_id, &event_type);
 	let prev = self
@@ -109,7 +109,7 @@ pub async fn update(
 		txn.del_raw(&self.db.roomuserdataid_accountdata, prev);
 	}
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -259,7 +259,7 @@ pub async fn erase_user(&self, user_id: &UserId, room_id: Option<&RoomId>) {
 		.ready_for_each(|key| txn.del_raw(&self.db.roomusertype_roomuserdataid, key))
 		.await;
 
-	txn.execute();
+	txn.execute().await.expect("database write error");
 }
 
 /// Returns all changes to the account data that happened after `since`.

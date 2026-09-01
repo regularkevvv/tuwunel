@@ -55,7 +55,8 @@ pub async fn create_device(
 		display_name: initial_device_display_name.map(Into::into),
 		last_seen_ts: Some(MilliSecondsSinceUnixEpoch::now()),
 		last_seen_ip: client_ip.map(to_small_string),
-	});
+	})
+	.await?;
 
 	if let Some(access_token) = access_token {
 		self.set_access_token(user_id, &device_id, access_token, expires_in, refresh_token)
@@ -86,7 +87,13 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 		.todeviceid_events
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.todeviceid_events.remove(key))
+		.for_each(|key| async move {
+			self.db
+				.todeviceid_events
+				.remove(key)
+				.await
+				.expect("database remove error");
+		})
 		.await;
 
 	// Remove pushers
@@ -96,7 +103,7 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 		.map(Vec::into_iter)
 		.map(IterStream::stream)
 		.flatten_stream()
-		.for_each(async |pushkey| {
+		.for_each(|pushkey| async move {
 			self.services
 				.pusher
 				.delete_pusher(user_id, &pushkey)
@@ -117,7 +124,13 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 		.userdeviceidalgorithm_fallback
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.userdeviceidalgorithm_fallback.remove(key))
+		.for_each(|key| async move {
+			self.db
+				.userdeviceidalgorithm_fallback
+				.remove(key)
+				.await
+				.expect("database remove error");
+		})
 		.await;
 
 	// MSC3890: drop this device's local notification settings.
@@ -129,11 +142,21 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 		.ok();
 
 	let userdeviceid = (user_id, device_id);
-	self.db.userdeviceid_metadata.del(userdeviceid);
-	self.db.oidcdevice_userdeviceid.del(userdeviceid);
+	self.db
+		.userdeviceid_metadata
+		.del(userdeviceid)
+		.await
+		.expect("database write error");
+	self.db
+		.oidcdevice_userdeviceid
+		.del(userdeviceid)
+		.await
+		.expect("database write error");
 
 	self.mark_device_key_update(user_id).await;
-	increment(&self.db.userid_devicelistversion, user_id.as_bytes());
+	increment(&self.db.userid_devicelistversion, user_id.as_bytes())
+		.await
+		.expect("database write error");
 }
 
 /// Returns an iterator over all device ids of this user.
@@ -240,7 +263,7 @@ pub async fn set_access_token(
 	txn.put_raw(&self.db.userdeviceidtoken_index, key, []);
 	txn.put_raw(&self.db.userdeviceid_token, userdeviceid, access_token);
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -254,11 +277,17 @@ pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) 
 		.userdeviceidtoken_index
 		.keys_prefix(&prefix)
 		.ignore_err()
-		.ready_for_each(|(_, _, token): (Ignore, Ignore, &str)| {
-			self.db.token_userdeviceid.remove(token);
+		.for_each(|(_, _, token): (Ignore, Ignore, &str)| async move {
+			self.db
+				.token_userdeviceid
+				.remove(token)
+				.await
+				.expect("database write error");
 			self.db
 				.userdeviceidtoken_index
-				.del((user_id, device_id, token));
+				.del((user_id, device_id, token))
+				.await
+				.expect("database write error");
 		})
 		.await;
 
@@ -279,7 +308,7 @@ pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) 
 
 	txn.del(&self.db.userdeviceid_token, (user_id, device_id));
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -306,7 +335,7 @@ pub async fn remove_access_token_value(&self, access_token: &str) {
 
 	txn.del_raw(&self.db.token_userdeviceid, access_token);
 
-	txn.execute();
+	txn.execute().await.expect("database write error");
 }
 
 #[implement(super::Service)]
@@ -383,7 +412,7 @@ pub async fn set_refresh_token(
 		txn.put_raw(&self.db.userdeviceid_spentrefresh, userdeviceid, &*spent);
 	}
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -442,7 +471,7 @@ pub async fn remove_refresh_token(&self, user_id: &UserId, device_id: &DeviceId)
 	self.forget_spent_refresh_token(user_id, device_id, &mut txn)
 		.await;
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }
@@ -559,7 +588,7 @@ pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
 pub fn generate_refresh_token() -> String { format!("refresh_{}", random_string(TOKEN_LENGTH)) }
 
 #[implement(super::Service)]
-pub fn add_to_device_event(
+pub async fn add_to_device_event(
 	&self,
 	sender: &UserId,
 	target_user_id: &UserId,
@@ -567,17 +596,26 @@ pub fn add_to_device_event(
 	event_type: &str,
 	content: &serde_json::Value,
 ) -> u64 {
-	let count = self.services.globals.next_count();
+	let count = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
 
 	let key = (target_user_id, target_device_id, *count);
-	self.db.todeviceid_events.put(
-		key,
-		Json(json!({
-			"type": event_type,
-			"sender": sender,
-			"content": content,
-		})),
-	);
+	self.db
+		.todeviceid_events
+		.put(
+			key,
+			Json(json!({
+				"type": event_type,
+				"sender": sender,
+				"content": content,
+			})),
+		)
+		.await
+		.expect("database insert error");
 
 	trace!(
 		%target_user_id,
@@ -633,8 +671,12 @@ pub async fn remove_to_device_events<Until>(
 		.ready_take_while(move |(user_id_, device_id_, _): &Key<'_>| {
 			user_id == *user_id_ && device_id == *device_id_
 		})
-		.ready_for_each(|key: Key<'_>| {
-			self.db.todeviceid_events.del(key);
+		.for_each(|key: Key<'_>| async move {
+			self.db
+				.todeviceid_events
+				.del(key)
+				.await
+				.expect("database write error");
 		})
 		.await;
 }
@@ -659,21 +701,30 @@ pub async fn update_device_last_seen(
 		.last_seen_ts
 		.replace(last_seen_ts.unwrap_or_else(MilliSecondsSinceUnixEpoch::now));
 
-	self.put_device_metadata(user_id, false, &device);
+	self.put_device_metadata(user_id, false, &device)
+		.await?;
 
 	Ok(())
 }
 
 #[implement(super::Service)]
-pub fn put_device_metadata(&self, user_id: &UserId, notify: bool, device: &Device) {
+pub async fn put_device_metadata(
+	&self,
+	user_id: &UserId,
+	notify: bool,
+	device: &Device,
+) -> Result {
 	let key = (user_id, &device.device_id);
 	self.db
 		.userdeviceid_metadata
-		.put(key, Json(device));
+		.put(key, Json(device))
+		.await?;
 
 	if notify {
-		increment(&self.db.userid_devicelistversion, user_id.as_bytes());
+		increment(&self.db.userid_devicelistversion, user_id.as_bytes()).await?;
 	}
+
+	Ok(())
 }
 
 /// Get device metadata.
@@ -728,23 +779,32 @@ pub async fn get_oidc_device_idp(
 }
 
 #[implement(super::Service)]
-pub fn mark_oidc_device(&self, user_id: &UserId, device_id: &DeviceId, idp_id: &str) {
+pub async fn mark_oidc_device(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	idp_id: &str,
+) -> Result {
 	self.db
 		.oidcdevice_userdeviceid
-		.put((user_id, device_id), Json(idp_id));
+		.put((user_id, device_id), Json(idp_id))
+		.await?;
+
+	Ok(())
 }
 
 /// Allow cross-signing key replacement without UIAA for the next 10 minutes.
 /// Returns the expiry timestamp in milliseconds.
-#[expect(clippy::must_use_candidate)]
 #[implement(super::Service)]
-pub fn allow_cross_signing_replacement(&self, user_id: &UserId) -> SystemTime {
+pub async fn allow_cross_signing_replacement(&self, user_id: &UserId) -> SystemTime {
 	let duration = Duration::from_mins(10);
 	let expires = timepoint_from_now(duration).expect("failed to create timepoint from now");
 
 	self.db
 		.oidccskeybypass_userid
-		.raw_put(user_id, Cbor(expires));
+		.raw_put(user_id, Cbor(expires))
+		.await
+		.expect("database write error");
 
 	expires
 }
@@ -767,7 +827,11 @@ pub async fn can_replace_cross_signing_keys(&self, user_id: &UserId) -> bool {
 		return true;
 	}
 
-	self.db.oidccskeybypass_userid.remove(user_id);
+	self.db
+		.oidccskeybypass_userid
+		.remove(user_id)
+		.await
+		.expect("database write error");
 	false
 }
 
@@ -794,10 +858,10 @@ pub fn all_devices_metadata<'a>(
 }
 
 //TODO: this is an ABA
-fn increment(db: &Arc<Map>, key: &[u8]) {
+async fn increment(db: &Arc<Map>, key: &[u8]) -> Result {
 	let old = db.get_blocking(key);
 	let new = utils::increment(old.ok().as_deref());
-	db.insert(key, new);
+	db.insert(key, new).await
 }
 
 #[cfg(test)]

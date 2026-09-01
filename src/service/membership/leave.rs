@@ -230,7 +230,7 @@ async fn clear_local_leave(
 	leave_content: RoomMemberEventContent,
 	last_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
 ) -> Result {
-	let count = self.services.globals.next_count();
+	let count = self.services.globals.next_count().await?;
 	self.services
 		.state_cache
 		.update_membership(MembershipUpdate {

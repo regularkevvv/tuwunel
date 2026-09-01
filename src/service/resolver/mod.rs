@@ -40,7 +40,10 @@ impl crate::Service for Service {
 
 	async fn clear_cache(&self) {
 		self.resolver.clear_cache();
-		self.cache.clear().await;
+		self.cache
+			.clear()
+			.await
+			.expect("database clear error");
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }

@@ -29,7 +29,7 @@ use futures::{Stream, StreamExt};
 use http::StatusCode;
 use ruma::{OwnedServerName, ServerName, api::error::ErrorBody};
 use tuwunel_core::{
-	Error, implement,
+	Error, Result, implement,
 	utils::{
 		stream::{ReadyExt, TryIgnore},
 		time::now_secs,
@@ -130,7 +130,8 @@ pub struct PeerBackoff {
 pub async fn record_success(&self, server: &ServerName) {
 	self.statuses
 		.del_prefix(&(server, Interfix))
-		.await;
+		.await
+		.expect("database write error");
 }
 
 /// Clears a peer's failure rows after it has proven reachable via inbound
@@ -150,7 +151,8 @@ pub async fn note_peer_alive(&self, server: &ServerName) -> bool {
 	if sad {
 		self.statuses
 			.del_prefix(&(server, Interfix))
-			.await;
+			.await
+			.expect("database write error");
 	}
 
 	sad
@@ -174,14 +176,21 @@ pub async fn peer_has_failures(&self, server: &ServerName) -> bool {
 }
 
 #[implement(super::Service)]
-pub fn record_failure(&self, server: &ServerName, classification: Classification) {
+pub async fn record_failure(
+	&self,
+	server: &ServerName,
+	classification: Classification,
+) -> Result {
 	// Raw-value additive extension; old one-byte rows stay readable.
 	let mut value = [0_u8; 9];
 	value[0] = u8::from(classification);
 	value[1..].copy_from_slice(&now_secs().to_be_bytes());
 
 	self.statuses
-		.put_raw((server, self.current_bucket()), value);
+		.put_raw((server, self.current_bucket()), value)
+		.await?;
+
+	Ok(())
 }
 
 #[implement(super::Service)]

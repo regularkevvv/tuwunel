@@ -806,7 +806,7 @@ pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Re
 		})
 		.await;
 
-	txn.execute();
+	txn.execute().await?;
 
 	Ok(())
 }

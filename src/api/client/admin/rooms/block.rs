@@ -44,10 +44,16 @@ pub(crate) async fn admin_set_room_block_route(
 	require_admin(&services, sender_user).await?;
 
 	match body.block {
-		| true => services
-			.metadata
-			.block_room(&body.room_id, sender_user),
-		| false => services.metadata.unban_room(&body.room_id),
+		| true =>
+			services
+				.metadata
+				.block_room(&body.room_id, sender_user)
+				.await?,
+		| false =>
+			services
+				.metadata
+				.unban_room(&body.room_id)
+				.await?,
 	}
 
 	Ok(SetResponse { block: body.block })

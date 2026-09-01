@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, pin::pin, sync::Arc};
 
-use futures::{Stream, StreamExt, TryFutureExt, future::join3};
+use futures::{Stream, StreamExt, TryFutureExt, future::try_join3};
 use ruma::{
 	CanonicalJsonValue, EventId, OwnedEventId, OwnedUserId, RoomId, UserId,
 	api::{Direction, client::threads::get_threads::v1::IncludeThreads},
@@ -198,7 +198,7 @@ impl Service {
 			txn.insert_raw(&self.db.threadrootid_latestcount, root_id, count.to_be_bytes());
 		}
 
-		txn.execute();
+		txn.execute().await?;
 
 		if let CanonicalJsonValue::Object(unsigned) = root_pdu_json
 			.entry("unsigned".into())
@@ -314,7 +314,9 @@ impl Service {
 			if count < pointer {
 				self.db
 					.threadactivityid_rootid
-					.remove(&activity_id);
+					.remove(&activity_id)
+					.await
+					.expect("database write error");
 			}
 
 			return None;
@@ -392,7 +394,7 @@ impl Service {
 			return Ok(());
 		};
 
-		join3(
+		try_join3(
 			self.db.threadid_userids.del_prefix(&shortroomid),
 			self.db
 				.threadactivityid_rootid
@@ -401,7 +403,7 @@ impl Service {
 				.threadrootid_latestcount
 				.del_prefix(&shortroomid),
 		)
-		.await;
+		.await?;
 
 		Ok(())
 	}
@@ -410,8 +412,8 @@ impl Service {
 	/// startup behind a `global` marker, and on demand from the admin command.
 	/// Clears first so a partial or stale index is replaced wholesale.
 	pub async fn rebuild_thread_activity(&self) -> Result {
-		self.db.threadactivityid_rootid.clear().await;
-		self.db.threadrootid_latestcount.clear().await;
+		self.db.threadactivityid_rootid.clear().await?;
+		self.db.threadrootid_latestcount.clear().await?;
 
 		self.db
 			.threadid_userids
@@ -455,6 +457,6 @@ impl Service {
 
 		txn.insert_raw(&self.db.threadactivityid_rootid, activity_id, root_id);
 		txn.insert_raw(&self.db.threadrootid_latestcount, root_id, latest.to_be_bytes());
-		txn.execute();
+		txn.execute().await.expect("database write error");
 	}
 }

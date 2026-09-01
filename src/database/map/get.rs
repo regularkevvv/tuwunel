@@ -33,9 +33,11 @@ where
 	use crate::pool::Get;
 
 	if let Inner::Mem(mem) = self.inner() {
-		let result = mem
-			.store
-			.get(self.id().expect("model-backend maps are catalog maps"), key.as_ref());
+		let result = mem.store.get(
+			self.id()
+				.expect("model-backend maps are catalog maps"),
+			key.as_ref(),
+		);
 		STATS
 			.get
 			.record(result.as_ref().map_or(0, |val| val.len()));
@@ -49,9 +51,11 @@ where
 
 	let cached = self.get_cached(key);
 	if matches!(cached, Err(_) | Ok(Some(_))) {
-		STATS
-			.get_cached
-			.record(cached.as_ref().map_or(0, |c| c.as_ref().map_or(0, |h| h.len())));
+		STATS.get_cached.record(
+			cached
+				.as_ref()
+				.map_or(0, |c| c.as_ref().map_or(0, |h| h.len())),
+		);
 
 		return Either::Left(Either::Right(
 			task::consume_budget().map(move |()| cached.map_expect("data found in cache")),
@@ -107,7 +111,11 @@ where
 	if let Inner::Mem(mem) = self.inner() {
 		return mem
 			.store
-			.get(self.id().expect("model-backend maps are catalog maps"), key.as_ref())
+			.get(
+				self.id()
+					.expect("model-backend maps are catalog maps"),
+				key.as_ref(),
+			)
 			.map(Handle::from)
 			.ok_or(err!(Request(NotFound("Not found in database"))));
 	}

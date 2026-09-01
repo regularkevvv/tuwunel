@@ -40,7 +40,13 @@ pub async fn purge_event_relations(
 		.raw_keys_from(target.as_slice())
 		.ignore_err()
 		.ready_take_while(move |key| key.starts_with(&target))
-		.ready_for_each(|key| self.db.tofrom_relation.remove(key))
+		.for_each(|key| async move {
+			self.db
+				.tofrom_relation
+				.remove(key)
+				.await
+				.expect("database remove error");
+		})
 		.await;
 
 	let mut prefix = Prefix::new();
@@ -53,16 +59,30 @@ pub async fn purge_event_relations(
 		.raw_keys_from(prefix.as_slice())
 		.ignore_err()
 		.ready_take_while(move |key| key.starts_with(&prefix))
-		.ready_for_each(|key| self.db.relatesto_typed.remove(key))
+		.for_each(|key| async move {
+			self.db
+				.relatesto_typed
+				.remove(key)
+				.await
+				.expect("database remove error");
+		})
 		.await;
 
-	self.db.referencedevents.del((room_id, event_id));
+	self.db
+		.referencedevents
+		.del((room_id, event_id))
+		.await
+		.expect("database write error");
 
 	self.services
 		.event_handler
-		.clear_policy_signature_state(event_id);
+		.clear_policy_signature_state(event_id)
+		.await
+		.expect("database write error");
 
-	self.clear_event_soft_failed(event_id);
+	self.clear_event_soft_failed(event_id)
+		.await
+		.expect("database write error");
 }
 
 /// Rebuild `relatesto_typed` from every stored PDU. Run once at startup behind
@@ -70,7 +90,7 @@ pub async fn purge_event_relations(
 /// partial or stale index is replaced wholesale.
 #[implement(Service)]
 pub async fn rebuild_typed_relations(&self) -> Result {
-	self.db.relatesto_typed.clear().await;
+	self.db.relatesto_typed.clear().await?;
 
 	let pdus = self.services.db["pduid_pdu"].clone();
 

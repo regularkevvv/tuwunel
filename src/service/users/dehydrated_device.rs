@@ -61,13 +61,16 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 		.await?;
 
 	trace!(device_data = ?request.device_data);
-	self.db.userid_dehydrateddevice.raw_put(
-		user_id,
-		Json(&DehydratedDevice {
-			device_id: device_id.clone(),
-			device_data: request.device_data,
-		}),
-	);
+	self.db
+		.userid_dehydrateddevice
+		.raw_put(
+			user_id,
+			Json(&DehydratedDevice {
+				device_id: device_id.clone(),
+				device_data: request.device_data,
+			}),
+		)
+		.await?;
 
 	trace!(device_keys = ?request.device_keys);
 	self.add_device_keys(user_id, &device_id, &request.device_keys)
@@ -130,7 +133,10 @@ pub(super) async fn remove_dehydrated_device(
 		return Err!(Request(NotFound("Not the user's dehydrated device.")));
 	}
 
-	self.db.userid_dehydrateddevice.remove(user_id);
+	self.db
+		.userid_dehydrateddevice
+		.remove(user_id)
+		.await?;
 
 	Ok(device_id)
 }

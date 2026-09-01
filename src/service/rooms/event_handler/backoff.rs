@@ -2,7 +2,7 @@ use std::{ops::Range, time::Duration};
 
 use ruma::EventId;
 use tuwunel_core::{
-	implement,
+	Result, implement,
 	utils::{
 		continue_exponential_backoff,
 		stream::{ReadyExt, TryIgnore},
@@ -119,16 +119,25 @@ impl Summary {
 /// Record a federation attempt before a cancellable await, so a premature
 /// cancellation still leaves a `Pending` row behind to rate-gate against.
 #[implement(super::Service)]
-pub(super) fn record_attempt(&self, ctx: Context, event_id: &EventId) {
-	self.record_outcome(ctx, event_id, Disposition::Pending);
+pub(super) async fn record_attempt(&self, ctx: Context, event_id: &EventId) -> Result {
+	self.record_outcome(ctx, event_id, Disposition::Pending)
+		.await
 }
 
 #[implement(super::Service)]
-pub(super) fn record_outcome(&self, ctx: Context, event_id: &EventId, disposition: Disposition) {
-	self.db.eventid_backoff.put(
-		(u8::from(ctx), event_id, current_bucket()),
-		(u64::from(disposition), now_secs()),
-	);
+pub(super) async fn record_outcome(
+	&self,
+	ctx: Context,
+	event_id: &EventId,
+	disposition: Disposition,
+) -> Result {
+	self.db
+		.eventid_backoff
+		.put(
+			(u8::from(ctx), event_id, current_bucket()),
+			(u64::from(disposition), now_secs()),
+		)
+		.await
 }
 
 /// Clears the upgrade backoff recorded against an event.
@@ -147,7 +156,8 @@ pub(super) async fn record_success(&self, ctx: Context, event_id: &EventId) {
 	self.db
 		.eventid_backoff
 		.del_prefix(&(u8::from(ctx), event_id, Interfix))
-		.await;
+		.await
+		.expect("database write error");
 }
 
 #[implement(super::Service)]

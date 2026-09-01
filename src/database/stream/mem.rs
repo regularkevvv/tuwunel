@@ -17,7 +17,7 @@ use tuwunel_core::Result;
 
 use crate::{
 	Map,
-	backend::mem,
+	backend::{mem, mem::Entry},
 	keyval::{Key, KeyVal},
 };
 
@@ -26,17 +26,17 @@ use crate::{
 /// Implemented for the two item shapes the map streams yield: key-value
 /// pairs and bare keys.
 pub(crate) trait Project<'a>: Sized {
-	fn project(entry: &'a (Box<[u8]>, Box<[u8]>)) -> Self;
+	fn project(entry: &'a Entry) -> Self;
 }
 
 impl<'a> Project<'a> for KeyVal<'a> {
 	#[inline]
-	fn project(entry: &'a (Box<[u8]>, Box<[u8]>)) -> Self { (&entry.0, &entry.1) }
+	fn project(entry: &'a Entry) -> Self { (&entry.0, &entry.1) }
 }
 
 impl<'a> Project<'a> for Key<'a> {
 	#[inline]
-	fn project(entry: &'a (Box<[u8]>, Box<[u8]>)) -> Self { &entry.0 }
+	fn project(entry: &'a Entry) -> Self { &entry.0 }
 }
 
 /// One positioned model-backend scan.
@@ -44,10 +44,14 @@ impl<'a> Project<'a> for Key<'a> {
 /// The snapshot is immutable for the stream's life; yielded items borrow it.
 /// As with the RocksDB cursor streams, an item is valid only until the next
 /// poll and must be owned before it is retained.
+/// Ties the stream to the map borrow and its projection without storing
+/// either.
+type SeekMarker<'a, T> = PhantomData<(&'a (), fn() -> T)>;
+
 pub(crate) struct MemSeek<'a, T> {
-	snapshot: Vec<(Box<[u8]>, Box<[u8]>)>,
+	snapshot: Vec<Entry>,
 	at: usize,
-	_marker: PhantomData<(&'a (), fn() -> T)>,
+	_marker: SeekMarker<'a, T>,
 }
 
 impl<'a, T> MemSeek<'a, T> {
@@ -87,7 +91,7 @@ where
 			return Poll::Ready(None);
 		}
 
-		let entry: &(Box<[u8]>, Box<[u8]>) = &this.snapshot[this.at];
+		let entry: &Entry = &this.snapshot[this.at];
 		this.at = this.at.saturating_add(1);
 
 		// SAFETY: The snapshot is owned by this stream, never mutated after
@@ -97,7 +101,7 @@ where
 		// streams extend their borrows; the same caller contract applies: an
 		// item is valid only until the next poll and must not outlive the
 		// stream.
-		let entry: &'a (Box<[u8]>, Box<[u8]>) = unsafe { std::mem::transmute(entry) };
+		let entry: &'a Entry = unsafe { std::mem::transmute(entry) };
 
 		Poll::Ready(Some(Ok(T::project(entry))))
 	}

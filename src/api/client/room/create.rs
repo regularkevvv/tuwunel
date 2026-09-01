@@ -90,7 +90,7 @@ pub(crate) async fn create_room_route(
 
 	// Increment and hold the counter; the room will sync atomically to clients
 	// which is preferable.
-	let next_count = services.globals.next_count();
+	let next_count = services.globals.next_count().await?;
 
 	// 1. Create the create event.
 	let (room_id, state_lock) = match version_rules.room_id_format {
@@ -542,11 +542,15 @@ async fn finalize_alias_and_directory(
 	if let Some(alias) = alias {
 		services
 			.alias
-			.set_alias_by(alias, room_id, sender_user)?;
+			.set_alias_by(alias, room_id, sender_user)
+			.await?;
 	}
 
 	if body.visibility == room::Visibility::Public {
-		services.directory.set_public(room_id, alias);
+		services
+			.directory
+			.set_public(room_id, alias)
+			.await?;
 
 		services
 			.admin

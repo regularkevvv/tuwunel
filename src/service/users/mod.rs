@@ -156,7 +156,10 @@ impl Service {
 		origin: Option<&str>,
 	) -> Result {
 		let origin = origin.unwrap_or("password");
-		self.db.userid_origin.insert(user_id, origin);
+		self.db
+			.userid_origin
+			.insert(user_id, origin)
+			.await?;
 		self.set_password(user_id, password).await
 	}
 
@@ -293,7 +296,7 @@ impl Service {
 			.ok()
 	}
 
-	pub fn set_suspended(&self, user_id: &UserId, by: &UserId) {
+	pub async fn set_suspended(&self, user_id: &UserId, by: &UserId) -> Result {
 		let entry = Moderation {
 			when: MilliSecondsSinceUnixEpoch::now(),
 			by: by.to_owned(),
@@ -301,23 +304,33 @@ impl Service {
 
 		self.db
 			.userid_suspended
-			.raw_put(user_id, Json(entry));
+			.raw_put(user_id, Json(entry))
+			.await?;
+
+		Ok(())
 	}
 
-	pub fn clear_suspended(&self, user_id: &UserId) { self.db.userid_suspended.remove(user_id); }
+	pub async fn clear_suspended(&self, user_id: &UserId) -> Result {
+		self.db.userid_suspended.remove(user_id).await
+	}
 
 	/// MSC4025: mark the user erased, recording the current global count.
-	pub fn set_erased(&self, user_id: &UserId) {
+	pub async fn set_erased(&self, user_id: &UserId) -> Result {
 		let count = self.services.globals.current_count();
 
-		self.db.userid_erased.raw_put(user_id, count);
+		self.db
+			.userid_erased
+			.raw_put(user_id, count)
+			.await
 	}
 
 	/// MSC4025: erasure is reversible; clearing the marker restores the
 	/// unredacted view.
-	pub fn clear_erased(&self, user_id: &UserId) { self.db.userid_erased.remove(user_id); }
+	pub async fn clear_erased(&self, user_id: &UserId) -> Result {
+		self.db.userid_erased.remove(user_id).await
+	}
 
-	pub fn set_locked(&self, user_id: &UserId, by: &UserId) {
+	pub async fn set_locked(&self, user_id: &UserId, by: &UserId) -> Result {
 		let entry = Moderation {
 			when: MilliSecondsSinceUnixEpoch::now(),
 			by: by.to_owned(),
@@ -325,10 +338,15 @@ impl Service {
 
 		self.db
 			.userid_locked
-			.raw_put(user_id, Json(entry));
+			.raw_put(user_id, Json(entry))
+			.await?;
+
+		Ok(())
 	}
 
-	pub fn clear_locked(&self, user_id: &UserId) { self.db.userid_locked.remove(user_id); }
+	pub async fn clear_locked(&self, user_id: &UserId) -> Result {
+		self.db.userid_locked.remove(user_id).await
+	}
 
 	/// Returns the number of users registered on this server.
 	#[inline]
@@ -402,16 +420,24 @@ impl Service {
 			| None => {
 				self.db
 					.userid_password
-					.insert(user_id, PASSWORD_DISABLED);
+					.insert(user_id, PASSWORD_DISABLED)
+					.await?;
 			},
 			| Some(Ok(_)) if password == Some(PASSWORD_SENTINEL) => {
 				self.db
 					.userid_password
-					.insert(user_id, PASSWORD_SENTINEL);
+					.insert(user_id, PASSWORD_SENTINEL)
+					.await?;
 			},
 			| Some(Ok(hash)) => {
-				self.db.userid_password.insert(user_id, hash);
-				self.db.userid_origin.insert(user_id, "password");
+				self.db
+					.userid_password
+					.insert(user_id, hash)
+					.await?;
+				self.db
+					.userid_origin
+					.insert(user_id, "password")
+					.await?;
 			},
 			| Some(Err(e)) => {
 				return Err!(Request(InvalidParam(
@@ -425,13 +451,20 @@ impl Service {
 
 	/// Creates a new sync filter. Returns the filter id.
 	#[must_use]
-	pub fn create_filter(&self, user_id: &UserId, filter: &FilterDefinition) -> String {
+	pub async fn create_filter(
+		&self,
+		user_id: &UserId,
+		filter: &FilterDefinition,
+	) -> Result<String> {
 		let filter_id = utils::random_string(4);
 
 		let key = (user_id, &filter_id);
-		self.db.userfilterid_filter.put(key, Json(filter));
+		self.db
+			.userfilterid_filter
+			.put(key, Json(filter))
+			.await?;
 
-		filter_id
+		Ok(filter_id)
 	}
 
 	pub async fn get_filter(
@@ -449,7 +482,7 @@ impl Service {
 
 	/// Creates an OpenID token, which can be used to prove that a user has
 	/// access to an account (primarily for integrations)
-	pub fn create_openid_token(&self, user_id: &UserId, token: &str) -> Result<u64> {
+	pub async fn create_openid_token(&self, user_id: &UserId, token: &str) -> Result<u64> {
 		use std::num::Saturating as Sat;
 
 		let expires_in = self.services.server.config.openid_token_ttl;
@@ -460,7 +493,8 @@ impl Service {
 
 		self.db
 			.openidtoken_expiresatuserid
-			.insert(token.as_bytes(), value.as_slice());
+			.insert(token.as_bytes(), value.as_slice())
+			.await?;
 
 		Ok(expires_in)
 	}
@@ -486,7 +520,8 @@ impl Service {
 			debug_warn!("OpenID token is expired, removing");
 			self.db
 				.openidtoken_expiresatuserid
-				.remove(token.as_bytes());
+				.remove(token.as_bytes())
+				.await?;
 
 			return Err!(Request(Unauthorized("OpenID token is expired")));
 		}
@@ -501,7 +536,7 @@ impl Service {
 	/// Creates a short-lived login token, which can be used to log in using the
 	/// `m.login.token` mechanism.
 	#[must_use]
-	pub fn create_login_token(&self, user_id: &UserId, token: &str) -> u64 {
+	pub async fn create_login_token(&self, user_id: &UserId, token: &str) -> u64 {
 		use std::num::Saturating as Sat;
 
 		let expires_in = self.services.server.config.login_token_ttl;
@@ -510,7 +545,9 @@ impl Service {
 		let value = (expires_at.0, user_id);
 		self.db
 			.logintoken_expiresatuserid
-			.raw_put(token, value);
+			.raw_put(token, value)
+			.await
+			.expect("database write error");
 
 		expires_in
 	}
@@ -531,7 +568,10 @@ impl Service {
 
 		if expires_at < utils::millis_since_unix_epoch() {
 			trace!(?user_id, ?token, "Removing expired login token");
-			self.db.logintoken_expiresatuserid.remove(token);
+			self.db
+				.logintoken_expiresatuserid
+				.remove(token)
+				.await?;
 			return Err!(Request(Forbidden("Login token is expired")));
 		}
 
@@ -554,12 +594,18 @@ impl Service {
 		if expires_at < utils::millis_since_unix_epoch() {
 			trace!(?user_id, ?token, "Removing expired login token");
 
-			self.db.logintoken_expiresatuserid.remove(token);
+			self.db
+				.logintoken_expiresatuserid
+				.remove(token)
+				.await?;
 
 			return Err!(Request(Forbidden("Login token is expired")));
 		}
 
-		self.db.logintoken_expiresatuserid.remove(token);
+		self.db
+			.logintoken_expiresatuserid
+			.remove(token)
+			.await?;
 
 		Ok(user_id)
 	}

@@ -74,7 +74,7 @@ pub const DEVICE_GRANT_INTERVAL_SECS: u64 = 5;
 
 #[implement(super::Server)]
 #[must_use]
-pub fn create_device_grant(&self, client_id: &str, scope: &str) -> DeviceGrant {
+pub async fn create_device_grant(&self, client_id: &str, scope: &str) -> DeviceGrant {
 	let now = SystemTime::now();
 	let device_code = utils::random_string(DEVICE_CODE_LENGTH);
 	let user_code = utils::random_string_from(USER_CODE_CHARSET, USER_CODE_LENGTH);
@@ -93,11 +93,15 @@ pub fn create_device_grant(&self, client_id: &str, scope: &str) -> DeviceGrant {
 
 	self.db
 		.oidcdevicecode_devicegrant
-		.raw_put(&*device_code, Cbor(&grant));
+		.raw_put(&*device_code, Cbor(&grant))
+		.await
+		.expect("database write error");
 
 	self.db
 		.oidcusercode_devicecode
-		.raw_put(&*user_code, Cbor(&device_code));
+		.raw_put(&*user_code, Cbor(&device_code))
+		.await
+		.expect("database write error");
 
 	grant
 }
@@ -127,7 +131,8 @@ pub async fn verify_device_grant(&self, user_code: &str) -> Result<DeviceGrant> 
 	let mut grant = self.get_device_grant(&device_code).await?;
 
 	if SystemTime::now() > grant.expires_at {
-		self.remove_device_grant(&grant.device_code, &grant.user_code);
+		self.remove_device_grant(&grant.device_code, &grant.user_code)
+			.await?;
 
 		return Err!(Request(NotFound("The device authorization has expired")));
 	}
@@ -138,14 +143,16 @@ pub async fn verify_device_grant(&self, user_code: &str) -> Result<DeviceGrant> 
 
 	grant.attempts = grant.attempts.saturating_add(1);
 	if grant.attempts > MAX_VERIFY_ATTEMPTS {
-		self.remove_device_grant(&grant.device_code, &grant.user_code);
+		self.remove_device_grant(&grant.device_code, &grant.user_code)
+			.await?;
 
 		return Err!(Request(Forbidden("Too many attempts; request a new code")));
 	}
 
 	self.db
 		.oidcdevicecode_devicegrant
-		.raw_put(&*grant.device_code, Cbor(&grant));
+		.raw_put(&*grant.device_code, Cbor(&grant))
+		.await?;
 
 	Ok(grant)
 }
@@ -186,7 +193,8 @@ pub async fn poll_device_grant(
 	}
 
 	if SystemTime::now() > grant.expires_at {
-		self.remove_device_grant(&grant.device_code, &grant.user_code);
+		self.remove_device_grant(&grant.device_code, &grant.user_code)
+			.await?;
 
 		return Ok(DeviceGrantPoll::Expired);
 	}
@@ -194,12 +202,14 @@ pub async fn poll_device_grant(
 	match grant.status {
 		| DeviceGrantStatus::Pending => Ok(DeviceGrantPoll::Pending),
 		| DeviceGrantStatus::Denied => {
-			self.remove_device_grant(&grant.device_code, &grant.user_code);
+			self.remove_device_grant(&grant.device_code, &grant.user_code)
+				.await?;
 
 			Ok(DeviceGrantPoll::Denied)
 		},
 		| DeviceGrantStatus::Approved { user_id, idp_id } => {
-			self.remove_device_grant(&grant.device_code, &grant.user_code);
+			self.remove_device_grant(&grant.device_code, &grant.user_code)
+				.await?;
 
 			Ok(DeviceGrantPoll::Approved(ApprovedDeviceGrant {
 				client_id: grant.client_id,
@@ -230,7 +240,8 @@ async fn set_device_grant_status(&self, user_code: &str, status: DeviceGrantStat
 	let mut grant = self.get_device_grant(&device_code).await?;
 
 	if SystemTime::now() > grant.expires_at {
-		self.remove_device_grant(&grant.device_code, &grant.user_code);
+		self.remove_device_grant(&grant.device_code, &grant.user_code)
+			.await?;
 
 		return Err!(Request(NotFound("The device authorization has expired")));
 	}
@@ -242,17 +253,22 @@ async fn set_device_grant_status(&self, user_code: &str, status: DeviceGrantStat
 	grant.status = status;
 	self.db
 		.oidcdevicecode_devicegrant
-		.raw_put(&*grant.device_code, Cbor(&grant));
+		.raw_put(&*grant.device_code, Cbor(&grant))
+		.await?;
 
 	Ok(())
 }
 
 #[implement(super::Server)]
-fn remove_device_grant(&self, device_code: &str, user_code: &str) {
+async fn remove_device_grant(&self, device_code: &str, user_code: &str) -> Result {
 	self.db
 		.oidcdevicecode_devicegrant
-		.remove(device_code);
-	self.db.oidcusercode_devicecode.remove(user_code);
+		.remove(device_code)
+		.await?;
+	self.db
+		.oidcusercode_devicecode
+		.remove(user_code)
+		.await
 }
 
 /// Fold user input back to the stored form: uppercase, keeping only charset

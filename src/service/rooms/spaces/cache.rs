@@ -23,7 +23,12 @@ pub(super) struct Cached {
 #[implement(super::Service)]
 #[inline]
 #[tracing::instrument(name = "evict", level = "debug", skip_all, fields(room_id))]
-pub fn cache_evict(&self, room_id: &RoomId) { self.db.roomid_spacehierarchy.remove(room_id); }
+pub async fn cache_evict(&self, room_id: &RoomId) -> Result {
+	self.db
+		.roomid_spacehierarchy
+		.remove(room_id)
+		.await
+}
 
 #[implement(super::Service)]
 #[tracing::instrument(
@@ -31,15 +36,22 @@ pub fn cache_evict(&self, room_id: &RoomId) { self.db.roomid_spacehierarchy.remo
 	skip(self, summary),
 	fields(summary = summary.is_some())
 )]
-pub(super) fn cache_put(&self, room_id: &RoomId, summary: Option<&ParentSummary>) {
+pub(super) async fn cache_put(
+	&self,
+	room_id: &RoomId,
+	summary: Option<&ParentSummary>,
+) -> Result {
 	debug!(?room_id, "cache put");
-	self.db.roomid_spacehierarchy.raw_put(
-		room_id,
-		Json(Cached {
-			expires: self.generate_ttl(),
-			summary: summary.cloned().filter(is_summary_serializable),
-		}),
-	);
+	self.db
+		.roomid_spacehierarchy
+		.raw_put(
+			room_id,
+			Json(Cached {
+				expires: self.generate_ttl(),
+				summary: summary.cloned().filter(is_summary_serializable),
+			}),
+		)
+		.await
 }
 
 #[implement(super::Service)]

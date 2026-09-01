@@ -107,12 +107,19 @@ async fn create_shorteventid(&self, event_id: &EventId) -> ShortEventId {
 		return shorteventid;
 	}
 
-	let short = self.services.globals.next_count();
+	let short = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
 	let mut txn = self.services.db.txn();
 
 	txn.insert_raw(&self.db.shorteventid_eventid, (*short).to_be_bytes(), event_id);
 	txn.insert_raw(&self.db.eventid_shorteventid, event_id, (*short).to_be_bytes());
-	txn.execute();
+	txn.execute()
+		.await
+		.expect("database transaction execute error");
 
 	*short
 }
@@ -160,12 +167,19 @@ async fn create_shortstatekey(
 	}
 
 	let key = (event_type, state_key);
-	let shortstatekey = self.services.globals.next_count();
+	let shortstatekey = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
 	let mut txn = self.services.db.txn();
 
 	txn.put(&self.db.shortstatekey_statekey, *shortstatekey, key);
 	txn.put(&self.db.statekey_shortstatekey, key, *shortstatekey);
-	txn.execute();
+	txn.execute()
+		.await
+		.expect("database transaction execute error");
 
 	*shortstatekey
 }
@@ -284,7 +298,7 @@ where
 		return Ok((shortstatehash, true));
 	}
 
-	let shortstatehash = self.services.globals.next_count();
+	let shortstatehash = self.services.globals.next_count().await?;
 	let mut txn = self.services.db.txn();
 
 	txn.insert_raw(
@@ -293,7 +307,7 @@ where
 		(*shortstatehash).to_be_bytes(),
 	);
 	write_statediff(&mut txn, *shortstatehash)?;
-	txn.execute();
+	txn.execute().await?;
 
 	Ok((*shortstatehash, false))
 }
@@ -351,13 +365,20 @@ async fn create_shortroomid(&self, room_id: &RoomId) -> ShortRoomId {
 		return shortroomid;
 	}
 
-	let short = self.services.globals.next_count();
+	let short = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
 
 	debug_assert!(size_of_val(&*short) == BUFSIZE, "buffer requirement changed");
 
 	self.db
 		.roomid_shortroomid
-		.raw_aput::<BUFSIZE, _, _>(room_id, *short);
+		.raw_aput::<BUFSIZE, _, _>(room_id, *short)
+		.await
+		.expect("database insert error");
 
 	*short
 }
@@ -371,7 +392,7 @@ pub async fn delete_shortroomid(&self, room_id: &RoomId) -> Result {
 		.await
 		.is_ok()
 	{
-		self.db.roomid_shortroomid.remove(room_id);
+		self.db.roomid_shortroomid.remove(room_id).await?;
 		Ok(())
 	} else {
 		Err!(Database("not found"))

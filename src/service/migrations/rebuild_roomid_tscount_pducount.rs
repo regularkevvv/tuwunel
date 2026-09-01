@@ -1,11 +1,7 @@
+use futures::StreamExt;
 use ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId};
 use serde::Deserialize;
-use tuwunel_core::{
-	Result, info,
-	matrix::pdu::RawPduId,
-	utils::{ReadyExt, stream::TryIgnore},
-	warn,
-};
+use tuwunel_core::{Result, info, matrix::pdu::RawPduId, utils::stream::TryIgnore, warn};
 
 use crate::{Services, rooms::timeline::bias_count};
 
@@ -23,12 +19,13 @@ pub(super) async fn rebuild_roomid_tscount_pducount(services: &Services) -> Resu
 
 	warn!("Rebuilding roomid_tscount_pducount index for same-timestamp event ordering");
 
-	let count = pduid_pdu
-		.raw_stream()
-		.ignore_err()
-		.ready_fold(0_usize, |count, (key, value)| {
+	let mut count = 0_usize;
+	{
+		let stream = pduid_pdu.raw_stream().ignore_err();
+		futures::pin_mut!(stream);
+		while let Some((key, value)) = stream.next().await {
 			let Ok(pdu) = serde_json::from_slice::<PduRoomTs>(value) else {
-				return count;
+				continue;
 			};
 
 			let ts = u64::from(pdu.origin_server_ts.get());
@@ -36,15 +33,19 @@ pub(super) async fn rebuild_roomid_tscount_pducount(services: &Services) -> Resu
 			let count_key = bias_count(pdu_id.count());
 			let room_id: &RoomId = &pdu.room_id;
 
-			roomid_tscount_pducount.put_raw((room_id, ts, count_key), pdu_id.count());
+			roomid_tscount_pducount
+				.put_raw((room_id, ts, count_key), pdu_id.count())
+				.await?;
 
-			count.saturating_add(1)
-		})
-		.await;
+			count = count.saturating_add(1);
+		}
+	}
 
 	drop(cork);
 	info!(%count, "Rebuilt roomid_tscount_pducount index");
 
-	db["global"].insert(b"rebuild_roomid_tscount_pducount", []);
+	db["global"]
+		.insert(b"rebuild_roomid_tscount_pducount", [])
+		.await?;
 	roomid_tscount_pducount.sort()
 }

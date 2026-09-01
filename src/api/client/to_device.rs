@@ -58,7 +58,12 @@ pub(crate) async fn send_event_to_device_route(
 					&federation::transactions::edu::Edu::DirectToDevice(DirectDeviceContent {
 						sender: sender_user.to_owned(),
 						ev_type: body.event_type.clone(),
-						message_id: services.globals.next_count().to_string().into(),
+						message_id: services
+							.globals
+							.next_count()
+							.await?
+							.to_string()
+							.into(),
 						messages,
 					}),
 				)
@@ -66,7 +71,8 @@ pub(crate) async fn send_event_to_device_route(
 
 				services
 					.sending
-					.send_edu_server(target_user_id.server_name(), buf)?;
+					.send_edu_server(target_user_id.server_name(), buf)
+					.await?;
 
 				continue;
 			}
@@ -79,13 +85,16 @@ pub(crate) async fn send_event_to_device_route(
 
 			match target_device_id_maybe {
 				| DeviceIdOrAllDevices::DeviceId(target_device_id) => {
-					let count = services.users.add_to_device_event(
-						sender_user,
-						target_user_id,
-						target_device_id,
-						event_type,
-						&event,
-					);
+					let count = services
+						.users
+						.add_to_device_event(
+							sender_user,
+							target_user_id,
+							target_device_id,
+							event_type,
+							&event,
+						)
+						.await;
 
 					services
 						.sending
@@ -107,22 +116,26 @@ pub(crate) async fn send_event_to_device_route(
 						.is_interested_in_user(target_user_id)
 						.await;
 
+					let event_ref = &event;
 					let deliveries: Deliveries = services
 						.users
 						.all_device_ids(target_user_id)
-						.map(|target_device_id| {
-							let count = services.users.add_to_device_event(
-								sender_user,
-								target_user_id,
-								target_device_id,
-								event_type,
-								&event,
-							);
+						.then(move |target_device_id| async move {
+							let count = services
+								.users
+								.add_to_device_event(
+									sender_user,
+									target_user_id,
+									target_device_id,
+									event_type,
+									event_ref,
+								)
+								.await;
 
-							(target_device_id, count)
+							(target_device_id.to_owned(), count)
 						})
 						.ready_filter_map(|(target_device_id, count)| {
-							interested.then(|| (target_device_id.to_owned(), count))
+							interested.then_some((target_device_id, count))
 						})
 						.collect()
 						.await;
@@ -151,7 +164,8 @@ pub(crate) async fn send_event_to_device_route(
 	// Save transaction id with empty data
 	services
 		.transaction_ids
-		.add_txnid(sender_user, sender_device, &body.txn_id, &[]);
+		.add_txnid(sender_user, sender_device, &body.txn_id, &[])
+		.await?;
 
 	Ok(send_event_to_device::v3::Response {})
 }

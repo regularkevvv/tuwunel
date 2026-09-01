@@ -30,7 +30,8 @@ pub(crate) async fn create_filter_route(
 ) -> Result<create_filter::v3::Response> {
 	let filter_id = services
 		.users
-		.create_filter(body.sender_user(), &body.filter);
+		.create_filter(body.sender_user(), &body.filter)
+		.await?;
 
 	Ok(create_filter::v3::Response::new(filter_id))
 }

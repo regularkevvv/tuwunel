@@ -29,7 +29,12 @@ type ThreadLastReads = BTreeMap<OwnedEventId, u64>;
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn reset_notification_counts(&self, user_id: &UserId, room_id: &RoomId) {
-	let count = self.services.globals.next_count();
+	let count = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
 
 	let userroom_id = (user_id, room_id);
 
@@ -38,12 +43,16 @@ pub async fn reset_notification_counts(&self, user_id: &UserId, room_id: &RoomId
 
 	self.db
 		.userroomid_highlightcount
-		.put(userroom_id, 0_u64);
+		.put(userroom_id, 0_u64)
+		.await
+		.expect("database write error");
 
 	let roomuser_id = (room_id, user_id);
 	self.db
 		.roomuserid_lastnotificationread
-		.put(roomuser_id, *count);
+		.put(roomuser_id, *count)
+		.await
+		.expect("database write error");
 
 	let removed = self.clear_suppressed_room(user_id, room_id);
 	if removed > 0 {
@@ -65,7 +74,9 @@ where
 
 	self.db
 		.userroomid_notificationcount
-		.put(key, 0_u64);
+		.put(key, 0_u64)
+		.await
+		.expect("database write error");
 }
 
 /// Reset counts for a single thread within a room.
@@ -79,7 +90,12 @@ pub async fn reset_thread_notification_counts(
 	room_id: &RoomId,
 	thread_root: &EventId,
 ) {
-	let count = self.services.globals.next_count();
+	let count = self
+		.services
+		.globals
+		.next_count()
+		.await
+		.expect("failed to obtain next sequence number");
 
 	let userroom_thread = (user_id, room_id, thread_root);
 
@@ -88,12 +104,16 @@ pub async fn reset_thread_notification_counts(
 
 	self.db
 		.userroomid_highlightcount
-		.put(userroom_thread, 0_u64);
+		.put(userroom_thread, 0_u64)
+		.await
+		.expect("database write error");
 
 	let roomuser_thread = (room_id, user_id, thread_root);
 	self.db
 		.roomuserid_lastnotificationread
-		.put(roomuser_thread, *count);
+		.put(roomuser_thread, *count)
+		.await
+		.expect("database write error");
 }
 
 /// Clear all per-thread notification state for this user and room.
@@ -126,10 +146,13 @@ pub async fn clear_all_thread_notification_counts(&self, user_id: &UserId, room_
 		self.db
 			.userroomid_notificationcount
 			.del_prefix(&userroom_prefix)
-			.await;
+			.await
+			.expect("database write error");
 	};
 
-	join3(notifications, highlights, last_reads).await;
+	let ((), highlights, last_reads) = join3(notifications, highlights, last_reads).await;
+	highlights.expect("database write error");
+	last_reads.expect("database write error");
 }
 
 /// Dispatcher: route a receipt's `ReceiptThread` to the matching reset path.
@@ -187,7 +210,7 @@ pub async fn global_notification_count(&self, user_id: &UserId) -> u64 {
 
 			(count > 0).then(|| (KeyBuf::from(key), count))
 		})
-		.broad_filter_map(async |(key, count)| {
+		.broad_filter_map(|(key, count)| async move {
 			let (_, room_id, _): (Ignore, &RoomId, IgnoreAll) =
 				deserialize_key(&key).expect("notification count key");
 
@@ -299,17 +322,21 @@ pub async fn thread_last_notification_reads(
 #[implement(super::Service)]
 pub async fn delete_room_notification_read(&self, room_id: &RoomId) -> Result {
 	let key = (room_id, Interfix);
-	self.db
-		.roomuserid_lastnotificationread
-		.keys_prefix_raw(&key)
-		.ignore_err()
-		.ready_for_each(|key| {
+	{
+		let stream = self
+			.db
+			.roomuserid_lastnotificationread
+			.keys_prefix_raw(&key)
+			.ignore_err();
+		futures::pin_mut!(stream);
+		while let Some(key) = stream.next().await {
 			trace!("Removing key: {key:?}");
 			self.db
 				.roomuserid_lastnotificationread
-				.remove(key);
-		})
-		.await;
+				.remove(key)
+				.await?;
+		}
+	}
 
 	Ok(())
 }

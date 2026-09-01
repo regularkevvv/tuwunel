@@ -121,9 +121,7 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			| 0 | 1 | 2 => {
 				let key = gen_key(&mut rng);
 				let val = gen_val(&mut rng);
-				map.insert(&key, &val)
-					.await
-					.expect("trace put");
+				map.insert(&key, &val).await.expect("trace put");
 				written[mi].push(key.clone());
 				write!(out, "{{\"op\":\"put\",\"map\":{mi},\"key\":\"{}\"}}", hex(&key))
 					.expect("write");
@@ -131,9 +129,7 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			// delete
 			| 3 => {
 				let key = pick_key(&mut rng, &written[mi]);
-				map.remove(&key)
-					.await
-					.expect("trace del");
+				map.remove(&key).await.expect("trace del");
 				write!(out, "{{\"op\":\"del\",\"map\":{mi},\"key\":\"{}\"}}", hex(&key))
 					.expect("write");
 			},
@@ -225,13 +221,7 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 	out
 }
 
-fn write_scan(
-	out: &mut String,
-	op: &str,
-	mi: usize,
-	bound: &[u8],
-	items: &[(Vec<u8>, Vec<u8>)],
-) {
+fn write_scan(out: &mut String, op: &str, mi: usize, bound: &[u8], items: &[(Vec<u8>, Vec<u8>)]) {
 	write!(out, "{{\"op\":\"{op}\",\"map\":{mi},\"bound\":\"{}\",\"items\":[", hex(bound))
 		.expect("write");
 	for (i, (k, v)) in items.iter().enumerate() {

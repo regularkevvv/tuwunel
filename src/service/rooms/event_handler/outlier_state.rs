@@ -96,5 +96,7 @@ pub(super) async fn cache_resolved_state(
 
 	self.db
 		.eventid_resolvedstate
-		.raw_aput::<BUFSIZE, _, _>(event_id, saved.shortstatehash);
+		.raw_aput::<BUFSIZE, _, _>(event_id, saved.shortstatehash)
+		.await
+		.expect("database insert error");
 }

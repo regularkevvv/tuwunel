@@ -72,7 +72,7 @@ impl Service {
 		let room = typing.entry(room_id.to_owned()).or_default();
 		room.users.insert(user_id.to_owned(), timeout);
 
-		let count = self.services.globals.next_count();
+		let count = self.services.globals.next_count().await?;
 
 		room.update = *count;
 
@@ -121,7 +121,7 @@ impl Service {
 		let room = typing.entry(room_id.to_owned()).or_default();
 		room.users.remove(user_id);
 
-		let count = self.services.globals.next_count();
+		let count = self.services.globals.next_count().await?;
 
 		room.update = *count;
 
@@ -198,7 +198,7 @@ impl Service {
 		}
 
 		// update clients
-		let count = self.services.globals.next_count();
+		let count = self.services.globals.next_count().await?;
 
 		room.update = *count;
 

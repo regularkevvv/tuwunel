@@ -1,7 +1,7 @@
+use futures::StreamExt;
 use tuwunel_core::{
 	Result, debug, err, info,
 	utils::{
-		ReadyExt,
 		hash::{password, verify_password},
 		stream::TryExpect,
 	},
@@ -30,34 +30,34 @@ pub(super) async fn fix_hashed_sentinel_passwords(services: &Services) -> Result
 		 {PASSWORD_SENTINEL:?}"
 	);
 
-	let (checked, good, bad) = userid_password
-		.stream()
-		.expect_ok()
-		.ready_fold(
-			(0, 0, 0),
-			|(mut checked, mut good, mut bad): (usize, usize, usize),
-			 (key, val): (&str, &str)| {
-				let good_sentinel = val == PASSWORD_SENTINEL;
-				let bad_sentinel = !val.is_empty()
-					&& !good_sentinel
-					&& verify_password(PASSWORD_SENTINEL, val).is_ok();
+	let (mut checked, mut good, mut bad) = (0_usize, 0_usize, 0_usize);
+	{
+		let stream = userid_password.stream().expect_ok();
+		futures::pin_mut!(stream);
+		while let Some(item) = stream.next().await {
+			let (key, val): (&str, &str) = item;
+			let good_sentinel = val == PASSWORD_SENTINEL;
+			let bad_sentinel = !val.is_empty()
+				&& !good_sentinel
+				&& verify_password(PASSWORD_SENTINEL, val).is_ok();
 
-				checked = checked.saturating_add(usize::from(true));
-				good = good.saturating_add(usize::from(good_sentinel));
-				bad = bad.saturating_add(usize::from(bad_sentinel));
+			checked = checked.saturating_add(usize::from(true));
+			good = good.saturating_add(usize::from(good_sentinel));
+			bad = bad.saturating_add(usize::from(bad_sentinel));
 
-				if bad_sentinel {
-					userid_password.insert(key, PASSWORD_SENTINEL);
-				}
-
-				(checked, good, bad)
-			},
-		)
-		.await;
+			if bad_sentinel {
+				userid_password
+					.insert(key, PASSWORD_SENTINEL)
+					.await?;
+			}
+		}
+	}
 
 	drop(cork);
 	info!(?checked, ?good, ?bad, "Fixed any occurrences of hashed sentinel passwords");
 
-	db["global"].insert(b"fix_hashed_sentinel_passwords", []);
+	db["global"]
+		.insert(b"fix_hashed_sentinel_passwords", [])
+		.await?;
 	userid_password.sort()
 }

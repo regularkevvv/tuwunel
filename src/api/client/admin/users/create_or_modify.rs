@@ -113,8 +113,12 @@ pub(crate) async fn admin_create_or_modify_route(
 	}
 
 	match body.locked {
-		| Some(true) => services.users.set_locked(user_id, sender_user),
-		| Some(false) => services.users.clear_locked(user_id),
+		| Some(true) =>
+			services
+				.users
+				.set_locked(user_id, sender_user)
+				.await?,
+		| Some(false) => services.users.clear_locked(user_id).await?,
 		| None => {},
 	}
 

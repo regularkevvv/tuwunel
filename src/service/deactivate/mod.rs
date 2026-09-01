@@ -42,7 +42,7 @@ impl Service {
 		self.services
 			.profile
 			.clear_profile_keys(user_id)
-			.await;
+			.await?;
 
 		self.services
 			.profile
@@ -142,7 +142,7 @@ impl Service {
 		// MSC4025: erase non-event data when the user requested it, and mark
 		// the user so their events serve as pruned copies (phase B).
 		if erase {
-			self.services.users.set_erased(user_id);
+			self.services.users.set_erased(user_id).await?;
 
 			self.services
 				.account_data
@@ -182,7 +182,8 @@ impl Service {
 
 			self.services
 				.state_cache
-				.forget(&room_id, user_id);
+				.forget(&room_id, user_id)
+				.await?;
 		}
 
 		Ok(())

@@ -55,7 +55,8 @@ async fn append_pdu_to(
 	if self.should_append_to(appservice, pdu).await {
 		self.services
 			.sending
-			.send_pdu_appservice(appservice.registration.id.clone(), pdu_id)?;
+			.send_pdu_appservice(appservice.registration.id.clone(), pdu_id)
+			.await?;
 	}
 
 	Ok(())

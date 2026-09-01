@@ -81,7 +81,11 @@ async fn run_shutdown(
 	};
 
 	if block {
-		services.metadata.block_room(room_id, sender);
+		services
+			.metadata
+			.block_room(room_id, sender)
+			.await
+			.expect("database insert error");
 	}
 
 	summary

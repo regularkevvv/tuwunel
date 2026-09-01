@@ -58,7 +58,9 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 		}
 	}
 
-	db["global"].insert(b"feat_sha256_media", []);
+	db["global"]
+		.insert(b"feat_sha256_media", [])
+		.await?;
 	info!("Finished applying sha256_media");
 	Ok(())
 }
@@ -136,7 +138,7 @@ async fn handle_media_check(
 
 		txn.del_raw(storage.mediaid_file, key);
 		txn.del_raw(storage.mediaid_user, key);
-		txn.execute();
+		txn.execute().await?;
 	}
 
 	if config.media_compat_file_link && !old_exists && new_exists {

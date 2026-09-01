@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use futures::{Stream, StreamExt, future::join};
+use futures::{Stream, StreamExt, TryStreamExt, future::join};
 use ruma::{
 	MxcUri, OwnedMxcUri, OwnedRoomId, RoomId, UserId,
 	api::federation::query::get_profile_information,
@@ -13,7 +13,6 @@ use tuwunel_core::{
 	Err, Result, err, extract_variant, implement,
 	matrix::PduBuilder,
 	utils::{
-		TryReadyExt,
 		future::TryExtExt,
 		stream::{IterStream, TryIgnore, automatic_width},
 	},
@@ -302,17 +301,16 @@ pub fn all_profile_keys(&self, user_id: &UserId) -> impl Stream<Item = ProfileFi
 }
 
 #[implement(Service)]
-pub async fn clear_profile_keys(&self, user_id: &UserId) {
+pub async fn clear_profile_keys(&self, user_id: &UserId) -> Result {
 	let prefix = (user_id, Interfix);
 
 	self.useridprofilekey_value
 		.keys_prefix_raw(&prefix)
-		.ready_try_for_each(|key| {
-			self.useridprofilekey_value.remove(key);
+		.try_for_each(|key| async move {
+			self.useridprofilekey_value.remove(key).await?;
 			Ok(())
 		})
 		.await
-		.ok();
 }
 
 /// Sets new profile key values, removes the key if value is None
@@ -355,9 +353,11 @@ pub async fn set_profile_keys(
 		let key = (user_id, name.as_str());
 
 		if let Some(value) = value {
-			self.useridprofilekey_value.put(key, Json(value));
+			self.useridprofilekey_value
+				.put(key, Json(value))
+				.await?;
 		} else {
-			self.useridprofilekey_value.del(key);
+			self.useridprofilekey_value.del(key).await?;
 		}
 	}
 

@@ -64,7 +64,8 @@ where
 	if soft_fail {
 		self.services
 			.pdu_metadata
-			.mark_as_referenced(&pdu.room_id, pdu.prev_events.iter().map(AsRef::as_ref));
+			.mark_as_referenced(&pdu.room_id, pdu.prev_events.iter().map(AsRef::as_ref))
+			.await?;
 
 		// Keep the previous band rather than let a soft-failed event empty it; a
 		// later accepted event self-chains and heals it.
@@ -169,7 +170,8 @@ where
 	// We must keep track of all events that have been referenced.
 	self.services
 		.pdu_metadata
-		.mark_as_referenced(pdu.room_id(), pdu.prev_events().map(AsRef::as_ref));
+		.mark_as_referenced(pdu.room_id(), pdu.prev_events().map(AsRef::as_ref))
+		.await?;
 
 	self.services
 		.state
@@ -177,7 +179,7 @@ where
 		.await;
 
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
-	let next_count = self.services.globals.next_count();
+	let next_count = self.services.globals.next_count().await?;
 
 	// Mark as read first so the sending client doesn't get a notification even if
 	// appending fails. Route through the dispatcher so per-thread counts are
@@ -207,7 +209,8 @@ where
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
 	// Insert pdu
-	self.append_pdu_json(&pdu_id, pdu, &pdu_json);
+	self.append_pdu_json(&pdu_id, pdu, &pdu_json)
+		.await?;
 
 	drop(insert_lock);
 
@@ -281,7 +284,8 @@ async fn append_pdu_effects(
 			if let Some(body) = content.body {
 				self.services
 					.search
-					.index_pdu(shortroomid, &pdu_id, &body);
+					.index_pdu(shortroomid, &pdu_id, &body)
+					.await?;
 
 				if self
 					.services
@@ -300,14 +304,18 @@ async fn append_pdu_effects(
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
 				self.services
 					.search
-					.index_pdu(shortroomid, &pdu_id, &topic);
+					.index_pdu(shortroomid, &pdu_id, &topic)
+					.await?;
 			},
 		| _ => {},
 	}
 
 	// The cached hierarchy summary projects room state; evict on any state change.
 	if pdu.state_key().is_some() {
-		self.services.spaces.cache_evict(pdu.room_id());
+		self.services
+			.spaces
+			.cache_evict(pdu.room_id())
+			.await?;
 	}
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>()
@@ -317,7 +325,8 @@ async fn append_pdu_effects(
 	{
 		self.services
 			.pdu_metadata
-			.add_relation(count, related_pducount);
+			.add_relation(count, related_pducount)
+			.await?;
 	}
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesTo>() {
@@ -328,7 +337,8 @@ async fn append_pdu_effects(
 				if let Ok(related_pducount) = self.get_pdu_count(&in_reply_to.event_id).await {
 					self.services
 						.pdu_metadata
-						.add_relation(count, related_pducount);
+						.add_relation(count, related_pducount)
+						.await?;
 				}
 			},
 			| Relation::Thread(thread) => {
@@ -418,7 +428,12 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 }
 
 #[implement(super::Service)]
-fn append_pdu_json(&self, pdu_id: &RawPduId, pdu: &PduEvent, json: &CanonicalJsonObject) {
+async fn append_pdu_json(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &PduEvent,
+	json: &CanonicalJsonObject,
+) -> Result {
 	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
 	let mut txn = self.db.db.txn();
@@ -432,7 +447,7 @@ fn append_pdu_json(&self, pdu_id: &RawPduId, pdu: &PduEvent, json: &CanonicalJso
 	let key = (pdu.room_id(), ts, count_key);
 	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
 
-	txn.execute();
+	txn.execute().await
 }
 
 #[cfg(test)]

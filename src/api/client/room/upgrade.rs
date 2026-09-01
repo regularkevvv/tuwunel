@@ -23,7 +23,6 @@ use tuwunel_core::{
 	Err, Result, debug_info, err, error, implement, info, is_equal_to, is_less_than,
 	matrix::{Event, StateKey, pdu::PduBuilder, room_version},
 	utils::{
-		ReadyExt,
 		future::TryExtExt,
 		stream::{IterStream, TryIgnore, WidebandExt},
 	},
@@ -608,10 +607,11 @@ async fn move_local_aliases(&self) -> Result {
 	self.services
 		.alias
 		.local_aliases_for_room(self.old_room_id)
-		.ready_for_each(|alias| {
+		.for_each(|alias| async move {
 			self.services
 				.alias
 				.set_alias_by(alias, self.new_room_id, self.creator)
+				.await
 				.inspect_err(|e| error!(?self, "Failed to add alias: {e}"))
 				.ok();
 		})

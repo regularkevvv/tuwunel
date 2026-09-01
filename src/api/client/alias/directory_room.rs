@@ -44,7 +44,8 @@ pub(crate) async fn create_alias_route(
 
 	services
 		.alias
-		.set_alias_by(&body.room_alias, &body.room_id, sender_user)?;
+		.set_alias_by(&body.room_alias, &body.room_id, sender_user)
+		.await?;
 
 	Ok(create_alias::v3::Response::new())
 }

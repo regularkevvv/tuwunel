@@ -62,7 +62,9 @@ where
 
 	if let Inner::Mem(mem) = self.inner() {
 		let store = mem.store.clone();
-		let id = self.id().expect("model-backend maps are catalog maps");
+		let id = self
+			.id()
+			.expect("model-backend maps are catalog maps");
 		return futures::future::Either::Left(keys.map(move |key| {
 			let found = store.get(id, key.as_ref());
 			STATS
@@ -74,21 +76,23 @@ where
 		}));
 	}
 
-	futures::future::Either::Right(keys.ready_chunks(automatic_amplification())
-		.widen_then(automatic_width(), |chunk| {
-			STATS.get_batch.record(chunk.len());
-			self.rocks().engine.pool.execute_get(Get {
-				map: self.clone(),
-				res: None,
-				key: chunk
-					.iter()
-					.map(AsRef::as_ref)
-					.map(Into::into)
-					.collect(),
+	futures::future::Either::Right(
+		keys.ready_chunks(automatic_amplification())
+			.widen_then(automatic_width(), |chunk| {
+				STATS.get_batch.record(chunk.len());
+				self.rocks().engine.pool.execute_get(Get {
+					map: self.clone(),
+					res: None,
+					key: chunk
+						.iter()
+						.map(AsRef::as_ref)
+						.map(Into::into)
+						.collect(),
+				})
 			})
-		})
-		.map_ok(|results| results.into_iter().stream())
-		.try_flatten())
+			.map_ok(|results| results.into_iter().stream())
+			.try_flatten(),
+	)
 }
 
 /// Fetches an exact-size raw-key iterator from block cache.

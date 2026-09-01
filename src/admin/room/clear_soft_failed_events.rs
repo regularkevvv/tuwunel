@@ -65,7 +65,9 @@ pub(super) async fn room_clear_soft_failed_events(&self, room_id: OwnedRoomOrAli
 async fn clear_event(services: &Services, event_id: &EventId) -> ClearSummary {
 	services
 		.event_handler
-		.clear_policy_signature_state(event_id);
+		.clear_policy_signature_state(event_id)
+		.await
+		.expect("database write error");
 
 	services
 		.event_handler
@@ -74,7 +76,9 @@ async fn clear_event(services: &Services, event_id: &EventId) -> ClearSummary {
 
 	services
 		.pdu_metadata
-		.clear_event_soft_failed(event_id);
+		.clear_event_soft_failed(event_id)
+		.await
+		.expect("database write error");
 
 	ClearSummary { cleared: 1, ..Default::default() }
 }

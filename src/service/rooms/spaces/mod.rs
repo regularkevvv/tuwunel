@@ -69,7 +69,13 @@ impl crate::Service for Service {
 		}))
 	}
 
-	async fn clear_cache(&self) { self.db.roomid_spacehierarchy.clear().await; }
+	async fn clear_cache(&self) {
+		self.db
+			.roomid_spacehierarchy
+			.clear()
+			.await
+			.expect("database clear error");
+	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
@@ -137,7 +143,7 @@ fn get_space_child_events<'a>(
 		.state_accessor
 		.room_state_keys_with_ids(room_id, &StateEventType::SpaceChild)
 		.ready_filter_map(Result::ok)
-		.broad_filter_map(async |(state_key, event_id): (_, OwnedEventId)| {
+		.broad_filter_map(move |(state_key, event_id): (_, OwnedEventId)| async move {
 			self.services
 				.timeline
 				.get_pdu(&event_id)

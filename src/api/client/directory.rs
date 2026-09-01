@@ -160,7 +160,8 @@ pub(crate) async fn set_room_visibility_route(
 
 			services
 				.directory
-				.set_public(&body.room_id, published_alias.as_deref());
+				.set_public(&body.room_id, published_alias.as_deref())
+				.await?;
 
 			services
 				.admin
@@ -172,7 +173,11 @@ pub(crate) async fn set_room_visibility_route(
 
 			info!("{sender_user} made {0} public to the room directory", body.room_id);
 		},
-		| room::Visibility::Private => services.directory.set_not_public(&body.room_id),
+		| room::Visibility::Private =>
+			services
+				.directory
+				.set_not_public(&body.room_id)
+				.await?,
 		| _ => {
 			return Err!(Request(InvalidParam("Room visibility type is not supported.",)));
 		},

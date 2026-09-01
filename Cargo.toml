@@ -899,7 +899,10 @@ opt-level = 'z'
 [workspace.lints.rust]
 absolute_paths_not_starting_with_crate = "warn"
 ambiguous_negative_literals = "warn"
-closure_returning_async_block = "warn"
+# The storage seam's stream callbacks must return `async move` blocks: async
+# closures cannot yet coerce to the `FnMut() -> Fut` bounds of futures-util
+# combinators when they capture environment (even by Copy).
+closure_returning_async_block = "allow"
 deprecated_in_future = "warn"
 deref_into_dyn_supertrait = "warn"
 elided_lifetimes_in_paths = "warn"
@@ -932,7 +935,7 @@ unused_extern_crates = "warn"
 unused_import_braces = "warn"
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"
-unused_must_use = "warn"
+unused_must_use = "deny"
 unused_qualifications = "warn"
 #unused_results = "warn"                                             # TODO
 
