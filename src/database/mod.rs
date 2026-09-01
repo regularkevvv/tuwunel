@@ -12,6 +12,7 @@ tuwunel_core::mod_ctor! {}
 tuwunel_core::mod_dtor! {}
 tuwunel_core::rustc_flags_capture! {}
 
+pub mod backend;
 mod cork;
 mod de;
 mod deserialized;
@@ -73,12 +74,6 @@ impl Database {
 		let ctx = Context::new(server)?;
 		let engine = Engine::open(ctx.clone(), maps::MAPS).await?;
 		let maps = open_maps(&engine)?;
-		let cf_index = maps
-			.values()
-			.map(|map| (map.cf_id(), Arc::downgrade(map)))
-			.collect();
-
-		engine.set_cf_index(cf_index);
 
 		Ok(Arc::new(Self { maps, engine, _ctx: ctx }))
 	}
@@ -146,6 +141,10 @@ impl Database {
 	/// A secondary instance follows another database and does not act as its
 	/// primary writer. The value applies to every map owned by this database.
 	pub fn is_secondary(&self) -> bool { self.engine.is_secondary() }
+}
+
+impl Drop for Database {
+	fn drop(&mut self) { backend::metrics::dump_on_close(); }
 }
 
 impl Index<&str> for Database {

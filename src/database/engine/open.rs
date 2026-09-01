@@ -2,7 +2,7 @@ use std::{
 	collections::BTreeSet,
 	fs::read_dir,
 	path::Path,
-	sync::{Arc, OnceLock, atomic::AtomicU32},
+	sync::{Arc, atomic::AtomicU32},
 };
 
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteOptions};
@@ -81,7 +81,6 @@ pub(crate) async fn open(ctx: Arc<Context>, desc: &[Descriptor]) -> Result<Arc<S
 		secondary: config.rocksdb_secondary,
 		checksums: config.rocksdb_checksums,
 		write_options: WriteOptions::default(),
-		cf_index: OnceLock::new(),
 		corks: AtomicU32::new(0),
 	}))
 }

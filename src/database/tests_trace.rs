@@ -21,7 +21,7 @@ use std::{env::var, fmt::Write as _, sync::Arc};
 use futures::TryStreamExt;
 
 use super::{TestDb, new_test_database};
-use crate::{Map, Txn};
+use crate::Map;
 
 /// Deterministic 64-bit generator (xorshift*), no external dependencies.
 struct Rng(u64);
@@ -121,7 +121,9 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			| 0 | 1 | 2 => {
 				let key = gen_key(&mut rng);
 				let val = gen_val(&mut rng);
-				map.insert(&key, &val);
+				map.insert(&key, &val)
+					.await
+					.expect("trace put");
 				written[mi].push(key.clone());
 				write!(out, "{{\"op\":\"put\",\"map\":{mi},\"key\":\"{}\"}}", hex(&key))
 					.expect("write");
@@ -129,7 +131,9 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			// delete
 			| 3 => {
 				let key = pick_key(&mut rng, &written[mi]);
-				map.remove(&key);
+				map.remove(&key)
+					.await
+					.expect("trace del");
 				write!(out, "{{\"op\":\"del\",\"map\":{mi},\"key\":\"{}\"}}", hex(&key))
 					.expect("write");
 			},
@@ -153,7 +157,7 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 					}
 					write!(keys, "\"{}:{}\"", ti, hex(&key)).expect("write");
 				}
-				txn.execute();
+				txn.execute().await.expect("trace txn");
 				write!(out, "{{\"op\":\"txn\",\"keys\":[{keys}]}}").expect("write");
 			},
 			// point read

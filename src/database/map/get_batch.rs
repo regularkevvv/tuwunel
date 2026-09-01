@@ -11,7 +11,7 @@ use tuwunel_core::{
 };
 
 use super::get::{cached_handle_from, handle_from};
-use crate::Handle;
+use crate::{Handle, backend::metrics::STATS, map::Inner};
 
 /// Extends a stream of raw keys with batched map lookup.
 ///
@@ -60,9 +60,24 @@ where
 {
 	use crate::pool::Get;
 
-	keys.ready_chunks(automatic_amplification())
+	if let Inner::Mem(mem) = self.inner() {
+		let store = mem.store.clone();
+		let id = self.id().expect("model-backend maps are catalog maps");
+		return futures::future::Either::Left(keys.map(move |key| {
+			let found = store.get(id, key.as_ref());
+			STATS
+				.get
+				.record(found.as_ref().map_or(0, |val| val.len()));
+			found
+				.map(Handle::from)
+				.ok_or(tuwunel_core::err!(Request(NotFound("Not found in database"))))
+		}));
+	}
+
+	futures::future::Either::Right(keys.ready_chunks(automatic_amplification())
 		.widen_then(automatic_width(), |chunk| {
-			self.engine.pool.execute_get(Get {
+			STATS.get_batch.record(chunk.len());
+			self.rocks().engine.pool.execute_get(Get {
 				map: self.clone(),
 				res: None,
 				key: chunk
@@ -73,7 +88,7 @@ where
 			})
 		})
 		.map_ok(|results| results.into_iter().stream())
-		.try_flatten()
+		.try_flatten())
 }
 
 /// Fetches an exact-size raw-key iterator from block cache.
@@ -90,7 +105,7 @@ where
 	I: Iterator<Item = &'a K> + ExactSizeIterator + Send,
 	K: AsRef<[u8]> + Send + ?Sized + Sync + 'a,
 {
-	self.get_batch_blocking_opts(keys, &self.cache_read_options)
+	self.get_batch_blocking_opts(keys, &self.rocks().cache_read_options)
 		.map(cached_handle_from)
 }
 
@@ -108,7 +123,7 @@ where
 	I: Iterator<Item = &'a K> + ExactSizeIterator + Send,
 	K: AsRef<[u8]> + Send + ?Sized + Sync + 'a,
 {
-	self.get_batch_blocking_opts(keys, &self.read_options)
+	self.get_batch_blocking_opts(keys, &self.rocks().read_options)
 		.map(handle_from)
 }
 
@@ -130,8 +145,10 @@ where
 	// comparator**.
 	const SORTED: bool = false;
 
-	self.engine
+	let rocks = self.rocks();
+	rocks
+		.engine
 		.db
-		.batched_multi_get_cf_opt(&self.cf(), keys, SORTED, read_options)
+		.batched_multi_get_cf_opt(&&*rocks.cf, keys, SORTED, read_options)
 		.into_iter()
 }

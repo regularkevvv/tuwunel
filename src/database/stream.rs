@@ -2,6 +2,7 @@ mod items;
 mod items_rev;
 mod keys;
 mod keys_rev;
+pub(crate) mod mem;
 
 use std::{mem::replace, sync::Arc};
 

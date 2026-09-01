@@ -64,7 +64,16 @@ where
 {
 	use crate::pool::Get;
 
-	keys.ready_chunks(automatic_amplification())
+	if matches!(self.inner(), crate::map::Inner::Mem(_)) {
+		return futures::future::Either::Left(
+			keys.map(|key| {
+				ser::serialize_to::<KeyBuf, _>(key).expect("failed to serialize query key")
+			})
+			.then(async move |key| self.get(&key).await),
+		);
+	}
+
+	futures::future::Either::Right(keys.ready_chunks(automatic_amplification())
 		.widen_then(automatic_width(), |chunk| {
 			let keys = chunk
 				.iter()
@@ -72,10 +81,11 @@ where
 				.map(|result| result.expect("failed to serialize query key"))
 				.collect();
 
-			self.engine
+			self.rocks()
+				.engine
 				.pool
 				.execute_get(Get { map: self.clone(), key: keys, res: None })
 		})
 		.map_ok(|results| results.into_iter().stream())
-		.try_flatten()
+		.try_flatten())
 }

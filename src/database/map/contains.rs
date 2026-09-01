@@ -104,6 +104,10 @@ pub fn exists_blocking<K>(&self, key: &K) -> Result
 where
 	K: AsRef<[u8]> + ?Sized + Debug,
 {
+	if matches!(self.inner(), crate::map::Inner::Mem(_)) {
+		return self.get_blocking(key).map(|_| ());
+	}
+
 	self.maybe_exists(key)
 		.then(|| self.get_blocking(key))
 		.flat_ok()
@@ -120,7 +124,9 @@ pub(crate) fn maybe_exists<K>(&self, key: &K) -> bool
 where
 	K: AsRef<[u8]> + ?Sized,
 {
-	self.engine
+	let rocks = self.rocks();
+	rocks
+		.engine
 		.db
-		.key_may_exist_cf_opt(&self.cf(), key, &self.cache_read_options)
+		.key_may_exist_cf_opt(&&*rocks.cf, key, &rocks.cache_read_options)
 }

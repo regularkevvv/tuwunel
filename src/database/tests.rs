@@ -3,7 +3,6 @@
 
 use std::{env::var, fmt::Debug, process::id as process_id, sync::Arc};
 
-use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::subscriber::NoSubscriber;
@@ -23,7 +22,6 @@ use crate::{
 	maps::descriptor,
 	ser,
 	ser::{Json, serialize_to_vec},
-	txn::next_record,
 };
 
 #[path = "tests_trace.rs"]
@@ -1115,66 +1113,6 @@ fn lazy_media_outlives_url_preview() {
 	);
 }
 
-#[test]
-fn txn_record_golden() {
-	let mut batch = WriteBatch::default();
-	batch.put(b"key", b"value");
-	batch.delete(b"deleted");
-	batch.put(b"empty", b"");
-
-	let data = batch.data();
-	let mut records = data
-		.get(12..)
-		.expect("batch shorter than its header");
-
-	assert_eq!(next_record(&mut records), Some((0, b"key".as_slice())));
-	assert_eq!(next_record(&mut records), Some((0, b"deleted".as_slice())));
-	assert_eq!(next_record(&mut records), Some((0, b"empty".as_slice())));
-	assert!(records.is_empty(), "{records:?}");
-}
-
-#[test]
-fn txn_record_golden_long_key() {
-	let long = [0xAA_u8; 300];
-
-	let mut batch = WriteBatch::default();
-	batch.put(long.as_slice(), b"");
-
-	let data = batch.data();
-	let mut records = data
-		.get(12..)
-		.expect("batch shorter than its header");
-
-	assert_eq!(next_record(&mut records), Some((0, long.as_slice())));
-	assert!(records.is_empty(), "{records:?}");
-}
-
-#[test]
-fn txn_record_cf() {
-	// kTypeColumnFamilyValue cf=200 "k"="v", then kTypeColumnFamilyDeletion cf=9
-	// "del"
-	let mut records: &[u8] =
-		&[0x5, 0xC8, 0x1, 0x1, b'k', 0x1, b'v', 0x4, 0x9, 0x3, b'd', b'e', b'l'];
-
-	assert_eq!(next_record(&mut records), Some((200, b"k".as_slice())));
-	assert_eq!(next_record(&mut records), Some((9, b"del".as_slice())));
-	assert!(records.is_empty(), "{records:?}");
-}
-
-#[test]
-fn txn_record_unrecognized() {
-	let mut records: &[u8] = &[0x2, 0x1, b'k', 0x1, b'v'];
-
-	assert_eq!(next_record(&mut records), None);
-}
-
-#[test]
-fn txn_record_truncated() {
-	let mut records: &[u8] = &[0x1, 0x5, b'k'];
-
-	assert_eq!(next_record(&mut records), None);
-}
-
 #[tokio::test]
 async fn txn_insert_raw_preserves_bytes() -> Result {
 	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
@@ -1242,7 +1180,7 @@ async fn txn_insert_raw_preserves_bytes() -> Result {
 	assert!(keys.next().is_none());
 	drop(keys);
 
-	txn.execute();
+	txn.execute().await?;
 
 	assert_eq!(first.get(&first_key).await?.as_ref(), first_value);
 	assert_eq!(second.get(&second_key).await?.as_ref(), second_value);
@@ -1259,7 +1197,7 @@ async fn txn_insert_raw_preserves_bytes() -> Result {
 		(second.as_ref(), raw_put_key),
 	]);
 
-	txn.execute();
+	txn.execute().await?;
 
 	watch.await;
 

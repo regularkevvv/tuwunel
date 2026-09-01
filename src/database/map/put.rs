@@ -7,7 +7,7 @@
 use std::{fmt::Debug, io::Write};
 
 use serde::Serialize;
-use tuwunel_core::{arrayvec::ArrayVec, implement};
+use tuwunel_core::{Result, arrayvec::ArrayVec, implement};
 
 use crate::{
 	keyval::{KeyBuf, ValBuf},
@@ -25,14 +25,14 @@ use crate::{
 /// an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn put<K, V>(&self, key: K, val: V)
+pub async fn put<K, V>(&self, key: K, val: V) -> Result
 where
 	K: Serialize + Debug,
 	V: Serialize,
 {
 	let mut key_buf = KeyBuf::new();
 	let mut val_buf = ValBuf::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf));
+	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
 }
 
 /// Stores a serialized key and raw value using an owned key buffer.
@@ -46,13 +46,13 @@ where
 /// uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn put_raw<K, V>(&self, key: K, val: V)
+pub async fn put_raw<K, V>(&self, key: K, val: V) -> Result
 where
 	K: Serialize + Debug,
 	V: AsRef<[u8]>,
 {
 	let mut key_buf = KeyBuf::new();
-	self.bput_raw(key, val, &mut key_buf);
+	self.bput_raw(key, val, &mut key_buf).await
 }
 
 /// Stores a raw key and serialized value using an owned value buffer.
@@ -66,13 +66,13 @@ where
 /// uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn raw_put<K, V>(&self, key: K, val: V)
+pub async fn raw_put<K, V>(&self, key: K, val: V) -> Result
 where
 	K: AsRef<[u8]>,
 	V: Serialize,
 {
 	let mut val_buf = ValBuf::new();
-	self.raw_bput(key, val, &mut val_buf);
+	self.raw_bput(key, val, &mut val_buf).await
 }
 
 /// Stores a serialized key and value with fixed-capacity value storage.
@@ -87,14 +87,14 @@ where
 /// rejects the write, or an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn put_aput<const VMAX: usize, K, V>(&self, key: K, val: V)
+pub async fn put_aput<const VMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
 	K: Serialize + Debug,
 	V: Serialize,
 {
 	let mut key_buf = KeyBuf::new();
 	let mut val_buf = ArrayVec::<u8, VMAX>::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf));
+	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
 }
 
 /// Stores a serialized key and value with fixed-capacity key storage.
@@ -109,14 +109,14 @@ where
 /// rejects the write, or an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn aput_put<const KMAX: usize, K, V>(&self, key: K, val: V)
+pub async fn aput_put<const KMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
 	K: Serialize + Debug,
 	V: Serialize,
 {
 	let mut key_buf = ArrayVec::<u8, KMAX>::new();
 	let mut val_buf = ValBuf::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf));
+	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
 }
 
 /// Stores a serialized key and value using fixed-capacity buffers.
@@ -130,14 +130,14 @@ where
 /// RocksDB rejects the write, or an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn aput<const KMAX: usize, const VMAX: usize, K, V>(&self, key: K, val: V)
+pub async fn aput<const KMAX: usize, const VMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
 	K: Serialize + Debug,
 	V: Serialize,
 {
 	let mut key_buf = ArrayVec::<u8, KMAX>::new();
 	let mut val_buf = ArrayVec::<u8, VMAX>::new();
-	self.bput(key, val, (&mut key_buf, &mut val_buf));
+	self.bput(key, val, (&mut key_buf, &mut val_buf)).await
 }
 
 /// Stores a serialized key and raw value with fixed-capacity key storage.
@@ -151,13 +151,13 @@ where
 /// rejects the write, or an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn aput_raw<const KMAX: usize, K, V>(&self, key: K, val: V)
+pub async fn aput_raw<const KMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
 	K: Serialize + Debug,
 	V: AsRef<[u8]>,
 {
 	let mut key_buf = ArrayVec::<u8, KMAX>::new();
-	self.bput_raw(key, val, &mut key_buf);
+	self.bput_raw(key, val, &mut key_buf).await
 }
 
 /// Stores a raw key and serialized value with fixed-capacity value storage.
@@ -171,13 +171,13 @@ where
 /// rejects the write, or an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn raw_aput<const VMAX: usize, K, V>(&self, key: K, val: V)
+pub async fn raw_aput<const VMAX: usize, K, V>(&self, key: K, val: V) -> Result
 where
 	K: AsRef<[u8]>,
 	V: Serialize,
 {
 	let mut val_buf = ArrayVec::<u8, VMAX>::new();
-	self.raw_bput(key, val, &mut val_buf);
+	self.raw_bput(key, val, &mut val_buf).await
 }
 
 /// Stores a serialized key and value using caller-supplied buffers.
@@ -191,7 +191,7 @@ where
 /// Panics if either value cannot be serialized, RocksDB rejects the write, or
 /// an uncorked flush fails.
 #[implement(super::Map)]
-pub fn bput<K, V, Bk, Bv>(&self, key: K, val: V, mut buf: (Bk, Bv))
+pub async fn bput<K, V, Bk, Bv>(&self, key: K, val: V, mut buf: (Bk, Bv)) -> Result
 where
 	K: Serialize + Debug,
 	V: Serialize,
@@ -199,7 +199,7 @@ where
 	Bv: Write + AsRef<[u8]>,
 {
 	let val = ser::serialize(&mut buf.1, val).expect("failed to serialize insertion val");
-	self.bput_raw(key, val, &mut buf.0);
+	self.bput_raw(key, val, &mut buf.0).await
 }
 
 /// Stores a serialized key and raw value using a caller-supplied key buffer.
@@ -214,14 +214,14 @@ where
 /// uncorked flush fails.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, val, buf), level = "trace")]
-pub fn bput_raw<K, V, Bk>(&self, key: K, val: V, mut buf: Bk)
+pub async fn bput_raw<K, V, Bk>(&self, key: K, val: V, mut buf: Bk) -> Result
 where
 	K: Serialize + Debug,
 	V: AsRef<[u8]>,
 	Bk: Write + AsRef<[u8]>,
 {
 	let key = ser::serialize(&mut buf, key).expect("failed to serialize insertion key");
-	self.insert(&key, val);
+	self.insert(&key, val).await
 }
 
 /// Stores a raw key and serialized value using a caller-supplied value buffer.
@@ -235,12 +235,12 @@ where
 /// Panics if the value cannot be serialized, RocksDB rejects the write, or an
 /// uncorked flush fails.
 #[implement(super::Map)]
-pub fn raw_bput<K, V, Bv>(&self, key: K, val: V, mut buf: Bv)
+pub async fn raw_bput<K, V, Bv>(&self, key: K, val: V, mut buf: Bv) -> Result
 where
 	K: AsRef<[u8]>,
 	V: Serialize,
 	Bv: Write + AsRef<[u8]>,
 {
 	let val = ser::serialize(&mut buf, val).expect("failed to serialize insertion val");
-	self.insert(&key, val);
+	self.insert(&key, val).await
 }

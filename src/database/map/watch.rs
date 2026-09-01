@@ -119,6 +119,10 @@ where
 /// Panics if the watcher mutex is poisoned.
 #[implement(super::Map)]
 fn subscribe(&self, key: KeyBuf) -> Receiver<()> {
+	crate::backend::metrics::STATS
+		.watch
+		.record(key.len());
+
 	match self
 		.watch
 		.watchers

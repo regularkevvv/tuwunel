@@ -77,9 +77,16 @@ pub fn compact_blocking(&self, opts: Options) -> Result {
 		| (Some(_), Some(_)) => return Err!("compacting between specific levels not supported"),
 	}
 
-	self.engine
+	let rocks = match self.inner() {
+		| crate::map::Inner::Rocks(rocks) => rocks,
+		| crate::map::Inner::Mem(_) =>
+			return Err!("compaction is a RocksDB backend capability, unsupported here"),
+	};
+
+	rocks
+		.engine
 		.db
-		.compact_range_cf_opt(&self.cf(), opts.range.0, opts.range.1, &co);
+		.compact_range_cf_opt(&&*rocks.cf, opts.range.0, opts.range.1, &co);
 
 	Ok(())
 }

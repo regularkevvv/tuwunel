@@ -1,8 +1,10 @@
-//! Pinned database values returned by point queries.
+//! Database values returned by point queries.
 //!
-//! A handle keeps the RocksDB slice pin alive while exposing the stored bytes
-//! through standard reference traits. Callers can deserialize directly from the
-//! pinned bytes or copy them into owned storage.
+//! A handle exposes stored bytes through standard reference traits without
+//! committing the facade to one backend's value representation: the RocksDB
+//! backend returns zero-copy pinned slices, while other backends return
+//! owned bytes. Callers can deserialize directly from the handle or copy the
+//! bytes into owned storage.
 
 use std::{fmt, fmt::Debug, ops::Deref};
 
@@ -12,27 +14,48 @@ use tuwunel_core::Result;
 
 use crate::{Deserialized, Slice, keyval::deserialize_val};
 
-/// Pinned view of a value returned by RocksDB.
+/// Backend-neutral view of a value returned by a point query.
 ///
-/// The handle keeps its underlying [`DBPinnableSlice`] alive and dereferences
-/// to [`Slice`] without an additional copy. Convert it into `Vec<u8>` when the
-/// bytes must outlive the pin.
+/// For RocksDB results the handle keeps its underlying [`DBPinnableSlice`]
+/// alive and dereferences to [`Slice`] without an additional copy; for other
+/// backends it owns the bytes outright. Convert it into `Vec<u8>` when the
+/// bytes must outlive the handle.
 pub struct Handle<'a> {
-	val: DBPinnableSlice<'a>,
+	val: Inner<'a>,
+}
+
+/// The backend-specific value storage behind a handle.
+enum Inner<'a> {
+	/// Zero-copy pin into RocksDB block storage.
+	Pinned(DBPinnableSlice<'a>),
+	/// Bytes owned by the handle itself.
+	Owned(Box<[u8]>),
 }
 
 impl<'a> From<DBPinnableSlice<'a>> for Handle<'a> {
-	fn from(val: DBPinnableSlice<'a>) -> Self { Self { val } }
+	fn from(val: DBPinnableSlice<'a>) -> Self { Self { val: Inner::Pinned(val) } }
+}
+
+impl From<Box<[u8]>> for Handle<'_> {
+	fn from(val: Box<[u8]>) -> Self { Self { val: Inner::Owned(val) } }
+}
+
+impl From<Vec<u8>> for Handle<'_> {
+	fn from(val: Vec<u8>) -> Self { Self { val: Inner::Owned(val.into()) } }
 }
 
 impl Debug for Handle<'_> {
-	// The pinned slice's address is the informative content here.
+	// The slice's address is the informative content here.
 	#[expect(clippy::pointer_format)]
 	fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let val: &Slice = self;
 		let ptr = val.as_ptr();
 		let len = val.len();
-		write!(out, "Handle {{val: {{ptr: {ptr:?}, len: {len}}}}}")
+		let kind = match self.val {
+			| Inner::Pinned(_) => "pinned",
+			| Inner::Owned(_) => "owned",
+		};
+		write!(out, "Handle {{{kind}: {{ptr: {ptr:?}, len: {len}}}}}")
 	}
 }
 
@@ -78,17 +101,27 @@ impl<'a> Deserialized for &'a Handle<'a> {
 }
 
 impl From<Handle<'_>> for Vec<u8> {
-	fn from(handle: Handle<'_>) -> Self { handle.deref().to_vec() }
+	fn from(handle: Handle<'_>) -> Self {
+		match handle.val {
+			| Inner::Pinned(val) => val.to_vec(),
+			| Inner::Owned(val) => val.into_vec(),
+		}
+	}
 }
 
 impl Deref for Handle<'_> {
 	type Target = Slice;
 
 	#[inline]
-	fn deref(&self) -> &Self::Target { &self.val }
+	fn deref(&self) -> &Self::Target {
+		match &self.val {
+			| Inner::Pinned(val) => val,
+			| Inner::Owned(val) => val,
+		}
+	}
 }
 
 impl AsRef<Slice> for Handle<'_> {
 	#[inline]
-	fn as_ref(&self) -> &Slice { &self.val }
+	fn as_ref(&self) -> &Slice { self }
 }

@@ -10,14 +10,17 @@ use tuwunel_core::{Err, Result, err, implement, utils::result::MapExpect};
 
 use crate::{
 	Handle,
+	backend::metrics::STATS,
+	map::Inner,
 	util::{is_incomplete, map_err, or_else},
 };
 
-/// Fetches a raw key asynchronously and returns a pinned value handle.
+/// Fetches a raw key asynchronously and returns a value handle.
 ///
-/// Cache results consume cooperative scheduler budget, while misses run on the
-/// engine's blocking pool. The returned handle keeps its RocksDB value storage
-/// pinned for the handle's lifetime.
+/// On the RocksDB backend, cache results consume cooperative scheduler budget
+/// while misses run on the engine's blocking pool, and the returned handle
+/// keeps its RocksDB value storage pinned for the handle's lifetime. On the
+/// model backend the handle owns its bytes.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), fields(%self), level = "trace")]
 pub fn get<K>(
@@ -29,11 +32,30 @@ where
 {
 	use crate::pool::Get;
 
+	if let Inner::Mem(mem) = self.inner() {
+		let result = mem
+			.store
+			.get(self.id().expect("model-backend maps are catalog maps"), key.as_ref());
+		STATS
+			.get
+			.record(result.as_ref().map_or(0, |val| val.len()));
+
+		return Either::Left(Either::Left(task::consume_budget().map(move |()| {
+			result
+				.map(Handle::from)
+				.ok_or(err!(Request(NotFound("Not found in database"))))
+		})));
+	}
+
 	let cached = self.get_cached(key);
 	if matches!(cached, Err(_) | Ok(Some(_))) {
-		return Either::Left(
+		STATS
+			.get_cached
+			.record(cached.as_ref().map_or(0, |c| c.as_ref().map_or(0, |h| h.len())));
+
+		return Either::Left(Either::Right(
 			task::consume_budget().map(move |()| cached.map_expect("data found in cache")),
-		);
+		));
 	}
 
 	debug_assert!(matches!(cached, Ok(None)), "expected status Incomplete");
@@ -44,38 +66,53 @@ where
 	};
 
 	Either::Right(
-		self.engine
+		self.rocks()
+			.engine
 			.pool
 			.execute_get(cmd)
-			.and_then(|mut res| ready(res.remove(0))),
+			.and_then(|mut res| {
+				let res = res.remove(0);
+				STATS
+					.get
+					.record(res.as_ref().map_or(0, |h| h.len()));
+				ready(res)
+			}),
 	)
 }
 
 /// Fetches a raw key from block cache without storage I/O.
 ///
 /// A cache miss returns `Ok(None)`, while a cached absence or database failure
-/// remains an error.
+/// remains an error. RocksDB-path internal helper.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), name = "cache", level = "trace")]
 pub(crate) fn get_cached<K>(&self, key: &K) -> Result<Option<Handle<'_>>>
 where
 	K: AsRef<[u8]> + Debug + ?Sized,
 {
-	let res = self.get_blocking_opts(key, &self.cache_read_options);
+	let res = self.get_blocking_opts(key, &self.rocks().cache_read_options);
 	cached_handle_from(res)
 }
 
-/// Fetches a raw key synchronously and returns a pinned value handle.
+/// Fetches a raw key synchronously and returns a value handle.
 ///
-/// The call may block on storage and populate RocksDB caches. The returned
-/// handle keeps its value storage pinned for the handle's lifetime.
+/// The call may block on storage and populate RocksDB caches. On the model
+/// backend it locks the store briefly and returns owned bytes.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), name = "blocking", level = "trace")]
 pub fn get_blocking<K>(&self, key: &K) -> Result<Handle<'_>>
 where
 	K: AsRef<[u8]> + ?Sized,
 {
-	let res = self.get_blocking_opts(key, &self.read_options);
+	if let Inner::Mem(mem) = self.inner() {
+		return mem
+			.store
+			.get(self.id().expect("model-backend maps are catalog maps"), key.as_ref())
+			.map(Handle::from)
+			.ok_or(err!(Request(NotFound("Not found in database"))));
+	}
+
+	let res = self.get_blocking_opts(key, &self.rocks().read_options);
 	handle_from(res)
 }
 
@@ -92,9 +129,11 @@ fn get_blocking_opts<K>(
 where
 	K: AsRef<[u8]> + ?Sized,
 {
-	self.engine
+	let rocks = self.rocks();
+	rocks
+		.engine
 		.db
-		.get_pinned_cf_opt(&self.cf(), key, read_options)
+		.get_pinned_cf_opt(&&*rocks.cf, key, read_options)
 }
 
 /// Converts a RocksDB point-read result into a required value handle.

@@ -1,7 +1,7 @@
 use std::{fmt::Debug, io::Write};
 
 use serde::Serialize;
-use tuwunel_core::{arrayvec::ArrayVec, implement};
+use tuwunel_core::{Result, arrayvec::ArrayVec, implement};
 
 use crate::{keyval::KeyBuf, ser};
 
@@ -16,12 +16,12 @@ use crate::{keyval::KeyBuf, ser};
 /// flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn del<K>(&self, key: K)
+pub async fn del<K>(&self, key: K) -> Result
 where
 	K: Serialize + Debug,
 {
 	let mut buf = KeyBuf::new();
-	self.bdel(key, &mut buf);
+	self.bdel(key, &mut buf).await
 }
 
 /// Deletes a serialized key using a fixed-capacity buffer.
@@ -35,12 +35,12 @@ where
 /// RocksDB rejects the deletion, or an uncorked flush fails.
 #[implement(super::Map)]
 #[inline]
-pub fn adel<const MAX: usize, K>(&self, key: K)
+pub async fn adel<const MAX: usize, K>(&self, key: K) -> Result
 where
 	K: Serialize + Debug,
 {
 	let mut buf = ArrayVec::<u8, MAX>::new();
-	self.bdel(key, &mut buf);
+	self.bdel(key, &mut buf).await
 }
 
 /// Deletes a serialized key using a caller-supplied buffer.
@@ -55,11 +55,11 @@ where
 /// flush fails.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, buf), level = "trace")]
-pub fn bdel<K, B>(&self, key: K, buf: &mut B)
+pub async fn bdel<K, B>(&self, key: K, buf: &mut B) -> Result
 where
 	K: Serialize + Debug,
 	B: Write + AsRef<[u8]>,
 {
 	let key = ser::serialize(buf, key).expect("failed to serialize deletion key");
-	self.remove(key);
+	self.remove(key).await
 }
