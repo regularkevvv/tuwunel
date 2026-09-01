@@ -28,16 +28,18 @@ impl Data {
 		let global = args.db["global"].clone();
 		let count = Self::stored_count(&args.db["global"]).expect("initialize global counter");
 		let retires = Sender::new(count);
+		let release_retires = retires.clone();
 		let commit: CommitFn = Box::new(move |count| {
 			let db = db.clone();
 			let global = global.clone();
 			Box::pin(async move { Self::store_count(&db, &global, count).await })
 		});
-		let release: ReleaseFn = Box::new(move |count| Self::handle_retire(&retires, count));
+		let release: ReleaseFn =
+			Box::new(move |count| Self::handle_retire(&release_retires, count));
 		Self {
 			db: args.db.clone(),
 			global: args.db["global"].clone(),
-			retires: Sender::new(count),
+			retires,
 			counter: Counter::new(count, commit, release),
 		}
 	}
