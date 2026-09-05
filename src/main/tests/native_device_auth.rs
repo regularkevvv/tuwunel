@@ -55,7 +55,9 @@ async fn round_trip(services: &Services) -> Result {
 
 	let oidc = services.oauth.get_server()?;
 	let client_id = "native-device-client";
-	let grant = oidc.create_device_grant(client_id, "openid");
+	let grant = oidc
+		.create_device_grant(client_id, "openid")
+		.await;
 	let user_id = UserId::parse_with_server_name("nativealice", services.globals.server_name())?;
 
 	oidc.approve_device_grant(&grant.user_code, user_id.clone(), None)

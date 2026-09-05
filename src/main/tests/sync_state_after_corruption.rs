@@ -144,7 +144,9 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	let statediffs = services.db.get("shortstatehash_statediff")?;
 
-	statediffs.remove(&after_shortstatehash.to_be_bytes());
+	statediffs
+		.remove(&after_shortstatehash.to_be_bytes())
+		.await?;
 	services.clear_cache().await;
 
 	let fallback = sync(services, base, token, Some(&since), true, Some(STABLE_REQUEST)).await?;
@@ -171,7 +173,9 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	drop(fallback);
 
-	statediffs.remove(&legacy_shortstatehash.to_be_bytes());
+	statediffs
+		.remove(&legacy_shortstatehash.to_be_bytes())
+		.await?;
 	services.clear_cache().await;
 
 	let omitted = sync(services, base, token, Some(&since), true, Some(STABLE_REQUEST)).await?;

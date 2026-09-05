@@ -38,7 +38,17 @@ impl Rng {
 		x.wrapping_mul(0x2545_F491_4F6C_DD1D)
 	}
 
-	fn below(&mut self, n: u64) -> u64 { self.next() % n }
+	fn below(&mut self, n: u64) -> u64 {
+		self.next()
+			.checked_rem(n)
+			.expect("trace bounds are never zero")
+	}
+}
+
+/// Uniform index into a non-empty slice of `len` items; consumes one draw.
+fn index_below(rng: &mut Rng, len: usize) -> usize {
+	let len = u64::try_from(len).expect("slice length fits u64");
+	usize::try_from(rng.below(len)).expect("index fits usize")
 }
 
 /// Maps exercised by the traces: plain presets only, no TTL, no FIFO cache.
@@ -48,7 +58,7 @@ const OPS_PER_SEED: usize = 400;
 const SEEDS: &[u64] = &[0xDEC0_DE01, 0xDEC0_DE02, 0xDEC0_DE03];
 
 fn hex(bytes: &[u8]) -> String {
-	let mut out = String::with_capacity(bytes.len() * 2);
+	let mut out = String::with_capacity(bytes.len().saturating_mul(2));
 	for byte in bytes {
 		write!(out, "{byte:02x}").expect("hex write");
 	}
@@ -58,7 +68,9 @@ fn hex(bytes: &[u8]) -> String {
 /// Generates a key with adversarial byte patterns: 0x00/0xFF runs, separator
 /// bytes, shared prefixes, lengths 1..=64.
 fn gen_key(rng: &mut Rng) -> Vec<u8> {
-	let len = 1 + rng.below(64) as usize;
+	let len = usize::try_from(rng.below(64))
+		.expect("key length fits usize")
+		.saturating_add(1);
 	let mut key = Vec::with_capacity(len);
 	for _ in 0..len {
 		key.push(match rng.below(8) {
@@ -67,7 +79,7 @@ fn gen_key(rng: &mut Rng) -> Vec<u8> {
 			| 2 => 0xFE,
 			| 3 => b'p',
 			| 4 => b'q',
-			| _ => (rng.below(256)) as u8,
+			| _ => u8::try_from(rng.below(256)).expect("below 256 fits u8"),
 		});
 	}
 	key
@@ -77,13 +89,13 @@ fn gen_key(rng: &mut Rng) -> Vec<u8> {
 /// are legal records.
 fn gen_val(rng: &mut Rng) -> Vec<u8> {
 	let len = if rng.below(8) == 0 {
-		rng.below(2049) as usize
+		usize::try_from(rng.below(2049)).expect("value length fits usize")
 	} else {
-		rng.below(193) as usize
+		usize::try_from(rng.below(193)).expect("value length fits usize")
 	};
 	let mut val = Vec::with_capacity(len);
 	for _ in 0..len {
-		val.push((rng.below(256)) as u8);
+		val.push(u8::try_from(rng.below(256)).expect("below 256 fits u8"));
 	}
 	val
 }
@@ -91,7 +103,7 @@ fn gen_val(rng: &mut Rng) -> Vec<u8> {
 /// A previously written key, or a fresh one three times out of four misses.
 fn pick_key(rng: &mut Rng, written: &[Vec<u8>]) -> Vec<u8> {
 	if !written.is_empty() && rng.below(4) < 3 {
-		written[rng.below(written.len() as u64) as usize].clone()
+		written[index_below(rng, written.len())].clone()
 	} else {
 		gen_key(rng)
 	}
@@ -113,12 +125,12 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			out.push(',');
 		}
 
-		let mi = rng.below(maps.len() as u64) as usize;
+		let mi = index_below(&mut rng, maps.len());
 		let map = &maps[mi];
 
 		match rng.below(10) {
 			// put
-			| 0 | 1 | 2 => {
+			| 0..=2 => {
 				let key = gen_key(&mut rng);
 				let val = gen_val(&mut rng);
 				map.insert(&key, &val).await.expect("trace put");
@@ -136,10 +148,10 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			// multi-map transaction
 			| 4 => {
 				let mut txn = db.database.txn();
-				let count = 2 + rng.below(4);
+				let count = rng.below(4).saturating_add(2);
 				let mut keys = String::new();
 				for i in 0..count {
-					let ti = rng.below(maps.len() as u64) as usize;
+					let ti = index_below(&mut rng, maps.len());
 					let key = gen_key(&mut rng);
 					if rng.below(4) == 0 {
 						txn.del_raw(&maps[ti], &key);
@@ -204,7 +216,11 @@ async fn run_trace(db: &TestDb, seed: u64) -> String {
 			// prefix scan with a short prefix
 			| _ => {
 				let mut prefix = pick_key(&mut rng, &written[mi]);
-				prefix.truncate(1 + rng.below(4) as usize);
+				prefix.truncate(
+					usize::try_from(rng.below(4))
+						.expect("prefix length fits usize")
+						.saturating_add(1),
+				);
 				let items: Vec<(Vec<u8>, Vec<u8>)> = map
 					.raw_stream_prefix(&prefix)
 					.map_ok(|(k, v)| (k.to_vec(), v.to_vec()))

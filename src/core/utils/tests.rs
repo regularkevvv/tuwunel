@@ -1,5 +1,5 @@
 use std::{
-	panic::{AssertUnwindSafe, catch_unwind},
+	panic::AssertUnwindSafe,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -7,15 +7,17 @@ use std::{
 	task::{Context, Waker},
 };
 
+use futures::FutureExt;
+
 use crate::{
-	Error, Result,
+	Error, err,
 	utils::{
-		self, MutexMap, math::usize_from_f64, two_phase_counter::Counter,
+		self, MutexMap,
+		math::usize_from_f64,
+		two_phase_counter::{CommitFn, Counter, ReleaseFn},
 		url::hostname_matches_domain,
 	},
 };
-
-type CounterCallback = Box<dyn Fn(u64) -> Result + Send + Sync>;
 
 #[test]
 fn increment_none() {
@@ -388,37 +390,86 @@ fn page_size() {
 	assert!(val != 0, "page size was zero");
 }
 
-#[test]
-fn two_phase_counter_recovers_from_panicking_commit() {
+/// Commit callback for the counter tests: refuses (panics) while `refuse` is
+/// set, fails (returns an error) while `fail` is set, and otherwise persists.
+fn test_commit(refuse: Arc<AtomicBool>, fail: Arc<AtomicBool>) -> CommitFn {
+	Box::new(move |count| {
+		let refuse = refuse.clone();
+		let fail = fail.clone();
+		Box::pin(async move {
+			assert!(!refuse.load(Ordering::Relaxed), "commit refused sequence number {count}");
+			if fail.load(Ordering::Relaxed) {
+				return Err(err!("commit failed for sequence number {count}"));
+			}
+
+			Ok(())
+		})
+	})
+}
+
+fn test_release() -> ReleaseFn { Box::new(|_| Ok(())) }
+
+#[tokio::test]
+async fn two_phase_counter_recovers_from_panicking_commit() {
 	let refuse = Arc::new(AtomicBool::new(false));
-	let refuse_in_commit = refuse.clone();
-	let commit: CounterCallback = Box::new(move |count| {
-		assert!(
-			!refuse_in_commit.load(Ordering::Relaxed),
-			"commit refused sequence number {count}"
-		);
-
-		Ok(())
-	});
-
-	let release: CounterCallback = Box::new(|_| Ok(()));
-	let counter = Counter::new(0, commit, release);
-	let first = counter.next().expect("first sequence number");
+	let counter = Counter::new(
+		0,
+		test_commit(refuse.clone(), Arc::new(AtomicBool::new(false))),
+		test_release(),
+	);
+	let first = counter
+		.next()
+		.await
+		.expect("first sequence number");
 
 	assert_eq!(*first, 1, "the first sequence number dispatched is one");
 	drop(first);
 
 	refuse.store(true, Ordering::Relaxed);
-	catch_unwind(AssertUnwindSafe(|| drop(counter.next())))
-		.expect_err("a panicking commit callback unwinds out of the counter");
+	let unwound = AssertUnwindSafe(counter.next())
+		.catch_unwind()
+		.await;
+	assert!(unwound.is_err(), "a panicking commit callback unwinds out of the counter");
 
 	refuse.store(false, Ordering::Relaxed);
 	let second = counter
 		.next()
-		.expect("the counter outlives a poisoned lock");
+		.await
+		.expect("the counter outlives a panicking commit");
 
 	assert_eq!(*second, 2, "the failed dispatch consumed no sequence number");
 	assert_eq!(counter.current(), 1, "the retirement value trails the pending permit");
+}
+
+#[tokio::test]
+async fn two_phase_counter_dispatches_nothing_when_commit_fails() {
+	let fail = Arc::new(AtomicBool::new(false));
+	let counter = Counter::new(
+		0,
+		test_commit(Arc::new(AtomicBool::new(false)), fail.clone()),
+		test_release(),
+	);
+	let first = counter
+		.next()
+		.await
+		.expect("first sequence number");
+
+	assert_eq!(*first, 1, "the first sequence number dispatched is one");
+	drop(first);
+
+	fail.store(true, Ordering::Relaxed);
+	assert!(counter.next().await.is_err(), "a failing commit dispatches nothing");
+
+	assert_eq!(counter.dispatched(), 1, "a failed commit draws no sequence number");
+	assert_eq!(counter.current(), 1, "a failed commit leaves nothing pending");
+
+	fail.store(false, Ordering::Relaxed);
+	let second = counter
+		.next()
+		.await
+		.expect("the counter recovers after a failed commit");
+
+	assert_eq!(*second, 2, "the failed dispatch consumed no sequence number");
 }
 
 #[test]

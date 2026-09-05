@@ -109,15 +109,23 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let object_state = foreign_leave_pdu(&user_id, &object_room);
 	let leftstate = services.db.get("userroomid_leftstate")?;
 
-	leftstate.put_raw((&user_id, &object_room), object_state.to_string());
-	leftstate.put_raw((&user_id, &partial_room), partial_leave_event(&user_id).to_string());
-	leftstate.put_raw((&user_id, &null_room), "null");
+	leftstate
+		.put_raw((&user_id, &object_room), object_state.to_string())
+		.await?;
+	leftstate
+		.put_raw((&user_id, &partial_room), partial_leave_event(&user_id).to_string())
+		.await?;
+	leftstate
+		.put_raw((&user_id, &null_room), "null")
+		.await?;
 
 	// Left rooms are scanned by raw byte prefix, which a longer user id extends.
 	let neighbor = UserId::parse(format!("{user_id}.example.net"))?;
 	let neighbor_room = RoomId::parse("!neighbor:localhost.example.net")?;
 
-	leftstate.put_raw((&neighbor, &neighbor_room), "[]");
+	leftstate
+		.put_raw((&neighbor, &neighbor_room), "[]")
+		.await?;
 	services.clear_cache().await;
 
 	let expected =

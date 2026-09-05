@@ -102,7 +102,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	services
 		.db
 		.get("pduid_pdu")?
-		.remove(&create_pdu_id);
+		.remove(&create_pdu_id)
+		.await?;
 
 	services.clear_cache().await;
 

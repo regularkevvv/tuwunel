@@ -127,10 +127,10 @@ async fn send_to_device(
 	device: &DeviceId,
 	content: &Value,
 ) -> Result {
-	let count =
-		services
-			.users
-			.add_to_device_event(sender, target, device, "m.room.encrypted", content);
+	let count = services
+		.users
+		.add_to_device_event(sender, target, device, "m.room.encrypted", content)
+		.await;
 
 	services
 		.sending

@@ -118,7 +118,7 @@ async fn contract_point_ops_and_ordering() -> Result {
 	let pair = &rig.pairs[0];
 
 	for (i, key) in edge_keys().iter().enumerate() {
-		let val = vec![i as u8; i % 7];
+		let val = vec![u8::try_from(i).expect("edge key index fits u8"); i % 7];
 
 		pair.rocks.insert(key, &val).await?;
 		pair.mem.insert(key, &val).await?;
@@ -369,9 +369,11 @@ fn map_id_table_is_a_catalog_bijection() {
 	for i in 0..ids::MAP_IDS.len() {
 		let (name, _) = ids::MAP_IDS[i];
 		assert_eq!(
-			ids::map_id(name)
-				.expect("catalog name must have an id")
-				.0 as usize,
+			usize::from(
+				ids::map_id(name)
+					.expect("catalog name must have an id")
+					.0
+			),
 			i,
 			"table order and id diverge for {name}"
 		);

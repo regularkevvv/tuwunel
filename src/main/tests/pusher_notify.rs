@@ -218,16 +218,18 @@ async fn prepare_push_retry(services: &Services) -> Result<PushRetry> {
 		permit_rx,
 	)));
 
-	let first_id = persist_message_pdu(services, &room_id, RETRY_EVENT_ID_1, 1)?;
-	let second_id = persist_message_pdu(services, &room_id, RETRY_EVENT_ID_2, 2)?;
+	let first_id = persist_message_pdu(services, &room_id, RETRY_EVENT_ID_1, 1).await?;
+	let second_id = persist_message_pdu(services, &room_id, RETRY_EVENT_ID_2, 2).await?;
 
 	services
 		.sending
-		.send_pdu_push(&first_id, &user, pushkey.to_owned())?;
+		.send_pdu_push(&first_id, &user, pushkey.to_owned())
+		.await?;
 
 	services
 		.sending
-		.send_pdu_push(&second_id, &user, pushkey.to_owned())?;
+		.send_pdu_push(&second_id, &user, pushkey.to_owned())
+		.await?;
 
 	services.sending.refresh_push_badge(&user).await?;
 
@@ -273,8 +275,8 @@ async fn verify_badge_recovery(services: &Services, recovery: &mut BadgeRecovery
 	let joined = services.db.get("userroomid_joined")?;
 	let unread = services.db.get("userroomid_notificationcount")?;
 
-	joined.put((user_id, &room_id), 1_u64);
-	unread.put((user_id, &room_id), 1_u64);
+	joined.put((user_id, &room_id), 1_u64).await?;
+	unread.put((user_id, &room_id), 1_u64).await?;
 
 	// This wake sits behind the two pre-start messages in the worker channel.
 	// Its completed row is a deterministic barrier for stale-wake processing.
@@ -507,16 +509,18 @@ async fn verify_permanent_push_error(services: &Services) -> Result {
 	services
 		.db
 		.get("senderkey_pusher")?
-		.put((&user, pushkey), Json(&action));
+		.put((&user, pushkey), Json(&action))
+		.await?;
 
 	services.pusher.get_pusher(&user, pushkey).await?;
 
-	let pdu_id = persist_message_pdu(services, &room_id, PERMANENT_EVENT_ID, 3)?;
+	let pdu_id = persist_message_pdu(services, &room_id, PERMANENT_EVENT_ID, 3).await?;
 	let destination = Destination::Push(user.clone(), pushkey.to_owned());
 
 	services
 		.sending
-		.send_pdu_push(&pdu_id, &user, pushkey.to_owned())?;
+		.send_pdu_push(&pdu_id, &user, pushkey.to_owned())
+		.await?;
 
 	wait_for_queue_cleanup(services, &destination).await?;
 	services.sending.refresh_push_badge(&user).await?;
@@ -535,12 +539,13 @@ async fn verify_missing_pusher_reap(services: &Services) -> Result {
 	let user = UserId::parse_with_server_name("push-missing", server_name)?;
 	let pushkey = "pk-push-missing";
 	let room_id = OwnedRoomId::from_parts('!', "push-missing", Some(server_name.as_str()))?;
-	let pdu_id = persist_message_pdu(services, &room_id, MISSING_PUSHER_EVENT_ID, 4)?;
+	let pdu_id = persist_message_pdu(services, &room_id, MISSING_PUSHER_EVENT_ID, 4).await?;
 	let destination = Destination::Push(user.clone(), pushkey.to_owned());
 
 	services
 		.sending
-		.send_pdu_push(&pdu_id, &user, pushkey.to_owned())?;
+		.send_pdu_push(&pdu_id, &user, pushkey.to_owned())
+		.await?;
 
 	wait_for_queue_cleanup(services, &destination).await
 }
@@ -590,8 +595,8 @@ async fn run_cases(services: &Services) -> Result {
 	let unread = services.db.get("userroomid_notificationcount")?;
 
 	for room_id in [&room_id, &other_room_id] {
-		joined.put((&user, room_id), 1_u64);
-		unread.put((&user, room_id), 1_u64);
+		joined.put((&user, room_id), 1_u64).await?;
+		unread.put((&user, room_id), 1_u64).await?;
 	}
 
 	let pdu = message_event(room_id.as_str(), EVENT_ID)?;
@@ -636,7 +641,7 @@ fn message_event(room_id: &str, event_id: &str) -> Result<Pdu> {
 	.map_err(|e| err!("invalid test pdu: {e}"))
 }
 
-fn persist_message_pdu(
+async fn persist_message_pdu(
 	services: &Services,
 	room_id: &RoomId,
 	event_id: &str,
@@ -652,7 +657,8 @@ fn persist_message_pdu(
 	services
 		.db
 		.get("pduid_pdu")?
-		.raw_put(pdu_id, Json(&pdu));
+		.raw_put(pdu_id, Json(&pdu))
+		.await?;
 
 	Ok(pdu_id)
 }
@@ -905,8 +911,12 @@ async fn account_wide_count_delivery(fixture: &Fixture<'_>, room_id: &RoomId) ->
 	let stale_room_id =
 		RoomId::parse(format!("!push-stale:{}", fixture.services.globals.server_name()))?;
 
-	unread.put((fixture.user, room_id, &root), 7_u64);
-	unread.put((fixture.user, &stale_room_id), 41_u64);
+	unread
+		.put((fixture.user, room_id, &root), 7_u64)
+		.await?;
+	unread
+		.put((fixture.user, &stale_room_id), 41_u64)
+		.await?;
 
 	let (_, body) =
 		deliver(fixture, "pk-badge-thread", false, true, r#"{"rejected":[]}"#).await?;
@@ -915,7 +925,9 @@ async fn account_wide_count_delivery(fixture: &Fixture<'_>, room_id: &RoomId) ->
 
 	assert_eq!(thread_notification.get("counts"), Some(&json!({"unread": 7})));
 
-	unread.put((fixture.user, room_id), u64::MAX);
+	unread
+		.put((fixture.user, room_id), u64::MAX)
+		.await?;
 
 	let (_, body) = deliver(fixture, "pk-badge-max", false, true, r#"{"rejected":[]}"#).await?;
 	let max_notification = notification(&body)?;
@@ -975,8 +987,10 @@ async fn badge_delivery_memo(fixture: &Fixture<'_>, room_id: &RoomId) -> Result 
 
 	let root = EventId::parse(EVENT_ID)?;
 
-	unread.put((fixture.user, room_id), 0_u64);
-	unread.put((fixture.user, room_id, &root), 0_u64);
+	unread.put((fixture.user, room_id), 0_u64).await?;
+	unread
+		.put((fixture.user, room_id, &root), 0_u64)
+		.await?;
 
 	let pushkey = "pk-badge-memo";
 	let config = StubPusherConfig::new(r#"{"rejected":[]}"#);
@@ -1005,7 +1019,7 @@ async fn badge_delivery_memo(fixture: &Fixture<'_>, room_id: &RoomId) -> Result 
 		| Ok(_) => return Err!("unchanged badge total was re-sent to the gateway"),
 	}
 
-	unread.put((fixture.user, room_id), 3_u64);
+	unread.put((fixture.user, room_id), 3_u64).await?;
 	refresh().await?;
 
 	let (_, body) = recv(&mut rx).await?;
@@ -1016,7 +1030,7 @@ async fn badge_delivery_memo(fixture: &Fixture<'_>, room_id: &RoomId) -> Result 
 
 	// The event notification carries the new total and stamps the memo, so
 	// the refresh behind it has nothing to add.
-	unread.put((fixture.user, room_id), 5_u64);
+	unread.put((fixture.user, room_id), 5_u64).await?;
 	fixture
 		.services
 		.pusher

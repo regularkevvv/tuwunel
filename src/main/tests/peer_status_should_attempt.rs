@@ -30,7 +30,8 @@ fn should_attempt_backs_off_after_failure() -> Result {
 
 		services
 			.federation
-			.record_failure(&peer, Classification::Transient);
+			.record_failure(&peer, Classification::Transient)
+			.await?;
 
 		let verdict = services.federation.should_attempt(&peer).await;
 

@@ -337,7 +337,7 @@ async fn missing_state_diff(
 		.try_collect::<Vec<_>>()
 		.await
 		.map_err(|error| err!("state diff fixture corrupted the restored state: {error}"))?;
-	suppress_upgrade(services, held.event_id.as_ref())?;
+	suppress_upgrade(services, held.event_id.as_ref()).await?;
 	assert_unevaluable(services, top.event_id.as_ref(), "missing state diff").await?;
 	assert_fetches(
 		services,
@@ -365,7 +365,7 @@ async fn missing_event_reverse(
 	let shorteventid = services.short.get_shorteventid(&named).await?;
 
 	remove_short_row(services, "shorteventid_eventid", shorteventid).await?;
-	suppress_upgrade(services, held.event_id.as_ref())?;
+	suppress_upgrade(services, held.event_id.as_ref()).await?;
 	assert_unevaluable(services, top.event_id.as_ref(), "missing event reverse map").await?;
 	assert_fetches(
 		services,
@@ -395,8 +395,8 @@ async fn missing_state_key_reverse(
 		.await?;
 
 	remove_short_row(services, "shortstatekey_statekey", shortstatekey).await?;
-	suppress_upgrade(services, left.event_id.as_ref())?;
-	suppress_upgrade(services, right.event_id.as_ref())?;
+	suppress_upgrade(services, left.event_id.as_ref()).await?;
+	suppress_upgrade(services, right.event_id.as_ref()).await?;
 	assert_unevaluable(services, top.event_id.as_ref(), "missing state key reverse map").await?;
 	assert_fetches(
 		services,
@@ -429,7 +429,8 @@ async fn missing_named_pdu(
 
 	services
 		.timeline
-		.add_pdu_outlier(&fork.event_id, &fork_json);
+		.add_pdu_outlier(&fork.event_id, &fork_json)
+		.await?;
 
 	set_forward_extremity(services, &room_id, fork.event_id.as_ref()).await;
 
@@ -437,10 +438,11 @@ async fn missing_named_pdu(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	corrupt_timeline_pdu(services, &missing, PduFailure::Missing).await?;
-	suppress_upgrade(services, fork.event_id.as_ref())?;
+	suppress_upgrade(services, fork.event_id.as_ref()).await?;
 
 	let before_report = services.event_handler.state_local_metrics();
 
@@ -496,7 +498,8 @@ async fn auth_ancestor_failure(
 
 		services
 			.timeline
-			.add_pdu_outlier(&top.event_id, &top_json);
+			.add_pdu_outlier(&top.event_id, &top_json)
+			.await?;
 
 		(top, top_json)
 	} else {
@@ -504,11 +507,11 @@ async fn auth_ancestor_failure(
 	};
 
 	corrupt_timeline_pdu(services, &ancestor, pdu_failure).await?;
-	suppress_upgrade(services, left.event_id.as_ref())?;
-	suppress_upgrade(services, right.event_id.as_ref())?;
+	suppress_upgrade(services, left.event_id.as_ref()).await?;
+	suppress_upgrade(services, right.event_id.as_ref()).await?;
 
 	if interior {
-		suppress_upgrade(services, fork.event_id.as_ref())?;
+		suppress_upgrade(services, fork.event_id.as_ref()).await?;
 	}
 
 	let context = match failure {
@@ -573,7 +576,7 @@ async fn corrupt_chain_cache_rebuilds(
 		.await
 		.map_err(|error| err!("initial auth-chain cache row was not written: {error}"))?;
 
-	cache.insert(&key, b"!");
+	cache.insert(&key, b"!").await?;
 
 	let complete = AtomicBool::new(true);
 	let mut rebuilt = services
@@ -616,8 +619,8 @@ async fn unpolled_chain_stays_clear(
 	let (left, right, top, top_json) = held_message_fork(services, user_id, &room_id).await?;
 
 	corrupt_timeline_pdu(services, &ancestor, PduFailure::Missing).await?;
-	suppress_upgrade(services, left.event_id.as_ref())?;
-	suppress_upgrade(services, right.event_id.as_ref())?;
+	suppress_upgrade(services, left.event_id.as_ref()).await?;
+	suppress_upgrade(services, right.event_id.as_ref()).await?;
 
 	let report = services
 		.event_handler
@@ -643,7 +646,7 @@ async fn direct_memo_failure_is_miss(
 		held_message_chain(services, user_id, &room_id, &boundary).await?;
 
 	services.clear_cache().await;
-	suppress_upgrade(services, held.event_id.as_ref())?;
+	suppress_upgrade(services, held.event_id.as_ref()).await?;
 	plant_memo(services, top.event_id.as_ref(), ShortStateHash::MAX).await?;
 
 	let memo = services.db.get("eventid_resolvedstate")?;
@@ -681,11 +684,12 @@ async fn walk_memo_failure_is_unevaluable(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	services.clear_cache().await;
-	suppress_upgrade(services, memo.event_id.as_ref())?;
-	suppress_upgrade(services, middle.event_id.as_ref())?;
+	suppress_upgrade(services, memo.event_id.as_ref()).await?;
+	suppress_upgrade(services, middle.event_id.as_ref()).await?;
 	plant_memo(services, memo.event_id.as_ref(), ShortStateHash::MAX).await?;
 
 	let report = services
@@ -735,7 +739,8 @@ async fn degree_one_state_miss(
 
 	services
 		.timeline
-		.add_pdu_outlier(&incoming.event_id, &incoming_json);
+		.add_pdu_outlier(&incoming.event_id, &incoming_json)
+		.await?;
 
 	assert_ne!(intact_state, corrupt_state, "degree one fixture reused the intact state");
 	restore_room_state(services, &room_id, intact_state, &anchor).await;
@@ -784,7 +789,8 @@ async fn sibling_state_miss(
 
 	services
 		.state
-		.set_room_state(&room_id, boundary_state, &state_lock);
+		.set_room_state(&room_id, boundary_state, &state_lock)
+		.await?;
 
 	services
 		.state
@@ -807,7 +813,8 @@ async fn sibling_state_miss(
 
 	services
 		.timeline
-		.add_pdu_outlier(&incoming.event_id, &incoming_json);
+		.add_pdu_outlier(&incoming.event_id, &incoming_json)
+		.await?;
 
 	remove_short_row(services, "shortstatehash_statediff", left_state).await?;
 	assert_all_committed(services, incoming.event_id.as_ref(), "sibling state miss").await?;
@@ -834,7 +841,8 @@ async fn held_message_chain(
 
 	services
 		.timeline
-		.add_pdu_outlier(&held.event_id, &held_json);
+		.add_pdu_outlier(&held.event_id, &held_json)
+		.await?;
 
 	set_forward_extremity(services, room_id, held.event_id.as_ref()).await;
 
@@ -842,7 +850,8 @@ async fn held_message_chain(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	Ok((held, top, top_json))
 }
@@ -857,11 +866,13 @@ async fn held_state_fork(
 
 	services
 		.timeline
-		.add_pdu_outlier(&left.event_id, &left_json);
+		.add_pdu_outlier(&left.event_id, &left_json)
+		.await?;
 
 	services
 		.timeline
-		.add_pdu_outlier(&right.event_id, &right_json);
+		.add_pdu_outlier(&right.event_id, &right_json)
+		.await?;
 
 	set_forward_extremities(services, room_id, [left.event_id.as_ref(), right.event_id.as_ref()])
 		.await;
@@ -870,7 +881,8 @@ async fn held_state_fork(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	Ok((left, right, top, top_json))
 }
@@ -886,11 +898,13 @@ async fn held_message_fork(
 
 	services
 		.timeline
-		.add_pdu_outlier(&left.event_id, &left_json);
+		.add_pdu_outlier(&left.event_id, &left_json)
+		.await?;
 
 	services
 		.timeline
-		.add_pdu_outlier(&right.event_id, &right_json);
+		.add_pdu_outlier(&right.event_id, &right_json)
+		.await?;
 
 	set_forward_extremities(services, room_id, [left.event_id.as_ref(), right.event_id.as_ref()])
 		.await;
@@ -899,7 +913,8 @@ async fn held_message_fork(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	Ok((left, right, top, top_json))
 }
@@ -972,7 +987,7 @@ async fn remove_short_row(services: &Services, map_name: &str, short: u64) -> Re
 		.await
 		.map_err(|error| err!("short-id row {map_name}[{short}] unavailable: {error}"))?;
 
-	map.remove(&key);
+	map.remove(&key).await?;
 	services.clear_cache().await;
 
 	assert!(
@@ -1007,11 +1022,11 @@ async fn corrupt_timeline_pdu(
 
 	let failure_name = match failure {
 		| PduFailure::Missing => {
-			pdus.remove(&pdu_id);
+			pdus.remove(&pdu_id).await?;
 			"missing"
 		},
 		| PduFailure::Malformed => {
-			pdus.insert(&pdu_id, b"{");
+			pdus.insert(&pdu_id, b"{").await?;
 			"malformed"
 		},
 	};
@@ -1047,7 +1062,8 @@ async fn plant_memo(
 		.get("eventid_resolvedstate")
 		.map_err(|error| err!("resolved-state memo map unavailable for {event_id}: {error}"))?;
 
-	memo.raw_aput::<{ size_of::<ShortStateHash>() }, _, _>(event_id.as_bytes(), shortstatehash);
+	memo.raw_aput::<{ size_of::<ShortStateHash>() }, _, _>(event_id.as_bytes(), shortstatehash)
+		.await?;
 
 	let stored: ShortStateHash = memo
 		.get(event_id)
@@ -1347,9 +1363,10 @@ async fn disabled_local_build_ignores_planted_memo(
 
 	services
 		.timeline
-		.add_pdu_outlier(&held.event_id, &held_json);
+		.add_pdu_outlier(&held.event_id, &held_json)
+		.await?;
 
-	suppress_upgrade(services, &held.event_id)?;
+	suppress_upgrade(services, &held.event_id).await?;
 
 	let state_lock = services.state.mutex.lock(room_id).await;
 
@@ -1369,10 +1386,12 @@ async fn disabled_local_build_ignores_planted_memo(
 	let resolved_state = services.db.get("eventid_resolvedstate")?;
 	let incoming_event_id: &EventId = incoming.event_id.as_ref();
 
-	resolved_state.raw_aput::<{ size_of::<ShortStateHash>() }, _, _>(
-		incoming_event_id.as_bytes(),
-		shortstatehash,
-	);
+	resolved_state
+		.raw_aput::<{ size_of::<ShortStateHash>() }, _, _>(
+			incoming_event_id.as_bytes(),
+			shortstatehash,
+		)
+		.await?;
 
 	let planted: ShortStateHash = resolved_state
 		.get(incoming_event_id)
@@ -1434,14 +1453,16 @@ async fn held_multi_prev_fork_resolves_locally(
 
 	services
 		.timeline
-		.add_pdu_outlier(&left.event_id, &left_json);
+		.add_pdu_outlier(&left.event_id, &left_json)
+		.await?;
 
 	services
 		.timeline
-		.add_pdu_outlier(&right.event_id, &right_json);
+		.add_pdu_outlier(&right.event_id, &right_json)
+		.await?;
 
-	suppress_upgrade(services, &left.event_id)?;
-	suppress_upgrade(services, &right.event_id)?;
+	suppress_upgrade(services, &left.event_id).await?;
+	suppress_upgrade(services, &right.event_id).await?;
 
 	let state_lock = services.state.mutex.lock(room_id).await;
 	let prevs = [left.event_id.as_ref(), right.event_id.as_ref()];
@@ -1457,7 +1478,8 @@ async fn held_multi_prev_fork_resolves_locally(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	let shortstatehash = services
 		.state
@@ -1603,7 +1625,7 @@ async fn positional_rejection_stays_uncommitted(
 			"positionally rejected event gained a state row"
 		);
 
-		suppress_upgrade(services, denied.event_id.as_ref())?;
+		suppress_upgrade(services, denied.event_id.as_ref()).await?;
 	}
 
 	set_forward_extremities(services, room_id, [
@@ -1616,7 +1638,8 @@ async fn positional_rejection_stays_uncommitted(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	let before_report = services.event_handler.state_local_metrics();
 
@@ -1777,9 +1800,10 @@ async fn missing_create_falls_through_to_fetch(
 
 	services
 		.timeline
-		.add_pdu_outlier(&held.event_id, &held_json);
+		.add_pdu_outlier(&held.event_id, &held_json)
+		.await?;
 
-	suppress_upgrade(services, held.event_id.as_ref())?;
+	suppress_upgrade(services, held.event_id.as_ref()).await?;
 
 	let state_lock = services.state.mutex.lock(room_id).await;
 
@@ -1794,7 +1818,8 @@ async fn missing_create_falls_through_to_fetch(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	let report = services
 		.event_handler
@@ -1971,7 +1996,8 @@ async fn prepare_soft_fail_descendant<'a>(
 ) -> Result<OwnedEventId> {
 	services
 		.timeline
-		.add_pdu_outlier(&delayed.event_id, delayed_json);
+		.add_pdu_outlier(&delayed.event_id, delayed_json)
+		.await?;
 
 	set_forward_extremity(services, room_id, delayed.event_id.as_ref()).await;
 
@@ -1980,7 +2006,8 @@ async fn prepare_soft_fail_descendant<'a>(
 
 	services
 		.timeline
-		.add_pdu_outlier(&held.event_id, &held_json);
+		.add_pdu_outlier(&held.event_id, &held_json)
+		.await?;
 
 	set_forward_extremity(services, room_id, held.event_id.as_ref()).await;
 
@@ -1989,7 +2016,8 @@ async fn prepare_soft_fail_descendant<'a>(
 
 	services
 		.timeline
-		.add_pdu_outlier(&top.event_id, &top_json);
+		.add_pdu_outlier(&top.event_id, &top_json)
+		.await?;
 
 	set_forward_extremity(services, room_id, original_prev).await;
 
@@ -2015,7 +2043,9 @@ async fn restore_room_state(
 
 	services
 		.state
-		.set_room_state(room_id, shortstatehash, &state_lock);
+		.set_room_state(room_id, shortstatehash, &state_lock)
+		.await
+		.expect("test write");
 
 	services
 		.state
@@ -2058,11 +2088,12 @@ async fn sign_message(
 		.await
 }
 
-fn suppress_upgrade(services: &Services, event_id: &EventId) -> Result {
+async fn suppress_upgrade(services: &Services, event_id: &EventId) -> Result {
 	services
 		.db
 		.get("eventid_backoff")?
-		.put((2_u8, event_id, 0_u32), (2_u64, u64::MAX));
+		.put((2_u8, event_id, 0_u32), (2_u64, u64::MAX))
+		.await?;
 
 	Ok(())
 }

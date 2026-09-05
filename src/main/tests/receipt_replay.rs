@@ -227,8 +227,8 @@ async fn private_read_premirror(services: &Services, room: &RoomId, user: &UserI
 
 	let mirror = &services.db[PRIVATE_READ_MIRROR];
 
-	mirror.del((room, user));
-	mirror.del((room, user, ""));
+	mirror.del((room, user)).await?;
+	mirror.del((room, user, "")).await?;
 
 	let events = services
 		.read_receipt
@@ -250,8 +250,8 @@ async fn private_read_premirror(services: &Services, room: &RoomId, user: &UserI
 		.last_privateread_update(user, &admin_room)
 		.await;
 
-	mirror.del((&admin_room, user));
-	mirror.del((&admin_room, user, ""));
+	mirror.del((&admin_room, user)).await?;
+	mirror.del((&admin_room, user, "")).await?;
 
 	let served = services
 		.read_receipt
@@ -337,14 +337,18 @@ async fn private_read_dangling(services: &Services, room: &RoomId, user: &UserId
 
 	let mirror = &services.db[PRIVATE_READ_MIRROR];
 
-	mirror.put((&admin_room, dangler, "not-a-thread"), (1_u64, 1_u64));
+	mirror
+		.put((&admin_room, dangler, "not-a-thread"), (1_u64, 1_u64))
+		.await?;
 
 	let undecodable = services
 		.read_receipt
 		.private_read_get_fallible(&admin_room, dangler, update)
 		.await;
 
-	mirror.del((&admin_room, dangler, "not-a-thread"));
+	mirror
+		.del((&admin_room, dangler, "not-a-thread"))
+		.await?;
 
 	if !undecodable.is_err_and(|error| !error.is_not_found()) {
 		return Err!("undecodable mirror row did not fail the range");

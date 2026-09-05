@@ -65,11 +65,11 @@ async fn exercise(services: &Services) -> Result {
 	let stray = event_id!("$stray:localhost");
 	let cross = event_id!("$cross:localhost");
 
-	add_outlier(services, room_id, tail, &[])?;
-	add_outlier(services, room_id, left, &[tail])?;
-	add_outlier(services, room_id, torn, &[tail, absent])?;
-	add_outlier(services, foreign_room_id, stray, &[])?;
-	add_outlier(services, room_id, cross, &[stray])?;
+	add_outlier(services, room_id, tail, &[]).await?;
+	add_outlier(services, room_id, left, &[tail]).await?;
+	add_outlier(services, room_id, torn, &[tail, absent]).await?;
+	add_outlier(services, foreign_room_id, stray, &[]).await?;
+	add_outlier(services, room_id, cross, &[stray]).await?;
 
 	let left_short = services
 		.short
@@ -154,7 +154,7 @@ async fn mint_distinct_bucket(
 	for attempt in 0..NUM_BUCKETS {
 		let right = OwnedEventId::try_from(format!("$right-{attempt}:localhost"))?;
 
-		add_outlier(services, room_id, &right, &[tail])?;
+		add_outlier(services, room_id, &right, &[tail]).await?;
 
 		let right_short = services
 			.short
@@ -169,7 +169,7 @@ async fn mint_distinct_bucket(
 	panic!("bucket separation must converge");
 }
 
-fn add_outlier(
+async fn add_outlier(
 	services: &Services,
 	room_id: &RoomId,
 	event_id: &EventId,
@@ -182,7 +182,10 @@ fn add_outlier(
 
 	let pdu: CanonicalJsonObject = serde_json::from_value(pdu)?;
 
-	services.timeline.add_pdu_outlier(event_id, &pdu);
+	services
+		.timeline
+		.add_pdu_outlier(event_id, &pdu)
+		.await?;
 
 	Ok(())
 }

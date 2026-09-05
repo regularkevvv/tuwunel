@@ -406,7 +406,9 @@ async fn assert_claim_boundary_failure(
 
 	let session = begin_registration(client, base, username).await?;
 
-	services.db["threepidsid_pending"].insert(sid.as_str(), b"invalid-cbor");
+	services.db["threepidsid_pending"]
+		.insert(sid.as_str(), b"invalid-cbor")
+		.await?;
 
 	let request =
 		registration_body(username, Some(email_auth(&sid, CLIENT_SECRET, Some(&session))));
