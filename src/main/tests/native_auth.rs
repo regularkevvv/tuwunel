@@ -68,7 +68,10 @@ async fn native_round_trip(services: &Services) -> Result {
 	// The native submit handler authenticates, mints a login token, and lets
 	// _complete consume it; exercise that token tail directly.
 	let token = "native-auth-test-login-token";
-	let _expires_in = services.users.create_login_token(&user_id, token);
+	let _expires_in = services
+		.users
+		.create_login_token(&user_id, token)
+		.await;
 	let resolved = services
 		.users
 		.find_from_login_token(token)
