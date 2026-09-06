@@ -1,4 +1,5 @@
 pub mod local;
+pub mod r2;
 pub mod s3;
 
 #[cfg(test)]

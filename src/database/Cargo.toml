@@ -61,14 +61,19 @@ futures.workspace = true
 log.workspace = true
 minicbor.workspace = true
 minicbor-serde.workspace = true
+rand.workspace = true
+reqwest.workspace = true
 rust-rocksdb.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tuwunel-bridge.workspace = true
 tuwunel-core.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 criterion.workspace = true
 
 [lints]

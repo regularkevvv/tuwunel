@@ -1,5 +1,29 @@
 use rocksdb::{Direction, ErrorKind, IteratorMode};
-use tuwunel_core::Result;
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tuwunel_core::{Err, Result};
+
+/// Drives one asynchronous backend operation from a synchronous caller.
+///
+/// The facade keeps a handful of blocking readers (startup signing keys, the
+/// global counter) that predate the asynchronous backend contract. On the
+/// RocksDB and model backends those read inline; on the remote backend the
+/// read is a network round trip, so the worker thread is handed back to tokio
+/// with `block_in_place` while the future is driven on the current runtime.
+/// That requires the multi-threaded runtime the server always uses; anywhere
+/// else this is a returned error, never a panic or a nested runtime.
+pub(crate) fn blocking<F>(future: F) -> Result<F::Output>
+where
+	F: Future,
+{
+	match Handle::try_current() {
+		| Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread =>
+			Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+		| Ok(_) => Err!(Database(
+			"a blocking read reached the remote backend outside a multi-threaded runtime"
+		)),
+		| Err(_) => Err!(Database("a blocking read reached the remote backend with no runtime")),
+	}
+}
 
 #[inline]
 pub(crate) fn _into_direction(mode: &IteratorMode<'_>) -> Direction {

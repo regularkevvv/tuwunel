@@ -64,13 +64,13 @@ where
 {
 	use crate::pool::Get;
 
-	if matches!(self.inner(), crate::map::Inner::Mem(_)) {
-		return futures::future::Either::Left(
-			keys.map(|key| {
-				ser::serialize_to::<KeyBuf, _>(key).expect("failed to serialize query key")
-			})
-			.then(async move |key| self.get(&key).await),
-		);
+	// Off RocksDB there is no worker pool to batch through: serialize the keys
+	// and let the backend's own raw batch path decide how they travel (one
+	// `Get` per chunk on the remote backend, an inline map on the model).
+	if !matches!(self.inner(), crate::map::Inner::Rocks(_)) {
+		return futures::future::Either::Left(self.get_batch(keys.map(|key| {
+			ser::serialize_to::<KeyBuf, _>(key).expect("failed to serialize query key")
+		})));
 	}
 
 	futures::future::Either::Right(

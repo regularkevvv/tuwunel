@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryStreamExt};
 use rocksdb::{DBPinnableSlice, ReadOptions};
+use tuwunel_bridge::MAX_GET_KEYS;
 use tuwunel_core::{
-	Result, implement,
+	Result, err, implement,
 	utils::{
 		IterStream,
 		stream::{WidebandExt, automatic_amplification, automatic_width},
@@ -47,7 +48,9 @@ where
 /// Fetches a stream of raw keys in asynchronous batches.
 ///
 /// Each batch runs on the engine's blocking pool and is flattened back into
-/// individual lookup results.
+/// individual lookup results. On the remote backend one chunk of at most
+/// [`MAX_GET_KEYS`] keys becomes one `Get` request, and the reply preserves
+/// request order with a not-found error for each miss.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, keys), level = "trace")]
 pub(crate) fn get_batch<'a, S, K>(
@@ -65,15 +68,49 @@ where
 		let id = self
 			.id()
 			.expect("model-backend maps are catalog maps");
-		return futures::future::Either::Left(keys.map(move |key| {
-			let found = store.get(id, key.as_ref());
-			STATS
-				.get
-				.record(found.as_ref().map_or(0, |val| val.len()));
-			found
-				.map(Handle::from)
-				.ok_or(tuwunel_core::err!(Request(NotFound("Not found in database"))))
-		}));
+		return futures::future::Either::Left(futures::future::Either::Left(keys.map(
+			move |key| {
+				let found = store.get(id, key.as_ref());
+				STATS
+					.get
+					.record(found.as_ref().map_or(0, |val| val.len()));
+				found
+					.map(Handle::from)
+					.ok_or(err!(Request(NotFound("Not found in database"))))
+			},
+		)));
+	}
+
+	if let Inner::Remote(remote) = self.inner() {
+		let backend = remote.backend.clone();
+		let id = self
+			.id()
+			.expect("remote-backend maps are catalog maps");
+		let chunk = automatic_amplification().clamp(1, MAX_GET_KEYS);
+
+		return futures::future::Either::Left(futures::future::Either::Right(
+			keys.ready_chunks(chunk)
+				.then(move |chunk| {
+					let backend = backend.clone();
+					async move {
+						STATS.get_batch.record(chunk.len());
+						let keys: Vec<&[u8]> = chunk.iter().map(AsRef::as_ref).collect();
+						backend.get_many(id, &keys).await
+					}
+				})
+				.map_ok(|vals| {
+					vals.into_iter()
+						.map(|val| {
+							STATS
+								.get
+								.record(val.as_ref().map_or(0, |val| val.len()));
+							val.map(Handle::from)
+								.ok_or(err!(Request(NotFound("Not found in database"))))
+						})
+						.stream()
+				})
+				.try_flatten(),
+		));
 	}
 
 	futures::future::Either::Right(

@@ -44,6 +44,18 @@ pub(super) type MapsVal = Arc<Map>;
 /// the opened database. Individual map handles share the supplied engine.
 pub(super) fn open(engine: &Arc<Engine>) -> Result<Maps> { open_list(engine, MAPS) }
 
+/// Opens every configured map on the remote D1 backend.
+///
+/// Remote maps are addressed by stable [`MapId`](crate::backend::MapId), so
+/// there is nothing to probe: every live descriptor becomes a map. Dropped
+/// descriptors are skipped exactly as on RocksDB.
+pub(super) fn open_remote(backend: &Arc<crate::backend::remote::Backend>) -> Maps {
+	MAPS.iter()
+		.filter(|desc| !desc.dropped)
+		.map(|desc| (desc.name, Map::open_remote(backend, desc.name)))
+		.collect()
+}
+
 /// Opens maps from an explicit descriptor list.
 ///
 /// Dropped descriptors and column families missing from the engine are skipped.

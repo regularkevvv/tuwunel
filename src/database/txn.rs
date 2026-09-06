@@ -4,13 +4,15 @@
 //! them only when [`Txn::execute`] consumes it. Typed operations use the
 //! database codec, while raw operations preserve caller-provided bytes. The
 //! backend lowers the queued batch to its native atomic form: one RocksDB
-//! `WriteBatch`, one model-store critical section, or (phase 2) one remote
-//! transactional commit.
+//! `WriteBatch`, one model-store critical section, or one fenced remote
+//! commit over the bridge (ADR-0012).
 
 use std::{fmt::Debug, iter::once, sync::Arc};
 
 use rocksdb::WriteBatch;
 use serde::Serialize;
+use serde_bytes::ByteBuf;
+use tuwunel_bridge::Mutation;
 use tuwunel_core::{Result, implement};
 
 use crate::{
@@ -395,6 +397,27 @@ pub async fn execute(self) -> Result {
 					},
 				)
 			}));
+		},
+		| Sink::Remote(backend) => {
+			backend
+				.commit(
+					self.ops
+						.iter()
+						.map(|(map, op)| {
+							let map = map.remote_id();
+							match op {
+								| Op::Put { key, val } => Mutation::Put {
+									map,
+									key: ByteBuf::from(key.to_vec()),
+									val: ByteBuf::from(val.to_vec()),
+								},
+								| Op::Delete { key } =>
+									Mutation::Delete { map, key: ByteBuf::from(key.to_vec()) },
+							}
+						})
+						.collect(),
+				)
+				.await?;
 		},
 	}
 

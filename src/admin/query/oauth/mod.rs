@@ -5,6 +5,7 @@ mod list_providers;
 mod list_sessions;
 mod list_users;
 mod revoke;
+mod revoke_sessions;
 mod show_provider;
 mod show_session;
 mod show_user;
@@ -92,6 +93,13 @@ pub(crate) enum OauthCommand {
 	Revoke {
 		#[arg(value_parser = session_or_user_id)]
 		id: Either<SessionId, OwnedUserId>,
+	},
+
+	/// Immediately revoke every Matrix session of a user and drop the stored
+	/// upstream grant, leaving the account active.
+	RevokeSessions {
+		/// MXID of the local user whose sessions end now.
+		user_id: OwnedUserId,
 	},
 
 	/// Remove oauth state (DANGER!)

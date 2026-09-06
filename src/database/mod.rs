@@ -1,8 +1,11 @@
 //! Persistent storage primitives for Tuwunel.
 //!
-//! The crate wraps RocksDB with typed maps, serialization helpers, and atomic
-//! transactions. Database handles expose the configured column families and the
-//! engine that owns them.
+//! The crate presents typed maps, serialization helpers, and atomic
+//! transactions over a backend-neutral seam (ADR-0002). A database opens on
+//! one of the backends in [`backend`]: the production RocksDB engine, or the
+//! remote D1 backend that reaches the canonical database through the Worker
+//! bridge (ADR-0012). `database_backend` selects between them, and the
+//! RocksDB engine is a capability that only the RocksDB backend offers.
 
 #![deny(missing_docs)]
 
@@ -35,6 +38,7 @@ use log as _;
 use tuwunel_core::{Result, Server, err};
 
 pub use self::{
+	backend::remote::LeaseStatus,
 	cork::Cork,
 	de::{Ignore, IgnoreAll, from_slice as deserialize_from_slice},
 	deserialized::Deserialized,
@@ -46,45 +50,140 @@ pub use self::{
 	txn::Txn,
 };
 pub(crate) use self::{engine::context::Context, util::or_else};
-use crate::maps::{Maps, MapsKey, MapsVal, open as open_maps};
+use crate::{
+	backend::{Sink, remote},
+	maps::{Maps, MapsKey, MapsVal, open as open_maps, open_remote as open_remote_maps},
+};
+
+/// Configuration value selecting the remote D1 backend.
+const BACKEND_D1: &str = "d1";
+
+/// Configuration value selecting the local RocksDB backend (the default).
+const BACKEND_ROCKSDB: &str = "rocksdb";
 
 /// An open Tuwunel database and its configured maps.
 ///
-/// Each instance owns maps created by one RocksDB engine. Typed accessors
-/// preserve that ownership relationship for individual reads and atomic
-/// transactions.
+/// Each instance owns maps created by one backend. Typed accessors preserve
+/// that ownership relationship for individual reads and atomic transactions.
 pub struct Database {
 	maps: Maps,
-	/// The RocksDB engine backing every map in this database.
-	///
-	/// Callers use the engine for database-wide operations such as backups and
-	/// memory reporting. Maps and transactions must remain associated with
-	/// this same engine.
-	pub engine: Arc<Engine>,
-	pub(crate) _ctx: Arc<Context>,
+	inner: Inner,
+}
+
+/// The backend an open database runs on.
+enum Inner {
+	/// The local RocksDB engine and the context that outlives it.
+	Rocks {
+		engine: Arc<Engine>,
+		_ctx: Arc<Context>,
+	},
+
+	/// The remote D1 backend behind the Worker bridge (ADR-0012).
+	Remote(Arc<remote::Backend>),
 }
 
 impl Database {
 	/// Loads an existing database or creates a new one.
 	///
-	/// The configured map catalog is opened after the engine and indexed by
-	/// column family identity. The returned shared handle keeps the engine
-	/// context alive for its full lifetime.
+	/// `database_backend` selects the backend. On `"rocksdb"` (the default)
+	/// the engine opens at `database_path` and the configured map catalog is
+	/// indexed by column-family identity. On `"d1"` no RocksDB engine, worker
+	/// pool, block cache or filesystem path is opened at all: the remote
+	/// backend performs the bridge handshake, refuses to serve on a protocol
+	/// or schema mismatch, acquires the writer lease, and the catalog is
+	/// opened by stable map id.
 	pub async fn open(server: &Arc<Server>) -> Result<Arc<Self>> {
+		if server
+			.config
+			.database_backend
+			.eq_ignore_ascii_case(BACKEND_D1)
+		{
+			let backend = remote::Backend::open(server).await?;
+			let maps = open_remote_maps(&backend);
+
+			return Ok(Arc::new(Self { maps, inner: Inner::Remote(backend) }));
+		}
+
 		let ctx = Context::new(server)?;
 		let engine = Engine::open(ctx.clone(), maps::MAPS).await?;
 		let maps = open_maps(&engine)?;
 
-		Ok(Arc::new(Self { maps, engine, _ctx: ctx }))
+		Ok(Arc::new(Self {
+			maps,
+			inner: Inner::Rocks { engine, _ctx: ctx },
+		}))
+	}
+
+	/// Returns the RocksDB engine backing this database.
+	///
+	/// The engine is a backend capability, not part of the storage contract
+	/// (ADR-0002): database-wide operations such as backups, checkpoints,
+	/// memory reporting and physical inspection exist only on RocksDB. On any
+	/// other backend this is the capability error, which callers report as
+	/// "unsupported on this backend".
+	#[inline]
+	pub fn engine(&self) -> Result<&Arc<Engine>> {
+		match &self.inner {
+			| Inner::Rocks { engine, .. } => Ok(engine),
+			| Inner::Remote(_) => Err(err!(
+				"operation is a RocksDB backend capability, unsupported on this backend"
+			)),
+		}
+	}
+
+	/// Names the backend this database opened on.
+	///
+	/// Reported by `GET /_tuwunel/readiness` so an operator can tell a local
+	/// RocksDB instance from the canonical D1 one at a glance.
+	#[inline]
+	#[must_use]
+	pub fn backend(&self) -> &'static str {
+		match &self.inner {
+			| Inner::Rocks { .. } => BACKEND_ROCKSDB,
+			| Inner::Remote(_) => BACKEND_D1,
+		}
+	}
+
+	/// Returns the writer lease state, or `None` off the remote backend.
+	///
+	/// Only the remote backend has a lease: RocksDB is exclusive by holding
+	/// its own directory lock (ADR-0003 fences the shared database, not the
+	/// local one).
+	#[inline]
+	#[must_use]
+	pub fn lease_status(&self) -> Option<LeaseStatus> {
+		match &self.inner {
+			| Inner::Rocks { .. } => None,
+			| Inner::Remote(backend) => Some(backend.lease_status()),
+		}
+	}
+
+	/// Stops background lease renewal and releases the writer lease.
+	///
+	/// A no-op off the remote backend. Releasing is best effort: a successor
+	/// otherwise waits out the lease's natural expiry.
+	pub async fn close(&self) {
+		if let Inner::Remote(backend) = &self.inner {
+			backend.close().await;
+		}
 	}
 
 	#[inline]
 	/// Creates an empty transaction for this database.
 	///
-	/// The transaction is bound to this database's engine and accepts writes
-	/// only for maps owned by that engine. Queued operations remain unapplied
-	/// until the transaction is executed.
-	pub fn txn(&self) -> Txn { Txn::new(&self.engine) }
+	/// The transaction is bound to this database's backend and accepts writes
+	/// only for maps owned by it. Queued operations remain unapplied until the
+	/// transaction is executed.
+	pub fn txn(&self) -> Txn { Txn::new_with_sink(self.sink()) }
+
+	/// Returns the backend instance owning every map in this database.
+	#[inline]
+	fn sink(&self) -> Sink {
+		match &self.inner {
+			| Inner::Rocks { engine, .. } => Sink::Rocks(engine.clone()),
+			| Inner::Remote(backend) => Sink::Remote(backend.clone()),
+		}
+	}
 
 	#[inline]
 	/// Retrieves a configured map by name.
@@ -101,11 +200,18 @@ impl Database {
 	///
 	/// Migration readers use this for foreign database families that are not
 	/// described by `MAPS`. An absent family returns `None` without creating
-	/// it.
+	/// it. Backends other than RocksDB have no foreign families at all —
+	/// every map they address is a catalog map with a stable id — so they
+	/// answer `None` as well, and the migrations that look for imported
+	/// Conduit or conduwuit columns skip themselves there.
 	pub fn open_cf(&self, name: &'static str) -> Result<Option<Arc<Map>>> {
-		self.engine
+		let Inner::Rocks { engine, .. } = &self.inner else {
+			return Ok(None);
+		};
+
+		engine
 			.has_cf(name)
-			.then(|| Map::open(&self.engine, name))
+			.then(|| Map::open(engine, name))
 			.transpose()
 	}
 
@@ -127,20 +233,32 @@ impl Database {
 
 	#[inline]
 	#[must_use]
-	/// Reports whether the engine rejects writes.
+	/// Reports whether the backend rejects writes.
 	///
-	/// Writes are rejected when the database is opened read-only or as a
-	/// secondary instance. The value applies to every map owned by this
-	/// database.
-	pub fn is_read_only(&self) -> bool { self.engine.is_read_only() }
+	/// On RocksDB, writes are rejected when the database is opened read-only
+	/// or as a secondary instance. On the remote backend they are rejected
+	/// while the writer lease is uncertain (a renewal failed) or lost
+	/// (ADR-0003). The value applies to every map owned by this database.
+	pub fn is_read_only(&self) -> bool {
+		match &self.inner {
+			| Inner::Rocks { engine, .. } => engine.is_read_only(),
+			| Inner::Remote(backend) => !backend.is_writable(),
+		}
+	}
 
 	#[inline]
 	#[must_use]
 	/// Reports whether this database is a secondary RocksDB instance.
 	///
 	/// A secondary instance follows another database and does not act as its
-	/// primary writer. The value applies to every map owned by this database.
-	pub fn is_secondary(&self) -> bool { self.engine.is_secondary() }
+	/// primary writer. Only the RocksDB backend has the concept; the remote
+	/// backend is always the single primary writer it holds the lease for.
+	pub fn is_secondary(&self) -> bool {
+		match &self.inner {
+			| Inner::Rocks { engine, .. } => engine.is_secondary(),
+			| Inner::Remote(_) => false,
+		}
+	}
 }
 
 impl Database {

@@ -36,6 +36,31 @@ pub(crate) struct TestDb {
 	pub(crate) _server: Arc<Server>,
 }
 
+/// Builds a throwaway server from a raw configuration.
+///
+/// Shared by the RocksDB fixtures here and by the remote-backend fixtures,
+/// which configure `database_backend = "d1"` and a fake bridge URL instead of
+/// a database path.
+pub(crate) fn test_server(raw_config: &Figment) -> Result<Arc<Server>> {
+	let config = Config::new(raw_config)?;
+	let runtime = Handle::current();
+	let logging = Logging {
+		subscriber: Arc::new(NoSubscriber::new()),
+		reload: LogLevelReloadHandles::default(),
+		capture: Arc::new(State::new()),
+	};
+
+	let metrics = Metrics::new(Some(&runtime));
+
+	Ok(Arc::new(Server::new(
+		config,
+		Sources::default(),
+		Some(&runtime),
+		logging,
+		metrics,
+	)))
+}
+
 /// Opens a fresh throwaway database under the platform temp directory.
 ///
 /// `tag` distinguishes concurrent tests; the process id distinguishes
@@ -48,17 +73,7 @@ pub(crate) async fn new_test_database(tag: &str) -> Result<TestDb> {
 		.merge(("database_path", &path))
 		.merge(("test", ["fresh", "cleanup"]));
 
-	let config = Config::new(&raw_config)?;
-	let runtime = Handle::current();
-	let logging = Logging {
-		subscriber: Arc::new(NoSubscriber::new()),
-		reload: LogLevelReloadHandles::default(),
-		capture: Arc::new(State::new()),
-	};
-
-	let metrics = Metrics::new(Some(&runtime));
-	let server =
-		Arc::new(Server::new(config, Sources::default(), Some(&runtime), logging, metrics));
+	let server = test_server(&raw_config)?;
 	let database = Database::open(&server).await?;
 
 	Ok(TestDb { database, _server: server })

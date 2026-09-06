@@ -1,0 +1,23 @@
+[package]
+name = "tuwunel_bridge"
+description = "Wire contract of the private Worker<->Container bridge (ADR-0012): storage, lease, and media operations. No runtime, no I/O; builds for wasm32."
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lib]
+path = "mod.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+minicbor-serde.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_bytes.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

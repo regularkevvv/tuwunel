@@ -38,7 +38,7 @@ use tuwunel_service::{
 	client::read_response_capped,
 	media::MXC_LENGTH,
 	oauth::{
-		CODE_VERIFIER_LENGTH, Provider, SESSION_ID_LENGTH, Session, TokenResponse, UserInfo,
+		CODE_VERIFIER_LENGTH, IdTokenClaims, Provider, SESSION_ID_LENGTH, Session, UserInfo,
 		unique_id_sub,
 	},
 	users::{PASSWORD_SENTINEL, Register},
@@ -209,12 +209,16 @@ pub(crate) async fn sso_login_with_provider_route(
 
 async fn handle_sso_login(
 	services: &Services,
-	_client: &IpAddr,
+	client: &IpAddr,
 	idp_id: String,
 	redirect_url: String,
 	login_token: Option<String>,
 	action: Option<SsoRedirectAction>,
 ) -> Result<sso_login_with_provider::v3::Response> {
+	// Each redirect mints and stores a grant session, so an unthrottled endpoint
+	// is both a database filler and a way to farm authorization URLs.
+	services.oauth.check_rate_limit(*client)?;
+
 	let redirect_url: Url = redirect_url.parse().map_err(|e| {
 		err!(Request(InvalidParam(debug_warn!(
 			?e,
@@ -222,6 +226,8 @@ async fn handle_sso_login(
 			"Failed to parse redirect_url.",
 		))))
 	})?;
+
+	check_redirect_allowed(services, &redirect_url)?;
 
 	let provider = services.oauth.providers.get(&idp_id).await?;
 	let sess_id = utils::random_string(SESSION_ID_LENGTH);
@@ -335,14 +341,16 @@ async fn handle_sso_login(
 	})
 }
 
+// The callback body carries the authorization code, and the grant cookie
+// carries the CSRF nonce; neither may be recorded (plan.md, non-negotiable
+// invariant 7). Only the provider being answered for is.
 #[tracing::instrument(
 	name = "sso_callback"
 	level = "debug",
 	skip_all,
 	fields(
 		%client,
-		cookie = ?body.cookie,
-		body = ?body.body,
+		idp_id = body.body.idp_id,
 	),
 )]
 pub(crate) async fn sso_callback_route(
@@ -350,6 +358,11 @@ pub(crate) async fn sso_callback_route(
 	ClientIp(client): ClientIp,
 	body: Ruma<sso_callback::unstable::Request>,
 ) -> Result<sso_callback::unstable::Response> {
+	// The callback is reachable unauthenticated and its `state` is the only thing
+	// standing between a guess and a session lookup, so it is throttled per source
+	// address like the other OIDC endpoints.
+	services.oauth.check_rate_limit(client)?;
+
 	let sess_id = body
 		.body
 		.state
@@ -393,6 +406,8 @@ pub(crate) async fn sso_callback_route(
 		return Err!(Request(Unauthorized("Authorization grant session has expired.")));
 	}
 
+	check_grant_session_unused(&session)?;
+
 	if provider.check_cookie {
 		validate_session_cookie(&body.cookie, &provider, &session, sess_id)?;
 	}
@@ -402,7 +417,15 @@ pub(crate) async fn sso_callback_route(
 		.request_token((&provider, &session), code)
 		.await?;
 
-	let session = apply_token_response(session, token_response)?;
+	let session = session.apply_token_response(token_response)?;
+
+	// Verified before userinfo is even requested: the id_token is the provider's
+	// signed statement about who authenticated, and a userinfo response is only
+	// whatever the access token dereferences to.
+	let claims = services
+		.oauth
+		.verify_id_token((&provider, &session))
+		.await?;
 
 	let userinfo = services
 		.oauth
@@ -429,11 +452,20 @@ pub(crate) async fn sso_callback_route(
 			})
 		})?;
 
+	check_subject_binding(claims.as_ref(), &userinfo, provider.id())?;
+
 	let unique_id = unique_id_sub((&provider, &userinfo.sub))?;
 
 	let complete_identity = async |old_user_id: Option<OwnedUserId>| {
 		let session = Session {
 			user_info: Some(userinfo.clone()),
+			// Single-use authorization state: consumed here so the same `state`
+			// cannot open a second callback, and so the PKCE verifier and nonce are
+			// not retained past the exchange that needed them.
+			code_verifier: None,
+			query_nonce: None,
+			cookie_nonce: None,
+			authorize_expires_at: None,
 			..session
 		};
 
@@ -452,10 +484,11 @@ pub(crate) async fn sso_callback_route(
 				| true => "sso",
 				// Present in LDAP is an existing user to provision, not a new registration.
 				| false if ldap_user_exists(&services, &user_id).await => "ldap",
-				| false =>
+				| false => {
 					return Err!(Request(Forbidden(
 						"Registration from this provider is disabled"
-					))),
+					)));
+				},
 			};
 
 			register_user(&services, &provider, &session, &userinfo, &user_id, origin).await?;
@@ -503,6 +536,79 @@ pub(crate) async fn sso_callback_route(
 	Ok(sso_callback::unstable::Response { location, cookie: Some(cookie) })
 }
 
+/// Refuse a callback for an authorization state that has already been spent.
+///
+/// The PKCE verifier is cleared once a callback has been served, so the
+/// `state` is single-use here as well as at the provider. Without this a
+/// captured `state`+`code` pair could be re-presented until the grant session
+/// expired, and only the provider's own one-time use of the code
+/// (RFC 6749 §4.1.2) would stand in the way. It also refuses a session that was
+/// never an authorization request at all — an adopted or associated record,
+/// which carries no verifier.
+/// Refuse to send a finished login anywhere but an approved destination.
+///
+/// `finalize_login_redirect` appends a `loginToken` to this URL, and that token
+/// is exchangeable for a Matrix session. Without an allowlist a crafted sign-in
+/// link names a destination the attacker controls and the token is handed
+/// straight to them — an account takeover with one click and no password.
+///
+/// Entries are matched exactly as the built-in OIDC server matches a
+/// dynamically registered client's `redirect_uris`: by host when the URL has
+/// one, by scheme for a private-use URI that does not (RFC 8252). Two
+/// destinations are always permitted regardless of the list: the `uiaa:`
+/// scheme, which is this server's internal user-interactive-auth continuation
+/// and never leaves the process, and this server's own `well_known.client`
+/// host, through which the built-in OIDC server brokers back to itself.
+fn check_redirect_allowed(services: &Services, redirect_url: &Url) -> Result {
+	let own_host = services
+		.config
+		.well_known
+		.client
+		.as_ref()
+		.and_then(Url::host_str);
+
+	if redirect_allowlisted(&services.config.sso_allowed_redirect_hosts, own_host, redirect_url) {
+		return Ok(());
+	}
+
+	warn!(
+		scheme = redirect_url.scheme(),
+		host = redirect_url.host_str(),
+		"Refusing an SSO login redirect to an unlisted destination.",
+	);
+
+	Err!(Request(InvalidParam(
+		"redirectUrl is not an approved destination for this server."
+	)))
+}
+
+/// Whether `redirect_url` names an approved destination.
+///
+/// An empty `allowed` list imposes no restriction, which is the historical
+/// behaviour of this endpoint.
+fn redirect_allowlisted(allowed: &[String], own_host: Option<&str>, redirect_url: &Url) -> bool {
+	if allowed.is_empty() || redirect_url.scheme() == "uiaa" {
+		return true;
+	}
+
+	let name = redirect_url
+		.host_str()
+		.unwrap_or_else(|| redirect_url.scheme());
+
+	own_host.is_some_and(|host| host.eq_ignore_ascii_case(name))
+		|| allowed
+			.iter()
+			.any(|entry| entry.eq_ignore_ascii_case(name))
+}
+
+fn check_grant_session_unused(session: &Session) -> Result {
+	if session.code_verifier.is_none() {
+		return Err!(Request(Unauthorized("Authorization grant session has already been used.")));
+	}
+
+	Ok(())
+}
+
 fn validate_session_cookie(
 	cookies: &CookieJar,
 	provider: &Provider,
@@ -532,29 +638,35 @@ fn validate_session_cookie(
 	Ok(())
 }
 
-fn apply_token_response(session: Session, token: TokenResponse) -> Result<Session> {
-	let expires_at = token
-		.expires_in
-		.map(Duration::from_secs)
-		.map(timepoint_from_now)
-		.transpose()?;
+/// Bind the userinfo response to the verified `id_token`.
+///
+/// The account is chosen from the userinfo `sub`, so an attacker who can make
+/// the userinfo endpoint answer for a different subject — a substituted access
+/// token, a compromised or confused userinfo host — substitutes the account.
+/// When the provider signed an assertion about who authenticated, the two must
+/// name the same subject.
+fn check_subject_binding(
+	claims: Option<&IdTokenClaims>,
+	userinfo: &UserInfo,
+	idp_id: &str,
+) -> Result {
+	let Some(claims) = claims else {
+		return Ok(());
+	};
 
-	let refresh_token_expires_at = token
-		.refresh_token_expires_in
-		.map(Duration::from_secs)
-		.map(timepoint_from_now)
-		.transpose()?;
+	if claims.sub != userinfo.sub {
+		warn!(
+			idp_id,
+			"Provider userinfo subject does not match the verified id_token subject; refusing \
+			 the login."
+		);
 
-	Ok(Session {
-		scope: token.scope,
-		token_type: token.token_type,
-		access_token: token.access_token,
-		id_token: token.id_token,
-		expires_at,
-		refresh_token: token.refresh_token,
-		refresh_token_expires_at,
-		..session
-	})
+		return Err!(Request(Unauthorized(
+			"Provider userinfo subject does not match the verified id_token subject."
+		)));
+	}
+
+	Ok(())
 }
 
 fn chain_next_idp_url(
@@ -869,12 +981,28 @@ async fn try_user_id(
 		.inspect_err(|e| warn!(?username, "Username invalid: {e}"))
 		.ok()?;
 
+	if is_reserved_localpart(
+		services
+			.config
+			.forbidden_usernames
+			.is_match(username),
+		&services.globals.server_user,
+		&user_id,
+	) {
+		warn!(?username, "Username is reserved.");
+		return None;
+	}
+
+	// An appservice namespace is exclusive by definition (spec: Application
+	// Service API, "Exclusive namespaces"); the client registration endpoints
+	// refuse it, so an SSO provisioning path that did not would be the way
+	// around them.
 	if services
-		.config
-		.forbidden_usernames
-		.is_match(username)
+		.appservice
+		.is_exclusive_user_id(&user_id)
+		.await
 	{
-		warn!(?username, "Username forbidden.");
+		warn!(?username, "Username is reserved by an appservice namespace.");
 		return None;
 	}
 
@@ -915,6 +1043,16 @@ async fn try_user_id(
 	}
 
 	Some(user_id)
+}
+
+/// Localparts the SSO provisioning path must never claim.
+///
+/// `forbidden` is the operator's `forbidden_usernames` verdict for this
+/// localpart. The server user is refused unconditionally: it owns the admin
+/// room, and a login flow that could claim it would hand an SSO identity the
+/// server's own account.
+fn is_reserved_localpart(forbidden: bool, server_user: &UserId, user_id: &UserId) -> bool {
+	forbidden || user_id == server_user
 }
 
 fn parse_user_id(server_name: &ServerName, username: &str) -> Result<OwnedUserId> {
@@ -1004,6 +1142,132 @@ mod tests {
 
 		let message = format!("{error}");
 		assert!(message.contains("invalid base64"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn a_spent_grant_session_cannot_be_replayed() {
+		let fresh = Session {
+			code_verifier: Some("verifier".to_owned()),
+			..Default::default()
+		};
+
+		check_grant_session_unused(&fresh).expect("an unspent authorization state is accepted");
+
+		let spent = Session { code_verifier: None, ..fresh };
+
+		let error = check_grant_session_unused(&spent)
+			.expect_err("a spent authorization state must not open a second callback");
+
+		assert!(format!("{error}").contains("already been used"), "unexpected: {error}");
+	}
+
+	#[test]
+	fn an_adopted_session_is_not_a_usable_grant_session() {
+		// Adopted and associated records carry an identity but never a PKCE
+		// verifier, so a callback quoting their session id is refused too.
+		let adopted = Session {
+			idp_id: Some("cf-client-id".to_owned()),
+			sess_id: Some("adopted".to_owned()),
+			user_info: Some(UserInfo {
+				sub: "subject".to_owned(),
+				..Default::default()
+			}),
+			..Default::default()
+		};
+
+		check_grant_session_unused(&adopted)
+			.expect_err("a record that was never an authorization request is refused");
+	}
+
+	#[test]
+	fn userinfo_must_name_the_subject_the_id_token_asserted() {
+		let claims: IdTokenClaims = serde_json::from_value(json!({
+			"iss": "https://team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc",
+			"sub": "the-real-subject",
+			"aud": "abc",
+			"exp": 4_102_444_800_u64,
+		}))
+		.expect("claims deserialize");
+
+		let matching = UserInfo {
+			sub: "the-real-subject".to_owned(),
+			..Default::default()
+		};
+		check_subject_binding(Some(&claims), &matching, "abc")
+			.expect("a matching subject is accepted");
+
+		let substituted = UserInfo {
+			sub: "another-subject".to_owned(),
+			..Default::default()
+		};
+		let error = check_subject_binding(Some(&claims), &substituted, "abc")
+			.expect_err("a substituted userinfo subject must be refused");
+
+		assert!(format!("{error}").contains("does not match"), "unexpected: {error}");
+
+		// A provider that issues no id_token has nothing to bind against.
+		check_subject_binding(None, &substituted, "abc")
+			.expect("no assertion means no binding to check");
+	}
+
+	#[test]
+	fn a_login_redirect_may_only_reach_an_approved_destination() {
+		let allowed = ["app.example.com".to_owned(), "io.element.android".to_owned()];
+		let own = Some("matrix.example.com");
+		let url = |s: &str| Url::parse(s).expect("test URL parses");
+
+		// An empty list is the historical no-restriction behaviour.
+		assert!(redirect_allowlisted(&[], own, &url("https://evil.example/steal")));
+
+		assert!(redirect_allowlisted(&allowed, own, &url("https://app.example.com/#/login")));
+		assert!(
+			redirect_allowlisted(&allowed, own, &url("https://APP.EXAMPLE.COM/")),
+			"host comparison is case-insensitive"
+		);
+		assert!(
+			redirect_allowlisted(&allowed, own, &url("io.element.android:/callback")),
+			"a private-use scheme with no host matches a scheme entry"
+		);
+		assert!(
+			redirect_allowlisted(&allowed, own, &url("https://matrix.example.com/_matrix/x")),
+			"the server brokers back to itself through this endpoint"
+		);
+		assert!(
+			redirect_allowlisted(&allowed, own, &url("uiaa:session-id")),
+			"the internal user-interactive-auth continuation never leaves the process"
+		);
+
+		assert!(
+			!redirect_allowlisted(&allowed, own, &url("https://evil.example/steal")),
+			"an unlisted host must not receive a loginToken"
+		);
+		assert!(
+			!redirect_allowlisted(&allowed, own, &url("https://app.example.com.evil.example/")),
+			"a suffix of an allowed host is not that host"
+		);
+		assert!(
+			!redirect_allowlisted(&allowed, own, &url("evil.scheme:/callback")),
+			"an unlisted private-use scheme is refused"
+		);
+	}
+
+	#[test]
+	fn the_server_user_localpart_is_reserved() {
+		let server_user = UserId::parse("@conduit:example.com").expect("server user parses");
+		let ordinary = UserId::parse("@alice:example.com").expect("user parses");
+
+		assert!(
+			is_reserved_localpart(false, &server_user, &server_user),
+			"the server user is refused even when no forbidden pattern matches"
+		);
+		assert!(
+			!is_reserved_localpart(false, &server_user, &ordinary),
+			"an ordinary localpart is not reserved"
+		);
+		assert!(
+			is_reserved_localpart(true, &server_user, &ordinary),
+			"a forbidden_usernames match is refused"
+		);
 	}
 
 	#[test]

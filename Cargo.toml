@@ -712,6 +712,11 @@ package = "tuwunel_database"
 path = "src/database"
 default-features = false
 
+[workspace.dependencies.tuwunel-bridge]
+package = "tuwunel_bridge"
+path = "src/bridge"
+default-features = false
+
 [workspace.dependencies.tuwunel-core]
 package = "tuwunel_core"
 path = "src/core"

@@ -1808,6 +1808,24 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub refresh_token_reuse_revoke: bool,
 
+	/// Whether a login must request refresh tokens.
+	///
+	/// `access_token_ttl` only applies to a login that asked for a refresh
+	/// token; a client that does not ask is handed an access token with no
+	/// expiry at all. Where a short session lifetime is a security property
+	/// rather than a preference — an upstream identity provider whose policy is
+	/// re-checked at refresh time, for instance — that silent opt-out defeats
+	/// it.
+	///
+	/// When true, `POST /_matrix/client/v3/login` refuses a login that does not
+	/// set `refresh_token: true` instead of issuing an indefinite token. The
+	/// client is then visibly unsupported rather than invisibly exempt.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub refresh_token_required: bool,
+
 	/// Enable native registration and login on the built-in OIDC provider
 	/// (next-gen auth), authenticating Matrix clients against this server's own
 	/// accounts without a third-party `identity_provider`.
@@ -3719,6 +3737,31 @@ pub struct Config {
 	#[serde(default)]
 	pub sso_custom_providers_page: bool,
 
+	/// Allowlist of destinations a completed SSO login may redirect back to.
+	///
+	/// A client starts SSO with `?redirectUrl=`, and the finished login is sent
+	/// there carrying a `loginToken` that can be exchanged for a Matrix
+	/// session. An unrestricted list means a crafted sign-in link can send that
+	/// token to a destination the attacker controls, which is an account
+	/// takeover with one click and no password.
+	///
+	/// Entries are matched the same way as
+	/// `oidc_registration_allowed_redirect_hosts`: a `redirectUrl` with a host
+	/// matches an entry naming that host, compared case-insensitively, and a
+	/// private-use scheme with no host (RFC 8252, as in `io.element.android:/`)
+	/// matches an entry naming the scheme. This server's own
+	/// `well_known.client` host is always permitted, because the built-in OIDC
+	/// server brokers through this endpoint back to itself.
+	///
+	/// The default (empty) imposes no restriction, which is the historical
+	/// behaviour. Set it on any deployment where the Matrix session is the
+	/// thing being protected.
+	///
+	/// reloadable: yes
+	/// default: []
+	#[serde(default)]
+	pub sso_allowed_redirect_hosts: Vec<String>,
+
 	/// From MSC3824:
 	/// > If the client finds oauth_aware_preferred to be true then, assuming it
 	/// > supports that auth type, it should present this as the only
@@ -3815,6 +3858,86 @@ pub struct Config {
 	#[serde(default)]
 	pub device_key_update_encrypted_rooms_only: bool,
 
+	// ---- BEGIN storage-backend block (ADR-0002, ADR-0012) ----
+	/// Selects the storage backend every map and transaction runs on.
+	///
+	/// "rocksdb" opens the local engine at `database_path`. "d1" opens no
+	/// engine, pool or database directory at all: reads, bounded scans and
+	/// atomic commits travel the private Worker bridge to the canonical D1
+	/// database, and the process takes an expiring writer lease before it
+	/// reports ready. On "d1" the RocksDB-only admin commands (backups,
+	/// checkpoints, compaction, physical properties) answer "unsupported on
+	/// this backend".
+	///
+	/// default: "rocksdb"
+	#[serde(default = "default_database_backend")]
+	pub database_backend: String,
+
+	/// Base URL of the private Worker bridge, without a path.
+	///
+	/// Unset falls back to the `BRIDGE_URL` environment variable the Container
+	/// receives at start, then to `http://bridge.internal`, the virtual host
+	/// the Worker's outbound interception routes back into itself. Only used
+	/// when `database_backend = "d1"`.
+	///
+	/// example: "http://bridge.internal"
+	pub d1_bridge_url: Option<String>,
+
+	/// Bearer token presented on every bridge request.
+	///
+	/// Unset falls back to the `BRIDGE_TOKEN` environment variable the
+	/// Container receives at start. Keep it out of configuration files where
+	/// the environment can carry it. Only used when
+	/// `database_backend = "d1"`.
+	///
+	/// display: sensitive
+	pub d1_bridge_token: Option<String>,
+
+	/// Deadline for one bridge request, in milliseconds.
+	///
+	/// A request that does not answer within it is a transport failure: it is
+	/// retried with backoff (50 ms doubling to 2 s, five attempts) and a
+	/// commit is re-sent with the same idempotency key, so a reply lost after
+	/// the batch applied is recognized instead of applied twice.
+	///
+	/// default: 10000
+	#[serde(default = "default_d1_request_timeout_ms")]
+	pub d1_request_timeout_ms: u64,
+
+	/// Lifetime of the writer lease, in milliseconds.
+	///
+	/// The lease is acquired before the database is usable and renewed every
+	/// third of this value on the Worker's clock. A failed renewal makes the
+	/// lease uncertain and commits fail fast; the lifetime elapsing without a
+	/// confirmed renewal loses it, and the process stops accepting writes and
+	/// shuts down (ADR-0003).
+	///
+	/// default: 15000
+	#[serde(default = "default_d1_lease_ttl_ms")]
+	pub d1_lease_ttl_ms: u64,
+
+	/// Rows fetched per page of a remote scan.
+	///
+	/// Larger pages cost fewer round trips and more memory per open scan;
+	/// the protocol caps a page at 1000 rows.
+	///
+	/// default: 256
+	#[serde(default = "default_d1_scan_page")]
+	pub d1_scan_page: u32,
+
+	/// Size of the process-local read cache of the remote backend, in
+	/// mebibytes.
+	///
+	/// The cache holds values and confirmed absences, and is coherent because
+	/// this process is the only writer: every commit invalidates the keys it
+	/// touches. Zero disables caching, so every point read costs a round
+	/// trip.
+	///
+	/// default: 64
+	#[serde(default = "default_d1_read_cache_mb")]
+	pub d1_read_cache_mb: u32,
+
+	// ---- END storage-backend block ----
 	/// Defines named media storage providers.
 	///
 	/// Each map key names a provider, and each value selects a local or
@@ -4688,6 +4811,12 @@ pub struct IdentityProvider {
 	/// overrides.
 	pub userinfo_url: Option<Url>,
 
+	/// Overrides the JWKS URL where the provider publishes the public keys that
+	/// sign its `id_token`; the same caveats apply as with the other URL
+	/// overrides. It is normally taken from the discovery document's
+	/// `jwks_uri`.
+	pub jwks_url: Option<Url>,
+
 	/// Whether to perform discovery and adjust this provider's configuration
 	/// accordingly. This defaults to true. When true, it is an error when
 	/// discovery fails and authorizations will not be attempted to the
@@ -4741,6 +4870,67 @@ pub struct IdentityProvider {
 	/// default: false
 	#[serde(default)]
 	pub forward_action_prompt: bool,
+
+	/// Cryptographically verify the `id_token` returned by this provider.
+	///
+	/// When the token response carries an `id_token` it is checked against the
+	/// keys the provider publishes at its `jwks_url`: signature, exact `iss`,
+	/// an `aud` containing `client_id`, `exp`/`iat` within a minute of clock
+	/// skew, and the `nonce` sent in the authorization request. The subject it
+	/// asserts must also equal the `sub` in the userinfo response, so a
+	/// substituted access token cannot substitute the identity.
+	///
+	/// A provider that issues no `id_token` (a plain OAuth 2.0 service such as
+	/// GitHub) is unaffected; see `require_id_token` to demand one.
+	///
+	/// Turning this off means the account is chosen from whatever the userinfo
+	/// endpoint returns for a bearer token, with no proof the provider issued
+	/// it for this login. Only do so for a provider whose `id_token` cannot be
+	/// verified, and never for one that gates access to real accounts.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub verify_id_token: bool,
+
+	/// Require this provider to return a verifiable `id_token`.
+	///
+	/// When true the token response must contain an `id_token` and it must
+	/// pass the checks described under `verify_id_token`; a response without
+	/// one fails the login. Set this for any OpenID Connect provider that
+	/// authenticates real users, so a provider that silently stops issuing the
+	/// assertion cannot silently downgrade the login to a bearer-token lookup.
+	///
+	/// default: false
+	#[serde(default)]
+	pub require_id_token: bool,
+
+	/// Re-check this provider's authorization policy on every Matrix token
+	/// refresh.
+	///
+	/// When true, `POST /_matrix/client/v3/refresh` first asks the provider to
+	/// re-authorize the stored upstream grant before a new Matrix access token
+	/// is issued. Combined with a short `access_token_ttl` this is what bounds
+	/// the delay between an upstream policy change and the Matrix session
+	/// ending.
+	///
+	/// The re-check uses the `refresh_token` grant at the provider's token
+	/// endpoint when a refresh token was stored, and falls back to a userinfo
+	/// request carrying the stored access token when it was not. Cloudflare
+	/// Access re-evaluates its Access policies during the refresh-token grant,
+	/// which is what makes the first form a policy check and not merely a
+	/// liveness check.
+	///
+	/// A `4xx` answer (revoked grant, or policy no longer allowing the user)
+	/// removes the Matrix device and answers `M_UNKNOWN_TOKEN` with
+	/// `soft_logout: false`. A network failure or `5xx` answers a retryable
+	/// `M_CONNECTION_FAILED` and leaves the session intact, so a provider
+	/// outage does not log the whole server out; sessions then survive the
+	/// outage for as long as it lasts, which is the bounded tolerance this
+	/// option deliberately accepts.
+	///
+	/// default: false
+	#[serde(default)]
+	pub require_upstream_refresh: bool,
 }
 
 impl IdentityProvider {
@@ -4772,8 +4962,9 @@ impl IdentityProvider {
 
 /// Selects the backend for a named media storage provider.
 ///
-/// Local providers store objects beneath a filesystem path, while S3 providers
-/// use a compatible object store. The default variant disables the entry.
+/// Local providers store objects beneath a filesystem path, S3 providers use a
+/// compatible object store, and R2 providers reach a private bucket through the
+/// edge Worker's media bridge. The default variant disables the entry.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub enum StorageProvider {
 	/// Selects a local filesystem backend.
@@ -4790,6 +4981,15 @@ pub enum StorageProvider {
 	#[expect(non_camel_case_types)]
 	#[serde(rename = "s3", alias = "S3")]
 	s3(Box<StorageProviderS3>),
+
+	/// Selects private R2 reached through the edge Worker's media bridge.
+	///
+	/// The boxed settings name the bridge base URL and the bearer token; the
+	/// Worker holds the bucket binding, so no bucket, region, or credential
+	/// appears here (ADR-0005, ADR-0012).
+	#[expect(non_camel_case_types)]
+	#[serde(rename = "r2", alias = "R2")]
+	r2(Box<StorageProviderR2>),
 
 	/// Disables this storage provider entry.
 	///
@@ -4956,6 +5156,66 @@ pub struct StorageProviderS3 {
 	/// default: true
 	#[serde(default = "true_fn")]
 	pub startup_check: bool,
+}
+
+/// Configures private R2 object storage reached through the edge Worker's
+/// media bridge.
+///
+/// The Worker owns the bucket binding and validates every key, so this side
+/// carries no bucket, region, or credential: only the bridge base URL, a
+/// bearer token, and an optional path prefix. Objects are served exclusively
+/// through the authenticated Matrix media routes, so this provider presigns
+/// nothing (ADR-0005, ADR-0012).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.storage_provider.<ID>.r2",
+	section_aliases = "R2"
+)]
+pub struct StorageProviderR2 {
+	/// Base URL of the bridge, without a path: the scheme and host the Worker
+	/// answers on. e.g. "http://bridge.internal".
+	///
+	/// When unset the `BRIDGE_URL` environment variable is used, and failing
+	/// that the virtual host the Worker's outbound interception installs for
+	/// the container. The media endpoints are appended to this base.
+	pub url: Option<String>,
+
+	/// Bearer token presented on every bridge request. It is a Worker secret
+	/// the container receives in its environment; prefer `token_file` or the
+	/// `BRIDGE_TOKEN` environment variable to keeping it in this file.
+	///
+	/// default:
+	/// display: sensitive
+	#[serde(skip_serializing)]
+	#[debug("{}", redacted_debug!(token))]
+	pub token: Option<String>,
+
+	/// Absolute path to a file whose contents are the bearer token. Read once
+	/// at startup and trimmed. Used when `token` is unset.
+	pub token_file: Option<String>,
+
+	/// Optional key prefix within the bucket beneath which all of this
+	/// provider's objects are stored.
+	#[serde(alias = "path")]
+	pub base_path: Option<String>,
+
+	/// Enables checks performed at startup such as listing through the bridge.
+	/// Failures are considered critical startup errors which abort startup.
+	/// When set to false, a faulty bridge is only discovered with first use
+	/// and will not be a fatal error.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub startup_check: bool,
+
+	/// Deadline in seconds for one bridge request: the whole exchange for
+	/// metadata operations and uploads, and the inactivity deadline between
+	/// body chunks of a download.
+	///
+	/// default: 30
+	#[serde(default = "default_r2_request_timeout")]
+	pub request_timeout: u64,
 }
 
 /// Defines one inline Matrix application service registration.
@@ -5673,6 +5933,22 @@ fn default_redaction_retention_seconds() -> u64 { 5_184_000 }
 
 fn default_media_storage_providers() -> BTreeSet<String> { ["media".to_owned()].into() }
 
+// ---- BEGIN storage-backend defaults (ADR-0002, ADR-0012) ----
+
+fn default_database_backend() -> String { "rocksdb".to_owned() }
+
+fn default_d1_request_timeout_ms() -> u64 { 10_000 }
+
+fn default_d1_lease_ttl_ms() -> u64 { 15_000 }
+
+fn default_d1_scan_page() -> u32 { 256 }
+
+fn default_d1_read_cache_mb() -> u32 { 64 }
+
+// ---- END storage-backend defaults ----
+
 fn default_multipart_threshold() -> ByteSize { ByteSize::mib(100) }
 
 fn default_multipart_part_size() -> ByteSize { ByteSize::mib(10) }
+
+fn default_r2_request_timeout() -> u64 { 30 }

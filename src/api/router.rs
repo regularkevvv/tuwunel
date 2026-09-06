@@ -420,6 +420,9 @@ fn register_client_misc_routes(router: Router<State>) -> Router<State> {
 		.ruma_route(&client::well_known_client)
 		.ruma_route(&client::tuwunel_remote_version)
 		.route("/_tuwunel/server_version", get(client::tuwunel_server_version))
+		// Unauthenticated by design: the platform probes readiness before any
+		// credential exists (ADR-0012, "Lease").
+		.route("/_tuwunel/readiness", get(client::tuwunel_readiness))
 		.route(
 			"/_tuwunel/3pid/email/validate",
 			get(client::get_email_validate_route).post(client::post_email_validate_route),

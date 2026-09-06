@@ -8,7 +8,7 @@ pub(super) async fn database_files(&self, map: Option<String>, level: Option<i32
 	let mut files: Vec<_> = self
 		.services
 		.db
-		.engine
+		.engine()?
 		.file_list()
 		.collect::<Result<_>>()?;
 

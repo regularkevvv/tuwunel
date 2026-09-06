@@ -238,6 +238,106 @@ client_secret = "oauth-secret"
 	}
 }
 
+/// The deployment injects the identity provider's client secret through the
+/// environment rather than a file, so the exact spelling that reaches a nested
+/// `identity_provider` entry has to be a verified fact and not a guess.
+///
+/// `Env::prefixed("TUWUNEL_").global().split("__")` lowercases the name and
+/// splits it on the double underscore, so
+/// `TUWUNEL_IDENTITY_PROVIDER__ACCESS__CLIENT_SECRET` becomes
+/// `identity_provider.access.client_secret`. Figment merges dictionaries
+/// deeply, so the value lands inside the table a config file declared without
+/// discarding the rest of it — and a provider declared only in the environment
+/// needs no file table at all.
+///
+/// Both spellings are exercised in one test because they mutate the same
+/// process-wide environment and the harness runs tests concurrently.
+#[test]
+fn identity_provider_fields_can_be_set_from_the_environment() {
+	const TOML: &str = r#"[global]
+
+[global.identity_provider.access]
+brand = "oidc"
+client_id = "cf-client-id"
+client_secret = "from-the-file"
+"#;
+
+	// Overlaying a table the config file declared.
+	let overlay = [
+		("TUWUNEL_IDENTITY_PROVIDER__ACCESS__CLIENT_SECRET", "from-the-environment"),
+		("TUWUNEL_IDENTITY_PROVIDER__ACCESS__REQUIRE_UPSTREAM_REFRESH", "true"),
+		("TUWUNEL_IDENTITY_PROVIDER__ACCESS__REQUIRE_ID_TOKEN", "true"),
+	];
+
+	let config = with_environment(&overlay, TOML).expect("environment-overlaid config parses");
+	let provider = config
+		.identity_provider
+		.get("access")
+		.expect("the [global.identity_provider.access] entry survives the overlay");
+
+	assert_eq!(
+		provider.client_secret.as_deref(),
+		Some("from-the-environment"),
+		"the environment overrides the file's client_secret"
+	);
+	assert_eq!(
+		provider.client_id, "cf-client-id",
+		"the file's other keys survive the deep merge"
+	);
+	assert!(provider.require_upstream_refresh, "a bool field is set from the environment");
+	assert!(provider.require_id_token, "a second bool field is set from the environment");
+
+	// Declaring the whole provider in the environment, with no file table.
+	let whole = [
+		("TUWUNEL_IDENTITY_PROVIDER__ACCESS__BRAND", "oidc"),
+		("TUWUNEL_IDENTITY_PROVIDER__ACCESS__CLIENT_ID", "cf-client-id"),
+		("TUWUNEL_IDENTITY_PROVIDER__ACCESS__CLIENT_SECRET", "cf-client-secret"),
+		(
+			"TUWUNEL_IDENTITY_PROVIDER__ACCESS__ISSUER_URL",
+			"https://team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/cf-client-id",
+		),
+	];
+
+	let config = with_environment(&whole, "[global]\n").expect("environment-only config parses");
+	let provider = config
+		.identity_provider
+		.get("access")
+		.expect("a provider declared only in the environment exists");
+
+	assert_eq!(provider.brand, "oidc");
+	assert_eq!(provider.client_id, "cf-client-id");
+	assert_eq!(provider.client_secret.as_deref(), Some("cf-client-secret"));
+	assert_eq!(
+		provider.issuer_url.as_ref().map(Url::as_str),
+		Some("https://team.cloudflareaccess.com/cdn-cgi/access/sso/oidc/cf-client-id")
+	);
+}
+
+/// Parse `toml` with `vars` present in the process environment.
+///
+/// The variables are removed again before the result is inspected, so a failed
+/// assertion cannot leak them into a later test.
+fn with_environment(vars: &[(&str, &str)], toml: &str) -> Result<Config> {
+	for (name, value) in vars {
+		// SAFETY: no other test in this binary reads the process environment —
+		// the proxy tests inject their variables through a closure precisely so
+		// that they do not — and the only test that writes it is this one, whose
+		// two cases run in sequence.
+		unsafe { std::env::set_var(name, value) };
+	}
+
+	let merged =
+		Config::merge_environment(Figment::new().merge(Data::nested(Toml::string(toml))));
+	let config = Config::new(&merged);
+
+	for (name, _) in vars {
+		// SAFETY: as above.
+		unsafe { std::env::remove_var(name) };
+	}
+
+	config
+}
+
 #[test]
 fn check_warns_when_oidc_registration_token_is_set() {
 	let token_unset = "[global]\n";

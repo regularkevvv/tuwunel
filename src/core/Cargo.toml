@@ -63,6 +63,7 @@ cargo_toml.workspace = true
 checked_ops.workspace = true
 chrono.workspace = true
 clap.workspace = true
+tuwunel-bridge.workspace = true
 tuwunel-macros.workspace = true
 const-str.workspace = true
 core_affinity.workspace = true

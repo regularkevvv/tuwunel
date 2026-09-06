@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 
+use serde_bytes::ByteBuf;
 use tuwunel_core::{Result, implement};
 
 use crate::{
@@ -41,6 +42,15 @@ where
 					.expect("model-backend maps are catalog maps"),
 				Op::Delete { key: key.as_ref().into() },
 			)));
+		},
+		| Inner::Remote(remote) => {
+			remote
+				.backend
+				.commit(vec![tuwunel_bridge::Mutation::Delete {
+					map: self.remote_id(),
+					key: ByteBuf::from(key.as_ref().to_vec()),
+				}])
+				.await?;
 		},
 	}
 

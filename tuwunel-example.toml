@@ -1506,6 +1506,23 @@
 #
 #refresh_token_reuse_revoke = true
 
+# Whether a login must request refresh tokens.
+#
+# `access_token_ttl` only applies to a login that asked for a refresh
+# token; a client that does not ask is handed an access token with no
+# expiry at all. Where a short session lifetime is a security property
+# rather than a preference — an upstream identity provider whose policy is
+# re-checked at refresh time, for instance — that silent opt-out defeats
+# it.
+#
+# When true, `POST /_matrix/client/v3/login` refuses a login that does not
+# set `refresh_token: true` instead of issuing an indefinite token. The
+# client is then visibly unsupported rather than invisibly exempt.
+#
+# reloadable: yes
+#
+#refresh_token_required = false
+
 # Enable native registration and login on the built-in OIDC provider
 # (next-gen auth), authenticating Matrix clients against this server's own
 # accounts without a third-party `identity_provider`.
@@ -3245,6 +3262,30 @@
 #
 #sso_custom_providers_page = false
 
+# Allowlist of destinations a completed SSO login may redirect back to.
+#
+# A client starts SSO with `?redirectUrl=`, and the finished login is sent
+# there carrying a `loginToken` that can be exchanged for a Matrix
+# session. An unrestricted list means a crafted sign-in link can send that
+# token to a destination the attacker controls, which is an account
+# takeover with one click and no password.
+#
+# Entries are matched the same way as
+# `oidc_registration_allowed_redirect_hosts`: a `redirectUrl` with a host
+# matches an entry naming that host, compared case-insensitively, and a
+# private-use scheme with no host (RFC 8252, as in `io.element.android:/`)
+# matches an entry naming the scheme. This server's own
+# `well_known.client` host is always permitted, because the built-in OIDC
+# server brokers through this endpoint back to itself.
+#
+# The default (empty) imposes no restriction, which is the historical
+# behaviour. Set it on any deployment where the Matrix session is the
+# thing being protected.
+#
+# reloadable: yes
+#
+#sso_allowed_redirect_hosts = []
+
 # From MSC3824:
 # > If the client finds oauth_aware_preferred to be true then, assuming it
 # > supports that auth type, it should present this as the only
@@ -3317,6 +3358,74 @@
 # reloadable: yes
 #
 #device_key_update_encrypted_rooms_only = false
+
+# Selects the storage backend every map and transaction runs on.
+#
+# "rocksdb" opens the local engine at `database_path`. "d1" opens no
+# engine, pool or database directory at all: reads, bounded scans and
+# atomic commits travel the private Worker bridge to the canonical D1
+# database, and the process takes an expiring writer lease before it
+# reports ready. On "d1" the RocksDB-only admin commands (backups,
+# checkpoints, compaction, physical properties) answer "unsupported on
+# this backend".
+#
+#database_backend = "rocksdb"
+
+# Base URL of the private Worker bridge, without a path.
+#
+# Unset falls back to the `BRIDGE_URL` environment variable the Container
+# receives at start, then to `http://bridge.internal`, the virtual host
+# the Worker's outbound interception routes back into itself. Only used
+# when `database_backend = "d1"`.
+#
+# example: "http://bridge.internal"
+#
+#d1_bridge_url =
+
+# Bearer token presented on every bridge request.
+#
+# Unset falls back to the `BRIDGE_TOKEN` environment variable the
+# Container receives at start. Keep it out of configuration files where
+# the environment can carry it. Only used when
+# `database_backend = "d1"`.
+#
+#d1_bridge_token =
+
+# Deadline for one bridge request, in milliseconds.
+#
+# A request that does not answer within it is a transport failure: it is
+# retried with backoff (50 ms doubling to 2 s, five attempts) and a
+# commit is re-sent with the same idempotency key, so a reply lost after
+# the batch applied is recognized instead of applied twice.
+#
+#d1_request_timeout_ms = 10000
+
+# Lifetime of the writer lease, in milliseconds.
+#
+# The lease is acquired before the database is usable and renewed every
+# third of this value on the Worker's clock. A failed renewal makes the
+# lease uncertain and commits fail fast; the lifetime elapsing without a
+# confirmed renewal loses it, and the process stops accepting writes and
+# shuts down (ADR-0003).
+#
+#d1_lease_ttl_ms = 15000
+
+# Rows fetched per page of a remote scan.
+#
+# Larger pages cost fewer round trips and more memory per open scan;
+# the protocol caps a page at 1000 rows.
+#
+#d1_scan_page = 256
+
+# Size of the process-local read cache of the remote backend, in
+# mebibytes.
+#
+# The cache holds values and confirmed absences, and is coherent because
+# this process is the only writer: every commit invalidates the keys it
+# touches. Zero disables caching, so every point read costs a round
+# trip.
+#
+#d1_read_cache_mb = 64
 
 
 
@@ -3942,6 +4051,13 @@
 #
 #userinfo_url =
 
+# Overrides the JWKS URL where the provider publishes the public keys that
+# sign its `id_token`; the same caveats apply as with the other URL
+# overrides. It is normally taken from the discovery document's
+# `jwks_uri`.
+#
+#jwks_url =
+
 # Whether to perform discovery and adjust this provider's configuration
 # accordingly. This defaults to true. When true, it is an error when
 # discovery fails and authorizations will not be attempted to the
@@ -3987,6 +4103,61 @@
 # the request.
 #
 #forward_action_prompt = false
+
+# Cryptographically verify the `id_token` returned by this provider.
+#
+# When the token response carries an `id_token` it is checked against the
+# keys the provider publishes at its `jwks_url`: signature, exact `iss`,
+# an `aud` containing `client_id`, `exp`/`iat` within a minute of clock
+# skew, and the `nonce` sent in the authorization request. The subject it
+# asserts must also equal the `sub` in the userinfo response, so a
+# substituted access token cannot substitute the identity.
+#
+# A provider that issues no `id_token` (a plain OAuth 2.0 service such as
+# GitHub) is unaffected; see `require_id_token` to demand one.
+#
+# Turning this off means the account is chosen from whatever the userinfo
+# endpoint returns for a bearer token, with no proof the provider issued
+# it for this login. Only do so for a provider whose `id_token` cannot be
+# verified, and never for one that gates access to real accounts.
+#
+#verify_id_token = true
+
+# Require this provider to return a verifiable `id_token`.
+#
+# When true the token response must contain an `id_token` and it must
+# pass the checks described under `verify_id_token`; a response without
+# one fails the login. Set this for any OpenID Connect provider that
+# authenticates real users, so a provider that silently stops issuing the
+# assertion cannot silently downgrade the login to a bearer-token lookup.
+#
+#require_id_token = false
+
+# Re-check this provider's authorization policy on every Matrix token
+# refresh.
+#
+# When true, `POST /_matrix/client/v3/refresh` first asks the provider to
+# re-authorize the stored upstream grant before a new Matrix access token
+# is issued. Combined with a short `access_token_ttl` this is what bounds
+# the delay between an upstream policy change and the Matrix session
+# ending.
+#
+# The re-check uses the `refresh_token` grant at the provider's token
+# endpoint when a refresh token was stored, and falls back to a userinfo
+# request carrying the stored access token when it was not. Cloudflare
+# Access re-evaluates its Access policies during the refresh-token grant,
+# which is what makes the first form a policy check and not merely a
+# liveness check.
+#
+# A `4xx` answer (revoked grant, or policy no longer allowing the user)
+# removes the Matrix device and answers `M_UNKNOWN_TOKEN` with
+# `soft_logout: false`. A network failure or `5xx` answers a retryable
+# `M_CONNECTION_FAILED` and leaves the session intact, so a provider
+# outage does not log the whole server out; sessions then survive the
+# outage for as long as it lasts, which is the bounded tolerance this
+# option deliberately accepts.
+#
+#require_upstream_refresh = false
 
 
 
@@ -4109,6 +4280,48 @@
 # is started in '--maintenance' mode.
 #
 #startup_check = true
+
+
+
+#[global.storage_provider.<ID>.r2]
+
+# Base URL of the bridge, without a path: the scheme and host the Worker
+# answers on. e.g. "http://bridge.internal".
+#
+# When unset the `BRIDGE_URL` environment variable is used, and failing
+# that the virtual host the Worker's outbound interception installs for
+# the container. The media endpoints are appended to this base.
+#
+#url =
+
+# Bearer token presented on every bridge request. It is a Worker secret
+# the container receives in its environment; prefer `token_file` or the
+# `BRIDGE_TOKEN` environment variable to keeping it in this file.
+#
+#token =
+
+# Absolute path to a file whose contents are the bearer token. Read once
+# at startup and trimmed. Used when `token` is unset.
+#
+#token_file =
+
+# Optional key prefix within the bucket beneath which all of this
+# provider's objects are stored.
+#
+#base_path =
+
+# Enables checks performed at startup such as listing through the bridge.
+# Failures are considered critical startup errors which abort startup.
+# When set to false, a faulty bridge is only discovered with first use
+# and will not be a fatal error.
+#
+#startup_check = true
+
+# Deadline in seconds for one bridge request: the whole exchange for
+# metadata operations and uploads, and the inactivity deadline between
+# body chunks of a download.
+#
+#request_timeout = 30
 
 
 

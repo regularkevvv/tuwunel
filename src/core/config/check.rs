@@ -76,6 +76,7 @@ pub fn check(config: &Config) -> Result {
 	check_observability(config)?;
 	check_network(config)?;
 	check_storage(config)?;
+	check_database_backend(config)?;
 	check_registration(config)?;
 	check_registration_terms(config)?;
 	check_turn_and_media_misc(config)?;
@@ -260,6 +261,86 @@ fn database_filesystem(config: &Config) -> Option<Filesystem> {
 		.find_map(Result::ok)
 		.flatten()
 }
+
+// ---- BEGIN storage-backend checks (ADR-0002, ADR-0012) ----
+
+/// Validates the storage backend selection and its remote settings.
+///
+/// Only the two named backends exist, and an unrecognized value must fail
+/// rather than silently fall back to RocksDB and open a local database the
+/// operator never asked for. The remote settings are checked only when they
+/// apply.
+fn check_database_backend(config: &Config) -> Result {
+	let backend = config.database_backend.as_str();
+	if !backend.eq_ignore_ascii_case("rocksdb") && !backend.eq_ignore_ascii_case("d1") {
+		return Err!(Config(
+			"database_backend",
+			"Unknown storage backend {backend:?}; the supported values are \"rocksdb\" and \
+			 \"d1\"."
+		));
+	}
+
+	if !backend.eq_ignore_ascii_case("d1") {
+		return Ok(());
+	}
+
+	if config.d1_request_timeout_ms == 0 {
+		return Err!(Config(
+			"d1_request_timeout_ms",
+			"A bridge request needs a nonzero deadline."
+		));
+	}
+
+	// The protocol refuses a lease lifetime outside this window, and a
+	// lifetime under a second cannot survive one renewal round trip.
+	if !(1_000..=300_000).contains(&config.d1_lease_ttl_ms) {
+		return Err!(Config(
+			"d1_lease_ttl_ms",
+			"The writer lease lifetime must be between 1000 and 300000 milliseconds."
+		));
+	}
+
+	if config.d1_scan_page == 0 || config.d1_scan_page > tuwunel_bridge::MAX_SCAN_PAGE {
+		return Err!(Config(
+			"d1_scan_page",
+			"A scan page must hold between 1 and {} rows.",
+			tuwunel_bridge::MAX_SCAN_PAGE
+		));
+	}
+
+	let url = config
+		.d1_bridge_url
+		.as_deref()
+		.filter(|url| !url.is_empty());
+
+	if let Some(url) = url
+		&& Url::parse(url).is_err()
+	{
+		return Err!(Config("d1_bridge_url", "The bridge URL must be an absolute URL."));
+	}
+
+	if url.is_none() && std::env::var_os(tuwunel_bridge::ENV_URL).is_none() {
+		debug_info!(
+			"No d1_bridge_url or {} is set; the bridge defaults to the Worker's virtual host.",
+			tuwunel_bridge::ENV_URL
+		);
+	}
+
+	if !is_secret_set(None, config.d1_bridge_token.as_deref())
+		&& std::env::var_os(tuwunel_bridge::ENV_TOKEN).is_none()
+	{
+		return Err!(Config(
+			"d1_bridge_token",
+			"The d1 backend needs the bridge token: set d1_bridge_token or the {} environment \
+			 variable.",
+			tuwunel_bridge::ENV_TOKEN
+		));
+	}
+
+	Ok(())
+}
+
+// ---- END storage-backend checks ----
 
 fn check_registration(config: &Config) -> Result {
 	if config
@@ -556,6 +637,7 @@ fn check_identity_providers(config: &Config) -> Result {
 
 	for (i, provider) in &config.identity_provider {
 		check_identity_provider_secret(i, provider)?;
+		check_identity_provider_assertions(i, provider)?;
 	}
 
 	if !config.sso_custom_providers_page
@@ -646,6 +728,43 @@ fn check_identity_provider_secret(i: &str, provider: &IdentityProvider) -> Resul
 			"client_secret_file",
 			"Client secret file {secret_path:?} is empty on identity provider №{i}"
 		));
+	}
+
+	Ok(())
+}
+
+/// Validate that a provider can actually perform the checks it is configured
+/// to require.
+///
+/// `require_id_token` without a way to reach a JWKS, and
+/// `require_upstream_refresh` without a token endpoint, are configurations
+/// that would fail every login or every refresh at runtime rather than at
+/// startup. They are rejected here so the failure is a startup error and not a
+/// production outage.
+fn check_identity_provider_assertions(i: &str, provider: &IdentityProvider) -> Result {
+	if provider.require_id_token && !provider.discovery && provider.jwks_url.is_none() {
+		return Err!(Config(
+			"jwks_url",
+			"Identity provider №{i} requires an id_token but has discovery disabled and no \
+			 jwks_url, so no signing key can ever be found."
+		));
+	}
+
+	if provider.require_upstream_refresh && !provider.discovery && provider.token_url.is_none() {
+		return Err!(Config(
+			"token_url",
+			"Identity provider №{i} requires an upstream refresh but has discovery disabled and \
+			 no token_url, so no re-check can ever be made."
+		));
+	}
+
+	if !provider.verify_id_token && !provider.require_id_token {
+		warn!(
+			provider = provider.id(),
+			"verify_id_token is disabled for this identity provider. The account is then chosen \
+			 from whatever its userinfo endpoint returns for a bearer token, with no proof the \
+			 provider issued that token for this login."
+		);
 	}
 
 	Ok(())

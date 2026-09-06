@@ -15,13 +15,32 @@
 //! With `TUWUNEL_TRACE_OUT` the trace is written; with `TUWUNEL_TRACE_GOLDEN`
 //! it is compared against the frozen file and any divergence fails the test.
 //! Traces avoid `_CACHE`/TTL maps so no compaction policy can evict entries.
+//!
+//! `TUWUNEL_TRACE_BACKEND=remote` replays the same traces through the remote
+//! D1 backend against the fake bridge of `backend::remote::tests`, so the
+//! frozen evidence covers the third backend too:
+//!
+//! ```text
+//! TUWUNEL_TRACE_BACKEND=remote TUWUNEL_TRACE_GOLDEN=../../tests/storage-contract/goldens/trace.json \
+//!   cargo test -p tuwunel_database trace_golden -- --ignored
+//! ```
 
 use std::{env::var, fmt::Write as _, sync::Arc};
 
 use futures::TryStreamExt;
 
 use super::{TestDb, new_test_database};
-use crate::Map;
+use crate::{Database, Map, backend::remote::tests::Fake};
+
+/// Environment variable selecting the backend the traces replay through.
+const ENV_BACKEND: &str = "TUWUNEL_TRACE_BACKEND";
+
+/// Rows per remote scan page during a replay; large enough that a whole-map
+/// scan is a couple of pages, small enough that continuation is exercised.
+const REMOTE_SCAN_PAGE: u32 = 64;
+
+/// Mebibytes of remote read cache during a replay.
+const REMOTE_CACHE_MB: u32 = 16;
 
 /// Deterministic 64-bit generator (xorshift*), no external dependencies.
 struct Rng(u64);
@@ -249,10 +268,30 @@ fn write_scan(out: &mut String, op: &str, mi: usize, bound: &[u8], items: &[(Vec
 	out.push_str("]}");
 }
 
+/// Opens the database the traces replay through.
+///
+/// The returned fake bridge must outlive the database on the remote backend;
+/// it is the Worker for that replay.
+async fn trace_database() -> tuwunel_core::Result<(TestDb, Option<Fake>)> {
+	if var(ENV_BACKEND).as_deref() != Ok("remote") {
+		return Ok((new_test_database("trace-golden").await?, None));
+	}
+
+	let fake = Fake::start().await?;
+	let server = crate::backend::remote::tests::remote_server(
+		&fake.url,
+		REMOTE_SCAN_PAGE,
+		REMOTE_CACHE_MB,
+	)?;
+	let database = Database::open(&server).await?;
+
+	Ok((TestDb { database, _server: server }, Some(fake)))
+}
+
 #[tokio::test]
 #[ignore = "explicit parity evidence; run via scripts/traces.sh"]
 async fn trace_golden() -> tuwunel_core::Result {
-	let db = new_test_database("trace-golden").await?;
+	let (db, _fake) = trace_database().await?;
 
 	let mut all = String::from("[");
 	for (i, &seed) in SEEDS.iter().enumerate() {

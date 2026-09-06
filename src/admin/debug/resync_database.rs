@@ -10,7 +10,7 @@ pub(super) async fn resync_database(&self) -> Result {
 
 	self.services
 		.db
-		.engine
+		.engine()?
 		.update()
 		.map_err(|e| err!("Failed to update from primary: {e:?}"))
 }

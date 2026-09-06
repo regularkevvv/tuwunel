@@ -24,7 +24,7 @@ pub(super) async fn checkpoint_database(
 	let path = self
 		.blocking_db(move |db| {
 			match map {
-				| None => db.engine.checkpoint(&path, log_size)?,
+				| None => db.engine()?.checkpoint(&path, log_size)?,
 				| Some(map) => db.get(&map)?.checkpoint(&path)?,
 			}
 

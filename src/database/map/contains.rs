@@ -104,7 +104,9 @@ pub fn exists_blocking<K>(&self, key: &K) -> Result
 where
 	K: AsRef<[u8]> + ?Sized + Debug,
 {
-	if matches!(self.inner(), crate::map::Inner::Mem(_)) {
+	// The RocksDB cache-tier probe is a backend capability; other backends
+	// answer the question with the point read itself.
+	if !matches!(self.inner(), crate::map::Inner::Rocks(_)) {
 		return self.get_blocking(key).map(|_| ());
 	}
 

@@ -3,6 +3,7 @@
 //! Overloads are provided for the user to choose the most efficient
 //! serialization or bypass for pre=serialized (raw) inputs.
 
+use serde_bytes::ByteBuf;
 use tuwunel_core::{Result, implement};
 
 use crate::{
@@ -54,6 +55,16 @@ where
 					val: val.as_ref().into(),
 				},
 			)));
+		},
+		| Inner::Remote(remote) => {
+			remote
+				.backend
+				.commit(vec![tuwunel_bridge::Mutation::Put {
+					map: self.remote_id(),
+					key: ByteBuf::from(key.as_ref().to_vec()),
+					val: ByteBuf::from(val.as_ref().to_vec()),
+				}])
+				.await?;
 		},
 	}
 

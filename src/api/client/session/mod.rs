@@ -140,6 +140,17 @@ pub(crate) async fn login_route(
 
 	services.users.locked_check(&user_id).await?;
 
+	// `access_token_ttl` only binds a login that asked for a refresh token, so a
+	// client that does not ask would otherwise be handed an access token with no
+	// expiry — and, with an upstream identity provider, a session no refresh-time
+	// policy re-check ever reaches. Refuse the login instead of exempting it.
+	if services.config.refresh_token_required && !body.body.refresh_token {
+		return Err!(Request(Unknown(
+			"This server issues only short-lived access tokens. The client must request refresh \
+			 tokens (`refresh_token: true`) when logging in."
+		)));
+	}
+
 	// Generate a new token for the device
 	let (access_token, expires_in) = services
 		.users

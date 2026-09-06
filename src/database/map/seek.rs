@@ -10,7 +10,7 @@ use tuwunel_core::Result;
 
 use super::{Map, cache_iter_options_default, iter_options_default};
 use crate::{
-	backend::metrics::STATS,
+	backend::{metrics::STATS, remote::scan::RemoteSeek},
 	map::Inner,
 	pool::{Seek, into_send_seek},
 	stream,
@@ -22,10 +22,12 @@ use crate::{
 /// On the RocksDB backend, a block-cache probe selects inline iteration when
 /// the initial seek is cached; otherwise the seek runs on the engine's
 /// blocking pool. On the model backend the visible range is snapshotted at
-/// creation. The projection type determines whether each item contains a key
-/// alone or a key-value pair. Both paths share snapshot-at-creation
-/// visibility and the caller contract that items are valid only until the
-/// next poll.
+/// creation. On the remote backend the scan is registered with the backend and
+/// pages lazily, and any commit touching the map drains it first, so it too
+/// observes the state at its creation. The projection type determines whether
+/// each item contains a key alone or a key-value pair. Every path shares
+/// snapshot-at-creation visibility and the caller contract that items are
+/// valid only until the next poll.
 pub(super) fn seek_stream<'a, C, T>(
 	map: &'a Arc<Map>,
 	dir: Direction,
@@ -36,7 +38,19 @@ where
 	T: Project<'a> + Send + Unpin + 'a,
 {
 	if let Inner::Mem(mem) = map.inner() {
-		return Metered::new(Either::Right(MemSeek::new(map, &mem.store, dir, from)));
+		return Metered::new(Either::Right(Either::Left(MemSeek::new(
+			map, &mem.store, dir, from,
+		))));
+	}
+
+	if let Inner::Remote(remote) = map.inner() {
+		return Metered::new(Either::Right(Either::Right(RemoteSeek::new(
+			remote.backend.clone(),
+			map.id()
+				.expect("remote-backend maps are catalog maps"),
+			matches!(dir, Direction::Reverse),
+			from,
+		))));
 	}
 
 	let opts = iter_options_default(map.engine());

@@ -6,8 +6,9 @@ use crate::admin_command;
 pub(super) async fn delete_backups(&self, keep: usize) -> Result {
 	let count = self
 		.blocking_db(move |db| {
-			db.engine.backup_purge(keep)?;
-			db.engine.backup_count()
+			let engine = db.engine()?;
+			engine.backup_purge(keep)?;
+			engine.backup_count()
 		})
 		.await?;
 

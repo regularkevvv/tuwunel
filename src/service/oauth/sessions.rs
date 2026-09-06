@@ -4,24 +4,26 @@ pub mod association;
 use std::{
 	iter::once,
 	sync::{Arc, Mutex},
-	time::SystemTime,
+	time::{Duration, SystemTime},
 };
 
+use derive_more::Debug;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
-	Err, Result, at, implement,
+	Err, Result, at, implement, redacted_debug,
 	utils::{
 		MutexMap,
 		stream::{IterStream, ReadyExt, TryExpect},
+		timepoint_from_now,
 	},
 };
 use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Map};
 use url::Url;
 
 pub use self::adopt::Counts;
-use super::{Provider, Providers, UserInfo, unique_id as session_unique_id};
+use super::{Provider, Providers, TokenResponse, UserInfo, unique_id as session_unique_id};
 use crate::SelfServices;
 
 pub struct Sessions {
@@ -50,6 +52,11 @@ struct Data {
 /// The record carries provider, redirect, PKCE, nonce, and token data across
 /// the authorization flow. Once linked, it also associates the provider
 /// identity with a Matrix user.
+///
+/// Its `Debug` redacts every credential it holds. The record is recorded into
+/// tracing spans at `info` level, and no access token, refresh token, ID
+/// token, PKCE verifier or nonce may reach a log (plan.md, non-negotiable
+/// invariant 7).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
 	/// Identity Provider ID (the `client_id` in the configuration) associated
@@ -63,9 +70,11 @@ pub struct Session {
 	pub token_type: Option<String>,
 
 	/// Access token to the provider.
+	#[debug("{}", redacted_debug!(access_token))]
 	pub access_token: Option<String>,
 
 	/// OIDC ID token returned by the provider.
+	#[debug("{}", redacted_debug!(id_token))]
 	pub id_token: Option<String>,
 
 	/// Duration in seconds the access_token is valid for.
@@ -75,6 +84,7 @@ pub struct Session {
 	pub expires_at: Option<SystemTime>,
 
 	/// Token used to refresh the access_token.
+	#[debug("{}", redacted_debug!(refresh_token))]
 	pub refresh_token: Option<String>,
 
 	/// Duration in seconds the refresh_token is valid for
@@ -90,12 +100,15 @@ pub struct Session {
 	pub redirect_url: Option<Url>,
 
 	/// Challenge preimage
+	#[debug("{}", redacted_debug!(code_verifier))]
 	pub code_verifier: Option<String>,
 
 	/// Random string passed exclusively in the grant session cookie.
+	#[debug("{}", redacted_debug!(cookie_nonce))]
 	pub cookie_nonce: Option<String>,
 
 	/// Random single-use string passed in the provider redirect.
+	#[debug("{}", redacted_debug!(query_nonce))]
 	pub query_nonce: Option<String>,
 
 	/// Point in time the authorization grant session expires.
@@ -106,6 +119,45 @@ pub struct Session {
 
 	/// Last userinfo response persisted here.
 	pub user_info: Option<UserInfo>,
+}
+
+impl Session {
+	/// Fold a provider token response into this session.
+	///
+	/// Fields the response omits keep their stored value. RFC 6749 §5.1 lets a
+	/// refresh response leave out `scope` (identical to the request) and
+	/// `refresh_token` (the presented one stays valid), so overwriting them
+	/// unconditionally would discard the grant on the first refresh.
+	pub fn apply_token_response(self, token: TokenResponse) -> Result<Self> {
+		let expires_at = token
+			.expires_in
+			.map(Duration::from_secs)
+			.map(timepoint_from_now)
+			.transpose()?
+			.or(self.expires_at);
+
+		let refresh_token_expires_at = token
+			.refresh_token_expires_in
+			.map(Duration::from_secs)
+			.map(timepoint_from_now)
+			.transpose()?
+			.or(self.refresh_token_expires_at);
+
+		Ok(Self {
+			scope: token.scope.or(self.scope),
+			token_type: token.token_type.or(self.token_type),
+			access_token: token.access_token.or(self.access_token),
+			id_token: token.id_token.or(self.id_token),
+			refresh_token: token.refresh_token.or(self.refresh_token),
+			expires_in: token.expires_in.or(self.expires_in),
+			refresh_token_expires_in: token
+				.refresh_token_expires_in
+				.or(self.refresh_token_expires_in),
+			expires_at,
+			refresh_token_expires_at,
+			..self
+		})
+	}
 }
 
 /// Session Identifier type.

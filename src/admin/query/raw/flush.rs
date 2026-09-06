@@ -15,7 +15,7 @@ use crate::admin_command;
 pub(super) async fn raw_flush(&self) -> Result {
 	let timer = Instant::now();
 
-	self.blocking_db(|db| db.engine.sort()).await?;
+	self.blocking_db(|db| db.engine()?.sort()).await?;
 
 	let elapsed = timer.elapsed();
 

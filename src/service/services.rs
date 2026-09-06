@@ -242,6 +242,11 @@ pub async fn stop(&self) {
 		manager.stop().await;
 	}
 
+	// Stops the writer-lease renewal and releases the lease on the remote
+	// backend, so a successor need not wait out its expiry (ADR-0003). A
+	// no-op on RocksDB.
+	self.db.close().await;
+
 	debug_info!("Services shutdown complete.");
 }
 

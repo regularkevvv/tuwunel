@@ -17,6 +17,12 @@
 //! and `Drop` lowers it, so a guard's scope delimits the coalescing window;
 //! nested guards compose, and per-write flushing resumes only when the last one
 //! drops.
+//!
+//! Because corking is a RocksDB write-buffering detail with no observable
+//! effect, a database on another backend hands out an inert guard rather than
+//! an error: callers cork for throughput, never for semantics. On the remote
+//! backend a transaction is already the coalescing unit (one commit, one round
+//! trip).
 
 use std::sync::Arc;
 
@@ -33,7 +39,9 @@ use crate::{Database, Engine};
 /// only.
 #[clippy::has_significant_drop]
 pub struct Cork {
-	engine: Arc<Engine>,
+	/// The corked engine; `None` on a backend without a write-ahead log,
+	/// where the guard is inert.
+	engine: Option<Arc<Engine>>,
 
 	/// Flush the WAL buffer to the OS when the guard drops.
 	flush: bool,
@@ -50,7 +58,7 @@ impl Database {
 	/// flush. Use when the burst need not be durable at any particular point.
 	#[inline]
 	#[must_use]
-	pub fn cork(&self) -> Cork { Cork::new(&self.engine, false, false) }
+	pub fn cork(&self) -> Cork { Cork::new(self.engine().ok(), false, false) }
 
 	/// Open a coalescing window that flushes the WAL to the OS on drop.
 	///
@@ -59,7 +67,7 @@ impl Database {
 	/// the burst.
 	#[inline]
 	#[must_use]
-	pub fn cork_and_flush(&self) -> Cork { Cork::new(&self.engine, true, false) }
+	pub fn cork_and_flush(&self) -> Cork { Cork::new(self.engine().ok(), true, false) }
 
 	/// Open a coalescing window that syncs the WAL to disk on drop.
 	///
@@ -68,32 +76,41 @@ impl Database {
 	/// gone.
 	#[inline]
 	#[must_use]
-	pub fn cork_and_sync(&self) -> Cork { Cork::new(&self.engine, true, true) }
+	pub fn cork_and_sync(&self) -> Cork { Cork::new(self.engine().ok(), true, true) }
 }
 
 impl Cork {
 	/// Raise the engine's cork count and capture the on-drop flush policy.
+	///
+	/// Without an engine the guard is inert and its drop does nothing.
 	#[inline]
-	pub(super) fn new(engine: &Arc<Engine>, flush: bool, sync: bool) -> Self {
-		engine.cork();
-		Self { engine: engine.clone(), flush, sync }
+	pub(super) fn new(engine: Option<&Arc<Engine>>, flush: bool, sync: bool) -> Self {
+		if let Some(engine) = engine {
+			engine.cork();
+		}
+
+		Self { engine: engine.cloned(), flush, sync }
 	}
 }
 
 impl Drop for Cork {
 	/// Lower the cork count, then flush and/or sync the WAL per the policy.
 	fn drop(&mut self) {
-		self.engine.uncork();
+		let Some(engine) = self.engine.as_ref() else {
+			return;
+		};
+
+		engine.uncork();
 
 		if self.flush {
-			self.engine
+			engine
 				.flush()
 				.inspect_err(|error| error!(%error, "Failed to flush the write-ahead log."))
 				.ok();
 		}
 
 		if self.sync {
-			self.engine
+			engine
 				.sync()
 				.inspect_err(|error| error!(%error, "Failed to sync the write-ahead log."))
 				.ok();

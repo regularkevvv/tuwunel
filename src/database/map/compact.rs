@@ -79,7 +79,7 @@ pub fn compact_blocking(&self, opts: Options) -> Result {
 
 	let rocks = match self.inner() {
 		| crate::map::Inner::Rocks(rocks) => rocks,
-		| crate::map::Inner::Mem(_) =>
+		| crate::map::Inner::Mem(_) | crate::map::Inner::Remote(_) =>
 			return Err!("compaction is a RocksDB backend capability, unsupported here"),
 	};
 

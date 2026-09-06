@@ -73,6 +73,16 @@ pub(crate) struct Stats {
 	pub(crate) scan_items: OpStat,
 	/// Watcher registrations (prefix length).
 	pub(crate) watch: OpStat,
+	/// Remote backend: scan pages fetched (rows in the page).
+	pub(crate) remote_page: OpStat,
+	/// Remote backend: open scans drained by a commit (rows materialized).
+	pub(crate) remote_drain: OpStat,
+	/// Remote backend: point reads answered from the process-local read cache
+	/// (result size; a cached absence records 0).
+	pub(crate) remote_cache_hit: OpStat,
+	/// Remote backend: point reads that had to cross the bridge (always 0
+	/// bytes; only the count is meaningful).
+	pub(crate) remote_cache_miss: OpStat,
 }
 
 pub(crate) static STATS: Stats = Stats {
@@ -84,6 +94,10 @@ pub(crate) static STATS: Stats = Stats {
 	txn_bytes: OpStat::new(),
 	scan_items: OpStat::new(),
 	watch: OpStat::new(),
+	remote_page: OpStat::new(),
+	remote_drain: OpStat::new(),
+	remote_cache_hit: OpStat::new(),
+	remote_cache_miss: OpStat::new(),
 };
 
 impl OpStat {
@@ -110,6 +124,10 @@ pub(crate) fn snapshot() -> serde_json::Value {
 		"txn_bytes": STATS.txn_bytes.json(),
 		"scan_items": STATS.scan_items.json(),
 		"watch": STATS.watch.json(),
+		"remote_page": STATS.remote_page.json(),
+		"remote_drain": STATS.remote_drain.json(),
+		"remote_cache_hit": STATS.remote_cache_hit.json(),
+		"remote_cache_miss": STATS.remote_cache_miss.json(),
 	})
 }
 

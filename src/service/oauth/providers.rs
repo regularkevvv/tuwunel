@@ -1,9 +1,15 @@
-use std::collections::BTreeMap;
+use std::{
+	collections::BTreeMap,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use serde_json::{Map as JsonObject, Value as JsonValue};
 use tokio::sync::RwLock;
 pub use tuwunel_core::config::IdentityProvider as Provider;
-use tuwunel_core::{Err, Result, debug, debug::INFO_SPAN_LEVEL, err, implement};
+use tuwunel_core::{
+	Err, Result, debug, debug::INFO_SPAN_LEVEL, err, implement, jwt::jwk::JwkSet,
+};
 use url::Url;
 
 use crate::{SelfServices, client::read_response_capped};
@@ -13,7 +19,28 @@ use crate::{SelfServices, client::read_response_capped};
 pub struct Providers {
 	services: SelfServices,
 	providers: RwLock<BTreeMap<ProviderId, Provider>>,
+	jwks: RwLock<BTreeMap<ProviderId, CachedJwks>>,
 }
+
+/// A provider's JWKS together with the instant it was fetched.
+struct CachedJwks {
+	fetched_at: Instant,
+	keys: Arc<JwkSet>,
+}
+
+/// How long a fetched JWKS is served from cache before it is fetched again.
+///
+/// A provider rotates signing keys on its own schedule and publishes the new
+/// one before it signs with it, so a bounded staleness is normal; the
+/// unknown-`kid` path below shortens it when a rotation happens early.
+const JWKS_CACHE_TTL: Duration = Duration::from_mins(10);
+
+/// Floor on how often an unknown `kid` may force a JWKS fetch.
+///
+/// Without it a forged `kid` in an unauthenticated callback would be an
+/// amplified request generator pointed at the provider (RFC 8725 §3.7 is the
+/// same concern for key resolution).
+const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Identity Provider ID
 pub type ProviderId = String;
@@ -230,6 +257,16 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			.map(|url| provider.token_url.replace(url));
 	}
 
+	if provider.jwks_url.is_none() {
+		response
+			.get("jwks_uri")
+			.and_then(JsonValue::as_str)
+			.map(Url::parse)
+			.transpose()?
+			.or_else(|| make_url(&provider, "jwks").ok())
+			.map(|url| provider.jwks_url.replace(url));
+	}
+
 	if provider.callback_url.is_none()
 		&& let Some(server_url) = self.services.config.well_known.client.as_ref()
 	{
@@ -253,6 +290,78 @@ pub async fn discover(&self, provider: &Provider) -> Result<JsonValue> {
 		.client
 		.oauth
 		.get(discovery_url(provider)?)
+		.send()
+		.await?
+		.error_for_status()?;
+
+	let body = read_response_capped(response, limit).await?;
+
+	serde_json::from_slice(&body).map_err(Into::into)
+}
+
+/// Get a provider's JWKS, fetching it when the cache is cold or stale.
+///
+/// `unknown_kid` marks the retry a caller makes when a verified-looking token
+/// names a key the cached set does not hold: it bypasses the TTL, but no more
+/// often than `JWKS_REFRESH_MIN_INTERVAL`, so an attacker cannot turn forged
+/// key ids into a request amplifier.
+#[implement(Providers)]
+#[tracing::instrument(level = "debug", skip(self), fields(provider = provider.id()))]
+pub async fn jwks(&self, provider: &Provider, unknown_kid: bool) -> Result<Arc<JwkSet>> {
+	let min_age = if unknown_kid {
+		JWKS_REFRESH_MIN_INTERVAL
+	} else {
+		JWKS_CACHE_TTL
+	};
+
+	if let Some(keys) = self.get_cached_jwks(provider.id(), min_age).await {
+		return Ok(keys);
+	}
+
+	let mut cache = self.jwks.write().await;
+
+	// Another task may have fetched while this one waited for the lock.
+	if let Some(cached) = cache.get(provider.id())
+		&& cached.fetched_at.elapsed() < min_age
+	{
+		return Ok(cached.keys.clone());
+	}
+
+	let keys = Arc::new(self.fetch_jwks(provider).await?);
+
+	_ = cache.insert(provider.id().to_owned(), CachedJwks {
+		fetched_at: Instant::now(),
+		keys: keys.clone(),
+	});
+
+	Ok(keys)
+}
+
+#[implement(Providers)]
+async fn get_cached_jwks(&self, id: &str, min_age: Duration) -> Option<Arc<JwkSet>> {
+	self.jwks
+		.read()
+		.await
+		.get(id)
+		.filter(|cached| cached.fetched_at.elapsed() < min_age)
+		.map(|cached| cached.keys.clone())
+}
+
+/// Send a network request for the provider's JWKS.
+#[implement(Providers)]
+#[tracing::instrument(level = "debug", skip(self))]
+async fn fetch_jwks(&self, provider: &Provider) -> Result<JwkSet> {
+	let url = provider
+		.jwks_url
+		.clone()
+		.ok_or_else(|| err!(Config("jwks_url", "Missing JWKS URL in config")))?;
+
+	let limit = self.services.config.max_response_size;
+	let response = self
+		.services
+		.client
+		.oauth
+		.get(url)
 		.send()
 		.await?
 		.error_for_status()?;

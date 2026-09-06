@@ -11,6 +11,7 @@ use tuwunel_core::{Err, Result, err, implement, utils::result::MapExpect};
 use crate::{
 	Handle,
 	backend::metrics::STATS,
+	keyval::KeyBuf,
 	map::Inner,
 	util::{is_incomplete, map_err, or_else},
 };
@@ -20,7 +21,9 @@ use crate::{
 /// On the RocksDB backend, cache results consume cooperative scheduler budget
 /// while misses run on the engine's blocking pool, and the returned handle
 /// keeps its RocksDB value storage pinned for the handle's lifetime. On the
-/// model backend the handle owns its bytes.
+/// model backend the handle owns its bytes. On the remote backend the read is
+/// answered from the process-local read cache or costs one bridge round trip,
+/// and the handle owns its bytes.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), fields(%self), level = "trace")]
 pub fn get<K>(
@@ -42,11 +45,30 @@ where
 			.get
 			.record(result.as_ref().map_or(0, |val| val.len()));
 
-		return Either::Left(Either::Left(task::consume_budget().map(move |()| {
+		return Either::Left(Either::Left(Either::Left(task::consume_budget().map(move |()| {
 			result
 				.map(Handle::from)
 				.ok_or(err!(Request(NotFound("Not found in database"))))
-		})));
+		}))));
+	}
+
+	if let Inner::Remote(remote) = self.inner() {
+		let backend = remote.backend.clone();
+		let id = self
+			.id()
+			.expect("remote-backend maps are catalog maps");
+		let key: KeyBuf = key.as_ref().into();
+
+		return Either::Left(Either::Right(async move {
+			let result = backend.get(id, key.as_slice()).await?;
+			STATS
+				.get
+				.record(result.as_ref().map_or(0, |val| val.len()));
+
+			result
+				.map(Handle::from)
+				.ok_or(err!(Request(NotFound("Not found in database"))))
+		}));
 	}
 
 	let cached = self.get_cached(key);
@@ -57,9 +79,9 @@ where
 				.map_or(0, |c| c.as_ref().map_or(0, |h| h.len())),
 		);
 
-		return Either::Left(Either::Right(
+		return Either::Left(Either::Left(Either::Right(
 			task::consume_budget().map(move |()| cached.map_expect("data found in cache")),
-		));
+		)));
 	}
 
 	debug_assert!(matches!(cached, Ok(None)), "expected status Incomplete");
@@ -101,7 +123,12 @@ where
 /// Fetches a raw key synchronously and returns a value handle.
 ///
 /// The call may block on storage and populate RocksDB caches. On the model
-/// backend it locks the store briefly and returns owned bytes.
+/// backend it locks the store briefly and returns owned bytes. On the remote
+/// backend the read still crosses the bridge, so the calling thread is parked
+/// with [`block_in_place`](tokio::task::block_in_place) and the read is driven
+/// on the current multi-threaded runtime; the few startup call sites that read
+/// synchronously (signing keys, the global counter) are the reason this exists
+/// at all.
 #[implement(super::Map)]
 #[tracing::instrument(skip(self, key), name = "blocking", level = "trace")]
 pub fn get_blocking<K>(&self, key: &K) -> Result<Handle<'_>>
@@ -116,6 +143,18 @@ where
 					.expect("model-backend maps are catalog maps"),
 				key.as_ref(),
 			)
+			.map(Handle::from)
+			.ok_or(err!(Request(NotFound("Not found in database"))));
+	}
+
+	if let Inner::Remote(remote) = self.inner() {
+		let backend = remote.backend.clone();
+		let id = self
+			.id()
+			.expect("remote-backend maps are catalog maps");
+		let key: KeyBuf = key.as_ref().into();
+
+		return crate::util::blocking(async move { backend.get(id, key.as_slice()).await })??
 			.map(Handle::from)
 			.ok_or(err!(Request(NotFound("Not found in database"))));
 	}

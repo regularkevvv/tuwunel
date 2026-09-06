@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use axum::{Json, extract::State, response::IntoResponse};
 use futures::StreamExt;
+use http::StatusCode;
 use ruma::api::{client::tuwunel::get_remote_version, federation::discovery::get_server_version};
 use tuwunel_core::Result;
 
@@ -65,4 +66,45 @@ pub(crate) async fn tuwunel_remote_version(
 		data: serde_json::value::to_raw_value(&server)?,
 		rtt_ms: elapsed,
 	})
+}
+
+/// # `GET /_tuwunel/readiness`
+///
+/// Reports the storage backend and, on the remote D1 backend, the writer
+/// lease (ADR-0003, ADR-0012). `200` means this process may write: it holds
+/// the lease, has confirmed a renewal, and the countdown has not run out.
+/// `503` means it may not, whether because the lease is uncertain, lost, or
+/// never held, or because a RocksDB database was opened read-only.
+///
+/// The body is `{"backend": "d1"|"rocksdb", "lease": {"held", "epoch",
+/// "expires_in_ms", "uncertain"} | null}`; the lease is `null` off the remote
+/// backend, which has none.
+///
+/// Unauthenticated on purpose: the platform's health probe runs before any
+/// credential exists, and the response carries no user data.
+pub(crate) async fn tuwunel_readiness(State(services): State<crate::State>) -> impl IntoResponse {
+	let db = &services.db;
+	let lease = db.lease_status().map(|lease| {
+		serde_json::json!({
+			"held": lease.held,
+			"epoch": lease.epoch,
+			"expires_in_ms": lease.expires_in_ms,
+			"uncertain": lease.uncertain,
+		})
+	});
+
+	let writable = !db.is_read_only();
+	let status = if writable {
+		StatusCode::OK
+	} else {
+		StatusCode::SERVICE_UNAVAILABLE
+	};
+
+	(
+		status,
+		Json(serde_json::json!({
+			"backend": db.backend(),
+			"lease": lease,
+		})),
+	)
 }

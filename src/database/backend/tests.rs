@@ -1,45 +1,74 @@
-//! Backend contract suite (plan phase 1, deliverable 5).
+//! Backend contract suite (plan phase 1, deliverable 5; phase 2 extends it
+//! to the remote backend).
 //!
 //! Every case runs the same facade operations against the production RocksDB
-//! backend and the in-memory model backend and requires identical observable
-//! results: byte ordering, prefix boundaries, reverse scans, multi-map
-//! atomic batches, missing-key classification, post-commit visibility, and
-//! watcher timing. A backend-specific assumption inside the facade fails
-//! here before it can reach a remote backend.
+//! backend, the in-memory model backend, and the remote D1 backend driven by
+//! the fake bridge of [`super::remote::tests`], and requires identical
+//! observable results: byte ordering, prefix boundaries, reverse scans,
+//! multi-map atomic batches, missing-key classification, post-commit
+//! visibility, and watcher timing. A backend-specific assumption inside the
+//! facade fails here.
+//!
+//! The remote leg runs with a three-row scan page so continuation is the
+//! common path in every case rather than a special one.
 
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
-use tuwunel_core::Result;
+use tuwunel_core::{Result, Server};
 
-use super::{ids, mem};
-use crate::{Map, Txn, backend::Sink, tests::new_test_database};
+use super::{
+	Sink, ids, mem,
+	remote::{self, tests::Fake},
+};
+use crate::{Map, Txn, tests::new_test_database};
 
 /// The maps exercised by the differential cases; plain presets only.
 const MAPS: &[&str] = &["alias_roomid", "pduid_pdu", "global"];
 
-/// One rocks map and its model twin, mutated and queried in lockstep.
-struct Pair {
+/// Rows per remote scan page while the suite runs.
+const SCAN_PAGE: u32 = 3;
+
+/// One map opened on every backend, mutated and queried in lockstep.
+struct Trio {
 	rocks: Arc<Map>,
 	mem: Arc<Map>,
+	remote: Arc<Map>,
 }
+
+impl Trio {
+	/// The three handles in a fixed order; index 0 is the reference.
+	fn all(&self) -> [&Arc<Map>; 3] { [&self.rocks, &self.mem, &self.remote] }
+}
+
+/// Names used in assertion messages, parallel to [`Trio::all`].
+const BACKENDS: [&str; 3] = ["rocks", "mem", "remote"];
 
 struct Rig {
 	_db: crate::tests::TestDb,
 	rocks_db: Arc<crate::Database>,
 	store: Arc<mem::Store>,
-	pairs: Vec<Pair>,
+	_fake: Fake,
+	_server: Arc<Server>,
+	backend: Arc<remote::Backend>,
+	trios: Vec<Trio>,
 }
 
 async fn rig(tag: &str) -> Result<Rig> {
 	let db = new_test_database(tag).await?;
 	let store = mem::Store::new();
-	let pairs = MAPS
+
+	let fake = Fake::start().await?;
+	let server = remote::tests::remote_server(&fake.url, SCAN_PAGE, 1)?;
+	let backend = remote::Backend::open(&server).await?;
+
+	let trios = MAPS
 		.iter()
 		.map(|name| {
-			Ok(Pair {
+			Ok(Trio {
 				rocks: db.database.get(name)?.clone(),
 				mem: Map::open_mem(&store, name),
+				remote: Map::open_remote(&backend, name),
 			})
 		})
 		.collect::<Result<Vec<_>>>()?;
@@ -48,7 +77,10 @@ async fn rig(tag: &str) -> Result<Rig> {
 		rocks_db: db.database.clone(),
 		_db: db,
 		store,
-		pairs,
+		_fake: fake,
+		_server: server,
+		backend,
+		trios,
 	})
 }
 
@@ -93,21 +125,24 @@ async fn rev(map: &Arc<Map>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 		.await
 }
 
-async fn assert_maps_equal(pair: &Pair, ctx: &str) -> Result {
-	let rocks_fwd = fwd(&pair.rocks).await?;
-	let mem_fwd = fwd(&pair.mem).await?;
-	assert_eq!(rocks_fwd, mem_fwd, "{ctx}: forward scans diverge");
+async fn assert_maps_equal(trio: &Trio, ctx: &str) -> Result {
+	let reference = fwd(&trio.rocks).await?;
 
-	let mut expect_rev = rocks_fwd.clone();
+	let mut expect_rev = reference.clone();
 	expect_rev.reverse();
-	let rocks_rev = rev(&pair.rocks).await?;
-	let mem_rev = rev(&pair.mem).await?;
-	assert_eq!(rocks_rev, expect_rev, "{ctx}: rocks reverse scan is not the fwd mirror");
-	assert_eq!(mem_rev, expect_rev, "{ctx}: mem reverse scan is not the fwd mirror");
 
-	let mut sorted = rocks_fwd.clone();
+	for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+		assert_eq!(fwd(map).await?, reference, "{ctx}: {name} forward scan diverges");
+		assert_eq!(
+			rev(map).await?,
+			expect_rev,
+			"{ctx}: {name} reverse scan is not the fwd mirror"
+		);
+	}
+
+	let mut sorted = reference.clone();
 	sorted.sort();
-	assert_eq!(rocks_fwd, sorted, "{ctx}: forward scan not in lexicographic byte order");
+	assert_eq!(reference, sorted, "{ctx}: forward scan not in lexicographic byte order");
 
 	Ok(())
 }
@@ -115,70 +150,49 @@ async fn assert_maps_equal(pair: &Pair, ctx: &str) -> Result {
 #[tokio::test]
 async fn contract_point_ops_and_ordering() -> Result {
 	let rig = rig("contract-point").await?;
-	let pair = &rig.pairs[0];
+	let trio = &rig.trios[0];
 
 	for (i, key) in edge_keys().iter().enumerate() {
 		let val = vec![u8::try_from(i).expect("edge key index fits u8"); i % 7];
 
-		pair.rocks.insert(key, &val).await?;
-		pair.mem.insert(key, &val).await?;
-
-		let got = pair.rocks.get(key).await?;
-		assert_eq!(&*got, &*val, "rocks readback");
-		let got = pair.mem.get(key).await?;
-		assert_eq!(&*got, &*val, "mem readback");
+		for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+			map.insert(key, &val).await?;
+			let got = map.get(key).await?;
+			assert_eq!(&*got, &*val, "{name} readback");
+		}
 	}
 
-	assert_maps_equal(pair, "after inserts").await?;
+	assert_maps_equal(trio, "after inserts").await?;
 
-	// Missing keys are the not-found error on both backends.
+	// Missing keys are the not-found error on every backend.
 	let missing: &[u8] = b"\xFF\xFF\xFF\xFF-missing";
-	assert!(
-		pair.rocks
-			.get(&missing)
-			.await
-			.unwrap_err()
-			.is_not_found()
-	);
-	assert!(
-		pair.mem
-			.get(&missing)
-			.await
-			.unwrap_err()
-			.is_not_found()
-	);
-	assert!(!pair.rocks.contains(&missing).await);
-	assert!(!pair.mem.contains(&missing).await);
+	for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+		assert!(
+			map.get(&missing)
+				.await
+				.unwrap_err()
+				.is_not_found(),
+			"{name} misclassified a missing key"
+		);
+		assert!(!map.contains(&missing).await, "{name} claims a missing key exists");
+	}
 
 	// Deleting an absent key succeeds; deleting a present key removes it.
-	pair.rocks.remove(&missing).await?;
-	pair.mem.remove(&missing).await?;
 	let victim = edge_keys().swap_remove(3);
-	pair.rocks.remove(&victim).await?;
-	pair.mem.remove(&victim).await?;
-	assert!(
-		pair.rocks
-			.get(&victim)
-			.await
-			.unwrap_err()
-			.is_not_found()
-	);
-	assert!(
-		pair.mem
-			.get(&victim)
-			.await
-			.unwrap_err()
-			.is_not_found()
-	);
+	for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+		map.remove(&missing).await?;
+		map.remove(&victim).await?;
+		assert!(map.get(&victim).await.unwrap_err().is_not_found(), "{name} kept a deleted key");
+	}
 
-	assert_maps_equal(pair, "after deletes").await?;
+	assert_maps_equal(trio, "after deletes").await?;
 
 	// Empty values are legal records distinct from absence.
 	let empty_key: &[u8] = b"empty-value";
-	pair.rocks.insert(&empty_key, []).await?;
-	pair.mem.insert(&empty_key, []).await?;
-	assert_eq!(&*pair.rocks.get(&empty_key).await?, b"");
-	assert_eq!(&*pair.mem.get(&empty_key).await?, b"");
+	for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+		map.insert(&empty_key, []).await?;
+		assert_eq!(&*map.get(&empty_key).await?, b"", "{name} lost an empty value");
+	}
 
 	Ok(())
 }
@@ -186,79 +200,84 @@ async fn contract_point_ops_and_ordering() -> Result {
 #[tokio::test]
 async fn contract_prefix_and_seek_boundaries() -> Result {
 	let rig = rig("contract-prefix").await?;
-	let pair = &rig.pairs[1];
+	let trio = &rig.trios[1];
 
 	for key in edge_keys() {
-		pair.rocks.insert(&key, &key).await?;
-		pair.mem.insert(&key, &key).await?;
+		for map in trio.all() {
+			map.insert(&key, &key).await?;
+		}
 	}
 
 	for prefix in
 		[&b"p"[..], b"prefix", b"\xFF", b"\xFF\xFF", b"\x00", b"p\xFF", b"absent-prefix"]
 	{
-		let rocks: Vec<Vec<u8>> = pair
-			.rocks
-			.raw_keys_prefix(&prefix)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		let mem: Vec<Vec<u8>> = pair
-			.mem
-			.raw_keys_prefix(&prefix)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		assert_eq!(rocks, mem, "prefix scan diverges for {prefix:?}");
-		assert!(
-			rocks.iter().all(|k| k.starts_with(prefix)),
-			"prefix scan leaked keys for {prefix:?}"
-		);
+		let mut reference: Option<Vec<Vec<u8>>> = None;
+		let mut reference_rev: Option<Vec<Vec<u8>>> = None;
 
-		// Reverse prefix scans agree as well.
-		let rocks_rev: Vec<Vec<u8>> = pair
-			.rocks
-			.rev_raw_keys_prefix(&prefix)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		let mem_rev: Vec<Vec<u8>> = pair
-			.mem
-			.rev_raw_keys_prefix(&prefix)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		assert_eq!(rocks_rev, mem_rev, "reverse prefix scan diverges for {prefix:?}");
+		for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+			let keys: Vec<Vec<u8>> = map
+				.raw_keys_prefix(&prefix)
+				.map_ok(<[u8]>::to_vec)
+				.try_collect()
+				.await?;
+
+			assert!(
+				keys.iter().all(|k| k.starts_with(prefix)),
+				"{name} prefix scan leaked keys for {prefix:?}"
+			);
+
+			match &reference {
+				| None => reference = Some(keys),
+				| Some(expect) =>
+					assert_eq!(&keys, expect, "{name} prefix scan diverges for {prefix:?}"),
+			}
+
+			let keys_rev: Vec<Vec<u8>> = map
+				.rev_raw_keys_prefix(&prefix)
+				.map_ok(<[u8]>::to_vec)
+				.try_collect()
+				.await?;
+
+			match &reference_rev {
+				| None => reference_rev = Some(keys_rev),
+				| Some(expect) => assert_eq!(
+					&keys_rev, expect,
+					"{name} reverse prefix scan diverges for {prefix:?}"
+				),
+			}
+		}
 	}
 
 	// Seek-from boundaries: forward from-inclusive, reverse seek_for_prev.
 	for from in [&b"p"[..], b"prefix\x00", b"\xFF", b"\x00", b"zz-absent"] {
-		let rocks: Vec<Vec<u8>> = pair
-			.rocks
-			.raw_keys_from(&from)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		let mem: Vec<Vec<u8>> = pair
-			.mem
-			.raw_keys_from(&from)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		assert_eq!(rocks, mem, "keys_from diverges for {from:?}");
+		let mut reference: Option<Vec<Vec<u8>>> = None;
+		let mut reference_rev: Option<Vec<Vec<u8>>> = None;
 
-		let rocks_rev: Vec<Vec<u8>> = pair
-			.rocks
-			.rev_raw_keys_from(&from)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		let mem_rev: Vec<Vec<u8>> = pair
-			.mem
-			.rev_raw_keys_from(&from)
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
-		assert_eq!(rocks_rev, mem_rev, "rev_keys_from diverges for {from:?}");
+		for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+			let keys: Vec<Vec<u8>> = map
+				.raw_keys_from(&from)
+				.map_ok(<[u8]>::to_vec)
+				.try_collect()
+				.await?;
+
+			match &reference {
+				| None => reference = Some(keys),
+				| Some(expect) =>
+					assert_eq!(&keys, expect, "{name} keys_from diverges for {from:?}"),
+			}
+
+			let keys_rev: Vec<Vec<u8>> = map
+				.rev_raw_keys_from(&from)
+				.map_ok(<[u8]>::to_vec)
+				.try_collect()
+				.await?;
+
+			match &reference_rev {
+				| None => reference_rev = Some(keys_rev),
+				| Some(expect) =>
+					assert_eq!(&keys_rev, expect, "{name} rev_keys_from diverges for {from:?}"),
+			}
+		}
 	}
 
 	Ok(())
@@ -269,57 +288,61 @@ async fn contract_multi_map_batch_and_watchers() -> Result {
 	let rig = rig("contract-batch").await?;
 
 	// Queue one batch across all three maps on each backend.
-	let mut rocks_txn = rig.rocks_db.txn();
-	let mut mem_txn = Txn::new_with_sink(Sink::Mem(rig.store.clone()));
+	let mut txns = [
+		rig.rocks_db.txn(),
+		Txn::new_with_sink(Sink::Mem(rig.store.clone())),
+		Txn::new_with_sink(Sink::Remote(rig.backend.clone())),
+	];
 
-	let watch_rocks = rig.pairs[0].rocks.watch_raw_prefix(b"batch");
-	let watch_mem = rig.pairs[0].mem.watch_raw_prefix(b"batch");
-	futures::pin_mut!(watch_rocks, watch_mem);
+	let watch_rocks = rig.trios[0].rocks.watch_raw_prefix(b"batch");
+	let watch_mem = rig.trios[0].mem.watch_raw_prefix(b"batch");
+	let watch_remote = rig.trios[0].remote.watch_raw_prefix(b"batch");
+	futures::pin_mut!(watch_rocks, watch_mem, watch_remote);
 
-	for (i, pair) in rig.pairs.iter().enumerate() {
+	for (i, trio) in rig.trios.iter().enumerate() {
 		let key = format!("batch-key-{i}");
 		let val = format!("batch-val-{i}");
-		rocks_txn.insert_raw(&pair.rocks, &key, &val);
-		mem_txn.insert_raw(&pair.mem, &key, &val);
+		for (txn, map) in txns.iter_mut().zip(trio.all()) {
+			txn.insert_raw(map, &key, &val);
+		}
 	}
 
 	// Nothing is visible or notified before execute.
-	assert!(
-		rig.pairs[0]
-			.rocks
-			.get(&"batch-key-0")
-			.await
-			.unwrap_err()
-			.is_not_found(),
-		"rocks batch visible before commit"
-	);
-	assert!(
-		rig.pairs[0]
-			.mem
-			.get(&"batch-key-0")
-			.await
-			.unwrap_err()
-			.is_not_found(),
-		"mem batch visible before commit"
-	);
+	for (map, name) in rig.trios[0].all().into_iter().zip(BACKENDS) {
+		assert!(
+			map.get(&"batch-key-0")
+				.await
+				.unwrap_err()
+				.is_not_found(),
+			"{name} batch visible before commit"
+		);
+	}
 	assert!(watch_rocks.as_mut().now_or_never().is_none(), "rocks watcher fired early");
 	assert!(watch_mem.as_mut().now_or_never().is_none(), "mem watcher fired early");
+	assert!(watch_remote.as_mut().now_or_never().is_none(), "remote watcher fired early");
 
-	rocks_txn.execute().await?;
-	mem_txn.execute().await?;
+	for txn in txns {
+		txn.execute().await?;
+	}
 
 	// Everything is visible after commit; watchers have fired.
-	for (i, pair) in rig.pairs.iter().enumerate() {
+	for (i, trio) in rig.trios.iter().enumerate() {
 		let key = format!("batch-key-{i}");
 		let val = format!("batch-val-{i}");
-		assert_eq!(&*pair.rocks.get(&key.as_bytes()).await?, val.as_bytes());
-		assert_eq!(&*pair.mem.get(&key.as_bytes()).await?, val.as_bytes());
+		for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+			assert_eq!(
+				&*map.get(&key.as_bytes()).await?,
+				val.as_bytes(),
+				"{name} lost a committed batch entry"
+			);
+		}
 	}
 	assert!(watch_rocks.now_or_never().is_some(), "rocks watcher missed commit");
 	assert!(watch_mem.now_or_never().is_some(), "mem watcher missed commit");
+	assert!(watch_remote.now_or_never().is_some(), "remote watcher missed commit");
 
-	for (i, pair) in rig.pairs.iter().enumerate() {
-		assert_maps_equal(pair, &format!("map {i} after batch")).await?;
+	for (i, trio) in rig.trios.iter().enumerate() {
+		assert_maps_equal(trio, &format!("map {i} after batch")).await?;
 	}
 
 	Ok(())
@@ -328,14 +351,17 @@ async fn contract_multi_map_batch_and_watchers() -> Result {
 #[tokio::test]
 async fn contract_del_prefix_parity() -> Result {
 	let rig = rig("contract-delprefix").await?;
-	let pair = &rig.pairs[2];
+	let trio = &rig.trios[2];
 
 	for key in edge_keys() {
-		pair.rocks.insert(&key, b"x").await?;
-		pair.mem.insert(&key, b"x").await?;
+		for map in trio.all() {
+			map.insert(&key, b"x").await?;
+		}
 	}
 
-	for map in [&pair.rocks, &pair.mem] {
+	// Removing while iterating: every backend's scan keeps the view it began
+	// with, so the same keys disappear on all three.
+	for map in trio.all() {
 		let doomed: Vec<Vec<u8>> = map
 			.raw_keys_prefix(&&b"prefix"[..])
 			.map_ok(<[u8]>::to_vec)
@@ -345,13 +371,13 @@ async fn contract_del_prefix_parity() -> Result {
 			map.remove(&key).await?;
 		}
 	}
-	assert_maps_equal(pair, "after prefix delete").await?;
+	assert_maps_equal(trio, "after prefix delete").await?;
 
-	pair.rocks.clear().await?;
-	pair.mem.clear().await?;
-	assert_maps_equal(pair, "after clear").await?;
-	assert_eq!(pair.rocks.count().await, 0, "clear left rocks entries");
-	assert_eq!(pair.mem.count().await, 0, "clear left mem entries");
+	for (map, name) in trio.all().into_iter().zip(BACKENDS) {
+		map.clear().await?;
+		assert_eq!(map.count().await, 0, "clear left {name} entries");
+	}
+	assert_maps_equal(trio, "after clear").await?;
 
 	Ok(())
 }

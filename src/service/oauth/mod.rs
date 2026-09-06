@@ -1,6 +1,9 @@
+pub mod id_token;
 pub mod providers;
 pub mod server;
 pub mod sessions;
+#[cfg(test)]
+mod tests;
 pub mod token_response;
 pub mod user_info;
 
@@ -25,20 +28,22 @@ use ruma::{
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tuwunel_core::{
-	Err, Error, Result, err, implement,
+	Err, Error, Result, debug_warn, err, implement, info,
+	itertools::Itertools,
 	utils::{hash::sha256, result::LogErr, stream::ReadyExt},
 	warn,
 };
 use url::Url;
 
-use self::{providers::Providers, sessions::Sessions};
 pub use self::{
+	id_token::{IdTokenClaims, verify as verify_id_token_claims},
 	providers::{Provider, ProviderId},
 	server::Server,
 	sessions::{CODE_VERIFIER_LENGTH, SESSION_ID_LENGTH, Session, SessionId},
 	token_response::TokenResponse,
 	user_info::UserInfo,
 };
+use self::{providers::Providers, sessions::Sessions};
 use crate::{SelfServices, client::read_response_capped};
 
 /// Per-client-IP token-bucket table: last-refill instant and remaining tokens.
@@ -313,13 +318,13 @@ pub async fn request_token(
 /// formed prior to this call and could point at anything, however this function
 /// uses the oauth-specific http client and is configured for JSON with special
 /// casing for an `error` property in the response.
+///
+/// The response is deliberately not recorded: a token-endpoint reply is raw
+/// JSON containing the access, refresh and ID tokens, and no such value may
+/// reach a log at any level (plan.md, non-negotiable invariant 7). Callers that
+/// need a decoded view record their own redacted type instead.
 #[implement(Service)]
-#[tracing::instrument(
-	name = "request",
-	level = "debug",
-	ret(level = "trace"),
-	skip(self, body)
-)]
+#[tracing::instrument(name = "request", level = "debug", skip(self, body))]
 pub async fn request<Body>(
 	&self,
 	(provider, session): (Option<&Provider>, Option<&Session>),
@@ -367,6 +372,281 @@ where
 	}
 
 	Ok(response)
+}
+
+/// Verify the `id_token` a provider returned for this session.
+///
+/// Returns the verified claims, or `None` when the provider issued no
+/// `id_token` and does not require one. The provider's JWKS is served from the
+/// runtime cache; a token naming a key id the cached set does not hold forces
+/// one bounded re-fetch, which is how a key rotation between our last fetch
+/// and this login is picked up without turning forged key ids into traffic.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip_all, fields(provider = provider.id()))]
+pub async fn verify_id_token(
+	&self,
+	(provider, session): (&Provider, &Session),
+) -> Result<Option<IdTokenClaims>> {
+	// `require_id_token` implies verification: demanding the assertion and then
+	// not checking it would be worse than not demanding it.
+	if !provider.verify_id_token && !provider.require_id_token {
+		return Ok(None);
+	}
+
+	let Some(token) = session.id_token.as_deref() else {
+		if provider.require_id_token {
+			return Err!(Request(Unauthorized(
+				"Provider returned no id_token but require_id_token is set."
+			)));
+		}
+
+		return Ok(None);
+	};
+
+	let issuer = provider
+		.issuer_url
+		.as_ref()
+		.map(Url::as_str)
+		.ok_or_else(|| err!(Config("issuer_url", "Missing issuer URL in config")))?;
+
+	let kid = id_token::key_id(token);
+	let mut jwks = self.providers.jwks(provider, false).await?;
+
+	if kid
+		.as_deref()
+		.is_some_and(|kid| jwks.find(kid).is_none())
+	{
+		debug_warn!(
+			provider = provider.id(),
+			"id_token names a key id absent from the cached JWKS; re-fetching.",
+		);
+
+		jwks = self.providers.jwks(provider, true).await?;
+	}
+
+	id_token::verify(token, &jwks, issuer, &provider.client_id, session.query_nonce.as_deref())
+		.map(Some)
+}
+
+/// Outcome of re-checking an upstream authorization.
+///
+/// The three cases are deliberately distinct: only an explicit refusal from
+/// the provider may end a Matrix session, because a provider outage that
+/// looked like a refusal would log out every user at once.
+#[derive(Clone, Debug)]
+pub enum Recheck {
+	/// The provider re-authorized the grant under its current policy.
+	Allowed,
+
+	/// The provider refused: the grant is revoked, or its policy no longer
+	/// admits this user.
+	Denied(String),
+
+	/// The provider could not be reached, or failed transiently. The session
+	/// is left intact and the caller answers a retryable error.
+	Unavailable(String),
+}
+
+/// Re-check every upstream grant a user holds with a provider that demands it.
+///
+/// Returns `None` when no provider configured with `require_upstream_refresh`
+/// applies to this user, which is the case for accounts that never came
+/// through SSO — the sealed recovery account and appservice users included.
+///
+/// A refusal from any applicable provider denies; otherwise a single provider
+/// that could not be reached makes the whole answer unavailable. Denial wins
+/// over unavailability so a partial outage cannot mask a revocation.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip(self))]
+pub async fn recheck_user(&self, user_id: &UserId) -> Option<Recheck> {
+	let sessions: Vec<(Provider, Session)> = self
+		.user_sessions(user_id)
+		.ready_filter_map(Result::ok)
+		.ready_filter(|(provider, _)| provider.require_upstream_refresh)
+		.collect()
+		.await;
+
+	if sessions.is_empty() {
+		return None;
+	}
+
+	let mut unavailable = None;
+
+	for (provider, session) in &sessions {
+		match self.recheck_session((provider, session)).await {
+			| Recheck::Allowed => (),
+			| Recheck::Denied(reason) => return Some(Recheck::Denied(reason)),
+			| Recheck::Unavailable(reason) => unavailable = Some(Recheck::Unavailable(reason)),
+		}
+	}
+
+	Some(unavailable.unwrap_or(Recheck::Allowed))
+}
+
+/// Re-check one upstream grant and persist the refreshed grant on success.
+///
+/// The `refresh_token` grant is preferred: Cloudflare Access re-evaluates its
+/// Access policies while serving it ("Cloudflare will use the refresh token to
+/// obtain a new access token after checking the user's identity against your
+/// Access policies" — Cloudflare One docs, Generic OIDC application), so it is
+/// a policy check and not merely a liveness check. A provider or configuration
+/// that issued no refresh token falls back to a userinfo request with the
+/// stored access token, which proves only that the token is still accepted;
+/// that weaker guarantee is recorded here so a deployment relying on it is not
+/// misled.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip_all, fields(provider = provider.id()))]
+pub async fn recheck_session(&self, (provider, session): (&Provider, &Session)) -> Recheck {
+	let Some(sess_id) = session.sess_id.as_deref() else {
+		return Recheck::Denied("Session has no identifier to re-check.".to_owned());
+	};
+
+	if let Some(refresh_token) = session.refresh_token.clone() {
+		return match self
+			.request_refresh((provider, session), &refresh_token)
+			.await
+		{
+			| Err(error) => classify_upstream(&error),
+			| Ok(token) => {
+				let refreshed = match session.clone().apply_token_response(token) {
+					| Ok(refreshed) => refreshed,
+					| Err(error) => {
+						return Recheck::Unavailable(format!(
+							"Provider token response could not be applied: {error}"
+						));
+					},
+				};
+
+				self.sessions.put(&refreshed).await;
+				info!(%sess_id, provider = provider.id(), "Upstream grant re-authorized.");
+
+				Recheck::Allowed
+			},
+		};
+	}
+
+	if session.access_token.is_none() {
+		return Recheck::Denied("No upstream grant is stored for this session.".to_owned());
+	}
+
+	match self.request_userinfo((provider, session)).await {
+		| Ok(..) => Recheck::Allowed,
+		| Err(error) => classify_upstream(&error),
+	}
+}
+
+/// Classify a provider failure as a policy denial or a transient failure.
+///
+/// Only an explicit `4xx` from the provider denies, and `408`/`429` are
+/// excluded because they are the provider asking us to come back later. A
+/// network failure, a `5xx`, a malformed response, and any local error are all
+/// transient by construction: the alternative is a provider outage revoking
+/// every session on the server.
+#[must_use]
+pub fn classify_upstream(error: &Error) -> Recheck {
+	let status = match error {
+		| Error::Reqwest(error) => error.status(),
+		| Error::Request(.., status) => Some(*status),
+		| _ => None,
+	};
+
+	match status {
+		| Some(status)
+			if status.is_client_error()
+				&& status != StatusCode::REQUEST_TIMEOUT
+				&& status != StatusCode::TOO_MANY_REQUESTS =>
+			Recheck::Denied(format!("Provider refused the grant: {error}")),
+
+		| _ => Recheck::Unavailable(format!("Provider could not be reached: {error}")),
+	}
+}
+
+/// Network request exchanging a stored refresh token for a fresh grant.
+///
+/// No bearer is attached: RFC 6749 §6 authenticates the client with its
+/// credentials in the request body, and sending the expiring access token as a
+/// bearer here is what makes a re-check fail once it lapses.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn request_refresh(
+	&self,
+	(provider, _session): (&Provider, &Session),
+	refresh_token: &str,
+) -> Result<TokenResponse> {
+	#[derive(Debug, Serialize)]
+	struct RefreshQuery<'a> {
+		client_id: &'a str,
+		client_secret: &'a str,
+		grant_type: &'a str,
+		refresh_token: &'a str,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		scope: Option<&'a str>,
+	}
+
+	let client_secret = provider.get_client_secret().await?;
+	let scope = provider.scope.iter().join(" ");
+	let scope = (!scope.is_empty()).then_some(scope);
+
+	let query = RefreshQuery {
+		client_id: &provider.client_id,
+		client_secret: &client_secret,
+		grant_type: "refresh_token",
+		refresh_token,
+		scope: scope.as_deref(),
+	};
+
+	let url = provider
+		.token_url
+		.clone()
+		.ok_or_else(|| err!(Config("token_url", "Missing token URL in config")))?;
+
+	self.request((Some(provider), None), Method::POST, url, Some(query))
+		.await
+		.and_then(|value| serde_json::from_value(value).map_err(Into::into))
+}
+
+/// Clear the stored upstream grant for every session of a user.
+///
+/// The provider is asked to revoke the token first when it publishes a
+/// revocation endpoint, then the token material is dropped from the record.
+/// The identity association is deliberately kept: deleting it would unbind
+/// `(iss, sub)` from the account and the next login would register a new one.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip(self))]
+pub async fn clear_user_grants(&self, user_id: &UserId) {
+	let sessions: Vec<(Provider, Session)> = self
+		.user_sessions(user_id)
+		.ready_filter_map(Result::ok)
+		.collect()
+		.await;
+
+	for (provider, session) in sessions {
+		self.revoke_token((&provider, &session))
+			.await
+			.log_err()
+			.ok();
+
+		let sess_id = session.sess_id.clone();
+		let cleared = Session {
+			access_token: None,
+			refresh_token: None,
+			id_token: None,
+			expires_at: None,
+			expires_in: None,
+			refresh_token_expires_at: None,
+			refresh_token_expires_in: None,
+			token_type: None,
+			code_verifier: None,
+			query_nonce: None,
+			cookie_nonce: None,
+			authorize_expires_at: None,
+			..session
+		};
+
+		self.sessions.put(&cleared).await;
+
+		info!(?sess_id, provider = provider.id(), "Cleared stored upstream grant.");
+	}
 }
 
 /// Generate a unique-id string determined by the combination of `Provider` and

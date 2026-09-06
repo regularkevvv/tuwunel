@@ -53,7 +53,7 @@ use self::watch::Watch;
 pub use self::{get_batch::Get, qry_batch::Qry};
 use crate::{
 	Engine,
-	backend::{MapId, Sink, ids, mem},
+	backend::{MapId, Sink, ids, mem, remote},
 	util::map_err,
 };
 
@@ -81,6 +81,8 @@ pub(crate) enum Inner {
 	Rocks(RocksMap),
 	/// One keyspace of the in-memory model store.
 	Mem(MemMap),
+	/// One keyspace of the remote D1 backend, addressed by [`MapId`].
+	Remote(RemoteMap),
 }
 
 /// RocksDB backend state for one map.
@@ -95,6 +97,15 @@ pub(crate) struct RocksMap {
 /// Model backend state for one map.
 pub(crate) struct MemMap {
 	pub(crate) store: Arc<mem::Store>,
+}
+
+/// Remote backend state for one map.
+///
+/// Nothing per-map is stored remotely: the map is its [`MapId`], carried on
+/// every request, and the backend holds the connection, lease, cache and
+/// open-scan registry shared by all maps.
+pub(crate) struct RemoteMap {
+	pub(crate) backend: Arc<remote::Backend>,
 }
 
 impl Map {
@@ -133,8 +144,8 @@ impl Map {
 		not(test),
 		expect(
 			dead_code,
-			reason = "contract-suite constructor until a runtime backend selector lands in \
-			          phase 2"
+			reason = "the model backend is a contract-suite oracle; it is never selectable at \
+			          runtime"
 		)
 	)]
 	pub(crate) fn open_mem(store: &Arc<mem::Store>, name: &'static str) -> Arc<Self> {
@@ -144,6 +155,23 @@ impl Map {
 			watch: Watch::default(),
 			selfref: selfref.clone(),
 			inner: Inner::Mem(MemMap { store: store.clone() }),
+		})
+	}
+
+	/// Opens a catalog map on the remote D1 backend.
+	///
+	/// # Panics
+	///
+	/// Panics when `name` is not a catalog map: remote backends address rows
+	/// by stable [`MapId`] only, so a foreign column family has no remote
+	/// representation.
+	pub(crate) fn open_remote(backend: &Arc<remote::Backend>, name: &'static str) -> Arc<Self> {
+		Arc::new_cyclic(|selfref| Self {
+			name,
+			id: Some(ids::map_id(name).expect("remote-backend maps must be catalog maps")),
+			watch: Watch::default(),
+			selfref: selfref.clone(),
+			inner: Inner::Remote(RemoteMap { backend: backend.clone() }),
 		})
 	}
 
@@ -209,12 +237,26 @@ impl Map {
 	#[inline]
 	pub(crate) fn id(&self) -> Option<MapId> { self.id }
 
+	/// Returns this map's stable numeric identity for a remote backend.
+	///
+	/// # Panics
+	///
+	/// Panics when the map has no catalog id; `open_remote` refuses such a
+	/// map, so a remote-path caller can never observe one.
+	#[inline]
+	pub(crate) fn remote_id(&self) -> u16 {
+		self.id
+			.expect("remote-backend maps are catalog maps")
+			.0
+	}
+
 	/// Returns the backend instance owning this map.
 	#[inline]
 	pub(crate) fn sink(&self) -> Sink {
 		match &self.inner {
 			| Inner::Rocks(rocks) => Sink::Rocks(rocks.engine.clone()),
 			| Inner::Mem(mem) => Sink::Mem(mem.store.clone()),
+			| Inner::Remote(remote) => Sink::Remote(remote.backend.clone()),
 		}
 	}
 
@@ -243,7 +285,8 @@ impl Map {
 	pub(crate) fn rocks(&self) -> &RocksMap {
 		match &self.inner {
 			| Inner::Rocks(rocks) => rocks,
-			| Inner::Mem(_) => unreachable!("rocks path reached for a model-backend map"),
+			| Inner::Mem(_) | Inner::Remote(_) =>
+				unreachable!("rocks path reached for a non-RocksDB map"),
 		}
 	}
 
@@ -252,8 +295,9 @@ impl Map {
 	fn rocks_capability(&self) -> Result<&RocksMap> {
 		match &self.inner {
 			| Inner::Rocks(rocks) => Ok(rocks),
-			| Inner::Mem(_) =>
-				Err(err!("operation is a RocksDB backend capability, unsupported here")),
+			| Inner::Mem(_) | Inner::Remote(_) => Err(err!(
+				"operation is a RocksDB backend capability, unsupported on this backend"
+			)),
 		}
 	}
 

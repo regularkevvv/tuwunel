@@ -29,18 +29,20 @@
 //!   WAL control) is a per-backend capability, not part of this contract.
 //!   Callers must tolerate `Unsupported`.
 //!
-//! Two implementations exist in phase 1: the production RocksDB engine
-//! (`crate::engine`, reached through the `Rocks` arms below) and the
-//! in-memory model backend ([`mem`]), which doubles as the semantic oracle
-//! for the differential contract suite. `Compare-and-set` and `increment`
-//! mutations enter the enum with the remote backend (phase 2): no current
-//! caller needs them locally because the single-writer process serializes
-//! read-modify-write at the service layer, and defining them without a
-//! consumer would freeze semantics nothing exercises.
+//! Three implementations exist: the production RocksDB engine
+//! (`crate::engine`, reached through the `Rocks` arms below), the in-memory
+//! model backend ([`mem`]), which doubles as the semantic oracle for the
+//! differential contract suite, and the [`remote`] D1 backend that reaches
+//! the canonical database through the Worker bridge (ADR-0012).
+//! `Compare-and-set` and `increment` mutations are still absent from the
+//! enum: no caller needs them because the single-writer process serializes
+//! read-modify-write at the service layer (ADR-0012, "Commits"), and defining
+//! them without a consumer would freeze semantics nothing exercises.
 
 pub mod ids;
 pub mod mem;
 pub(crate) mod metrics;
+pub mod remote;
 #[cfg(test)]
 mod tests;
 
@@ -114,6 +116,8 @@ pub(crate) enum Sink {
 	Rocks(Arc<Engine>),
 	/// The in-memory model backend.
 	Mem(Arc<mem::Store>),
+	/// The remote D1 backend behind the Worker bridge.
+	Remote(Arc<remote::Backend>),
 }
 
 impl Sink {
@@ -123,6 +127,7 @@ impl Sink {
 		match (self, other) {
 			| (Self::Rocks(a), Self::Rocks(b)) => Arc::ptr_eq(a, b),
 			| (Self::Mem(a), Self::Mem(b)) => Arc::ptr_eq(a, b),
+			| (Self::Remote(a), Self::Remote(b)) => Arc::ptr_eq(a, b),
 			| _ => false,
 		}
 	}
