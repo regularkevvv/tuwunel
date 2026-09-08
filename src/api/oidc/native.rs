@@ -179,9 +179,10 @@ async fn native_submit(
 	};
 
 	let token = utils::random_string(LOGIN_TOKEN_LENGTH);
-	let _expires_in = services
+	let _expires_in: u64 = services
 		.users
-		.create_login_token(&user_id, &token);
+		.create_login_token(&user_id, &token)
+		.await;
 
 	let redirect = complete_redirect(services, context, &token)?;
 

@@ -531,7 +531,7 @@ pub(crate) async fn sso_callback_route(
 
 	let next_idp_url = chain_next_idp_url(&services, &provider, &session, idp_id);
 
-	let location = finalize_login_redirect(&services, &session, next_idp_url, &user_id)?;
+	let location = finalize_login_redirect(&services, &session, next_idp_url, &user_id).await?;
 
 	Ok(sso_callback::unstable::Response { location, cookie: Some(cookie) })
 }
@@ -698,16 +698,17 @@ fn chain_next_idp_url(
 		})
 }
 
-fn finalize_login_redirect(
+async fn finalize_login_redirect(
 	services: &Services,
 	session: &Session,
 	next_idp_url: Option<Url>,
 	user_id: &UserId,
 ) -> Result<String> {
 	let login_token = utils::random_string(TOKEN_LENGTH);
-	let _login_token_expires_in = services
+	let _login_token_expires_in: u64 = services
 		.users
-		.create_login_token(user_id, &login_token);
+		.create_login_token(user_id, &login_token)
+		.await;
 
 	let location = next_idp_url
 		.or_else(|| session.redirect_url.clone())
