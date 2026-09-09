@@ -1,7 +1,9 @@
+mod requests;
+
 use std::{
-	collections::BTreeMap,
 	ops::ControlFlow,
 	sync::{Arc, RwLock},
+	time::Instant,
 };
 
 use futures::{TryStreamExt, pin_mut};
@@ -12,7 +14,7 @@ use ruma::{
 			AuthData, AuthType, EmailIdentity, Password, ThirdpartyIdCredentials, UiaaInfo,
 			UserIdentifier,
 		},
-		error::{ErrorKind, StandardErrorBody},
+		error::{ErrorKind, LimitExceededErrorData, StandardErrorBody},
 	},
 };
 use tuwunel_core::{
@@ -22,7 +24,7 @@ use tuwunel_core::{
 use tuwunel_database::{Deserialized, Json, Map};
 
 pub struct Service {
-	userdevicesessionid_uiaarequest: RwLock<RequestMap>,
+	userdevicesessionid_uiaarequest: RwLock<requests::Requests>,
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
 }
@@ -31,7 +33,6 @@ struct Data {
 	userdevicesessionid_uiaainfo: Arc<Map>,
 }
 
-type RequestMap = BTreeMap<RequestKey, CanonicalJsonValue>;
 type RequestKey = (OwnedUserId, OwnedDeviceId, String);
 
 pub const SESSION_ID_LENGTH: usize = 32;
@@ -45,7 +46,7 @@ enum EmailIdentityMode {
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			userdevicesessionid_uiaarequest: RwLock::new(RequestMap::new()),
+			userdevicesessionid_uiaarequest: RwLock::new(requests::Requests::default()),
 			db: Data {
 				userdevicesessionid_uiaainfo: args.db["userdevicesessionid_uiaainfo"].clone(),
 			},
@@ -64,19 +65,21 @@ pub async fn create(
 	device_id: &DeviceId,
 	uiaainfo: &UiaaInfo,
 	json_body: &CanonicalJsonValue,
-) {
-	// TODO: better session error handling (why is uiaainfo.session optional in
-	// ruma?)
+) -> Result {
 	let session = uiaainfo
 		.session
 		.as_ref()
-		.expect("session should be set");
+		.ok_or_else(|| err!(Request(InvalidParam("Missing UIAA session identifier."))))?;
 
-	self.set_uiaa_request(user_id, device_id, session, json_body);
+	self.set_uiaa_request(user_id, device_id, session, json_body)?;
 
-	self.update_uiaa_session(user_id, device_id, session, Some(uiaainfo))
-		.await
-		.expect("database write error");
+	let result = self
+		.update_uiaa_session(user_id, device_id, session, Some(uiaainfo))
+		.await;
+	if result.is_err() {
+		self.remove_uiaa_request(user_id, device_id, session);
+	}
+	result
 }
 
 /// Authenticate one stage without taking ownership of an email proof.
@@ -393,13 +396,33 @@ fn set_uiaa_request(
 	device_id: &DeviceId,
 	session: &str,
 	request: &CanonicalJsonValue,
-) {
+) -> Result {
 	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
 
 	self.userdevicesessionid_uiaarequest
 		.write()
 		.expect("locked for writing")
-		.insert(key, request.to_owned());
+		.insert(key, request, Instant::now())
+		.map_err(|error| match error {
+			| requests::Refusal::BodyTooLarge =>
+				err!(Request(TooLarge("UIAA request body exceeds the cache limit."))),
+			| requests::Refusal::Duplicate =>
+				err!(Request(InvalidParam("UIAA session already exists."))),
+			| requests::Refusal::Capacity => tuwunel_core::Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Too many pending UIAA requests.".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			),
+		})
+}
+
+#[implement(Service)]
+fn remove_uiaa_request(&self, user_id: &UserId, device_id: &DeviceId, session: &str) {
+	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
+	self.userdevicesessionid_uiaarequest
+		.write()
+		.expect("locked for writing")
+		.remove(&key);
 }
 
 #[implement(Service)]
@@ -413,10 +436,9 @@ pub fn get_uiaa_request(
 	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
 
 	self.userdevicesessionid_uiaarequest
-		.read()
-		.expect("locked for reading")
-		.get(&key)
-		.cloned()
+		.write()
+		.expect("locked for writing")
+		.get(&key, Instant::now())
 }
 
 #[implement(Service)]
@@ -438,7 +460,9 @@ pub async fn update_uiaa_session(
 		self.db
 			.userdevicesessionid_uiaainfo
 			.del(key)
-			.await
+			.await?;
+		self.remove_uiaa_request(user_id, device_id, session);
+		Ok(())
 	}
 }
 

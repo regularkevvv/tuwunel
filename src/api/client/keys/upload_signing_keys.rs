@@ -149,7 +149,7 @@ async fn create_oauth_uiaa(
 				.as_ref()
 				.ok_or_else(|| err!(Request(NotJson("JSON body is not valid"))))?,
 		)
-		.await;
+		.await?;
 
 	Ok(uiaainfo)
 }

@@ -378,7 +378,7 @@ async fn enforce_uiaa(
 				services
 					.uiaa
 					.create(&server_user, server_device, &uiaainfo, json)
-					.await;
+					.await?;
 
 				Err(Error::Uiaa(uiaainfo))
 			},

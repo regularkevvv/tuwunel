@@ -160,7 +160,7 @@ where
 				services
 					.uiaa
 					.create(sender_user, sender_device, &uiaainfo, json)
-					.await;
+					.await?;
 
 				Err(Error::Uiaa(uiaainfo))
 			},
