@@ -1,12 +1,19 @@
-use std::{borrow::Borrow, collections::HashMap, sync::Arc};
+use std::{
+	borrow::Borrow,
+	collections::HashMap,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
-	Result, err, implement,
+	Error, Result, err, implement,
 	matrix::room_version,
 	trace,
-	utils::stream::{IterStream, ReadyExt, TryWidebandExt, WidebandExt},
+	utils::stream::{IterStream, ReadyExt, WidebandExt},
 };
 
 use crate::rooms::{
@@ -40,44 +47,51 @@ pub async fn resolve_state(
 	let current_state_ids: HashMap<_, _> = self
 		.services
 		.state_accessor
-		.state_full_ids(current_sstatehash)
-		.collect()
-		.await;
+		.state_full_ids_strict(current_sstatehash)
+		.try_collect()
+		.await?;
 
 	trace!("Loading fork states");
 	let fork_states = [current_state_ids, incoming_state];
+	let chain_complete = AtomicBool::new(true);
 	let auth_chains = fork_states
 		.iter()
-		.try_stream()
-		.wide_and_then(|state| {
-			// The chain walk dedups short ids and maps them injectively, so
-			// the collected ids are distinct as `from_distinct` requires.
-			self.services
-				.auth_chain
-				.event_ids_iter(room_id, room_version, state.values().map(Borrow::borrow))
-				.try_collect()
-				.map_ok(AuthSet::from_distinct)
+		.stream()
+		.wide_then(|state| {
+			self.fork_chain_strict(
+				room_id,
+				room_version,
+				state.values().map(Borrow::borrow),
+				&chain_complete,
+			)
 		})
 		.ready_filter_map(Result::ok);
 
-	let fork_states = fork_states
+	let fork_states: Vec<_> = fork_states
 		.iter()
 		.stream()
 		.wide_then(|fork_state| {
-			let shortstatekeys = fork_state.keys().copied().stream();
-			let event_ids = fork_state.values().cloned().stream();
-			self.services
-				.short
-				.multi_get_statekey_from_short(shortstatekeys)
-				.zip(event_ids)
-				.ready_filter_map(|(ty_sk, id)| Some((ty_sk.ok()?, id)))
-				.collect::<StateMap<OwnedEventId>>()
-		});
+			self.fork_state(
+				fork_state
+					.iter()
+					.map(|(key, event_id)| (*key, event_id)),
+			)
+		})
+		.try_collect()
+		.await?;
 
 	trace!("Resolving state");
 	let state = self
-		.state_resolution(room_id, room_version, fork_states, auth_chains)
+		.state_resolution(room_id, room_version, fork_states.into_iter().stream(), auth_chains)
 		.await?;
+
+	// Unconflicted state need not poll auth chains. Any chain that resolution
+	// did consume must be complete before its result can be compressed or used.
+	if !chain_complete.load(Ordering::Relaxed) {
+		return Err(Error::bad_database(
+			"Incomplete auth chain during incoming state resolution",
+		));
+	}
 
 	trace!("State resolution done.");
 	let state_events: Vec<_> = state

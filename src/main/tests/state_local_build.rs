@@ -3,13 +3,12 @@
 #![allow(clippy::unnecessary_debug_formatting)]
 
 use std::{
-	collections::BTreeSet,
-	env::var,
-	fs::remove_dir_all,
+	collections::{BTreeSet, HashMap},
+	env::{current_exe, var, var_os},
 	iter::once,
 	net::TcpListener,
 	path::PathBuf,
-	process::id as process_id,
+	process::{Command, id as process_id},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -17,6 +16,7 @@ use std::{
 	time::Duration,
 };
 
+use clap::Parser;
 use futures::{
 	StreamExt, TryStreamExt,
 	future::{BoxFuture, join, ready},
@@ -67,6 +67,7 @@ enum Case {
 	SiblingStateMiss,
 	UnpolledChain,
 	InteriorForkSentinel,
+	IncomingResolve(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -101,7 +102,55 @@ const CASES: [Case; 15] = [
 ];
 
 #[test]
-fn state_local_build_paths() -> Result { CASES.into_iter().try_for_each(run_case) }
+fn state_local_build_paths() -> Result { run_cases(&CASES, "state_local_build_paths") }
+
+#[test]
+fn incoming_state_resolution_rejects_incomplete_sources() -> Result {
+	let cases: Vec<_> = [
+		"incoming_key",
+		"current_snapshot",
+		"current_event_reverse",
+		"current_key_reverse",
+		"auth_missing",
+		"auth_malformed",
+		"auth_reverse",
+		"auth_unpolled",
+	]
+	.into_iter()
+	.map(Case::IncomingResolve)
+	.collect();
+	run_cases(&cases, "incoming_state_resolution_rejects_incomplete_sources")
+}
+
+// Service graphs contain process-lifetime references. Each case must exit its
+// own process before the next one opens another runtime/database graph.
+// The outer scratch owner cleans database roots after all child processes exit.
+fn run_cases(cases: &[Case], test_name: &str) -> Result {
+	const CHILD_CASE: &str = "MATRIX_STATE_LOCAL_CHILD_CASE";
+	if let Some(selected) = var_os(CHILD_CASE) {
+		let selected = selected
+			.to_str()
+			.ok_or_else(|| err!("Invalid child case encoding"))?;
+		let case = cases
+			.iter()
+			.copied()
+			.find(|case| case_name(*case) == selected)
+			.ok_or_else(|| err!("Unknown child case for {test_name}"))?;
+		return run_case(case);
+	}
+	let executable = current_exe()?;
+	for case in cases {
+		let name = case_name(*case);
+		let status = Command::new(&executable)
+			.args(["--exact", test_name, "--nocapture"])
+			.env(CHILD_CASE, name)
+			.status()?;
+		if !status.success() {
+			return Err!("Isolated state local build case {name} failed: {status}");
+		}
+	}
+	Ok(())
+}
 
 fn run_case(case: Case) -> Result {
 	let name = case_name(case);
@@ -119,9 +168,13 @@ fn run_case(case: Case) -> Result {
 
 	let resolve_state_locally = !matches!(case, Case::Disabled);
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	// The harness owns these arguments; libtest selectors are not server CLI.
+	let mut args = Args::parse_from(["state-local-build-reference"]);
+	args.test
+		.extend(["fresh", "cleanup"].map(str::to_owned));
 
 	args.option.extend([
+		"server_name=\"localhost\"".to_owned(),
 		format!("database_path={db_path:?}"),
 		"address=[\"127.0.0.1\"]".to_owned(),
 		format!("port={port}"),
@@ -157,7 +210,6 @@ fn run_case(case: Case) -> Result {
 
 	drop(server);
 	drop(runtime);
-	remove_dir_all(&db_path).ok();
 
 	result.map_err(case_error)
 }
@@ -179,6 +231,7 @@ fn case_name(case: Case) -> &'static str {
 		| Case::SiblingStateMiss => "sibling-state-miss",
 		| Case::UnpolledChain => "unpolled-chain",
 		| Case::InteriorForkSentinel => "interior-fork-sentinel",
+		| Case::IncomingResolve(source) => source,
 	}
 }
 
@@ -214,6 +267,8 @@ fn exercise_case<'a>(
 	case: Case,
 ) -> BoxFuture<'a, Result> {
 	match case {
+		| Case::IncomingResolve(source) =>
+			Box::pin(incoming_resolution_source(services, base, token, user_id, source)),
 		| Case::Baseline => Box::pin(enabled_baseline(services, base, token, user_id)),
 		| Case::MissingStateDiff => Box::pin(missing_state_diff(services, base, token, user_id)),
 		| Case::MissingEventReverse =>
@@ -259,6 +314,106 @@ fn exercise_case<'a>(
 			disabled_local_build_ignores_planted_memo(services, user_id, &room_id).await
 		}),
 	}
+}
+
+async fn incoming_resolution_source(
+	services: &Services,
+	base: &str,
+	token: &str,
+	user_id: &UserId,
+	source: &str,
+) -> Result {
+	let room_id = create_room(services, base, token).await?;
+	let ancestor = if source.starts_with("auth_") {
+		Some(verified_replaced_membership_ancestor(services, &room_id, user_id).await?)
+	} else {
+		None
+	};
+	let named = append_state(services, user_id, &room_id, "incoming resolution baseline").await?;
+	let room_version = services.state.get_room_version(&room_id).await?;
+	let incoming_hash = services
+		.state
+		.get_room_shortstatehash(&room_id)
+		.await?;
+	let mut incoming: HashMap<_, _> = services
+		.state_accessor
+		.state_full_ids_strict(incoming_hash)
+		.try_collect()
+		.await?;
+	if ancestor.is_some() && source != "auth_unpolled" {
+		append_state(services, user_id, &room_id, "conflicting incoming resolution name").await?;
+	}
+	let state_hash = services
+		.state
+		.get_room_shortstatehash(&room_id)
+		.await?;
+	services
+		.event_handler
+		.resolve_state(&room_id, &room_version, incoming.clone())
+		.await?;
+	match source {
+		| "incoming_key" => {
+			assert!(
+				services.db["shortstatekey_statekey"]
+					.exists(&u64::MAX.to_be_bytes())
+					.await
+					.is_err_and(|error| error.is_not_found()),
+				"fixture requires an absent short state key"
+			);
+			incoming.insert(u64::MAX, named);
+		},
+		| "current_snapshot" => {
+			remove_short_row(services, "shortstatehash_statediff", state_hash).await?;
+		},
+		| "current_event_reverse" => {
+			let short = services.short.get_shorteventid(&named).await?;
+			remove_short_row(services, "shorteventid_eventid", short).await?;
+		},
+		| "current_key_reverse" => {
+			let short = services
+				.short
+				.get_shortstatekey(&StateEventType::RoomName, "")
+				.await?;
+			remove_short_row(services, "shortstatekey_statekey", short).await?;
+		},
+		| "auth_missing" | "auth_malformed" | "auth_unpolled" => {
+			let failure = if source == "auth_malformed" {
+				PduFailure::Malformed
+			} else {
+				PduFailure::Missing
+			};
+			corrupt_timeline_pdu(services, ancestor.as_ref().expect("auth fixture"), failure)
+				.await?;
+		},
+		| "auth_reverse" => {
+			let short = services
+				.short
+				.get_shorteventid(ancestor.as_ref().expect("auth fixture"))
+				.await?;
+			remove_short_row(services, "shorteventid_eventid", short).await?;
+		},
+		| _ => unreachable!("declared source"),
+	}
+	let outcome = services
+		.event_handler
+		.resolve_state(&room_id, &room_version, incoming)
+		.await;
+	if source == "auth_unpolled" {
+		outcome.map_err(|error| {
+			err!("unconflicted resolution must not poll unused chains: {error}")
+		})?;
+	} else {
+		assert!(outcome.is_err(), "incomplete {source} must not become partial success");
+	}
+	assert_eq!(
+		services
+			.state
+			.get_room_shortstatehash(&room_id)
+			.await?,
+		state_hash,
+		"incoming resolution must not replace the room state pointer for {source}"
+	);
+	Ok(())
 }
 
 async fn enabled_baseline(
