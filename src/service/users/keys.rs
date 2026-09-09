@@ -71,6 +71,8 @@ pub async fn add_one_time_keys(
 	keys: &BTreeMap<OwnedOneTimeKeyId, Raw<OneTimeKey>>,
 	limit: usize,
 ) -> Result {
+	let device = (user_id.to_owned(), device_id.to_owned());
+	let _guard = self.one_time_key_locks.lock(&device).await;
 	let mut txn = self.services.db.txn();
 	// Hold the oldest permit so the retirement frontier cannot pass this batch
 	// before commit.
@@ -100,7 +102,7 @@ pub async fn add_one_time_keys(
 }
 
 #[implement(super::Service)]
-pub async fn add_one_time_key(
+async fn add_one_time_key(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
@@ -133,8 +135,8 @@ pub async fn add_one_time_key(
 		return Err(e);
 	}
 
-	// Racy dedup: two concurrent uploads of the same id can both pass this
-	// check and produce duplicate rows that persist until aged out by prune.
+	// The batch caller holds the device pool lock through commit, so two
+	// concurrent uploads cannot both observe this id as absent.
 	let prefix = (user_id, device_id, Interfix);
 	let already_present = otk
 		.keys_prefix(&prefix)
@@ -302,6 +304,8 @@ pub async fn take_one_time_key(
 	device_id: &DeviceId,
 	key_algorithm: &OneTimeKeyAlgorithm,
 ) -> Result<(OwnedKeyId<OneTimeKeyAlgorithm, OneTimeKeyName>, Raw<OneTimeKey>)> {
+	let device = (user_id.to_owned(), device_id.to_owned());
+	let _guard = self.one_time_key_locks.lock(&device).await;
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		return Err!(Request(NotFound("No one-time-key found")));
 	};
@@ -335,6 +339,8 @@ pub async fn count_one_time_keys(
 	user_id: &UserId,
 	device_id: &DeviceId,
 ) -> BTreeMap<OneTimeKeyAlgorithm, UInt> {
+	let device = (user_id.to_owned(), device_id.to_owned());
+	let _guard = self.one_time_key_locks.lock(&device).await;
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		// Without the MSC4225 column this node cannot observe the authoritative
 		// pool, so preserve "unknown" instead of falsely reporting zero keys.
@@ -385,9 +391,10 @@ fn complete_one_time_key_counts(
 
 /// MSC4225: drop the `excess` oldest rows for this `(user, device)`. Forward
 /// iteration over the prefix runs in count_be ascending order, so
-/// `take(excess)` yields the earliest-uploaded rows.
+/// `take(excess)` yields the earliest-uploaded rows. The count caller holds
+/// the device pool lock across counting and pruning.
 #[implement(super::Service)]
-pub async fn prune_one_time_keys(&self, user_id: &UserId, device_id: &DeviceId, excess: usize) {
+async fn prune_one_time_keys(&self, user_id: &UserId, device_id: &DeviceId, excess: usize) {
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		return;
 	};

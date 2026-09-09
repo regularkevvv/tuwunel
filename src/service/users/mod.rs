@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
 	events::{
 		GlobalAccountDataEventType,
@@ -21,7 +21,7 @@ use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
 	matrix::pdu::PduCount,
 	trace,
-	utils::{self, BoolExt, ReadyExt, stream::TryIgnore},
+	utils::{self, BoolExt, MutexMap, ReadyExt, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
@@ -41,6 +41,9 @@ pub struct Moderation {
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
+	/// Serializes one-time-key pool reads and mutations per device. The guard
+	/// must cover the durable deletion, not just selection of a candidate key.
+	one_time_key_locks: MutexMap<(OwnedUserId, OwnedDeviceId), ()>,
 	db: Data,
 }
 
@@ -79,6 +82,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
+			one_time_key_locks: MutexMap::new(),
 			db: Data {
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
 				keyid_key: args.db["keyid_key"].clone(),
