@@ -40,9 +40,7 @@ use std::{
 
 use serde_bytes::ByteBuf;
 use tokio::task::JoinHandle;
-use tuwunel_bridge::{
-	self as bridge, MAX_GET_KEYS, MAX_SCAN_PAGE, REQUEST_ID_LEN, Request, Response,
-};
+use tuwunel_bridge::{self as bridge, MAX_SCAN_PAGE, REQUEST_ID_LEN, Request, Response};
 use tuwunel_core::{Err, Result, Server, debug, err, error, info, warn};
 
 pub use self::lease::LeaseStatus;
@@ -170,7 +168,8 @@ impl Backend {
 	/// Reads many keys of one map, preserving request order.
 	///
 	/// Cached keys never reach the wire; the rest are requested in chunks of
-	/// at most [`MAX_GET_KEYS`], one `Get` per chunk.
+	/// at most [`bridge::MAX_GET_KEYS`] and the encoded request byte budget,
+	/// one `Get` per chunk. Atomic write batches are never split this way.
 	pub(crate) async fn get_many(
 		&self,
 		map: MapId,
@@ -192,7 +191,14 @@ impl Backend {
 			}
 		}
 
-		for chunk in missing.chunks(MAX_GET_KEYS) {
+		let mut remaining = missing.as_slice();
+		while !remaining.is_empty() {
+			let count = bridge::request::get_key_count(remaining.iter().map(|at| keys[*at]));
+			if count == 0 {
+				return Err!(Database("bridge get: key exceeds request byte budget"));
+			}
+			let (chunk, rest) = remaining.split_at(count);
+			remaining = rest;
 			let stamp = self.commits.load(Relaxed);
 			let request = Request::Get {
 				map: map.0,

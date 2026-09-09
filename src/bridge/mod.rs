@@ -17,6 +17,7 @@
 #![deny(missing_docs)]
 
 pub mod catalog;
+pub mod request;
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -493,7 +494,7 @@ pub fn check(request: &Request) -> Result<(), Error> {
 		},
 		| Request::Hello | Request::LeaseRelease { .. } => {},
 	}
-	Ok(())
+	request::check_size(request)
 }
 
 fn check_map(map: u16) -> Result<(), Error> {
@@ -509,6 +510,39 @@ mod tests {
 	use super::*;
 
 	fn bytes(b: &[u8]) -> ByteBuf { ByteBuf::from(b.to_vec()) }
+
+	#[test]
+	fn aggregate_request_bytes_are_bounded() {
+		let request = Request::Get {
+			map: 0,
+			keys: vec![bytes(&vec![1; MAX_KEY_BYTES]); 300],
+		};
+		assert!(
+			matches!(check(&request), Err(Error::TooLarge { .. })),
+			"aggregate keys were accepted"
+		);
+		let ops = vec![
+			Mutation::Put {
+				map: 0,
+				key: bytes(b"k"),
+				val: bytes(&vec![1; MAX_VALUE_BYTES])
+			};
+			3
+		];
+		let request = Request::Commit {
+			request_id: bytes(&[1; REQUEST_ID_LEN]),
+			lease: Lease {
+				holder: "request-budget".into(),
+				epoch: 1,
+			},
+			digest: bytes(&digest(&ops)),
+			ops,
+		};
+		assert!(
+			matches!(check(&request), Err(Error::TooLarge { .. })),
+			"aggregate values were accepted"
+		);
+	}
 
 	#[test]
 	fn map_catalog_is_unique_and_exactly_closed() {
@@ -624,6 +658,8 @@ mod tests {
 			let wire = encode(&req).expect("encode");
 			let back: Request = decode(&wire).expect("decode");
 			assert_eq!(back, req);
+			assert_eq!(request::encode(&req).expect("bounded encode"), wire);
+			assert_eq!(request::decode(&wire).expect("bounded decode"), req);
 		}
 	}
 

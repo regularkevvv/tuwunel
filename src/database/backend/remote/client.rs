@@ -128,11 +128,9 @@ impl Client {
 
 	/// Sends one request once and classifies the outcome.
 	pub(crate) async fn call_once(&self, request: &Request) -> Result<Response, CallError> {
-		let body = bridge::encode(request).map_err(|error| CallError::Transport {
-			class: "encode",
-			detail: error.to_string(),
-			retryable: false,
-		})?;
+		// Refuse the complete request before allocating/sending its wire body.
+		// Oversized atomic commits are never split or retried as transport errors.
+		let body = bridge::request::encode(request).map_err(CallError::Bridge)?;
 
 		let reply = self
 			.http
@@ -254,4 +252,31 @@ fn classify(error: reqwest::Error) -> CallError {
 /// `op` names the operation; the message carries the failure class only.
 pub(crate) fn database_error(op: &str, error: &CallError) -> Error {
 	err!(Database("bridge {op} failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn oversized_request_is_nonretryable_before_transport() {
+		let client = Client {
+			http: reqwest::Client::new(),
+			endpoint: "invalid://must-not-reach-transport".into(),
+			token: "test-only".into(),
+			timeout: Duration::from_millis(1),
+		};
+		let request = Request::Get {
+			map: 0,
+			keys: vec![serde_bytes::ByteBuf::from(vec![0; bridge::MAX_KEY_BYTES]); 300],
+		};
+		let error = client
+			.call_once(&request)
+			.await
+			.expect_err("oversize refusal");
+		assert!(!error.is_retryable());
+		assert!(
+			matches!(error, CallError::Bridge(bridge::Error::TooLarge { what, .. }) if what == "request bytes")
+		);
+	}
 }

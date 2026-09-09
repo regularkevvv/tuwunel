@@ -24,7 +24,7 @@ use std::{
 use axum::{
 	Router,
 	body::Bytes,
-	extract::State as AxumState,
+	extract::{DefaultBodyLimit, State as AxumState},
 	http::{HeaderMap, StatusCode},
 	response::{IntoResponse, Response as HttpResponse},
 	routing::post,
@@ -94,6 +94,7 @@ impl Fake {
 		let addr: SocketAddr = listener.local_addr()?;
 		let app = Router::new()
 			.route(bridge::PATH_KV, post(kv))
+			.layer(DefaultBodyLimit::max(bridge::request::MAX_BYTES))
 			.with_state(shared.clone());
 
 		let task = tokio::spawn(async move {
@@ -790,6 +791,47 @@ async fn commit_during_an_open_scan_sees_the_pre_commit_snapshot() -> Result {
 
 	backend.close().await;
 
+	Ok(())
+}
+
+#[tokio::test]
+async fn large_multi_key_reads_chunk_by_bytes_and_preserve_order() -> Result {
+	let (fake, _server, backend) = rig(256, 0).await?;
+	let keys: Vec<Vec<u8>> = (0_u16..300)
+		.map(|n| {
+			let mut key = vec![0; bridge::MAX_KEY_BYTES];
+			key[..2].copy_from_slice(&n.to_be_bytes());
+			key
+		})
+		.collect();
+	{
+		let mut tables = fake
+			.shared
+			.tables
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		for key in &keys {
+			tables
+				.kv
+				.insert((map_id(), key.clone()), key[..2].to_vec());
+		}
+	}
+	let absent = vec![0xFF; bridge::MAX_KEY_BYTES];
+	let mut query: Vec<&[u8]> = keys.iter().rev().map(Vec::as_slice).collect();
+	query.push(&keys[0]);
+	query.push(&absent);
+	let rows = backend
+		.get_many(crate::backend::MapId(map_id()), &query)
+		.await?;
+	assert_eq!(rows.len(), query.len());
+	for (key, value) in query.iter().zip(&rows) {
+		if *key == absent.as_slice() {
+			assert!(value.is_none());
+		} else {
+			assert_eq!(value.as_deref(), Some(&key[..2]));
+		}
+	}
+	backend.close().await;
 	Ok(())
 }
 

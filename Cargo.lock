@@ -5419,6 +5419,7 @@ dependencies = [
 name = "tuwunel_bridge"
 version = "1.9.0"
 dependencies = [
+ "minicbor",
  "minicbor-serde",
  "serde",
  "serde_bytes",
