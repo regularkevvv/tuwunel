@@ -37,7 +37,12 @@ pub(super) async fn load_session(
 		self.get_uiaa_session(user, device, session).await
 	} else {
 		let mut info = template.clone();
-		info.session = Some(new_session);
+		info.session = Some(new_session.clone());
+		// Reserve durable capacity before any stage consumes a registration
+		// token or claims an email proof. A failed first attempt also needs a
+		// real session behind the identifier returned to the client.
+		self.save_progress(user, device, &new_session, &info, true)
+			.await?;
 		Ok(info)
 	}
 }

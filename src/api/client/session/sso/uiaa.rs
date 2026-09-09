@@ -24,13 +24,15 @@ pub(crate) async fn sso_fallback_route(
 			|| uiaainfo.completed.contains(&AuthType::OAuth)
 	};
 
-	// Single DB lookup — get_uiaa_session_by_session_id does a full table scan,
-	// so we call it once and reuse the result for both the completion check and
-	// the IdP extraction that follows.
+	// The durable session index supplies an age-checked direct lookup. Reuse
+	// its result for completion and provider extraction.
 	let session_data = services
 		.uiaa
 		.get_uiaa_session_by_session_id(session)
 		.await;
+	if session_data.is_none() {
+		return Err!(Request(Forbidden("UIAA session is invalid or has expired.")));
+	}
 
 	if session_data
 		.as_ref()

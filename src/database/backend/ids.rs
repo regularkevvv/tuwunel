@@ -15,7 +15,7 @@
 use super::MapId;
 
 /// Version of the (id table, wire contract) pair.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Immutable name -> id assignments for every described map, tombstones
 /// included.
@@ -158,6 +158,7 @@ pub static MAP_IDS: &[(&str, MapId)] = &[
 	("userroomid_leftstate", MapId(135)),
 	("userroomid_knockedstate", MapId(136)),
 	("userroomid_notificationcount", MapId(137)),
+	("uiaasessionid_metadata", MapId(138)),
 ];
 
 /// Looks up the immutable id for a catalog map name.

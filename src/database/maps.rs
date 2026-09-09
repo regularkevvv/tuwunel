@@ -636,6 +636,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
+		name: "uiaasessionid_metadata",
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
 		name: "userdevicetxnid_response",
 		..descriptor::RANDOM_SMALL
 	},

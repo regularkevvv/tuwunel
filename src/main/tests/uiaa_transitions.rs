@@ -191,6 +191,7 @@ async fn exercise(services: &Services) -> Result {
 	}
 
 	password_owner(services, &user, &body).await?;
+	password_retry(services, &user).await?;
 	completed_stage_retry(services, &user, &body).await?;
 	corrupt_binding_is_refused(services, &user).await
 }
@@ -253,13 +254,18 @@ async fn corrupt_binding_is_refused(services: &Services, user: &UserId) -> Resul
 	let auth =
 		AuthData::FallbackAcknowledgement(FallbackAcknowledgement::new("stored-binding".into()));
 	for session in [None, Some("different-session".into())] {
-		let info = UiaaInfo {
+		let mut info = UiaaInfo {
 			flows: vec![AuthFlow::new(vec![AuthType::Sso])],
 			completed: vec![AuthType::Sso],
-			session,
+			session: Some("stored-binding".into()),
 			..Default::default()
 		};
 		let device: &tuwunel_core::ruma::DeviceId = "DEVICE".into();
+		services
+			.uiaa
+			.create(user, device, &info, &CanonicalJsonValue::Object(Default::default()))
+			.await?;
+		info.session = session;
 		services.db["userdevicesessionid_uiaainfo"]
 			.put((user, device, "stored-binding"), Json(&info))
 			.await?;
@@ -287,6 +293,37 @@ async fn corrupt_binding_is_refused(services: &Services, user: &UserId) -> Resul
 fn assert_forbidden<T: Debug>(result: Result<T>) {
 	let error = result.expect_err("UIAA must refuse this authentication");
 	assert_eq!(error.kind(), tuwunel_core::ruma::api::error::ErrorKind::forbidden());
+}
+
+async fn password_retry(services: &Services, user: &UserId) -> Result {
+	let info = UiaaInfo {
+		flows: vec![AuthFlow::new(vec![AuthType::Password])],
+		..Default::default()
+	};
+	let wrong = AuthData::Password(Password::new(
+		UserIdentifier::Matrix(MatrixUserIdentifier::new(user.to_string())),
+		"wrong-password".into(),
+	));
+	let (worked, challenge) = services
+		.uiaa
+		.try_auth(user, "DEVICE".into(), &wrong, &info)
+		.await?;
+	assert!(!worked);
+	let mut correct = Password::new(
+		UserIdentifier::Matrix(MatrixUserIdentifier::new(user.to_string())),
+		"correct-local-password".into(),
+	);
+	correct.session = challenge.session.clone();
+	let auth = AuthData::Password(correct);
+	assert!(
+		services
+			.uiaa
+			.try_auth(user, "DEVICE".into(), &auth, &info)
+			.await?
+			.0,
+		"a failed first attempt must return a retryable durable session"
+	);
+	Ok(())
 }
 
 async fn completed_stage_retry(

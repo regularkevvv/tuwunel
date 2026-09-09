@@ -1,4 +1,6 @@
+mod lifecycle;
 mod requests;
+mod sweep;
 mod transitions;
 
 use std::{
@@ -7,7 +9,6 @@ use std::{
 	time::Instant,
 };
 
-use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	CanonicalJsonValue, DeviceId, OwnedDeviceId, OwnedUserId, UserId,
 	api::{
@@ -22,16 +23,20 @@ use tuwunel_core::{
 	Err, Result, err, error, extract, implement,
 	utils::{self, BoolExt, MutexMap, hash::verify_password, string::EMPTY},
 };
-use tuwunel_database::{Deserialized, Json, Map};
+use tuwunel_database::{Database, Map};
 
 pub struct Service {
 	userdevicesessionid_uiaarequest: RwLock<requests::Requests>,
 	transitions: MutexMap<transitions::SessionKey, ()>,
+	admission: tokio::sync::Mutex<()>,
+	sweep_cursor: tokio::sync::Mutex<sweep::Cursors>,
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
 }
 
 struct Data {
+	database: Arc<Database>,
+	uiaasessionid_metadata: Arc<Map>,
 	userdevicesessionid_uiaainfo: Arc<Map>,
 }
 
@@ -45,16 +50,34 @@ enum EmailIdentityMode {
 	Claim,
 }
 
+#[async_trait::async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			userdevicesessionid_uiaarequest: RwLock::new(requests::Requests::default()),
 			transitions: MutexMap::new(),
+			admission: tokio::sync::Mutex::new(()),
+			sweep_cursor: tokio::sync::Mutex::new(sweep::Cursors::default()),
 			db: Data {
+				database: args.db.clone(),
+				uiaasessionid_metadata: args.db["uiaasessionid_metadata"].clone(),
 				userdevicesessionid_uiaainfo: args.db["userdevicesessionid_uiaainfo"].clone(),
 			},
 			services: args.services.clone(),
 		}))
+	}
+
+	async fn worker(self: Arc<Self>) -> Result {
+		loop {
+			tokio::select! {
+				result = self.sweep_sessions() => result?,
+				() = self.services.server.until_shutdown() => return Ok(()),
+			}
+			tokio::select! {
+				() = tokio::time::sleep(sweep::INTERVAL) => {},
+				() = self.services.server.until_shutdown() => return Ok(()),
+			}
+		}
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
@@ -82,7 +105,7 @@ pub async fn create(
 	self.set_uiaa_request(user_id, device_id, session, json_body)?;
 
 	let result = self
-		.update_uiaa_session(user_id, device_id, session, Some(uiaainfo))
+		.save_progress(user_id, device_id, session, uiaainfo, true)
 		.await;
 	if result.is_err() {
 		self.remove_uiaa_request(user_id, device_id, session);
@@ -281,7 +304,7 @@ async fn try_auth_inner(
 				message: "Email address has not been validated.".to_owned(),
 			}));
 
-			self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo))
+			self.save_progress(user_id, device_id, session, &uiaainfo, false)
 				.await?;
 
 			return Ok((false, uiaainfo));
@@ -289,7 +312,7 @@ async fn try_auth_inner(
 	}
 
 	if !completed {
-		self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo))
+		self.save_progress(user_id, device_id, session, &uiaainfo, false)
 			.await?;
 
 		return Ok((false, uiaainfo));
@@ -301,7 +324,7 @@ async fn try_auth_inner(
 			.completed
 			.contains(&AuthType::EmailIdentity);
 
-	self.update_uiaa_session(user_id, device_id, session, retain_session.then_some(&uiaainfo))
+	self.finish_session(user_id, device_id, session, &uiaainfo, retain_session)
 		.await?;
 
 	Ok((true, uiaainfo))
@@ -456,78 +479,4 @@ pub fn get_uiaa_request(
 		.write()
 		.expect("locked for writing")
 		.get(&key, Instant::now())
-}
-
-#[implement(Service)]
-async fn update_uiaa_session(
-	&self,
-	user_id: &UserId,
-	device_id: &DeviceId,
-	session: &str,
-	uiaainfo: Option<&UiaaInfo>,
-) -> Result {
-	let key = (user_id, device_id, session);
-
-	if let Some(uiaainfo) = uiaainfo {
-		self.db
-			.userdevicesessionid_uiaainfo
-			.put(key, Json(uiaainfo))
-			.await
-	} else {
-		self.db
-			.userdevicesessionid_uiaainfo
-			.del(key)
-			.await?;
-		self.remove_uiaa_request(user_id, device_id, session);
-		Ok(())
-	}
-}
-
-#[implement(Service)]
-async fn get_uiaa_session(
-	&self,
-	user_id: &UserId,
-	device_id: &DeviceId,
-	session: &str,
-) -> Result<UiaaInfo> {
-	let key = (user_id, device_id, session);
-
-	let info = self
-		.db
-		.userdevicesessionid_uiaainfo
-		.qry(&key)
-		.await
-		.deserialized::<UiaaInfo>()
-		.map_err(|_| err!(Request(Forbidden("UIAA session does not exist."))))?;
-	if info.session.as_deref() != Some(session) {
-		return Err!(Request(Forbidden("UIAA session binding is invalid.")));
-	}
-	Ok(info)
-}
-
-#[implement(Service)]
-pub async fn get_uiaa_session_by_session_id(
-	&self,
-	session_id: &str,
-) -> Option<(OwnedUserId, OwnedDeviceId, UiaaInfo)> {
-	// Iterate over keys only (fastest way without a secondary index)
-	let stream = self
-		.db
-		.userdevicesessionid_uiaainfo
-		.keys::<(OwnedUserId, OwnedDeviceId, String)>();
-
-	pin_mut!(stream);
-	while let Ok(Some((user_id, device_id, session))) = stream.try_next().await {
-		if session == session_id {
-			// Found the key, now fetch the actual UiaaInfo
-			if let Ok(uiaainfo) = self
-				.get_uiaa_session(&user_id, &device_id, session_id)
-				.await
-			{
-				return Some((user_id, device_id, uiaainfo));
-			}
-		}
-	}
-
-	None
 }
