@@ -5,6 +5,7 @@ use std::{
 	time::Duration,
 };
 
+use futures::TryStreamExt;
 use serde_json::{Value, json};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -382,8 +383,8 @@ async fn expect_retry_active_set(
 		.sending
 		.db
 		.queued_requests(destination)
-		.ready_any(|_| true)
-		.await;
+		.try_any(|_| futures::future::ready(true))
+		.await?;
 
 	if queued {
 		return Err!("mixed push result left a queued request");
@@ -393,10 +394,10 @@ async fn expect_retry_active_set(
 		.sending
 		.db
 		.active_requests_for(destination)
-		.ready_fold((0_usize, false, 0_usize, 0_usize), |state, (_, event)| {
+		.try_fold((0_usize, false, 0_usize, 0_usize), async |state, (_, event)| {
 			let (pdu_count, expected_active, badge_count, other_count) = state;
 
-			match event {
+			Ok(match event {
 				| SendingEvent::Pdu(pdu_id) => (
 					pdu_count.saturating_add(1),
 					expected_active || &pdu_id == expected,
@@ -406,9 +407,9 @@ async fn expect_retry_active_set(
 				| SendingEvent::BadgeRefresh =>
 					(pdu_count, expected_active, badge_count.saturating_add(1), other_count),
 				| _ => (pdu_count, expected_active, badge_count, other_count.saturating_add(1)),
-			}
+			})
 		})
-		.await;
+		.await?;
 
 	match (pdu_count, expected_active, badge_count, other_count) {
 		| (1, true, 1, 0) => Ok(()),
@@ -467,8 +468,8 @@ async fn verify_badge_retry(services: &Services) -> Result {
 		.sending
 		.db
 		.active_requests_for(&destination)
-		.ready_any(|_| true)
-		.await;
+		.try_any(|_| futures::future::ready(true))
+		.await?;
 
 	if !active {
 		return Err!("failed badge notification did not remain active");
@@ -559,18 +560,18 @@ async fn wait_for_queue_cleanup(services: &Services, destination: &Destination) 
 				.sending
 				.db
 				.queued_requests(destination)
-				.ready_any(|_| true)
-				.await;
+				.try_any(|_| futures::future::ready(true))
+				.await?;
 
 			let active = services
 				.sending
 				.db
 				.active_requests_for(destination)
-				.ready_any(|_| true)
-				.await;
+				.try_any(|_| futures::future::ready(true))
+				.await?;
 
 			if !queued && !active {
-				break;
+				break Ok(());
 			}
 
 			sleep(Duration::from_millis(10)).await;
@@ -579,7 +580,7 @@ async fn wait_for_queue_cleanup(services: &Services, destination: &Destination) 
 
 	timeout(Duration::from_secs(10), cleared)
 		.await
-		.map_err(|_| err!("timed out waiting for sender queue cleanup"))
+		.map_err(|_| err!("timed out waiting for sender queue cleanup"))?
 }
 
 async fn run_cases(services: &Services) -> Result {

@@ -13,7 +13,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{
-	FutureExt, StreamExt, TryFutureExt,
+	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 	future::{BoxFuture, join, join3, try_join3},
 	pin_mut,
 	stream::FuturesUnordered,
@@ -113,6 +113,47 @@ type Devices = SmallVec<[(OwnedUserId, OwnedDeviceId); 1]>;
 /// re-arms, and stale push entries.
 type WakeQueue = BinaryHeap<Reverse<(TokioInstant, Destination)>>;
 
+/// Local database backpressure is not a remote delivery failure. In particular,
+/// once ACK cleanup completes, a retry must never clean up the unsent
+/// successor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueRecovery {
+	CleanupAcknowledged,
+	ResumePending,
+}
+
+impl QueueRecovery {
+	async fn clean_acknowledged<F, Fut>(&mut self, cleanup: F) -> Result
+	where
+		F: FnOnce() -> Fut,
+		Fut: Future<Output = Result>,
+	{
+		if *self == Self::CleanupAcknowledged {
+			cleanup().await?;
+			*self = Self::ResumePending;
+		}
+		Ok(())
+	}
+}
+
+type QueueRetries = BTreeMap<Destination, (TokioInstant, QueueRecovery)>;
+const QUEUE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+fn defer_queue_error(
+	retries: &mut QueueRetries,
+	destination: Destination,
+	stage: QueueRecovery,
+	error: Error,
+) -> Result {
+	if error.status_code() != http::StatusCode::TOO_MANY_REQUESTS {
+		return Err(error);
+	}
+
+	let (deadline, _) = wake_deadline(QUEUE_RETRY_DELAY);
+	retries.insert(destination, (deadline, stage));
+	Ok(())
+}
+
 /// Per-(room, user) bucket of `ReceiptData`. MSC3771 allows one receipt
 /// per thread context per user per EDU window; the dominant case is
 /// still a single receipt, so inline-1 fits without a heap touch.
@@ -178,15 +219,34 @@ impl Service {
 		let mut futures: SendingFutures<'_> = FuturesUnordered::new();
 		let mut wakes: WakeQueue = WakeQueue::new();
 
-		self.startup_netburst(id, &mut futures, &mut statuses)
-			.boxed()
-			.await;
+		loop {
+			match self
+				.startup_netburst(id, &mut futures, &mut statuses)
+				.boxed()
+				.await
+			{
+				| Ok(()) => break,
+				| Err(error) if error.status_code() == http::StatusCode::TOO_MANY_REQUESTS => {
+					// These futures have not been polled. Reconstruct from durable
+					// active/queued rows before dispatching any startup transaction.
+					futures.clear();
+					statuses.clear();
+					if !self.server.is_running() {
+						return Ok(());
+					}
+					tokio::time::sleep(QUEUE_RETRY_DELAY).await;
+				},
+				| Err(error) => return Err(error),
+			}
+		}
 
 		self.work_loop(id, &mut futures, &mut statuses, &mut wakes)
-			.await;
+			.await?;
 
 		if !futures.is_empty() {
-			self.finish_responses(&mut futures).boxed().await;
+			self.finish_responses(&mut futures)
+				.boxed()
+				.await?;
 		}
 
 		Ok(())
@@ -207,7 +267,7 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
-	) {
+	) -> Result {
 		use tokio::time::{Instant, sleep_until};
 
 		let receiver = self
@@ -215,25 +275,49 @@ impl Service {
 			.get(id)
 			.map(|(_, receiver)| receiver.clone())
 			.expect("Missing channel for sender worker");
+		let mut retries = QueueRetries::new();
 
 		while !receiver.is_closed() {
 			let next_due = wakes
 				.peek()
 				.map_or_else(Instant::now, |Reverse((instant, _))| *instant);
+			let retry_due = retries
+				.values()
+				.map(|(due, _)| *due)
+				.min()
+				.unwrap_or_else(Instant::now);
 
 			tokio::select! {
 				Some(response) = futures.next() => {
-					self.handle_response(response, futures, statuses, wakes).await;
+					let (dest, mut stage) = match &response {
+						Ok(dest) => (dest.clone(), QueueRecovery::CleanupAcknowledged),
+						Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
+					};
+					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage).await {
+						defer_queue_error(&mut retries, dest, stage, error)?;
+					}
 				},
 				request = receiver.recv_async() => match request {
-					Ok(request) => self.handle_request(request, futures, statuses).await,
-					Err(_) => return,
+					Ok(request) => {
+						let dest = request.dest.clone();
+						// Requests are durable queue rows (or coalescible empty-key
+						// wakes). The retry owns this destination until it dispatches.
+						if !retries.contains_key(&dest)
+							&& let Err(error) = self.handle_request(request, futures, statuses).await {
+							defer_queue_error(&mut retries, dest, QueueRecovery::ResumePending, error)?;
+						}
+					},
+					Err(_) => return Ok(()),
 				},
 				() = sleep_until(next_due), if !wakes.is_empty() => {
-					self.drain_due_wakes(futures, statuses, wakes).await;
+					self.drain_due_wakes(futures, statuses, wakes, &mut retries).await?;
+				},
+				() = sleep_until(retry_due), if !retries.is_empty() => {
+					self.retry_queue(futures, statuses, &mut retries).await?;
 				},
 			}
 		}
+		Ok(())
 	}
 
 	#[tracing::instrument(name = "response", level = "debug", skip_all)]
@@ -243,11 +327,12 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
-	) {
+		stage: &mut QueueRecovery,
+	) -> Result {
 		match response {
 			| Ok(dest) =>
-				self.handle_response_ok(&dest, futures, statuses)
-					.await,
+				self.resume_queue(&dest, futures, statuses, stage)
+					.await?,
 			| Err((dest, e)) => {
 				let retry_action = Self::handle_response_err(&dest, statuses, &e);
 
@@ -267,7 +352,7 @@ impl Service {
 						let Some(status @ TransactionStatus::Failed(tries, _)) =
 							statuses.get(&dest)
 						else {
-							return;
+							return Ok(());
 						};
 
 						let tries = *tries;
@@ -281,11 +366,12 @@ impl Service {
 					},
 					| dest if matches!(retry_action, RetryAction::Force) =>
 						self.handle_force_retry(dest, futures, statuses)
-							.await,
+							.await?,
 					| _ => {},
 				}
 			},
 		}
+		Ok(())
 	}
 }
 
@@ -359,15 +445,16 @@ impl Service {
 		dest: Destination,
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
-	) {
-		let Ok(Some(events)) = self
+	) -> Result {
+		let Some(events) = self
 			.select_events(&dest, Vec::new(), statuses)
-			.await
+			.await?
 		else {
-			return;
+			return Ok(());
 		};
 
 		self.schedule_events(dest, events, futures, statuses);
+		Ok(())
 	}
 
 	fn handle_response_err(
@@ -400,28 +487,50 @@ impl Service {
 	}
 
 	#[expect(clippy::needless_pass_by_ref_mut)]
-	async fn handle_response_ok<'a>(
+	async fn resume_queue<'a>(
 		&'a self,
 		dest: &Destination,
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
-	) {
+		stage: &mut QueueRecovery,
+	) -> Result {
 		let _cork = self.db.db.cork();
-		self.db.delete_all_active_requests_for(dest).await;
+		stage
+			.clean_acknowledged(|| self.db.delete_all_active_requests_for(dest))
+			.await?;
+
+		// A prior attempt may have promoted queued rows or persisted EDUs before
+		// backpressure interrupted selection. Replay that durable active set;
+		// never delete it as though it belonged to the acknowledged transaction.
+		let active = self
+			.db
+			.active_requests_for(dest)
+			.try_collect::<Vec<_>>()
+			.await?;
+		if !active.is_empty() {
+			statuses.insert(dest.clone(), TransactionStatus::Running);
+			futures.push(
+				self.send_events(
+					dest.clone(),
+					active
+						.into_iter()
+						.map(|(_, event)| event)
+						.collect(),
+				),
+			);
+			return Ok(());
+		}
 
 		// Find events that have been added since starting the last request
 		let new_events = self
 			.db
 			.queued_requests(dest)
 			.take(DEQUEUE_LIMIT)
-			.collect::<Vec<_>>()
-			.await;
+			.try_collect::<Vec<_>>()
+			.await?;
 
 		if !new_events.is_empty() {
-			self.db
-				.mark_as_active(new_events.iter())
-				.await
-				.expect("database write error");
+			self.db.mark_as_active(new_events.iter()).await?;
 		}
 
 		let mut events: Vec<SendingEvent> = new_events
@@ -436,20 +545,44 @@ impl Service {
 				.filter(|event| matches!(event, SendingEvent::Edu(_)))
 				.count();
 
-			if let Ok(select_edus) = self.select_edus(server_name, budget_used).await {
-				events.extend(select_edus.into_iter().map(SendingEvent::Edu));
-			}
+			let selected = self.select_edus(server_name, budget_used).await?;
+			events.extend(selected.into_iter().map(SendingEvent::Edu));
 		}
 
 		if events.is_empty() {
 			statuses.remove(dest);
 		} else {
-			if let Some(status) = statuses.get_mut(dest) {
-				*status = TransactionStatus::Running;
-			}
+			statuses.insert(dest.clone(), TransactionStatus::Running);
 
 			futures.push(self.send_events(dest.clone(), events));
 		}
+		Ok(())
+	}
+
+	async fn retry_queue<'a>(
+		&'a self,
+		futures: &mut SendingFutures<'a>,
+		statuses: &mut CurTransactionStatus,
+		retries: &mut QueueRetries,
+	) -> Result {
+		let now = TokioInstant::now();
+		let Some(dest) = retries
+			.iter()
+			.find(|(_, (due, _))| *due <= now)
+			.map(|(dest, _)| dest.clone())
+		else {
+			return Ok(());
+		};
+		let (_, mut stage) = retries
+			.remove(&dest)
+			.expect("selected queue retry");
+		if let Err(error) = self
+			.resume_queue(&dest, futures, statuses, &mut stage)
+			.await
+		{
+			defer_queue_error(retries, dest, stage, error)?;
+		}
+		Ok(())
 	}
 
 	#[expect(
@@ -476,7 +609,7 @@ impl Service {
 		msg: Msg,
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
-	) {
+	) -> Result {
 		let synthetic_badge =
 			msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::BadgeRefresh);
 
@@ -487,16 +620,17 @@ impl Service {
 				self.db
 					.queued_requests(&msg.dest)
 					.take(DEQUEUE_LIMIT)
-					.collect()
-					.await,
+					.try_collect()
+					.await?,
 		};
 
-		if let Ok(Some(events)) = self
+		if let Some(events) = self
 			.select_events(&msg.dest, new_events, statuses)
-			.await
+			.await?
 		{
 			self.schedule_events(msg.dest, events, futures, statuses);
 		}
+		Ok(())
 	}
 
 	async fn drain_due_wakes<'a>(
@@ -504,7 +638,8 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
-	) {
+		retries: &mut QueueRetries,
+	) -> Result {
 		use tokio::time::Instant;
 
 		let now = Instant::now();
@@ -513,9 +648,15 @@ impl Service {
 			.is_some_and(|Reverse((due, _))| *due <= now)
 		{
 			let Reverse((_, dest)) = wakes.pop().expect("peeked entry");
-			self.handle_wake(dest, futures, statuses, wakes)
-				.await;
+			if !retries.contains_key(&dest)
+				&& let Err(error) = self
+					.handle_wake(dest.clone(), futures, statuses, wakes)
+					.await
+			{
+				defer_queue_error(retries, dest, QueueRecovery::ResumePending, error)?;
+			}
 		}
+		Ok(())
 	}
 
 	async fn handle_wake<'a>(
@@ -524,14 +665,14 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
-	) {
+	) -> Result {
 		let status = statuses.get(&dest);
 
 		if matches!(
 			status,
 			Some(TransactionStatus::Running | TransactionStatus::RunningForceRetry)
 		) {
-			return;
+			return Ok(());
 		}
 
 		if matches!(
@@ -539,7 +680,7 @@ impl Service {
 			(Destination::Push(..), Some(TransactionStatus::Retrying(_)))
 		) {
 			trace!(?dest, "Dropping push wake while retry is in flight");
-			return;
+			return Ok(());
 		}
 
 		if let (Destination::Push(..), Some(remaining)) =
@@ -555,7 +696,7 @@ impl Service {
 				arm_wake_in(wakes, dest, remaining);
 			}
 
-			return;
+			return Ok(());
 		}
 
 		match dest {
@@ -578,16 +719,18 @@ impl Service {
 							queue_id: Vec::new(),
 						};
 
-						self.handle_request(msg, futures, statuses).await;
+						self.handle_request(msg, futures, statuses)
+							.await?;
 					},
 				}
 			},
 			| dest @ Destination::Push(..) => {
 				self.handle_force_retry(dest, futures, statuses)
-					.await;
+					.await?;
 			},
 			| Destination::Appservice(_) => {},
 		}
+		Ok(())
 	}
 
 	#[tracing::instrument(
@@ -596,7 +739,7 @@ impl Service {
 		skip_all,
 		fields(futures = %futures.len()),
 	)]
-	async fn finish_responses<'a>(&'a self, futures: &mut SendingFutures<'a>) {
+	async fn finish_responses<'a>(&'a self, futures: &mut SendingFutures<'a>) -> Result {
 		use tokio::{
 			select,
 			time::{Instant, sleep_until},
@@ -609,11 +752,11 @@ impl Service {
 		loop {
 			trace!("Waiting for {} requests to complete...", futures.len());
 			select! {
-				() = sleep_until(deadline) => return,
+				() = sleep_until(deadline) => return Ok(()),
 				response = futures.next() => match response {
-					Some(Ok(dest)) => self.db.delete_all_active_requests_for(&dest).await,
+					Some(Ok(dest)) => self.db.delete_all_active_requests_for(&dest).await?,
 					Some(_) => {},
-					None => return,
+					None => return Ok(()),
 				},
 			}
 		}
@@ -630,7 +773,7 @@ impl Service {
 		id: usize,
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
-	) {
+	) -> Result {
 		let keep =
 			usize::try_from(self.server.config.startup_netburst_keep).unwrap_or(usize::MAX);
 
@@ -638,7 +781,7 @@ impl Service {
 		let active = self.db.active_requests();
 
 		pin_mut!(active);
-		while let Some((key, event, dest)) = active.next().await {
+		while let Some((key, event, dest)) = active.try_next().await? {
 			if self.shard_id(&dest) != id {
 				continue;
 			}
@@ -646,10 +789,7 @@ impl Service {
 			let entry = txns.entry(dest.clone()).or_default();
 			if self.server.config.startup_netburst_keep >= 0 && entry.len() >= keep {
 				warn!("Dropping unsent event {dest:?} {:?}", String::from_utf8_lossy(&key));
-				self.db
-					.delete_active_request(&key)
-					.await
-					.expect("database write error");
+				self.db.delete_active_request(&key).await?;
 			} else {
 				entry.push(event);
 			}
@@ -665,15 +805,15 @@ impl Service {
 		// Active transaction generations must own their queued successors before
 		// queued-only badge destinations are woken.
 		if !self.server.config.startup_netburst || keep == 0 {
-			return;
+			return Ok(());
 		}
 
 		let destinations = self
 			.db
 			.queued_badge_refresh_destinations()
-			.ready_filter(|dest| self.shard_id(dest) == id)
-			.collect::<HashSet<_>>()
-			.await;
+			.try_filter(|dest| futures::future::ready(self.shard_id(dest) == id))
+			.try_collect::<HashSet<_>>()
+			.await?;
 
 		for dest in destinations {
 			let msg = Msg {
@@ -682,8 +822,10 @@ impl Service {
 				queue_id: Vec::new(),
 			};
 
-			self.handle_request(msg, futures, statuses).await;
+			self.handle_request(msg, futures, statuses)
+				.await?;
 		}
+		Ok(())
 	}
 
 	#[tracing::instrument(
@@ -724,10 +866,12 @@ impl Service {
 
 		// Must retry any previous transaction for this remote.
 		if retry {
-			self.db
+			let active = self
+				.db
 				.active_requests_for(dest)
-				.ready_for_each(|(_, e)| events.push(e))
-				.await;
+				.try_collect::<Vec<_>>()
+				.await?;
+			events.extend(active.into_iter().map(|(_, event)| event));
 
 			return Ok(Some(events));
 		}
@@ -736,12 +880,9 @@ impl Service {
 		let _cork = self.db.db.cork();
 		let queued = self.db.retain_queued(new_events);
 		futures::pin_mut!(queued);
-		while let Some(item) = queued.next().await {
+		while let Some(item) = queued.try_next().await? {
 			{
-				self.db
-					.mark_as_active(once(&item))
-					.await
-					.expect("database transaction execute error");
+				self.db.mark_as_active(once(&item)).await?;
 				if !matches!(&item.1, SendingEvent::Flush) {
 					events.push(item.1);
 				}
@@ -755,9 +896,8 @@ impl Service {
 				.filter(|event| matches!(event, SendingEvent::Edu(_)))
 				.count();
 
-			if let Ok(select_edus) = self.select_edus(server_name, budget_used).await {
-				events.extend(select_edus.into_iter().map(SendingEvent::Edu));
-			}
+			let selected = self.select_edus(server_name, budget_used).await?;
+			events.extend(selected.into_iter().map(SendingEvent::Edu));
 		}
 
 		Ok(Some(events))
@@ -830,7 +970,7 @@ impl Service {
 	#[tracing::instrument(name = "edus", level = "debug", skip_all)]
 	async fn select_edus(&self, server_name: &ServerName, budget_used: usize) -> Result<EduVec> {
 		// selection window
-		let since = self.db.get_latest_educount(server_name).await;
+		let since = self.db.get_latest_educount(server_name).await?;
 		let since_upper = self.services.globals.current_count();
 
 		// Nothing new since the last window: skip the scan and the watermark.
@@ -2054,4 +2194,77 @@ fn arm_wake(wakes: &mut WakeQueue, dest: Destination, earliest_retry: SystemTime
 		.unwrap_or_default();
 
 	arm_wake_in(wakes, dest, delay);
+}
+
+#[cfg(test)]
+mod queue_recovery_tests {
+	use tuwunel_core::{
+		Error, err,
+		http::StatusCode,
+		ruma::api::error::{ErrorKind, LimitExceededErrorData},
+	};
+
+	use super::{Destination, QueueRecovery, QueueRetries, defer_queue_error};
+
+	fn busy() -> Error {
+		Error::Request(
+			ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+			"queue admission busy".into(),
+			StatusCode::TOO_MANY_REQUESTS,
+		)
+	}
+
+	#[tokio::test]
+	async fn cleanup_retry_cannot_delete_an_unsent_successor() {
+		let mut stage = QueueRecovery::CleanupAcknowledged;
+		stage
+			.clean_acknowledged(|| async { Err(busy()) })
+			.await
+			.expect_err("cleanup refused");
+		assert_eq!(stage, QueueRecovery::CleanupAcknowledged);
+
+		stage
+			.clean_acknowledged(|| async { Ok(()) })
+			.await
+			.expect("acknowledged rows removed");
+		assert_eq!(stage, QueueRecovery::ResumePending);
+
+		// Selection may now promote the next batch and then fail. Retrying at
+		// this stage must not run even one deletion against that successor.
+		stage
+			.clean_acknowledged(|| async { panic!("must not delete the successor") })
+			.await
+			.expect("cleanup skipped");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn retries_coalesce_per_destination_and_preserve_cleanup_stage() {
+		let mut retries = QueueRetries::new();
+		let dest = Destination::Appservice("test".into());
+		defer_queue_error(&mut retries, dest.clone(), QueueRecovery::CleanupAcknowledged, busy())
+			.expect("retry admitted");
+		defer_queue_error(&mut retries, dest.clone(), QueueRecovery::CleanupAcknowledged, busy())
+			.expect("retry coalesced");
+		assert_eq!(retries.len(), 1);
+		assert_eq!(retries[&dest].1, QueueRecovery::CleanupAcknowledged);
+		assert!(retries[&dest].0 > tokio::time::Instant::now());
+
+		defer_queue_error(&mut retries, dest.clone(), QueueRecovery::ResumePending, busy())
+			.expect("selection retry");
+		assert_eq!(retries[&dest].1, QueueRecovery::ResumePending);
+	}
+
+	#[test]
+	fn storage_failure_is_not_relabelled_as_retryable_backpressure() {
+		let mut retries = QueueRetries::new();
+		let error = defer_queue_error(
+			&mut retries,
+			Destination::Appservice("test".into()),
+			QueueRecovery::ResumePending,
+			err!(Database("indeterminate commit")),
+		)
+		.expect_err("fatal storage failure reaches supervision");
+		assert!(retries.is_empty());
+		assert_ne!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+	}
 }

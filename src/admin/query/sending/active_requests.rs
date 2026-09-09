@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::TryStreamExt;
 use tuwunel_core::Result;
 
 use crate::admin_command;
@@ -10,7 +10,7 @@ pub(super) async fn sending_active_requests(&self) -> Result {
 		.sending
 		.db
 		.active_requests()
-		.collect::<Vec<_>>();
+		.try_collect::<Vec<_>>();
 
-	self.write_timed_query(query).await
+	self.write_timed_query_try(query).await
 }

@@ -146,11 +146,12 @@ impl crate::Service for Service {
 
 		while let Some(ret) = senders.join_next_with_id().await {
 			match ret {
-				| Ok((id, _)) => {
+				| Ok((id, Ok(()))) => {
 					debug!(?id, "sender worker finished");
 				},
+				| Ok((_, Err(error))) => return Err(error),
 				| Err(error) => {
-					error!(id = ?error.id(), ?error, "sender worker finished");
+					return Err(error.into());
 				},
 			}
 		}
@@ -609,11 +610,11 @@ impl Service {
 						user_id.to_owned(),
 						push_key.to_owned(),
 					))
-					.await,
+					.await?,
 			| (Some(appservice_id), None, None) =>
 				self.db
 					.delete_all_requests_for(&Destination::Appservice(appservice_id.to_owned()))
-					.await,
+					.await?,
 			| _ => debug_warn!("cleanup_events called with too many or too few arguments"),
 		}
 

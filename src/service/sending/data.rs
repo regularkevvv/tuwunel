@@ -1,11 +1,11 @@
 use std::{fmt::Debug, sync::Arc};
 
-use futures::{Stream, StreamExt, stream::iter};
+#[cfg(test)]
+mod tests;
+
+use futures::{Stream, StreamExt, TryStreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
-use tuwunel_core::{
-	Error, Result, at, utils,
-	utils::{ReadyExt, stream::TryIgnore},
-};
+use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
 use tuwunel_database::{Database, Deserialized, Map, Txn};
 
 use super::{
@@ -42,43 +42,28 @@ impl Data {
 		self.servercurrentevent_data.remove(key).await
 	}
 
-	pub(super) async fn delete_all_active_requests_for(&self, destination: &Destination) {
+	pub(super) async fn delete_all_active_requests_for(
+		&self,
+		destination: &Destination,
+	) -> Result {
 		let prefix = destination.get_prefix();
 		self.servercurrentevent_data
 			.raw_keys_prefix(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				self.servercurrentevent_data
-					.remove(key)
-					.await
-					.expect("database remove error");
-			})
-			.await;
+			.try_for_each(|key| async move { self.servercurrentevent_data.remove(key).await })
+			.await
 	}
 
-	pub(super) async fn delete_all_requests_for(&self, destination: &Destination) {
+	pub(super) async fn delete_all_requests_for(&self, destination: &Destination) -> Result {
 		let prefix = destination.get_prefix();
 		self.servercurrentevent_data
 			.raw_keys_prefix(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				self.servercurrentevent_data
-					.remove(key)
-					.await
-					.expect("database remove error");
-			})
-			.await;
+			.try_for_each(|key| async move { self.servercurrentevent_data.remove(key).await })
+			.await?;
 
 		self.servernameevent_data
 			.raw_keys_prefix(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				self.servernameevent_data
-					.remove(key)
-					.await
-					.expect("database remove error");
-			})
-			.await;
+			.try_for_each(|key| async move { self.servernameevent_data.remove(key).await })
+			.await
 	}
 
 	pub(super) async fn mark_as_active<'a, I>(&self, events: I) -> Result
@@ -120,34 +105,22 @@ impl Data {
 	}
 
 	#[inline]
-	pub fn active_requests(&self) -> impl Stream<Item = OutgoingItem> + Send + '_ {
+	pub fn active_requests(&self) -> impl Stream<Item = Result<OutgoingItem>> + Send + '_ {
 		self.servercurrentevent_data
 			.raw_stream()
-			.ignore_err()
-			.map(|(key, val)| {
-				let (dest, event) =
-					parse_servercurrentevent(key, val).expect("invalid servercurrentevent");
-
-				(key.to_vec(), event, dest)
-			})
+			.map(decode_outgoing)
 	}
 
 	#[inline]
 	pub fn active_requests_for(
 		&self,
 		destination: &Destination,
-	) -> impl Stream<Item = SendingItem> + Send + '_ + use<'_> {
+	) -> impl Stream<Item = Result<SendingItem>> + Send + '_ + use<'_> {
 		let prefix = destination.get_prefix();
 		self.servercurrentevent_data
 			.raw_stream_from(&prefix)
-			.ignore_err()
-			.ready_take_while(move |(key, _)| key.starts_with(&prefix))
-			.map(|(key, val)| {
-				let (_, event) =
-					parse_servercurrentevent(key, val).expect("invalid servercurrentevent");
-
-				(key.to_vec(), event)
-			})
+			.ready_take_while(move |row| within_prefix(row, &prefix))
+			.map(decode_sending)
 	}
 
 	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>
@@ -190,39 +163,31 @@ impl Data {
 	pub(super) fn retain_queued<'a, I>(
 		&'a self,
 		events: I,
-	) -> impl Stream<Item = QueueItem> + Send + 'a
+	) -> impl Stream<Item = Result<QueueItem>> + Send + 'a
 	where
 		I: IntoIterator<Item = QueueItem> + Send + 'a,
 		I::IntoIter: Send,
 	{
 		iter(events).filter_map(async |item| {
 			let key = &item.0;
-			let exists = async || {
-				self.servernameevent_data
-					.exists(key)
-					.await
-					.is_ok()
-			};
+			if key.is_empty() {
+				return Some(Ok(item));
+			}
 
-			(key.is_empty() || exists().await).then_some(item)
+			let exists = self.servernameevent_data.exists(key).await;
+			retain_existing(item, exists)
 		})
 	}
 
 	pub fn queued_requests(
 		&self,
 		destination: &Destination,
-	) -> impl Stream<Item = QueueItem> + Send + '_ + use<'_> {
+	) -> impl Stream<Item = Result<QueueItem>> + Send + '_ + use<'_> {
 		let prefix = destination.get_prefix();
 		self.servernameevent_data
 			.raw_stream_from(&prefix)
-			.ignore_err()
-			.ready_take_while(move |(key, _)| key.starts_with(&prefix))
-			.map(|(key, val)| {
-				let (_, event) =
-					parse_servercurrentevent(key, val).expect("invalid servercurrentevent");
-
-				(key.to_vec(), event)
-			})
+			.ready_take_while(move |row| within_prefix(row, &prefix))
+			.map(decode_sending)
 	}
 
 	/// Streams queued push destinations with a pending badge refresh.
@@ -230,18 +195,11 @@ impl Data {
 	/// Returned destinations are owned and may safely cross cursor advances.
 	pub(super) fn queued_badge_refresh_destinations(
 		&self,
-	) -> impl Stream<Item = Destination> + Send + '_ {
+	) -> impl Stream<Item = Result<Destination>> + Send + '_ {
 		self.servernameevent_data
 			.raw_stream_from(b"$")
-			.ignore_err()
-			.ready_take_while(|(key, _)| key.starts_with(b"$"))
-			.ready_filter_map(|(key, val)| {
-				(val == [TAG_BADGE_REFRESH]).then(|| {
-					parse_servercurrentevent(key, val)
-						.expect("invalid servercurrentevent")
-						.0
-				})
-			})
+			.ready_take_while(|row| within_prefix(row, b"$"))
+			.ready_filter_map(decode_badge_destination)
 	}
 
 	pub(super) async fn set_latest_educount(
@@ -256,12 +214,55 @@ impl Data {
 		Ok(())
 	}
 
-	pub async fn get_latest_educount(&self, server_name: &ServerName) -> u64 {
-		self.servername_educount
-			.get(server_name)
-			.await
-			.deserialized()
-			.unwrap_or(0)
+	pub async fn get_latest_educount(&self, server_name: &ServerName) -> Result<u64> {
+		missing_count_is_zero(
+			self.servername_educount
+				.get(server_name)
+				.await
+				.deserialized(),
+		)
+	}
+}
+
+// A scan error is an item, never an end-of-prefix marker or an absent row.
+fn within_prefix(row: &Result<(&[u8], &[u8])>, prefix: &[u8]) -> bool {
+	match row {
+		| Ok((key, _)) => key.starts_with(prefix),
+		| Err(_) => true,
+	}
+}
+
+fn decode_outgoing(row: Result<(&[u8], &[u8])>) -> Result<OutgoingItem> {
+	let (key, value) = row?;
+	let (destination, event) = parse_servercurrentevent(key, value)?;
+	Ok((key.to_vec(), event, destination))
+}
+
+fn decode_sending(row: Result<(&[u8], &[u8])>) -> Result<SendingItem> {
+	decode_outgoing(row).map(|(key, event, _)| (key, event))
+}
+
+fn decode_badge_destination(row: Result<(&[u8], &[u8])>) -> Option<Result<Destination>> {
+	match row {
+		| Ok((key, value)) if value == [TAG_BADGE_REFRESH] =>
+			Some(parse_servercurrentevent(key, value).map(at!(0))),
+		| Ok(_) => None,
+		| Err(error) => Some(Err(error)),
+	}
+}
+
+fn retain_existing(item: QueueItem, exists: Result) -> Option<Result<QueueItem>> {
+	match exists {
+		| Ok(()) => Some(Ok(item)),
+		| Err(error) if error.is_not_found() => None,
+		| Err(error) => Some(Err(error)),
+	}
+}
+
+fn missing_count_is_zero(count: Result<u64>) -> Result<u64> {
+	match count {
+		| Err(error) if error.is_not_found() => Ok(0),
+		| result => result,
 	}
 }
 

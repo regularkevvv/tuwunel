@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::TryStreamExt;
 use ruma::{OwnedServerName, OwnedUserId};
 use tuwunel_core::Result;
 
@@ -20,7 +20,7 @@ pub(super) async fn sending_queued_requests(
 		.sending
 		.db
 		.queued_requests(&destination)
-		.collect::<Vec<_>>();
+		.try_collect::<Vec<_>>();
 
-	self.write_timed_query(query).await
+	self.write_timed_query_try(query).await
 }
