@@ -9,10 +9,7 @@ use futures::{FutureExt, TryFutureExt, future::try_join};
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use ruma::{
 	Mxc, OwnedMxcUri, OwnedUserId, ServerName, UserId,
-	api::client::{
-		session::{SsoRedirectAction, sso_callback, sso_login, sso_login_with_provider},
-		uiaa::AuthType,
-	},
+	api::client::session::{SsoRedirectAction, sso_callback, sso_login, sso_login_with_provider},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -729,45 +726,9 @@ async fn handle_uiaa(
 ) -> Result<sso_callback::unstable::Response> {
 	let uiaa_session_id = redirect_url.path();
 
-	// Find the UIAA session by its ID. SECURITY: Ensure the user authenticating via
-	// SSO is the owner of the UIAA session
-	let (user_id, device_id, mut uiaainfo) = services
-		.uiaa
-		.get_uiaa_session_by_session_id(uiaa_session_id)
-		.await
-		.filter(|(db_user_id, ..)| user_id.eq(db_user_id))
-		.ok_or_else(|| err!(Request(Forbidden("UIAA session not found."))))?;
-
-	// MSC4312 m.oauth flow → mark OAuth.
-	let has_oauth_flow = uiaainfo
-		.flows
-		.iter()
-		.any(|f| f.stages.contains(&AuthType::OAuth));
-
-	// Mark the completed step based on the UIAA session's flow.
-	if has_oauth_flow && !uiaainfo.completed.contains(&AuthType::OAuth) {
-		// Grant 10-minute bypass for cross-signing key replacement (like Synapse).
-		services
-			.users
-			.allow_cross_signing_replacement(&user_id)
-			.await;
-
-		uiaainfo.completed.push(AuthType::OAuth);
-	}
-
-	// Legacy m.login.sso flow → mark Sso.
-	let has_sso_flow = uiaainfo
-		.flows
-		.iter()
-		.any(|f| f.stages.contains(&AuthType::Sso));
-
-	if has_sso_flow && !uiaainfo.completed.contains(&AuthType::Sso) {
-		uiaainfo.completed.push(AuthType::Sso);
-	}
-
 	services
 		.uiaa
-		.update_uiaa_session(&user_id, &device_id, uiaa_session_id, Some(&uiaainfo))
+		.complete_sso(user_id, uiaa_session_id)
 		.await?;
 
 	// Redirect back to the fallback page to render the success HTML

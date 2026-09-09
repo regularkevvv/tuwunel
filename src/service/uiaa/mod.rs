@@ -1,4 +1,5 @@
 mod requests;
+mod transitions;
 
 use std::{
 	ops::ControlFlow,
@@ -19,12 +20,13 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, err, error, extract, implement,
-	utils::{self, BoolExt, hash::verify_password, string::EMPTY},
+	utils::{self, BoolExt, MutexMap, hash::verify_password, string::EMPTY},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
 pub struct Service {
 	userdevicesessionid_uiaarequest: RwLock<requests::Requests>,
+	transitions: MutexMap<transitions::SessionKey, ()>,
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
 }
@@ -47,6 +49,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			userdevicesessionid_uiaarequest: RwLock::new(requests::Requests::default()),
+			transitions: MutexMap::new(),
 			db: Data {
 				userdevicesessionid_uiaainfo: args.db["userdevicesessionid_uiaainfo"].clone(),
 			},
@@ -70,6 +73,11 @@ pub async fn create(
 		.session
 		.as_ref()
 		.ok_or_else(|| err!(Request(InvalidParam("Missing UIAA session identifier."))))?;
+
+	let _transition = self
+		.transitions
+		.lock(&transitions::SessionKey::new(session))
+		.await;
 
 	self.set_uiaa_request(user_id, device_id, session, json_body)?;
 
@@ -123,18 +131,28 @@ async fn try_auth_inner(
 	uiaainfo: &UiaaInfo,
 	email_identity_mode: EmailIdentityMode,
 ) -> Result<(bool, UiaaInfo)> {
-	let mut uiaainfo = if let Some(session) = auth.session() {
-		self.get_uiaa_session(user_id, device_id, session)
-			.await?
-	} else {
-		uiaainfo.clone()
-	};
+	// Serialize read, stage side effects, and consumption with SSO completion.
+	// The database writer lease supplies cross-process exclusion; this lock
+	// prevents two requests in that writer from spending the same proof.
+	let session = auth
+		.session()
+		.map(ToOwned::to_owned)
+		.unwrap_or_else(|| utils::random_string(SESSION_ID_LENGTH));
+	let _transition = self
+		.transitions
+		.lock(&transitions::SessionKey::new(&session))
+		.await;
 
-	if uiaainfo.session.is_none() {
-		uiaainfo.session = Some(utils::random_string(SESSION_ID_LENGTH));
-	}
+	let mut uiaainfo = self
+		.load_session(user_id, device_id, auth, uiaainfo, session)
+		.await?;
 
 	match auth {
+		// Completed stages are polled, not executed again. In particular a
+		// registration-token retry must not spend a second token use.
+		| _ if auth
+			.auth_type()
+			.is_some_and(|stage| uiaainfo.completed.contains(&stage)) => {},
 		// Find out what the user completed
 		| AuthData::Password(password) => {
 			if let ControlFlow::Break(authed) = self
@@ -221,7 +239,7 @@ async fn try_auth_inner(
 
 			uiaainfo.completed.push(AuthType::EmailIdentity);
 		},
-		| auth => error!("AuthData type not supported: {auth:?}"),
+		| _ => error!("UIAA authentication type not supported"),
 	}
 
 	// Check if a flow now succeeds
@@ -242,7 +260,6 @@ async fn try_auth_inner(
 		.expect("session is always set");
 
 	if matches!(email_identity_mode, EmailIdentityMode::Claim)
-		&& !matches!(auth, AuthData::EmailIdentity(_))
 		&& uiaainfo
 			.completed
 			.contains(&AuthType::EmailIdentity)
@@ -339,7 +356,7 @@ async fn verify_password(
 			.map_err(|_| err!(Request(InvalidParam("User ID is invalid."))))?;
 
 	// Check if the access token being used matches the credentials used for UIAA
-	if user_id.localpart() != user_id_from_username.localpart() {
+	if user_id != user_id_from_username {
 		return Err!(Request(Forbidden("User ID and access token mismatch.")));
 	}
 
@@ -442,7 +459,7 @@ pub fn get_uiaa_request(
 }
 
 #[implement(Service)]
-pub async fn update_uiaa_session(
+async fn update_uiaa_session(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
@@ -475,12 +492,17 @@ async fn get_uiaa_session(
 ) -> Result<UiaaInfo> {
 	let key = (user_id, device_id, session);
 
-	self.db
+	let info = self
+		.db
 		.userdevicesessionid_uiaainfo
 		.qry(&key)
 		.await
-		.deserialized()
-		.map_err(|_| err!(Request(Forbidden("UIAA session does not exist."))))
+		.deserialized::<UiaaInfo>()
+		.map_err(|_| err!(Request(Forbidden("UIAA session does not exist."))))?;
+	if info.session.as_deref() != Some(session) {
+		return Err!(Request(Forbidden("UIAA session binding is invalid.")));
+	}
+	Ok(info)
 }
 
 #[implement(Service)]

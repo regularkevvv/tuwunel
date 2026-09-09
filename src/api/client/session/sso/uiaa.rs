@@ -2,19 +2,14 @@ use axum::{extract::State, response::IntoResponse};
 use http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use ruma::api::client::uiaa::{AuthType, UiaaInfo, get_uiaa_fallback_page};
 use serde_json::Value as JsonValue;
-use tuwunel_core::{Err, Result, trace, utils::BoolExt};
+use tuwunel_core::{Err, Result, utils::BoolExt};
 
 use crate::{Ruma, oidc::url_encode};
 
 /// # `GET /_matrix/client/v3/auth/m.login.sso/fallback/web?session={session_id}`
 ///
 /// Get UIAA fallback web page for SSO authentication.
-#[tracing::instrument(
-	name = "sso_fallback",
-	level = "debug",
-	skip_all,
-	fields(session = body.body.session),
-)]
+#[tracing::instrument(name = "sso_fallback", level = "debug", skip_all)]
 pub(crate) async fn sso_fallback_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_uiaa_fallback_page::v3::Request>,
@@ -35,8 +30,7 @@ pub(crate) async fn sso_fallback_route(
 	let session_data = services
 		.uiaa
 		.get_uiaa_session_by_session_id(session)
-		.await
-		.inspect(|session_data| trace!(?session_data));
+		.await;
 
 	if session_data
 		.as_ref()
@@ -66,7 +60,6 @@ pub(crate) async fn sso_fallback_route(
 	let idp_id: Option<String> = session_data
 		.as_ref()
 		.map(|(_, _, uiaainfo)| uiaainfo)
-		.inspect(|uiaainfo| trace!(?uiaainfo))
 		.and_then(|uiaainfo| {
 			let raw = uiaainfo.params.as_ref()?.get();
 			let params: JsonValue = serde_json::from_str(raw).ok()?;

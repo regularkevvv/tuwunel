@@ -366,7 +366,7 @@ async fn enforce_uiaa(
 
 			services
 				.uiaa
-				.update_uiaa_session(&claim.0, &claim.1, &claim.2, None)
+				.delete_session(&claim.0, &claim.1, &claim.2)
 				.await?;
 
 			Ok(association)
