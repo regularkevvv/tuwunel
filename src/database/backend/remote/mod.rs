@@ -25,6 +25,7 @@
 pub(crate) mod cache;
 pub(crate) mod client;
 pub(crate) mod lease;
+mod outcome;
 pub(crate) mod scan;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -280,10 +281,24 @@ impl Backend {
 		};
 
 		let maps: BTreeSet<u16> = ops.iter().map(bridge::Mutation::map).collect();
+		let admission = self.scans.begin_write(&maps)?;
 		self.drain(&maps).await?;
+		self.writable_lease()?;
 
-		let Response::Committed { duplicate } = self.call(&request, "commit").await? else {
-			return Err!(Database("bridge commit: unexpected reply"));
+		let mut outcome = outcome::CommitOutcome::dispatched(self);
+		let duplicate = match self.client.call(&request, None).await {
+			| Ok(Response::Committed { duplicate }) => {
+				outcome.acknowledged();
+				duplicate
+			},
+			| Ok(_) => return Err!(Database("bridge commit: unexpected reply")),
+			| Err(error) => {
+				outcome.refused(&error);
+				if error.is_stale_lease() {
+					self.lose_lease();
+				}
+				return Err(database_error("commit", &error));
+			},
 		};
 
 		self.commits.fetch_add(1, Relaxed);
@@ -291,6 +306,7 @@ impl Backend {
 			self.cache.invalidate(MapId(op.map()), op.key());
 		}
 
+		drop(admission);
 		drop(barrier);
 
 		if duplicate {
@@ -325,7 +341,7 @@ impl Backend {
 				.map(|from| ByteBuf::from(from.to_vec())),
 			inclusive: state.inclusive,
 			limit: limit.clamp(1, MAX_SCAN_PAGE),
-			lease: self.lease.current(),
+			lease: Some(self.writable_lease()?),
 		};
 
 		// An older Worker may still produce row-count-only pages. Keep the
@@ -422,6 +438,7 @@ impl Backend {
 	/// Stops renewals and releases the lease so a successor need not wait
 	/// out its expiry.
 	pub async fn close(&self) {
+		self.scans.close();
 		self.abort_renewals();
 		self.lease.release().await;
 	}
@@ -470,8 +487,19 @@ impl Backend {
 
 	/// Reacts to a stale-lease refusal: read-only for good, then shutdown.
 	fn lose_lease(&self) {
+		self.scans.close();
 		if self.lease.mark_lost() {
 			error!("another process holds the writer lease; stopping writes and shutting down");
+			self.server.shutdown().ok();
+		}
+	}
+
+	/// Called synchronously by the dispatch guard before releasing the barrier.
+	fn stop_indeterminate_commit(&self) {
+		self.scans.close();
+		self.abort_renewals();
+		if self.lease.mark_lost() {
+			error!("commit outcome unknown; stopping writes and shutting down");
 			self.server.shutdown().ok();
 		}
 	}

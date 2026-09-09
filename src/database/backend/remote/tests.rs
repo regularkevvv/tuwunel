@@ -59,6 +59,14 @@ pub(crate) struct Faults {
 	/// Refuse oversized Get replies in band, like the bounded Worker.
 	/// Off exercises compatibility with an older, oversized HTTP reply.
 	pub(crate) bounded_get: bool,
+	/// Explicit rejection before any mutation, distinct from storage ambiguity.
+	pub(crate) reject_commit: bool,
+	/// Apply, then fail the batch-response/digest recovery path in band.
+	pub(crate) ambiguous_commit: bool,
+	/// Lose every commit response, including deduplicated retry replies.
+	pub(crate) lose_all_commit_replies: bool,
+	/// Return a valid but wrong reply variant after applying the commit.
+	pub(crate) wrong_commit_reply: bool,
 }
 
 /// The fake's durable state: the kv table, the lease row, the commits table.
@@ -75,6 +83,14 @@ struct Tables {
 struct Shared {
 	tables: Mutex<Tables>,
 	faults: Mutex<Faults>,
+	commit_gate: Mutex<Option<Arc<CommitGate>>>,
+}
+
+/// Stops an already-dispatched commit after the backend's drain, before apply.
+#[derive(Default)]
+struct CommitGate {
+	entered: tokio::sync::Notify,
+	release: tokio::sync::Notify,
 }
 
 /// One running fake bridge.
@@ -91,6 +107,7 @@ impl Fake {
 		let shared = Arc::new(Shared {
 			tables: Mutex::new(Tables::default()),
 			faults: Mutex::new(Faults::default()),
+			commit_gate: Mutex::new(None),
 		});
 
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -118,6 +135,16 @@ impl Fake {
 			.faults
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner) = faults;
+	}
+
+	fn pause_commit(&self) -> Arc<CommitGate> {
+		let gate = Arc::new(CommitGate::default());
+		*self
+			.shared
+			.commit_gate
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner) = Some(gate.clone());
+		gate
 	}
 
 	/// Number of commits the fake actually applied.
@@ -172,8 +199,36 @@ async fn kv(
 	let Ok(request) = bridge::decode::<Request>(&body) else {
 		return StatusCode::BAD_REQUEST.into_response();
 	};
+	if matches!(request, Request::Commit { .. }) {
+		let gate = shared
+			.commit_gate
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.take();
+		if let Some(gate) = gate {
+			gate.entered.notify_one();
+			gate.release.notified().await;
+		}
+	}
 
-	match apply(&shared, &request) {
+	let response = apply(&shared, &request);
+	if matches!(request, Request::Commit { .. }) {
+		let faults = *shared
+			.faults
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		if faults.lose_all_commit_replies {
+			return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+		}
+		if faults.wrong_commit_reply {
+			return (
+				[(axum::http::header::CONTENT_TYPE, bridge::CONTENT_TYPE)],
+				bridge::encode(&Response::Released).expect("encode wrong reply"),
+			)
+				.into_response();
+		}
+	}
+	match response {
 		| Ok(response) => match bridge::encode(&response) {
 			| Ok(body) =>
 				([(axum::http::header::CONTENT_TYPE, bridge::CONTENT_TYPE)], body).into_response(),
@@ -377,6 +432,9 @@ fn commit(
 	now: u64,
 	faults: Faults,
 ) -> Result<Response, StatusCode> {
+	if faults.reject_commit {
+		return Ok(Response::Error(BridgeError::Invalid("test refusal".into())));
+	}
 	if digest.as_slice() != bridge::digest(ops) {
 		return Ok(Response::Error(BridgeError::Invalid("digest".into())));
 	}
@@ -413,6 +471,9 @@ fn commit(
 		.insert(request_id.to_vec(), digest.to_vec());
 
 	tables.applied = tables.applied.saturating_add(1);
+	if faults.ambiguous_commit {
+		return Ok(Response::Error(BridgeError::Storage("network".into())));
+	}
 
 	// The batch is durable; losing the reply here is the ambiguous outcome
 	// the request id exists for.
@@ -732,6 +793,156 @@ async fn page_continuation_over_adversarial_keys() -> Result {
 
 	backend.close().await;
 
+	Ok(())
+}
+
+#[tokio::test]
+async fn a_scan_created_after_drain_must_not_silently_observe_the_later_commit() -> Result {
+	let (fake, _server, backend) = rig(2, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	map.insert(&b"key".to_vec(), b"before").await?;
+	let gate = fake.pause_commit();
+	let writer = {
+		let map = map.clone();
+		tokio::spawn(async move { map.insert(&b"key".to_vec(), b"after").await })
+	};
+	tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+		.await
+		.expect("commit reached post-drain gate");
+	// Creation completes while the actual write is known not to have applied.
+	// A scan may explicitly refuse admission, but may never return a different
+	// snapshot as a successful result.
+	let mut scan = Box::pin(map.raw_stream());
+	gate.release.notify_one();
+	writer.await??;
+	match scan.next().await {
+		| Some(Ok((key, value))) => {
+			assert_eq!(key, b"key");
+			assert_eq!(value, b"before", "scan admitted after drain observed a later write");
+		},
+		| Some(Err(error)) => assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS),
+		| None => panic!("an empty result is not explicit admission refusal"),
+	}
+	backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_a_dispatched_commit_must_not_leave_the_writer_writable() -> Result {
+	let (fake, _server, backend) = rig(2, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let gate = fake.pause_commit();
+	let writer = {
+		let map = map.clone();
+		tokio::spawn(async move { map.insert(&b"key".to_vec(), b"value").await })
+	};
+	tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+		.await
+		.expect("commit reached post-drain gate");
+	writer.abort();
+	assert!(
+		writer
+			.await
+			.expect_err("cancelled task")
+			.is_cancelled()
+	);
+	let writable = backend.is_writable();
+	// Release the owned fake before asserting, including on a failing baseline.
+	gate.release.notify_one();
+	assert!(!writable, "cancelled dispatched commit left the writer writable");
+	backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
+async fn known_commit_refusal_reopens_admission_but_storage_ambiguity_stops_the_writer() -> Result
+{
+	let (fake, _server, backend) = rig(2, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	fake.faults(Faults { reject_commit: true, ..Faults::default() });
+	assert!(
+		map.insert(&b"key".to_vec(), b"refused")
+			.await
+			.is_err()
+	);
+	assert!(backend.is_writable());
+	assert_eq!(fake.applied(), 0);
+	let rows: Vec<Vec<u8>> = map
+		.raw_keys()
+		.map_ok(<[u8]>::to_vec)
+		.try_collect()
+		.await?;
+	assert!(rows.is_empty());
+	fake.faults(Faults {
+		ambiguous_commit: true,
+		..Faults::default()
+	});
+	assert!(
+		map.insert(&b"key".to_vec(), b"unknown")
+			.await
+			.is_err()
+	);
+	assert_eq!(fake.applied(), 1);
+	assert!(!backend.is_writable());
+	let mut scan = Box::pin(map.raw_keys());
+	scan.next()
+		.await
+		.expect("explicit closed-admission result")
+		.expect_err("closed admission refuses reads");
+	assert!(scan.next().await.is_none());
+	assert!(
+		map.insert(&b"later".to_vec(), b"must-not-apply")
+			.await
+			.is_err()
+	);
+	assert_eq!(fake.applied(), 1);
+	backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
+async fn exhausted_or_malformed_commit_replies_stop_without_double_application() -> Result {
+	for wrong_reply in [false, true] {
+		let (fake, _server, backend) = rig(2, 0).await?;
+		let map = Map::open_remote(&backend, MAP);
+		fake.faults(Faults {
+			lose_all_commit_replies: !wrong_reply,
+			wrong_commit_reply: wrong_reply,
+			..Faults::default()
+		});
+		assert!(
+			map.insert(&b"key".to_vec(), b"unknown")
+				.await
+				.is_err()
+		);
+		assert_eq!(fake.applied(), 1, "transport retries reuse the same operation identity");
+		assert!(!backend.is_writable());
+		assert!(
+			map.insert(&b"later".to_vec(), b"must-not-apply")
+				.await
+				.is_err()
+		);
+		assert_eq!(fake.applied(), 1);
+		backend.close().await;
+	}
+	Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_before_dispatch_does_not_stop_the_writer() -> Result {
+	let (fake, _server, backend) = rig(2, 0).await?;
+	let barrier = backend.barrier.write().await;
+	let map = Map::open_remote(&backend, MAP);
+	let key = b"key".to_vec();
+	let mut commit = Box::pin(map.insert(&key, b"not-dispatched"));
+	assert!(futures::poll!(&mut commit).is_pending());
+	drop(commit);
+	assert!(backend.is_writable());
+	assert_eq!(fake.applied(), 0);
+	drop(barrier);
+	map.insert(&b"key".to_vec(), b"works").await?;
+	assert_eq!(fake.applied(), 1);
+	backend.close().await;
 	Ok(())
 }
 

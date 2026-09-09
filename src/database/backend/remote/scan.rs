@@ -29,7 +29,11 @@ use std::{
 };
 
 use futures::{Stream, stream::FusedStream};
-use tuwunel_core::Result;
+use tuwunel_core::{
+	Error, Result, err,
+	http::StatusCode,
+	ruma::api::error::{ErrorKind, LimitExceededErrorData, RetryAfter},
+};
 
 use super::Backend;
 use crate::{
@@ -41,7 +45,32 @@ use crate::{
 #[derive(Default)]
 pub(crate) struct Registry {
 	next: AtomicU64,
-	scans: Mutex<HashMap<u64, Arc<Scan>>>,
+	state: Mutex<RegistryState>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+	scans: HashMap<u64, Arc<Scan>>,
+	writing: BTreeSet<u16>,
+	closed: bool,
+}
+
+/// Serializes scan admission with the write's drain and remote outcome.
+/// The backend owns its exclusive commit barrier for this guard's lifetime.
+pub(crate) struct WriteAdmission<'a>(&'a Registry);
+
+impl Drop for WriteAdmission<'_> {
+	fn drop(&mut self) { self.0.lock().writing.clear(); }
+}
+
+fn busy() -> Error {
+	Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData {
+			retry_after: Some(RetryAfter::Delay(std::time::Duration::from_millis(100))),
+		}),
+		"Snapshot admission is busy; retry the operation.".into(),
+		StatusCode::TOO_MANY_REQUESTS,
+	)
 }
 
 /// One open scan: its position and the rows fetched but not yet yielded.
@@ -71,7 +100,14 @@ impl Registry {
 		map: MapId,
 		reverse: bool,
 		from: Option<&[u8]>,
-	) -> (u64, Arc<Scan>) {
+	) -> Result<(u64, Arc<Scan>)> {
+		let mut state = self.lock();
+		if state.closed {
+			return Err(err!(Database("snapshot admission is closed")));
+		}
+		if state.writing.contains(&map.0) {
+			return Err(busy());
+		}
 		let scan = Arc::new(Scan {
 			map,
 			reverse,
@@ -84,17 +120,34 @@ impl Registry {
 		});
 
 		let id = self.next.fetch_add(1, Relaxed);
-		self.lock().insert(id, scan.clone());
+		state.scans.insert(id, scan.clone());
 
-		(id, scan)
+		Ok((id, scan))
 	}
 
+	/// Close admission on touched maps before collecting scans to drain.
+	pub(crate) fn begin_write(&self, maps: &BTreeSet<u16>) -> Result<WriteAdmission<'_>> {
+		let mut state = self.lock();
+		if state.closed {
+			return Err(err!(Database("snapshot admission is closed")));
+		}
+		if !state.writing.is_empty() {
+			return Err(busy());
+		}
+		state.writing.clone_from(maps);
+		Ok(WriteAdmission(self))
+	}
+
+	/// No new snapshot can safely be admitted after an indeterminate commit.
+	pub(crate) fn close(&self) { self.lock().closed = true; }
+
 	/// Forgets a scan; called from the stream's drop.
-	pub(crate) fn unregister(&self, id: u64) { self.lock().remove(&id); }
+	pub(crate) fn unregister(&self, id: u64) { self.lock().scans.remove(&id); }
 
 	/// Open scans on any of `maps`.
 	pub(crate) fn touching(&self, maps: &BTreeSet<u16>) -> Vec<Arc<Scan>> {
 		self.lock()
+			.scans
 			.values()
 			.filter(|scan| maps.contains(&scan.map.0))
 			.cloned()
@@ -103,10 +156,10 @@ impl Registry {
 
 	/// Number of open scans.
 	#[cfg(test)]
-	pub(crate) fn len(&self) -> usize { self.lock().len() }
+	pub(crate) fn len(&self) -> usize { self.lock().scans.len() }
 
-	fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Scan>>> {
-		self.scans
+	fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+		self.state
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner)
 	}
@@ -136,8 +189,8 @@ type Advance = Pin<Box<dyn Future<Output = Result<Option<Entry>>> + Send>>;
 /// until the next poll and must be owned before it is retained.
 pub(crate) struct RemoteSeek<'a, T> {
 	backend: Arc<Backend>,
-	id: u64,
-	scan: Arc<Scan>,
+	id: Option<u64>,
+	scan: Option<Arc<Scan>>,
 	current: Option<Entry>,
 	pending: Option<Advance>,
 	done: bool,
@@ -154,14 +207,18 @@ impl<T> RemoteSeek<'_, T> {
 		reverse: bool,
 		from: Option<&[u8]>,
 	) -> Self {
-		let (id, scan) = backend.scans().register(map, reverse, from);
+		let (id, scan, pending): (_, _, Option<Advance>) =
+			match backend.scans().register(map, reverse, from) {
+				| Ok((id, scan)) => (Some(id), Some(scan), None),
+				| Err(error) => (None, None, Some(Box::pin(async move { Err(error) }))),
+			};
 
 		Self {
 			backend,
 			id,
 			scan,
 			current: None,
-			pending: None,
+			pending,
 			done: false,
 			_marker: PhantomData,
 		}
@@ -223,7 +280,8 @@ where
 			// Fast path: a buffered row needs no lock wait and no allocation.
 			// The guard is released before the stream is touched again, so
 			// the borrow never overlaps the yield.
-			let buffered = match this.scan.state.try_lock() {
+			let scan = this.scan.as_ref().expect("an admitted scan");
+			let buffered = match scan.state.try_lock() {
 				| Ok(mut state) => match state.buffer.pop_front() {
 					| Some(entry) => Buffered::Row(entry),
 					| None if state.exhausted => Buffered::End,
@@ -241,7 +299,7 @@ where
 				| Buffered::Unknown => {},
 			}
 
-			this.pending = Some(Box::pin(advance(this.backend.clone(), this.scan.clone())));
+			this.pending = Some(Box::pin(advance(this.backend.clone(), scan.clone())));
 		}
 	}
 
@@ -250,8 +308,10 @@ where
 			return (0, Some(0));
 		}
 
-		let buffered = self
-			.scan
+		let Some(scan) = self.scan.as_ref() else {
+			return (1, Some(1));
+		};
+		let buffered = scan
 			.state
 			.try_lock()
 			.map_or(0, |state| state.buffer.len());
@@ -290,5 +350,50 @@ where
 }
 
 impl<T> Drop for RemoteSeek<'_, T> {
-	fn drop(&mut self) { self.backend.scans().unregister(self.id); }
+	fn drop(&mut self) {
+		if let Some(id) = self.id {
+			self.backend.scans().unregister(id);
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn write_admission_is_map_scoped_reopens_and_stays_closed_after_poison() {
+		let registry = Registry::default();
+		let (old, _) = registry
+			.register(MapId(0), false, None)
+			.expect("initial scan");
+		let writing = registry
+			.begin_write(&BTreeSet::from([0]))
+			.expect("write admission");
+		let error = registry
+			.register(MapId(0), false, None)
+			.err()
+			.expect("refused touching scan");
+		assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+		assert!(matches!(error.kind(), ErrorKind::LimitExceeded(_)));
+		let (other, _) = registry
+			.register(MapId(1), false, None)
+			.expect("unrelated scan");
+		assert_eq!(registry.touching(&BTreeSet::from([0])).len(), 1);
+		drop(writing);
+		let (after, _) = registry
+			.register(MapId(0), false, None)
+			.expect("admission reopened");
+		let writing = registry
+			.begin_write(&BTreeSet::from([0]))
+			.expect("next write");
+		registry.close();
+		drop(writing);
+		assert!(registry.register(MapId(0), false, None).is_err());
+		assert!(registry.register(MapId(1), false, None).is_err());
+		for id in [old, other, after] {
+			registry.unregister(id);
+		}
+		assert_eq!(registry.len(), 0);
+	}
 }
