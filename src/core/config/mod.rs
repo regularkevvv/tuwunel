@@ -12,6 +12,7 @@ pub mod manager;
 mod net;
 pub mod proxy;
 mod regenerate;
+pub mod registration_tokens;
 pub mod room_version;
 pub mod sources;
 #[cfg(test)]

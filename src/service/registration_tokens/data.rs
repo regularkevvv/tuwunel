@@ -1,9 +1,12 @@
 use std::{fmt, sync::Arc, time::SystemTime};
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
-	Err, Result, err,
+	Err, Error, Result,
+	config::registration_tokens::{MAX_TOKEN_BYTES, valid_token},
+	err,
+	ruma::api::error::{ErrorKind, LimitExceededErrorData},
 	utils::{self, MutexMap},
 };
 use tuwunel_database::{Database, Json, Map};
@@ -11,6 +14,26 @@ use tuwunel_database::{Database, Json, Map};
 pub(super) struct Data {
 	registrationtoken_info: Arc<Map>,
 	transitions: MutexMap<TokenKey, ()>,
+	admission: tokio::sync::Mutex<()>,
+}
+
+const MAX_RECORD_BYTES: usize = 1024;
+
+pub(super) fn check_lookup_key(token: &str) -> Result {
+	// Preserve exact admin lookup/revocation of legacy keys, but bound the
+	// key copied into a transition lock or backend request.
+	if token.len() > tuwunel_bridge::MAX_KEY_BYTES {
+		return Err!(Request(TooLarge("Registration token lookup key exceeds storage limit")));
+	}
+	Ok(())
+}
+
+fn capacity_error() -> Error {
+	Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+		"Registration token inventory limit reached".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	)
 }
 
 /// MutexMap instruments keys. A registration capability is never a trace field.
@@ -112,6 +135,7 @@ impl Data {
 		Self {
 			registrationtoken_info: db["registrationtoken_info"].clone(),
 			transitions: MutexMap::new(),
+			admission: tokio::sync::Mutex::new(()),
 		}
 	}
 
@@ -121,14 +145,21 @@ impl Data {
 		token: &str,
 		expires: TokenExpires,
 	) -> Result<DatabaseTokenInfo> {
+		if !valid_token(token) {
+			return Err!(Request(InvalidParam("Invalid registration token identifier")));
+		}
 		let _transition = self
 			.transitions
 			.lock(&TokenKey(token.to_owned()))
 			.await;
+		let _admission = self.admission.lock().await;
 		match self.registrationtoken_info.get(token).await {
 			| Ok(_) => return Err!(Request(InvalidParam("Registration token already exists"))),
 			| Err(error) if error.is_not_found() => {},
 			| Err(error) => return Err(error),
+		}
+		if self.bounded_keys().await?.len() >= super::MAX_DATABASE_TOKENS {
+			return Err(capacity_error());
 		}
 		let info = DatabaseTokenInfo::new(expires);
 		self.registrationtoken_info
@@ -139,6 +170,7 @@ impl Data {
 
 	/// Delete a registration token.
 	pub(super) async fn revoke_token(&self, token: &str) -> Result {
+		check_lookup_key(token)?;
 		let _transition = self
 			.transitions
 			.lock(&TokenKey(token.to_owned()))
@@ -153,6 +185,9 @@ impl Data {
 
 	/// Look up a registration token's metadata.
 	pub(super) async fn check_token(&self, token: &str, consume: bool) -> Result<bool> {
+		if !valid_token(token) {
+			return Ok(false);
+		}
 		let _transition = self
 			.transitions
 			.lock(&TokenKey(token.to_owned()))
@@ -189,7 +224,11 @@ impl Data {
 	/// Read current metadata. Absence, corruption and I/O failure stay
 	/// distinct.
 	pub(super) async fn get_token_info(&self, token: &str) -> Result<DatabaseTokenInfo> {
+		check_lookup_key(token)?;
 		let value = self.registrationtoken_info.get(token).await?;
+		if value.len() > MAX_RECORD_BYTES {
+			return Err!("Registration token metadata exceeds record-size limit");
+		}
 		serde_json::from_slice(value.as_ref())
 			.map_err(|_| err!("Invalid registration token metadata"))
 	}
@@ -200,6 +239,7 @@ impl Data {
 		token: &str,
 		expires: TokenExpires,
 	) -> Result<DatabaseTokenInfo> {
+		check_lookup_key(token)?;
 		let _transition = self
 			.transitions
 			.lock(&TokenKey(token.to_owned()))
@@ -222,17 +262,10 @@ impl Data {
 		// Close the scan before mutation. Re-read under the same lock as
 		// consumption/revocation/update: an old expiry snapshot must not delete
 		// a token that an operator has renewed in the meantime.
-		let all: Vec<Vec<u8>> = self
-			.registrationtoken_info
-			.raw_keys()
-			.map_ok(<[u8]>::to_vec)
-			.try_collect()
-			.await?;
+		let all = self.bounded_keys().await?;
 
 		let mut valid = Vec::new();
-		for key in all {
-			let token =
-				String::from_utf8(key).map_err(|_| err!("Invalid registration token key"))?;
+		for token in all {
 			let _transition = self
 				.transitions
 				.lock(&TokenKey(token.clone()))
@@ -250,6 +283,33 @@ impl Data {
 		}
 
 		Ok(valid)
+	}
+
+	async fn bounded_keys(&self) -> Result<Vec<String>> {
+		let keys: Vec<String> = self
+			.registrationtoken_info
+			.raw_keys()
+			.take(super::MAX_DATABASE_TOKENS.saturating_add(1))
+			.map(|key| {
+				let key = key?;
+				if key.len() > MAX_TOKEN_BYTES {
+					return Err!("Registration token inventory contains an oversized legacy key");
+				}
+				let token = std::str::from_utf8(key)
+					.map_err(|_| err!("Invalid registration token key"))?;
+				if !valid_token(token) {
+					return Err!(
+						"Registration token inventory contains an unsupported legacy key"
+					);
+				}
+				Ok(token.to_owned())
+			})
+			.try_collect()
+			.await?;
+		if keys.len() > super::MAX_DATABASE_TOKENS {
+			return Err(capacity_error());
+		}
+		Ok(keys)
 	}
 }
 

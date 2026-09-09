@@ -367,35 +367,10 @@ fn check_registration(config: &Config) -> Result {
 		));
 	}
 
-	if config
-		.registration_token
-		.as_ref()
-		.is_some_and(String::is_empty)
-	{
-		return Err!(Config(
-			"registration_token",
-			"Registration token was specified but is empty (\"\")"
-		));
-	}
-
-	// check if we can read the token file path, and check if the file is empty
-	if config
-		.registration_token_file
-		.as_ref()
-		.is_some_and(|path| {
-			let Ok(token) = read_to_string(path).inspect_err(|e| {
-				error!("Failed to read the registration token file: {e}");
-			}) else {
-				return true;
-			};
-
-			token == String::new()
-		}) {
-		return Err!(Config(
-			"registration_token_file",
-			"Registration token file was specified but is empty or failed to be read"
-		));
-	}
+	super::registration_tokens::configured_tokens(
+		config.registration_token.as_deref(),
+		config.registration_token_file.as_deref(),
+	)?;
 
 	let no_token =
 		config.registration_token.is_none() && config.registration_token_file.is_none();
