@@ -56,6 +56,9 @@ pub(crate) struct Faults {
 	pub(crate) protocol: Option<u32>,
 	/// D1 schema version reported by `Hello`.
 	pub(crate) schema_version: Option<u32>,
+	/// Refuse oversized Get replies in band, like the bounded Worker.
+	/// Off exercises compatibility with an older, oversized HTTP reply.
+	pub(crate) bounded_get: bool,
 }
 
 /// The fake's durable state: the kv table, the lease row, the commits table.
@@ -208,17 +211,33 @@ fn apply(shared: &Shared, request: &Request) -> Result<Response, StatusCode> {
 			now_ms: now,
 		}),
 
-		| Request::Get { map, keys } => Ok(Response::Got {
-			vals: keys
-				.iter()
-				.map(|key| {
-					tables
-						.kv
-						.get(&(*map, key.to_vec()))
-						.map(|val| serde_bytes::ByteBuf::from(val.clone()))
-				})
-				.collect(),
-		}),
+		| Request::Get { map, keys } => {
+			if faults.bounded_get {
+				let size = keys.iter().fold(0_usize, |size, key| {
+					size.saturating_add(bridge::response::ROW_OVERHEAD)
+						.saturating_add(
+							tables
+								.kv
+								.get(&(*map, key.to_vec()))
+								.map_or(0, Vec::len),
+						)
+				});
+				if size > bridge::response::DATA_BYTES {
+					return Ok(Response::Error(bridge::response::too_large()));
+				}
+			}
+			Ok(Response::Got {
+				vals: keys
+					.iter()
+					.map(|key| {
+						tables
+							.kv
+							.get(&(*map, key.to_vec()))
+							.map(|val| serde_bytes::ByteBuf::from(val.clone()))
+					})
+					.collect(),
+			})
+		},
 
 		| Request::Scan {
 			map,
@@ -830,6 +849,83 @@ async fn large_multi_key_reads_chunk_by_bytes_and_preserve_order() -> Result {
 		} else {
 			assert_eq!(value.as_deref(), Some(&key[..2]));
 		}
+	}
+	backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
+async fn oversized_read_replies_reduce_batches_without_losing_order_or_duplicates() -> Result {
+	for bounded_get in [false, true] {
+		let (fake, _server, backend) = rig(256, 0).await?;
+		fake.faults(Faults { bounded_get, ..Faults::default() });
+		{
+			let mut tables = fake
+				.shared
+				.tables
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner);
+			for key in [b'a', b'b', b'c'] {
+				tables
+					.kv
+					.insert((map_id(), vec![key]), vec![key; bridge::MAX_VALUE_BYTES]);
+			}
+		}
+		let query: &[&[u8]] = &[b"c", b"absent", b"a", b"b", b"c"];
+		let rows = backend
+			.get_many(crate::backend::MapId(map_id()), query)
+			.await?;
+		assert_eq!(rows.len(), query.len());
+		for (key, value) in query.iter().zip(&rows) {
+			if *key == b"absent" {
+				assert!(value.is_none());
+			} else {
+				let value = value.as_ref().expect("present key");
+				assert_eq!(value.len(), bridge::MAX_VALUE_BYTES);
+				assert!(value.iter().all(|byte| byte == &key[0]));
+			}
+		}
+		backend.close().await;
+	}
+	Ok(())
+}
+
+#[tokio::test]
+async fn oversized_legacy_scan_pages_reduce_without_losing_snapshot_or_cursor() -> Result {
+	let (fake, _server, backend) = rig(4, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	{
+		let mut tables = fake
+			.shared
+			.tables
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		for key in [b'a', b'b', b'c'] {
+			tables
+				.kv
+				.insert((map_id(), vec![key]), vec![key; bridge::MAX_VALUE_BYTES]);
+		}
+	}
+	let reverse: Vec<Vec<u8>> = map
+		.rev_raw_keys()
+		.map_ok(<[u8]>::to_vec)
+		.try_collect()
+		.await?;
+	assert_eq!(reverse, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+	let mut stream = Box::pin(map.raw_stream());
+	let first = stream.next().await.expect("first row")?;
+	let mut seen = vec![(first.0.to_vec(), first.1.to_vec())];
+	map.insert(&b"b".to_vec(), b"changed").await?;
+	map.insert(&b"d".to_vec(), b"new").await?;
+	while let Some(row) = stream.next().await {
+		let (key, value) = row?;
+		seen.push((key.to_vec(), value.to_vec()));
+	}
+	assert_eq!(seen.len(), 3);
+	for ((key, value), expected) in seen.iter().zip([b'a', b'b', b'c']) {
+		assert_eq!(key, &[expected]);
+		assert_eq!(value.len(), bridge::MAX_VALUE_BYTES);
+		assert!(value.iter().all(|byte| *byte == expected));
 	}
 	backend.close().await;
 	Ok(())

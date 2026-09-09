@@ -80,8 +80,12 @@ pub fn decode(bytes: &[u8]) -> Result<Request, Error> {
 
 /// Counts the exact existing CBOR encoding without allocating an encoded body.
 pub(super) fn check_size(request: &Request) -> Result<(), Error> {
+	check_serialized_size(request)
+}
+
+pub(crate) fn check_serialized_size<T: Serialize>(value: &T) -> Result<(), Error> {
 	let mut length = Length(0);
-	request
+	value
 		.serialize(&mut minicbor_serde::Serializer::new(&mut length))
 		.map_err(|_| too_large("request bytes", MAX_BYTES))
 }
@@ -101,7 +105,7 @@ impl Write for Length {
 	}
 }
 
-fn preflight(bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn preflight(bytes: &[u8]) -> Result<(), Error> {
 	if bytes.len() > MAX_BYTES {
 		return Err(too_large("request bytes", MAX_BYTES));
 	}

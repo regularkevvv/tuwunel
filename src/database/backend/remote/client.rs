@@ -69,6 +69,13 @@ impl fmt::Display for CallError {
 }
 
 impl CallError {
+	/// A read can be retried with fewer keys after an explicit size refusal.
+	/// Transport byte refusals also cover an older Worker's oversized reply.
+	pub(crate) fn is_response_too_large(&self) -> bool {
+		matches!(self, Self::Bridge(bridge::Error::TooLarge { what, .. }) if what == "response bytes")
+			|| matches!(self, Self::Transport { class: "response bytes", .. })
+	}
+
 	/// Whether this is the in-band stale-lease refusal.
 	#[inline]
 	pub(crate) fn is_stale_lease(&self) -> bool {
@@ -132,7 +139,7 @@ impl Client {
 		// Oversized atomic commits are never split or retried as transport errors.
 		let body = bridge::request::encode(request).map_err(CallError::Bridge)?;
 
-		let reply = self
+		let mut reply = self
 			.http
 			.post(&self.endpoint)
 			.header(CONTENT_TYPE, bridge::CONTENT_TYPE)
@@ -156,13 +163,31 @@ impl Client {
 			});
 		}
 
-		let bytes = reply.bytes().await.map_err(classify)?;
+		let byte_error = || CallError::Transport {
+			class: "response bytes",
+			detail: "reply exceeds the byte limit".into(),
+			retryable: false,
+		};
+		if reply.content_length().is_some_and(|length| {
+			length > u64::try_from(bridge::response::MAX_BYTES).unwrap_or(u64::MAX)
+		}) {
+			return Err(byte_error());
+		}
+		let mut bytes = Vec::new();
+		while let Some(chunk) = reply.chunk().await.map_err(classify)? {
+			bridge::response::append(&mut bytes, &chunk).map_err(|_| byte_error())?;
+		}
 		let response: Response =
-			bridge::decode(&bytes).map_err(|error| CallError::Transport {
+			bridge::response::decode(&bytes).map_err(|_| CallError::Transport {
 				class: "decode",
-				detail: error.to_string(),
+				detail: "invalid bounded reply".into(),
 				retryable: false,
 			})?;
+		bridge::response::check_for(&response, request).map_err(|_| CallError::Transport {
+			class: "decode",
+			detail: "reply does not match request".into(),
+			retryable: false,
+		})?;
 
 		match response {
 			| Response::Error(error) => Err(CallError::Bridge(error)),
@@ -257,6 +282,51 @@ pub(crate) fn database_error(op: &str, error: &CallError) -> Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn declared_and_chunked_oversized_replies_are_nonretryable() {
+		for chunked in [false, true] {
+			let app = axum::Router::new().route(
+				"/",
+				axum::routing::post(move || async move {
+					if chunked {
+						let chunks = futures::stream::iter(
+							std::iter::repeat_with(|| {
+								Ok::<_, std::convert::Infallible>(vec![0_u8; 64 * 1024])
+							})
+							.take(65),
+						);
+						axum::body::Body::from_stream(chunks)
+					} else {
+						axum::body::Body::from(vec![0_u8; bridge::response::MAX_BYTES + 1])
+					}
+				}),
+			);
+			let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+				.await
+				.expect("bind");
+			let address = listener.local_addr().expect("address");
+			let task = tokio::spawn(async move {
+				axum::serve(listener, app).await.expect("serve");
+			});
+			let client = Client {
+				http: reqwest::Client::builder()
+					.no_proxy()
+					.build()
+					.expect("client"),
+				endpoint: format!("http://{address}/"),
+				token: "test-only".into(),
+				timeout: Duration::from_secs(5),
+			};
+			let error = client
+				.call_once(&Request::Hello)
+				.await
+				.expect_err("oversized reply");
+			task.abort();
+			assert!(!error.is_retryable());
+			assert!(error.is_response_too_large());
+		}
+	}
 
 	#[tokio::test]
 	async fn oversized_request_is_nonretryable_before_transport() {

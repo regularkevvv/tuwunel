@@ -169,7 +169,9 @@ impl Backend {
 	///
 	/// Cached keys never reach the wire; the rest are requested in chunks of
 	/// at most [`bridge::MAX_GET_KEYS`] and the encoded request byte budget,
-	/// one `Get` per chunk. Atomic write batches are never split this way.
+	/// reducing a chunk after a response-byte refusal. Each successful read
+	/// advances at least one key. Atomic write batches are never split this
+	/// way.
 	pub(crate) async fn get_many(
 		&self,
 		map: MapId,
@@ -192,29 +194,47 @@ impl Backend {
 		}
 
 		let mut remaining = missing.as_slice();
+		let mut max_count = bridge::MAX_GET_KEYS;
 		while !remaining.is_empty() {
-			let count = bridge::request::get_key_count(remaining.iter().map(|at| keys[*at]));
+			let mut count = bridge::request::get_key_count(remaining.iter().map(|at| keys[*at]))
+				.min(max_count);
 			if count == 0 {
 				return Err!(Database("bridge get: key exceeds request byte budget"));
 			}
+			let (vals, stamp) = loop {
+				let (chunk, _) = remaining.split_at(count);
+				let stamp = self.commits.load(Relaxed);
+				let request = Request::Get {
+					map: map.0,
+					keys: chunk
+						.iter()
+						.map(|at| ByteBuf::from(keys[*at].to_vec()))
+						.collect(),
+				};
+				match self.client.call(&request, None).await {
+					| Ok(Response::Got { vals }) => break (vals, stamp),
+					| Ok(_) => return Err!(Database("bridge get: unexpected reply")),
+					| Err(error) if error.is_response_too_large() && count > 1 => {
+						count /= 2;
+						max_count = count;
+					},
+					| Err(error) => {
+						if error.is_stale_lease() {
+							self.lose_lease();
+						}
+						return Err(database_error("get", &error));
+					},
+				}
+			};
 			let (chunk, rest) = remaining.split_at(count);
 			remaining = rest;
-			let stamp = self.commits.load(Relaxed);
-			let request = Request::Get {
-				map: map.0,
-				keys: chunk
-					.iter()
-					.map(|at| ByteBuf::from(keys[*at].to_vec()))
-					.collect(),
-			};
-
-			let vals = self.got(&request).await?;
 			if vals.len() != chunk.len() {
 				return Err!(Database("bridge get: reply length does not match the request"));
 			}
 
 			let fill = self.commits.load(Relaxed) == stamp;
 			for (at, val) in chunk.iter().zip(vals) {
+				let val = val.map(|val| val.into_vec().into_boxed_slice());
 				if fill {
 					self.cache.insert(map, keys[*at], val.as_deref());
 				}
@@ -296,7 +316,7 @@ impl Backend {
 			return Ok(0);
 		}
 
-		let request = Request::Scan {
+		let mut request = Request::Scan {
 			map: scan.map.0,
 			reverse: scan.reverse,
 			from: state
@@ -308,8 +328,25 @@ impl Backend {
 			lease: self.lease.current(),
 		};
 
-		let Response::Scanned { items, more } = self.call(&request, "scan").await? else {
-			return Err!(Database("bridge scan: unexpected reply"));
+		// An older Worker may still produce row-count-only pages. Keep the
+		// cursor and lease unchanged while reducing that read to fit the wire
+		// envelope. At most ten halvings reach one row; no write is split.
+		let (items, more) = loop {
+			match self.client.call(&request, None).await {
+				| Ok(Response::Scanned { items, more }) => break (items, more),
+				| Ok(_) => return Err!(Database("bridge scan: unexpected reply")),
+				| Err(error) => {
+					let Request::Scan { limit, .. } = &mut request else { unreachable!() };
+					if error.is_response_too_large() && *limit > 1 {
+						*limit /= 2;
+						continue;
+					}
+					if error.is_stale_lease() {
+						self.lose_lease();
+					}
+					return Err(database_error("scan", &error));
+				},
+			}
 		};
 
 		STATS.remote_page.record(items.len());
@@ -406,10 +443,11 @@ impl Backend {
 	/// One `Get` call, unwrapped to its values.
 	async fn got(&self, request: &Request) -> Result<Vec<Option<Box<[u8]>>>> {
 		match self.call(request, "get").await? {
-			| Response::Got { vals } => Ok(vals
-				.into_iter()
-				.map(|val| val.map(|val| val.into_vec().into_boxed_slice()))
-				.collect()),
+			| Response::Got { vals } if matches!(request, Request::Get { keys, .. } if keys.len() == vals.len()) =>
+				Ok(vals
+					.into_iter()
+					.map(|val| val.map(|val| val.into_vec().into_boxed_slice()))
+					.collect()),
 			| _ => Err!(Database("bridge get: unexpected reply")),
 		}
 	}

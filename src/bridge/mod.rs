@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod request;
+pub mod response;
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -272,7 +273,7 @@ pub enum Response {
 	Scanned {
 		/// Rows in scan order.
 		items: Vec<(ByteBuf, ByteBuf)>,
-		/// The page was full; more rows may follow.
+		/// A row or byte boundary was reached; more rows may follow.
 		more: bool,
 	},
 	/// Reply to [`Request::Commit`]: durably committed.
@@ -311,7 +312,8 @@ pub enum Error {
 	},
 	/// A commit with this request id exists with a different digest.
 	DigestMismatch,
-	/// The request exceeds a protocol limit; it is never split.
+	/// A protocol limit was exceeded. Atomic commits are never split;
+	/// read callers may reduce a batch after a response-byte refusal.
 	TooLarge {
 		/// Which limit.
 		what: String,
