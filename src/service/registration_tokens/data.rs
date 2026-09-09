@@ -9,7 +9,7 @@ use tuwunel_core::{
 	ruma::api::error::{ErrorKind, LimitExceededErrorData},
 	utils::{self, MutexMap},
 };
-use tuwunel_database::{Database, Json, Map};
+use tuwunel_database::{Database, Json, Map, Txn};
 
 pub(super) struct Data {
 	registrationtoken_info: Arc<Map>,
@@ -219,6 +219,55 @@ impl Data {
 		}
 
 		Ok(true)
+	}
+
+	/// The UIAA caller already holds its session transition lock. Prepare its
+	/// progress while holding this token lock, then commit both map mutations
+	/// in one backend transaction. No token mutation precedes preparation.
+	pub(super) async fn consume_with<F>(
+		&self,
+		token: &str,
+		prepare: impl FnOnce() -> F + Send,
+	) -> Result
+	where
+		F: Future<Output = Result<Txn>> + Send,
+	{
+		if !valid_token(token) {
+			return Err!(Request(Forbidden("Registration token not valid")));
+		}
+		let _transition = self
+			.transitions
+			.lock(&TokenKey(token.to_owned()))
+			.await;
+		let mut info = match self.get_token_info(token).await {
+			| Ok(info) => info,
+			| Err(error) if error.is_not_found() =>
+				return Err!(Request(Forbidden("Registration token not valid"))),
+			| Err(error) => return Err(error),
+		};
+		if !info.is_valid() {
+			return Err!(Request(Forbidden("Registration token not valid")));
+		}
+		let mut txn = prepare().await?;
+		// Preparation may await the UIAA index. Recheck token expiry after it.
+		if !info.is_valid() {
+			return Err!(Request(Forbidden("Registration token not valid")));
+		}
+		info.uses = info
+			.uses
+			.checked_add(1)
+			.ok_or_else(|| err!("Registration token use counter overflow"))?;
+		if info.is_valid() {
+			let body = serde_json::to_vec(&info)
+				.map_err(|_| err!("Failed to encode registration token metadata"))?;
+			if body.len() > MAX_RECORD_BYTES {
+				return Err!("Registration token metadata exceeds record-size limit");
+			}
+			txn.insert_raw(&self.registrationtoken_info, token, &body);
+		} else {
+			txn.del_raw(&self.registrationtoken_info, token);
+		}
+		txn.execute().await
 	}
 
 	/// Read current metadata. Absence, corruption and I/O failure stay

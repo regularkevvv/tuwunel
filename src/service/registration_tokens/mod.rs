@@ -11,6 +11,7 @@ use tuwunel_core::{
 	err,
 	utils::{IterStream, random_string},
 };
+use tuwunel_database::Txn;
 
 const RANDOM_TOKEN_LENGTH: usize = 16;
 /// Maximum database registration tokens admitted by the single writer.
@@ -160,6 +161,26 @@ impl Service {
 	pub async fn is_token_valid(&self, token: &str) -> Result { self.check(token, false).await }
 
 	pub async fn try_consume(&self, token: &str) -> Result { self.check(token, true).await }
+
+	/// Consume a database token atomically with caller-owned UIAA progress.
+	/// Configuration tokens have no counter, but progress still must commit.
+	/// The closure must not acquire another token or UIAA transition lock.
+	pub(crate) async fn consume_with<F>(
+		&self,
+		token: &str,
+		prepare: impl FnOnce() -> F + Send,
+	) -> Result
+	where
+		F: Future<Output = Result<Txn>> + Send,
+	{
+		if !valid_token(token) {
+			return Err!(Request(Forbidden("Registration token not valid")));
+		}
+		if self.get_config_tokens().await?.contains(token) {
+			return prepare().await?.execute().await;
+		}
+		self.db.consume_with(token, prepare).await
+	}
 
 	async fn check(&self, token: &str, consume: bool) -> Result {
 		if !valid_token(token) {

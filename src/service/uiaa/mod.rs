@@ -1,4 +1,5 @@
 mod lifecycle;
+mod registration;
 mod requests;
 mod sweep;
 mod transitions;
@@ -188,16 +189,10 @@ async fn try_auth_inner(
 		| AuthData::RegistrationToken(t) => {
 			let token = t.token.trim();
 			match self
-				.services
-				.registration_tokens
-				.try_consume(token)
+				.complete_registration_token(user_id, device_id, &uiaainfo, token)
 				.await
 			{
-				| Ok(()) => {
-					uiaainfo
-						.completed
-						.push(AuthType::RegistrationToken);
-				},
+				| Ok(progress) => uiaainfo = progress,
 				| Err(error) if error.kind() == ErrorKind::forbidden() => {
 					uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 						kind: ErrorKind::forbidden(),

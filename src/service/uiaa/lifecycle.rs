@@ -10,7 +10,10 @@ use futures::{StreamExt, TryStreamExt};
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId, api::client::uiaa::UiaaInfo};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{Err, Result, err, implement};
-use tuwunel_database::keyval::serialize_key;
+use tuwunel_database::{
+	Txn,
+	keyval::{KeyBuf, serialize_key},
+};
 
 use super::Service;
 
@@ -96,61 +99,73 @@ pub(super) async fn save_progress(
 	info: &UiaaInfo,
 	new: bool,
 ) -> Result {
-	if info.session.as_deref() != Some(session) || !valid_session(session) {
-		return Err!(Request(Forbidden("Invalid UIAA session binding.")));
+	if !new {
+		return self
+			.prepare_progress(user, device, session, info)
+			.await?
+			.execute()
+			.await;
 	}
-	let body = bounded_json(info)?;
-	let key = serialize_key((user, device, session))?;
-	if key.len() > tuwunel_bridge::MAX_KEY_BYTES {
-		return Err!(Request(TooLarge("UIAA session identity exceeds the storage limit.")));
+	let (key, body) = progress_record(user, device, session, info)?;
+	let mut txn = self.db.database.txn();
+	let _admission = self.admission.lock().await;
+	if self.metadata(session).await?.is_some() {
+		return Err!(Request(InvalidParam("UIAA session already exists.")));
+	}
+	// Drop the bounded scan before committing: remote scans must not be
+	// drained by our write barrier while capacity is being measured.
+	let count = self
+		.db
+		.uiaasessionid_metadata
+		.raw_keys()
+		.map_ok(|_| ())
+		.take(MAX_SESSIONS)
+		.try_collect::<Vec<()>>()
+		.await?
+		.len();
+	if count >= MAX_SESSIONS {
+		return Err(tuwunel_core::Error::Request(
+			ruma::api::error::ErrorKind::LimitExceeded(
+				ruma::api::error::LimitExceededErrorData {
+					retry_after: Some(ruma::api::error::RetryAfter::Delay(
+						super::sweep::INTERVAL,
+					)),
+				},
+			),
+			"Too many pending UIAA sessions.".into(),
+			http::StatusCode::TOO_MANY_REQUESTS,
+		));
+	}
+	let metadata = bounded_json(&Metadata::new(user, device, now()?)?)?;
+	txn.insert_raw(&self.db.uiaasessionid_metadata, session, &metadata);
+	txn.insert_raw(&self.db.userdevicesessionid_uiaainfo, &key, &body);
+	txn.execute().await
+}
+
+/// Prepare existing-session progress without committing it. The caller holds
+/// the session transition lock through preparation and transaction execution.
+/// This permits a registration-token use to share the same atomic batch.
+#[implement(Service)]
+pub(super) async fn prepare_progress(
+	&self,
+	user: &UserId,
+	device: &DeviceId,
+	session: &str,
+	info: &UiaaInfo,
+) -> Result<Txn> {
+	let (key, body) = progress_record(user, device, session, info)?;
+	let metadata = self
+		.metadata(session)
+		.await?
+		.filter(|metadata| metadata.owner(user, device))
+		.ok_or_else(|| err!(Request(Forbidden("UIAA session does not exist."))))?;
+	if !metadata.active(now()?) {
+		return Err!(Request(Forbidden("UIAA session has expired.")));
 	}
 	let mut txn = self.db.database.txn();
-	if new {
-		let _admission = self.admission.lock().await;
-		if self.metadata(session).await?.is_some() {
-			return Err!(Request(InvalidParam("UIAA session already exists.")));
-		}
-		// Drop the bounded scan before committing: remote scans must not be
-		// drained by our write barrier while capacity is being measured.
-		let count = self
-			.db
-			.uiaasessionid_metadata
-			.raw_keys()
-			.map_ok(|_| ())
-			.take(MAX_SESSIONS)
-			.try_collect::<Vec<()>>()
-			.await?
-			.len();
-		if count >= MAX_SESSIONS {
-			return Err(tuwunel_core::Error::Request(
-				ruma::api::error::ErrorKind::LimitExceeded(
-					ruma::api::error::LimitExceededErrorData {
-						retry_after: Some(ruma::api::error::RetryAfter::Delay(
-							super::sweep::INTERVAL,
-						)),
-					},
-				),
-				"Too many pending UIAA sessions.".into(),
-				http::StatusCode::TOO_MANY_REQUESTS,
-			));
-		}
-		let metadata = bounded_json(&Metadata::new(user, device, now()?)?)?;
-		txn.insert_raw(&self.db.uiaasessionid_metadata, session, &metadata);
-		txn.insert_raw(&self.db.userdevicesessionid_uiaainfo, &key, &body);
-		txn.execute().await
-	} else {
-		let metadata = self
-			.metadata(session)
-			.await?
-			.filter(|metadata| metadata.owner(user, device))
-			.ok_or_else(|| err!(Request(Forbidden("UIAA session does not exist."))))?;
-		if !metadata.active(now()?) {
-			return Err!(Request(Forbidden("UIAA session has expired.")));
-		}
-		// Do not rewrite or extend the absolute creation/expiry metadata.
-		txn.insert_raw(&self.db.userdevicesessionid_uiaainfo, &key, &body);
-		txn.execute().await
-	}
+	// Do not rewrite or extend the absolute creation/expiry metadata.
+	txn.insert_raw(&self.db.userdevicesessionid_uiaainfo, &key, &body);
+	Ok(txn)
 }
 
 #[implement(Service)]
@@ -258,6 +273,23 @@ pub async fn get_uiaa_session_by_session_id(
 	let metadata = self.metadata(session).await.ok()??;
 	let info = self.read_info(session, &metadata).await.ok()?;
 	Some((metadata.user, metadata.device, info))
+}
+
+fn progress_record(
+	user: &UserId,
+	device: &DeviceId,
+	session: &str,
+	info: &UiaaInfo,
+) -> Result<(KeyBuf, Vec<u8>)> {
+	if info.session.as_deref() != Some(session) || !valid_session(session) {
+		return Err!(Request(Forbidden("Invalid UIAA session binding.")));
+	}
+	let body = bounded_json(info)?;
+	let key = serialize_key((user, device, session))?;
+	if key.len() > tuwunel_bridge::MAX_KEY_BYTES {
+		return Err!(Request(TooLarge("UIAA session identity exceeds the storage limit.")));
+	}
+	Ok((key, body))
 }
 
 fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>> {
