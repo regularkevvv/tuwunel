@@ -23,7 +23,7 @@ pub(crate) async fn admin_list_tokens_route(
 	let registration_tokens = services
 		.registration_tokens
 		.iterate_tokens()
-		.await
+		.await?
 		.map(|token| token_response(token.token, token.info))
 		.collect()
 		.await;

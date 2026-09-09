@@ -14,15 +14,19 @@ pub(crate) async fn check_registration_token_validity(
 	State(services): State<crate::State>,
 	body: Ruma<check_registration_token_validity::v1::Request>,
 ) -> Result<check_registration_token_validity::v1::Response> {
-	if !services.registration_tokens.is_enabled().await {
+	if !services.registration_tokens.is_enabled().await? {
 		return Err!(Request(Forbidden("Server does not allow token registration")));
 	}
 
-	let valid = services
+	let valid = match services
 		.registration_tokens
 		.is_token_valid(&body.token)
 		.await
-		.is_ok();
+	{
+		| Ok(()) => true,
+		| Err(error) if error.kind() == ruma::api::error::ErrorKind::forbidden() => false,
+		| Err(error) => return Err(error),
+	};
 
 	Ok(check_registration_token_validity::v1::Response { valid })
 }

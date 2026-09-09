@@ -187,23 +187,26 @@ async fn try_auth_inner(
 		},
 		| AuthData::RegistrationToken(t) => {
 			let token = t.token.trim();
-			if self
+			match self
 				.services
 				.registration_tokens
 				.try_consume(token)
 				.await
-				.is_ok()
 			{
-				uiaainfo
-					.completed
-					.push(AuthType::RegistrationToken);
-			} else {
-				uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
-					kind: ErrorKind::forbidden(),
-					message: "Invalid registration token.".to_owned(),
-				}));
+				| Ok(()) => {
+					uiaainfo
+						.completed
+						.push(AuthType::RegistrationToken);
+				},
+				| Err(error) if error.kind() == ErrorKind::forbidden() => {
+					uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
+						kind: ErrorKind::forbidden(),
+						message: "Invalid registration token.".to_owned(),
+					}));
 
-				return Ok((false, uiaainfo));
+					return Ok((false, uiaainfo));
+				},
+				| Err(error) => return Err(error),
 			}
 		},
 		| AuthData::FallbackAcknowledgement(_session) => {

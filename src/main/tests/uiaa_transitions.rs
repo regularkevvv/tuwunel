@@ -1,8 +1,18 @@
 #![cfg(test)]
 
+#[path = "uiaa_transitions/registration_tokens.rs"]
+mod token_races;
+
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::{
-	env::var, fmt::Debug, fs::remove_dir_all, iter::repeat_with, path::PathBuf,
-	process::id as process_id, sync::Arc,
+	env::var,
+	fmt::Debug,
+	fs::{DirBuilder, remove_dir_all},
+	iter::repeat_with,
+	path::PathBuf,
+	process::id as process_id,
+	sync::Arc,
 };
 
 use futures::{future::join_all, join};
@@ -32,11 +42,17 @@ impl Drop for DatabasePath {
 #[test]
 fn uiaa_transitions_are_owner_bound_and_single_consumer() -> Result {
 	let root = var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-	let db = DatabasePath(PathBuf::from(root).join(format!("uiaa-transitions-{}", process_id())));
+	let path = PathBuf::from(root).join(format!("uiaa-transitions-{}", process_id()));
+	let mut builder = DirBuilder::new();
+	builder.recursive(false);
+	#[cfg(unix)]
+	builder.mode(0o700);
+	builder.create(&path)?; // Never adopt an existing path as test-owned state.
+	let db = DatabasePath(path);
 	let mut args = Args::default_test(&["fresh", "cleanup"]);
 	args.maintenance = true;
 	args.option
-		.push(format!("database_path={:?}", db.0));
+		.push(format!("database_path={:?}", db.0.join("database")));
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -193,7 +209,80 @@ async fn exercise(services: &Services) -> Result {
 	password_owner(services, &user, &body).await?;
 	password_retry(services, &user).await?;
 	completed_stage_retry(services, &user, &body).await?;
+	shared_registration_token(services, &user, &body).await?;
+	token_races::exercise(services, &user).await?;
 	corrupt_binding_is_refused(services, &user).await
+}
+
+async fn shared_registration_token(
+	services: &Services,
+	user: &UserId,
+	body: &CanonicalJsonValue,
+) -> Result {
+	for round in 0..4 {
+		let (token, _) = services
+			.registration_tokens
+			.create_token(Some(&format!("one-use-{round}")), None, TokenExpires {
+				max_uses: Some(1),
+				max_age: None,
+			})
+			.await?;
+		let mut challenges = Vec::new();
+		for index in 0..32 {
+			let info = UiaaInfo {
+				flows: vec![AuthFlow::new(vec![AuthType::RegistrationToken, AuthType::Sso])],
+				session: Some(format!("shared-token-{round}-{index}")),
+				..Default::default()
+			};
+			services
+				.uiaa
+				.create(user, "DEVICE".into(), &info, body)
+				.await?;
+			challenges.push(info);
+		}
+		let barrier = Arc::new(tokio::sync::Barrier::new(challenges.len()));
+		let tasks = challenges.iter().map(|challenge| {
+			let barrier = Arc::clone(&barrier);
+			let uiaa = Arc::clone(&services.uiaa);
+			let user = user.to_owned();
+			let challenge = challenge.clone();
+			let mut auth = RegistrationToken::new(token.clone());
+			auth.session = challenge.session.clone();
+			tokio::spawn(async move {
+				barrier.wait().await;
+				uiaa.try_auth(
+					user.as_ref(),
+					"DEVICE".into(),
+					&AuthData::RegistrationToken(auth),
+					&challenge,
+				)
+				.await
+			})
+		});
+		let mut accepted = 0_usize;
+		for result in join_all(tasks).await {
+			let (finished, progress) = result.expect("UIA contender must not panic")?;
+			assert!(!finished, "SSO remains required");
+			if progress
+				.completed
+				.contains(&AuthType::RegistrationToken)
+			{
+				accepted = accepted.saturating_add(1);
+			}
+		}
+		assert_eq!(accepted, 1, "one token use must authorize exactly one distinct UIA session");
+		for challenge in challenges {
+			services
+				.uiaa
+				.delete_session(
+					user,
+					"DEVICE".into(),
+					challenge.session.as_deref().expect("session"),
+				)
+				.await?;
+		}
+	}
+	Ok(())
 }
 
 async fn password_owner(services: &Services, user: &UserId, body: &CanonicalJsonValue) -> Result {

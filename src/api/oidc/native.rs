@@ -97,7 +97,10 @@ pub(crate) async fn native_get_route(
 
 	let view = params.view.as_deref().unwrap_or("login");
 
-	account_html_response(StatusCode::OK, render_page(&services, view, context, None).await)
+	match render_page(&services, view, context, None).await {
+		| Ok(html) => account_html_response(StatusCode::OK, html),
+		| Err(error) => account_error_response(&error),
+	}
 }
 
 fn parse_flow<'a>(
@@ -149,9 +152,10 @@ pub(crate) async fn native_submit_route(
 			};
 
 			let msg = e.sanitized_message();
-			let html = render_page(&services, view, context, Some(&msg)).await;
-
-			account_html_response(e.status_code(), html)
+			match render_page(&services, view, context, Some(&msg)).await {
+				| Ok(html) => account_html_response(e.status_code(), html),
+				| Err(error) => account_error_response(&error),
+			}
 		},
 	}
 }
@@ -258,7 +262,7 @@ async fn do_register(services: &Services, body: &NativeSubmit) -> Result<OwnedUs
 
 	// This page cannot collect a 3PID, so refuse rather than silently bypass a
 	// mandatory-email policy.
-	let token_required = services.registration_tokens.is_enabled().await;
+	let token_required = services.registration_tokens.is_enabled().await?;
 	let smtp = &services.config.smtp;
 	let email_required = smtp.connection_uri.is_some()
 		&& (smtp.require_email_for_registration
@@ -401,13 +405,13 @@ async fn render_page(
 	view: &str,
 	context: Flow<'_>,
 	error: Option<&str>,
-) -> String {
+) -> Result<String> {
 	let registration_enabled = services.config.allow_registration;
 
 	match (context, view) {
 		| (Flow::Authorization(req_id), "register") if registration_enabled =>
 			render_register(services, req_id, error).await,
-		| _ => render_login(context, error, registration_enabled),
+		| _ => Ok(render_login(context, error, registration_enabled)),
 	}
 }
 
@@ -460,21 +464,25 @@ fn render_login(context: Flow<'_>, error: Option<&str>, show_register: bool) -> 
 		.replace("{context_fields}", &context_fields)
 }
 
-async fn render_register(services: &Services, req_id: &str, error: Option<&str>) -> String {
+async fn render_register(
+	services: &Services,
+	req_id: &str,
+	error: Option<&str>,
+) -> Result<String> {
 	let token_field = services
 		.registration_tokens
 		.is_enabled()
-		.await
+		.await?
 		.then_some(TOKEN_FIELD)
 		.unwrap_or_default();
 
-	REGISTER_HTML
+	Ok(REGISTER_HTML
 		.replace("{token_field}", token_field)
 		.replace("{req_id_enc}", &url_encode(req_id))
 		.replace("{terms}", &terms_block(services))
 		.replace("{error}", &error_block(error))
 		// Fill the caller-supplied {req_id} last so it cannot smuggle a placeholder.
-		.replace("{req_id}", &html_escape(req_id))
+		.replace("{req_id}", &html_escape(req_id)))
 }
 
 fn error_block(error: Option<&str>) -> String {

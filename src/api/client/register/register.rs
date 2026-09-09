@@ -281,7 +281,7 @@ async fn enforce_uiaa(
 		return Ok(None);
 	}
 
-	let token_required = services.registration_tokens.is_enabled().await;
+	let token_required = services.registration_tokens.is_enabled().await?;
 	let terms = services.config.login_terms_params();
 
 	let smtp = &services.config.smtp;

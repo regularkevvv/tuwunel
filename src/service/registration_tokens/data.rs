@@ -1,15 +1,26 @@
-use std::{sync::Arc, time::SystemTime};
+use std::{fmt, sync::Arc, time::SystemTime};
 
-use futures::StreamExt;
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, err,
-	utils::{self, stream::TryIgnore},
+	utils::{self, MutexMap},
 };
-use tuwunel_database::{Database, Deserialized, Json, Map};
+use tuwunel_database::{Database, Json, Map};
 
 pub(super) struct Data {
 	registrationtoken_info: Arc<Map>,
+	transitions: MutexMap<TokenKey, ()>,
+}
+
+/// MutexMap instruments keys. A registration capability is never a trace field.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct TokenKey(String);
+
+impl fmt::Debug for TokenKey {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("[redacted registration token]")
+	}
 }
 
 /// Metadata of a registration token.
@@ -48,8 +59,8 @@ impl DatabaseTokenInfo {
 	}
 }
 
-impl std::fmt::Display for DatabaseTokenInfo {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DatabaseTokenInfo {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "Token used {} times. {}", self.uses, self.expires)?;
 
 		Ok(())
@@ -62,8 +73,8 @@ pub struct TokenExpires {
 	pub max_age: Option<SystemTime>,
 }
 
-impl std::fmt::Display for TokenExpires {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for TokenExpires {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		let mut msgs = vec![];
 
 		if let Some(max_uses) = self.max_uses {
@@ -100,6 +111,7 @@ impl Data {
 	pub(super) fn new(db: &Arc<Database>) -> Self {
 		Self {
 			registrationtoken_info: db["registrationtoken_info"].clone(),
+			transitions: MutexMap::new(),
 		}
 	}
 
@@ -109,87 +121,77 @@ impl Data {
 		token: &str,
 		expires: TokenExpires,
 	) -> Result<DatabaseTokenInfo> {
-		if self
-			.registrationtoken_info
-			.exists(token)
-			.await
-			.is_err()
-		{
-			let info = DatabaseTokenInfo::new(expires);
-
-			self.registrationtoken_info
-				.raw_put(token, Json(&info))
-				.await?;
-
-			Ok(info)
-		} else {
-			Err!(Request(InvalidParam("Registration token already exists")))
+		let _transition = self
+			.transitions
+			.lock(&TokenKey(token.to_owned()))
+			.await;
+		match self.registrationtoken_info.get(token).await {
+			| Ok(_) => return Err!(Request(InvalidParam("Registration token already exists"))),
+			| Err(error) if error.is_not_found() => {},
+			| Err(error) => return Err(error),
 		}
+		let info = DatabaseTokenInfo::new(expires);
+		self.registrationtoken_info
+			.raw_put(token, Json(&info))
+			.await?;
+		Ok(info)
 	}
 
 	/// Delete a registration token.
 	pub(super) async fn revoke_token(&self, token: &str) -> Result {
-		if self
-			.registrationtoken_info
-			.exists(token)
-			.await
-			.is_ok()
-		{
-			self.registrationtoken_info.remove(token).await?;
-
-			Ok(())
-		} else {
-			Err!(Request(NotFound("Registration token not found")))
+		let _transition = self
+			.transitions
+			.lock(&TokenKey(token.to_owned()))
+			.await;
+		match self.registrationtoken_info.get(token).await {
+			| Ok(_) => self.registrationtoken_info.remove(token).await,
+			| Err(error) if error.is_not_found() =>
+				Err!(Request(NotFound("Registration token not found"))),
+			| Err(error) => Err(error),
 		}
 	}
 
 	/// Look up a registration token's metadata.
-	pub(super) async fn check_token(&self, token: &str, consume: bool) -> bool {
-		let info = self
-			.registrationtoken_info
-			.get(token)
-			.await
-			.deserialized::<DatabaseTokenInfo>()
-			.ok();
-
-		let Some(mut info) = info else {
-			return false;
+	pub(super) async fn check_token(&self, token: &str, consume: bool) -> Result<bool> {
+		let _transition = self
+			.transitions
+			.lock(&TokenKey(token.to_owned()))
+			.await;
+		let mut info = match self.get_token_info(token).await {
+			| Ok(info) => info,
+			| Err(error) if error.is_not_found() => return Ok(false),
+			| Err(error) => return Err(error),
 		};
 
 		if !info.is_valid() {
-			self.registrationtoken_info
-				.remove(token)
-				.await
-				.expect("database remove error");
-			return false;
+			self.registrationtoken_info.remove(token).await?;
+			return Ok(false);
 		}
 
 		if consume {
-			info.uses = info.uses.saturating_add(1);
+			info.uses = info
+				.uses
+				.checked_add(1)
+				.ok_or_else(|| err!("Registration token use counter overflow"))?;
 
 			if info.is_valid() {
 				self.registrationtoken_info
 					.raw_put(token, Json(info))
-					.await
-					.expect("database insert error");
+					.await?;
 			} else {
-				self.registrationtoken_info
-					.remove(token)
-					.await
-					.expect("database remove error");
+				self.registrationtoken_info.remove(token).await?;
 			}
 		}
 
-		true
+		Ok(true)
 	}
 
-	/// Look up a token's stored metadata, returning `None` when it is absent.
+	/// Read current metadata. Absence, corruption and I/O failure stay
+	/// distinct.
 	pub(super) async fn get_token_info(&self, token: &str) -> Result<DatabaseTokenInfo> {
-		self.registrationtoken_info
-			.get(token)
-			.await
-			.deserialized()
-			.map_err(|_| err!(Request(NotFound("Registration token not found"))))
+		let value = self.registrationtoken_info.get(token).await?;
+		serde_json::from_slice(value.as_ref())
+			.map_err(|_| err!("Invalid registration token metadata"))
 	}
 
 	/// Replace a token's expiry while preserving its use counter.
@@ -198,6 +200,10 @@ impl Data {
 		token: &str,
 		expires: TokenExpires,
 	) -> Result<DatabaseTokenInfo> {
+		let _transition = self
+			.transitions
+			.lock(&TokenKey(token.to_owned()))
+			.await;
 		let current = self.get_token_info(token).await?;
 
 		let info = DatabaseTokenInfo { uses: current.uses, expires };
@@ -213,16 +219,29 @@ impl Data {
 	pub(super) async fn iterate_and_clean_tokens(
 		&self,
 	) -> Result<Vec<(String, DatabaseTokenInfo)>> {
-		let all: Vec<(String, DatabaseTokenInfo)> = self
+		// Close the scan before mutation. Re-read under the same lock as
+		// consumption/revocation/update: an old expiry snapshot must not delete
+		// a token that an operator has renewed in the meantime.
+		let all: Vec<Vec<u8>> = self
 			.registrationtoken_info
-			.stream()
-			.ignore_err()
-			.map(|(token, info): (&str, DatabaseTokenInfo)| (token.to_owned(), info))
-			.collect()
-			.await;
+			.raw_keys()
+			.map_ok(<[u8]>::to_vec)
+			.try_collect()
+			.await?;
 
 		let mut valid = Vec::new();
-		for (token, info) in all {
+		for key in all {
+			let token =
+				String::from_utf8(key).map_err(|_| err!("Invalid registration token key"))?;
+			let _transition = self
+				.transitions
+				.lock(&TokenKey(token.clone()))
+				.await;
+			let info = match self.get_token_info(&token).await {
+				| Ok(info) => info,
+				| Err(error) if error.is_not_found() => continue,
+				| Err(error) => return Err(error),
+			};
 			if info.is_valid() {
 				valid.push((token, info));
 			} else {
@@ -231,5 +250,18 @@ impl Data {
 		}
 
 		Ok(valid)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::TokenKey;
+
+	#[test]
+	fn token_lock_debug_is_redacted() {
+		assert_eq!(
+			format!("{:?}", TokenKey("secret-capability".into())),
+			"[redacted registration token]"
+		);
 	}
 }
