@@ -16,6 +16,8 @@
 
 #![deny(missing_docs)]
 
+pub mod catalog;
+
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
@@ -127,7 +129,7 @@ pub struct LeaseState {
 pub enum Mutation {
 	/// Insert or replace one key.
 	Put {
-		/// Stable map id (`tuwunel_database::backend::ids`).
+		/// Stable map id from [`catalog`].
 		map: u16,
 		/// Encoded key bytes.
 		key: ByteBuf,
@@ -160,8 +162,9 @@ impl Mutation {
 		}
 	}
 
-	/// Checks the size limits of this mutation.
+	/// Checks the declared map identity and size limits of this mutation.
 	pub fn check(&self) -> Result<(), Error> {
+		check_map(self.map())?;
 		if self.key().is_empty() || self.key().len() > MAX_KEY_BYTES {
 			return Err(Error::TooLarge {
 				what: "key".into(),
@@ -435,7 +438,8 @@ pub fn check(request: &Request) -> Result<(), Error> {
 		limit: u64::try_from(limit).unwrap_or(u64::MAX),
 	};
 	match request {
-		| Request::Get { keys, .. } => {
+		| Request::Get { map, keys } => {
+			check_map(*map)?;
 			if keys.len() > MAX_GET_KEYS {
 				return Err(too_many("keys", MAX_GET_KEYS));
 			}
@@ -446,7 +450,8 @@ pub fn check(request: &Request) -> Result<(), Error> {
 				return Err(too_many("key", MAX_KEY_BYTES));
 			}
 		},
-		| Request::Scan { from, limit, .. } => {
+		| Request::Scan { map, from, limit, .. } => {
+			check_map(*map)?;
 			if from
 				.as_ref()
 				.is_some_and(|f| f.len() > MAX_KEY_BYTES)
@@ -491,11 +496,88 @@ pub fn check(request: &Request) -> Result<(), Error> {
 	Ok(())
 }
 
+fn check_map(map: u16) -> Result<(), Error> {
+	if catalog::contains(map) {
+		Ok(())
+	} else {
+		Err(Error::Invalid("unknown map id".into()))
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	fn bytes(b: &[u8]) -> ByteBuf { ByteBuf::from(b.to_vec()) }
+
+	#[test]
+	fn map_catalog_is_unique_and_exactly_closed() {
+		let mut ids = std::collections::BTreeSet::new();
+		let mut names = std::collections::BTreeSet::new();
+		for (name, id) in catalog::MAP_IDS {
+			assert!(ids.insert(id.0), "duplicate map identifier");
+			assert!(names.insert(*name), "duplicate map name");
+			assert_eq!(catalog::map_id(name), Some(*id));
+			check(&Request::Get { map: id.0, keys: vec![bytes(b"k")] }).expect("known map read");
+			check(&Request::Scan {
+				map: id.0,
+				reverse: false,
+				from: None,
+				inclusive: true,
+				limit: 1,
+				lease: None,
+			})
+			.expect("known map scan");
+			Mutation::Put {
+				map: id.0,
+				key: bytes(b"k"),
+				val: bytes(b"v"),
+			}
+			.check()
+			.expect("known map put");
+			Mutation::Delete { map: id.0, key: bytes(b"k") }
+				.check()
+				.expect("known map delete");
+		}
+		for id in 0..=u16::MAX {
+			assert_eq!(catalog::contains(id), ids.contains(&id));
+		}
+	}
+
+	#[test]
+	fn unknown_maps_are_rejected_on_every_kv_path() {
+		for map in [139, 900, 901, u16::MAX] {
+			let lease = Lease { holder: "map-check".into(), epoch: 1 };
+			let mut requests =
+				vec![Request::Get { map, keys: vec![bytes(b"k")] }, Request::Scan {
+					map,
+					reverse: false,
+					from: None,
+					inclusive: true,
+					limit: 1,
+					lease: None,
+				}];
+			for op in
+				[Mutation::Put { map, key: bytes(b"k"), val: bytes(b"v") }, Mutation::Delete {
+					map,
+					key: bytes(b"k"),
+				}] {
+				let ops = vec![op];
+				requests.push(Request::Commit {
+					request_id: bytes(&[1; REQUEST_ID_LEN]),
+					lease: lease.clone(),
+					digest: bytes(&digest(&ops)),
+					ops,
+				});
+			}
+			for request in requests {
+				assert!(
+					matches!(check(&request), Err(Error::Invalid(_))),
+					"unknown map {map} was accepted"
+				);
+			}
+		}
+	}
 
 	#[test]
 	fn roundtrip_every_request() {

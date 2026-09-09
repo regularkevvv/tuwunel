@@ -414,7 +414,7 @@ fn map_id_table_is_a_catalog_bijection() {
 	for desc in crate::maps::MAPS {
 		assert!(
 			ids::map_id(desc.name).is_some(),
-			"catalog map {} has no assigned MapId; append it to backend::ids",
+			"catalog map {} has no assigned MapId; append it to tuwunel_bridge::catalog",
 			desc.name
 		);
 	}

@@ -48,18 +48,17 @@ mod tests;
 
 use std::sync::Arc;
 
-use crate::{
-	Engine,
-	keyval::{KeyBuf, ValBuf},
-};
-
 /// Stable numeric identity of one logical map.
 ///
 /// Ids are immutable and append-only; see [`ids`]. Remote backends address
 /// rows by this value, so it must never be derived from catalog position at
 /// runtime.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct MapId(pub u16);
+pub use tuwunel_bridge::catalog::MapId;
+
+use crate::{
+	Engine,
+	keyval::{KeyBuf, ValBuf},
+};
 
 /// One queued, backend-neutral mutation.
 ///
