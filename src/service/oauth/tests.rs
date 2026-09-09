@@ -16,6 +16,119 @@ use url::Url;
 
 use super::{Recheck, Session, TokenResponse, classify_upstream};
 
+fn authorization(required: bool) -> Result<(super::Provider, Session)> {
+	let provider = serde_json::from_value(serde_json::json!({
+		"brand": "oidc", "client_id": "fixture", "require_upstream_refresh": required,
+	}))
+	.expect("valid provider fixture");
+	Ok((provider, Session::default()))
+}
+
+async fn rechecks(
+	items: Vec<Result<(super::Provider, Session)>>,
+	answers: Vec<Recheck>,
+) -> Option<Recheck> {
+	let mut answers = answers.into_iter();
+	let outcome = super::recheck_authorizations(futures::stream::iter(items), |_, _| {
+		std::future::ready(
+			answers
+				.next()
+				.expect("only applicable grants may be rechecked"),
+		)
+	})
+	.await;
+	assert!(answers.next().is_none(), "all supplied applicable grants must be checked");
+	outcome
+}
+
+#[test]
+fn only_an_absent_association_index_becomes_an_empty_list() {
+	use tuwunel_database::{Handle, serialize_to_vec};
+
+	use super::sessions::association_ids;
+	let missing = Error::BadRequest(ruma::api::error::ErrorKind::NotFound, "missing index");
+	assert!(association_ids(Err(missing)).unwrap().is_empty());
+	let unreadable = Error::Database("READ-CANARY-SECRET".into());
+	association_ids(Err(unreadable)).expect_err("unreadable index must fail");
+	association_ids(Ok(Handle::from(vec![0xFE]))).expect_err("corrupt index must fail");
+	let ids = vec!["one".to_owned(), "two".to_owned()];
+	let bytes = serialize_to_vec(&ids).unwrap();
+	assert_eq!(association_ids(Ok(Handle::from(bytes))).unwrap(), ids);
+}
+
+#[tokio::test]
+async fn absent_and_readable_optional_authorizations_remain_exempt() {
+	assert!(rechecks(vec![], vec![]).await.is_none());
+	assert!(
+		rechecks(vec![authorization(false)], vec![])
+			.await
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn dangling_session_provider_and_storage_errors_refuse_refresh_without_echoing_details() {
+	for error in [
+		Error::BadRequest(ruma::api::error::ErrorKind::NotFound, "SESSION-CANARY-SECRET"),
+		Error::BadRequest(ruma::api::error::ErrorKind::NotFound, "PROVIDER-CANARY-SECRET"),
+		Error::Database("READ-CANARY-SECRET".into()),
+	] {
+		let outcome = rechecks(vec![Err(error)], vec![]).await;
+		assert!(matches!(outcome, Some(Recheck::Unavailable(_))));
+		assert!(!format!("{outcome:?}").contains("CANARY"));
+	}
+}
+
+#[tokio::test]
+async fn lookup_failure_cannot_be_overridden_by_success_or_optional_provider() {
+	for error_first in [true, false] {
+		let error = Err(Error::Database("READ-CANARY-SECRET".into()));
+		let mut items = vec![authorization(true), authorization(false)];
+		if error_first {
+			items.insert(0, error);
+		} else {
+			items.push(error);
+		}
+		let outcome = rechecks(items, vec![Recheck::Allowed]).await;
+		assert!(matches!(outcome, Some(Recheck::Unavailable(_))));
+		assert!(!format!("{outcome:?}").contains("CANARY"));
+	}
+}
+
+#[tokio::test]
+async fn explicit_denial_wins_over_lookup_failure_and_provider_outage() {
+	let outcome = rechecks(
+		vec![
+			Err(Error::Database("READ-CANARY-SECRET".into())),
+			authorization(true),
+			authorization(true),
+		],
+		vec![
+			Recheck::Unavailable("provider outage".into()),
+			Recheck::Denied("revoked".into()),
+		],
+	)
+	.await;
+	assert!(matches!(outcome, Some(Recheck::Denied(reason)) if reason == "revoked"));
+}
+
+#[tokio::test]
+async fn every_applicable_provider_must_allow_a_refresh() {
+	let outcome =
+		rechecks(vec![authorization(true), authorization(false), authorization(true)], vec![
+			Recheck::Allowed,
+			Recheck::Allowed,
+		])
+		.await;
+	assert!(matches!(outcome, Some(Recheck::Allowed)));
+	let outcome = rechecks(vec![authorization(true), authorization(true)], vec![
+		Recheck::Unavailable("provider outage".into()),
+		Recheck::Allowed,
+	])
+	.await;
+	assert!(matches!(outcome, Some(Recheck::Unavailable(_))));
+}
+
 /// Start a provider whose token endpoint always answers `status`, and return
 /// its token URL.
 async fn provider(status: StatusCode) -> Url {

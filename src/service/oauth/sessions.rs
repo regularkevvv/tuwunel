@@ -19,7 +19,7 @@ use tuwunel_core::{
 		timepoint_from_now,
 	},
 };
-use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Map};
+use tuwunel_database::{Cbor, Database, Deserialized, Handle, Ignore, Map};
 use url::Url;
 
 pub use self::adopt::Counts;
@@ -412,10 +412,20 @@ pub fn get_sess_id_by_user(&self, user_id: &UserId) -> impl Stream<Item = Result
 	self.db
 		.userid_oauthid
 		.get(user_id)
-		.map(Deserialized::deserialized)
+		.map(association_ids)
 		.map_ok(Vec::into_iter)
 		.map_ok(IterStream::try_stream)
 		.try_flatten_stream()
+}
+
+/// Only a missing user association index means there is no upstream grant.
+/// Missing referenced sessions/providers and undecodable or unreadable index
+/// values are failures, not evidence that the user is exempt from rechecking.
+pub(super) fn association_ids(result: Result<Handle<'_>>) -> Result<Vec<String>> {
+	match result {
+		| Err(error) if error.is_not_found() => Ok(Vec::new()),
+		| result => result.deserialized(),
+	}
 }
 
 /// Resolve the `sess_id` from an associated provider issuer and subject hash.

@@ -459,28 +459,40 @@ pub enum Recheck {
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn recheck_user(&self, user_id: &UserId) -> Option<Recheck> {
-	let sessions: Vec<(Provider, Session)> = self
-		.user_sessions(user_id)
-		.ready_filter_map(Result::ok)
-		.ready_filter(|(provider, _)| provider.require_upstream_refresh)
-		.collect()
-		.await;
+	Box::pin(recheck_authorizations(
+		self.user_sessions(user_id),
+		|provider, session| async move { self.recheck_session((&provider, &session)).await },
+	))
+	.await
+}
 
-	if sessions.is_empty() {
-		return None;
-	}
-
-	let mut unavailable = None;
-
-	for (provider, session) in &sessions {
-		match self.recheck_session((provider, session)).await {
+/// Fold the actual lookup/recheck path without dropping storage, decoding or
+/// provider-resolution errors. A readable optional provider may be exempt;
+/// an unreadable one must never be assumed optional. Keep examining readable
+/// grants after an error so a later explicit denial still wins.
+async fn recheck_authorizations<S, F, Fut>(sessions: S, mut recheck: F) -> Option<Recheck>
+where
+	S: Stream<Item = Result<(Provider, Session)>>,
+	F: FnMut(Provider, Session) -> Fut,
+	Fut: Future<Output = Recheck>,
+{
+	futures::pin_mut!(sessions);
+	let mut outcome = None;
+	while let Some(session) = sessions.next().await {
+		let checked = match session {
+			| Ok((provider, _)) if !provider.require_upstream_refresh => continue,
+			| Ok((provider, session)) => recheck(provider, session).await,
+			| Err(_) =>
+				Recheck::Unavailable("Upstream authorization state could not be read.".into()),
+		};
+		match checked {
+			| Recheck::Denied(_) => return Some(checked),
+			| Recheck::Unavailable(_) => outcome = Some(checked),
+			| Recheck::Allowed if outcome.is_none() => outcome = Some(checked),
 			| Recheck::Allowed => (),
-			| Recheck::Denied(reason) => return Some(Recheck::Denied(reason)),
-			| Recheck::Unavailable(reason) => unavailable = Some(Recheck::Unavailable(reason)),
 		}
 	}
-
-	Some(unavailable.unwrap_or(Recheck::Allowed))
+	outcome
 }
 
 /// Re-check one upstream grant and persist the refreshed grant on success.

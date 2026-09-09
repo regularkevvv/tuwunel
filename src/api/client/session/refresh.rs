@@ -135,11 +135,10 @@ pub(crate) async fn refresh_token_route(
 ///
 /// A refusal removes the device and answers `M_UNKNOWN_TOKEN` with
 /// `soft_logout: false`: the identity is gone, not merely stale, so the client
-/// must not keep the device and retry. An unreachable provider answers
-/// `M_CONNECTION_FAILED` (HTTP 502) and revokes nothing, so an Access outage
-/// costs refreshes rather than every session on the server; the session then
-/// outlives the policy for as long as the outage lasts, the bounded tolerance
-/// this design accepts.
+/// must not keep the device and retry. An unreachable provider or unreadable
+/// authorization state answers `M_CONNECTION_FAILED` (HTTP 502) and revokes
+/// nothing. No new access token is issued; existing expiring tokens retain
+/// only their original lifetime, without an outage-based extension.
 ///
 /// Audit lines carry the user, device and provider only. No access token,
 /// refresh token, authorization code or upstream grant is logged (plan.md,
@@ -172,11 +171,11 @@ async fn upstream_gate(services: &Services, user_id: &UserId, device_id: &Device
 				%user_id,
 				%device_id,
 				%reason,
-				"Upstream identity provider unreachable; refusing to refresh without revoking.",
+				"Upstream authorization unavailable; refusing to refresh without revoking.",
 			);
 
 			Err!(Request(ConnectionFailed(
-				"The identity provider could not be reached to re-authorize this session."
+				"The upstream authorization could not be verified for this session."
 			)))
 		},
 	}
