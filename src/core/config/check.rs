@@ -284,6 +284,14 @@ fn check_database_backend(config: &Config) -> Result {
 		return Ok(());
 	}
 
+	if !config.maintenance && (!config.startup_netburst || config.startup_netburst_keep != -1) {
+		return Err!(Config(
+			"startup_netburst",
+			"D1 serving requires startup_netburst=true and startup_netburst_keep=-1; durable \
+			 queues must not be abandoned or trimmed on replacement."
+		));
+	}
+
 	if config.d1_request_timeout_ms == 0 {
 		return Err!(Config(
 			"d1_request_timeout_ms",
@@ -938,5 +946,54 @@ fn warn_unknown_key(config: &Config) -> Result {
 		Err!("Unknown config options were found: {unknown_keys:?}")
 	} else {
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod queue_recovery_policy_tests {
+	use super::check_database_backend;
+	use crate::config::{Config, Figment};
+
+	fn remote() -> Figment {
+		Figment::new()
+			.merge(("server_name", "localhost"))
+			.merge(("database_backend", "d1"))
+			.merge(("d1_bridge_url", "http://bridge.internal"))
+			.merge(("d1_bridge_token", "disposable-test-bridge-token"))
+	}
+
+	#[test]
+	fn d1_serving_refuses_queue_trimming_and_disabled_recovery() {
+		for keep in [0, 1, 50, 100] {
+			let config =
+				Config::new(&remote().merge(("startup_netburst_keep", keep))).expect("config");
+			let error =
+				check_database_backend(&config).expect_err("durable queue trimming refused");
+			assert!(error.to_string().contains("startup_netburst"));
+		}
+		let config = Config::new(
+			&remote()
+				.merge(("startup_netburst_keep", -1))
+				.merge(("startup_netburst", false)),
+		)
+		.expect("config");
+		check_database_backend(&config).expect_err("serving must reconstruct pending queues");
+	}
+
+	#[test]
+	fn complete_d1_recovery_and_offline_maintenance_are_valid() {
+		let serving =
+			Config::new(&remote().merge(("startup_netburst_keep", -1))).expect("config");
+		check_database_backend(&serving).expect("all durable rows recovered");
+		let maintenance = Config::new(
+			&remote()
+				.merge(("maintenance", true))
+				.merge(("startup_netburst", false)),
+		)
+		.expect("config");
+		check_database_backend(&maintenance).expect("offline maintenance starts no senders");
+		let reference = Config::new(&Figment::new().merge(("server_name", "localhost")))
+			.expect("reference config");
+		check_database_backend(&reference).expect("RocksDB reference policy is unchanged");
 	}
 }

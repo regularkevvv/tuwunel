@@ -81,25 +81,37 @@ impl Data {
 			.await
 	}
 
-	/// Write composed EDUs straight into the active set, keyed by fresh counts;
-	/// unlike `mark_as_active` there is no queue row to delete.
-	pub(super) async fn persist_active_edus(
+	/// Persist the selected/overflow EDUs and their consumed source watermark
+	/// together. A rejected or uncertain commit cannot acknowledge just the
+	/// cursor.
+	pub(super) async fn persist_edus(
 		&self,
 		server: &ServerName,
-		edus: &[EduBuf],
+		active: &[EduBuf],
+		queued: &[EduBuf],
+		last_count: u64,
 	) -> Result {
 		let prefix = Destination::Federation(server.to_owned()).get_prefix();
 
 		let mut txn = self.db.txn();
-		for edu in edus {
+		let rows = active
+			.iter()
+			.map(|edu| (&self.servercurrentevent_data, edu))
+			.chain(
+				queued
+					.iter()
+					.map(|edu| (&self.servernameevent_data, edu)),
+			);
+		for (map, edu) in rows {
 			let mut key = prefix.clone();
 			// The permit retires at the end of this iteration, before the
 			// batch executes; EDU counts never gate reader visibility.
 			let count = self.services.globals.next_count().await?;
 			key.extend(&count.to_be_bytes());
 
-			txn.insert_raw(&self.servercurrentevent_data, key, edu.as_slice());
+			txn.insert_raw(map, key, edu.as_slice());
 		}
+		txn.raw_put(&self.servername_educount, server, last_count);
 
 		txn.execute().await
 	}
@@ -202,18 +214,6 @@ impl Data {
 			.ready_filter_map(decode_badge_destination)
 	}
 
-	pub(super) async fn set_latest_educount(
-		&self,
-		server_name: &ServerName,
-		last_count: u64,
-	) -> Result {
-		self.servername_educount
-			.raw_put(server_name, last_count)
-			.await?;
-
-		Ok(())
-	}
-
 	pub async fn get_latest_educount(&self, server_name: &ServerName) -> Result<u64> {
 		missing_count_is_zero(
 			self.servername_educount
@@ -221,6 +221,28 @@ impl Data {
 				.await
 				.deserialized(),
 		)
+	}
+
+	/// Reconstruct unfinished source-window wakes after process replacement.
+	pub(super) fn pending_edu_destinations(
+		&self,
+		retired: u64,
+	) -> impl Stream<Item = Result<Destination>> + Send + '_ {
+		self.servername_educount
+			.stream()
+			.map(move |row: Result<(&ServerName, u64)>| {
+				let (server, count) = row?;
+				if count > retired {
+					return Err(Error::bad_database(
+						"Outgoing EDU watermark exceeds the retired counter",
+					));
+				}
+				Ok((server, count))
+			})
+			.try_filter(move |(_, count): &(&ServerName, u64)| {
+				futures::future::ready(*count < retired)
+			})
+			.map_ok(|(server, _)| Destination::Federation(server.to_owned()))
 	}
 }
 

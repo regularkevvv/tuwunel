@@ -6,7 +6,7 @@ use std::{
 	str::from_utf8,
 	sync::{
 		Arc,
-		atomic::{AtomicU64, AtomicUsize, Ordering},
+		atomic::{AtomicUsize, Ordering},
 	},
 	time::{Duration, Instant, SystemTime},
 };
@@ -51,7 +51,6 @@ use tuwunel_core::{
 	Error, Event, Result, debug, debug_warn, err, error,
 	error::error_chain,
 	extract_variant, implement,
-	result::LogErr,
 	smallvec::SmallVec,
 	trace,
 	utils::{
@@ -68,6 +67,9 @@ use super::{
 	reap_flushes,
 };
 use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
+
+#[cfg(test)]
+mod edu_tests;
 
 /// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
 /// in `peer_status` (federation only); appservice/push paths keep their own
@@ -204,6 +206,12 @@ impl PushFailures {
 
 const SELECT_PRESENCE_LIMIT: usize = 256;
 const SELECT_RECEIPT_LIMIT: usize = 256;
+const SELECT_DEVICE_CHANGE_LIMIT: usize = 256;
+/// Global source counts are unique across update producers. A complete window
+/// stays below the per-source caps without taking another source's larger
+/// cursor.
+const EDU_WINDOW_COUNTS: u64 = 128;
+const EDU_ROOM_READ_CONCURRENCY: usize = 8;
 const DEQUEUE_LIMIT: usize = 48;
 const PUSH_FAILURE_STREAK: u32 = 4;
 const WAKE_OVERFLOW_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
@@ -211,6 +219,15 @@ const WAKE_OVERFLOW_DELAY: Duration = Duration::from_secs(WAKE_OVERFLOW_DELAY_SE
 
 pub const PDU_LIMIT: usize = 50;
 pub const EDU_LIMIT: usize = 100;
+
+fn edu_window_end(since: u64, retired: u64) -> Result<u64> {
+	if since > retired {
+		return Err(Error::bad_database("Outgoing EDU watermark exceeds the retired counter"));
+	}
+	Ok(since
+		.saturating_add(EDU_WINDOW_COUNTS)
+		.min(retired))
+}
 
 impl Service {
 	#[tracing::instrument(skip(self), level = "debug")]
@@ -808,19 +825,26 @@ impl Service {
 			return Ok(());
 		}
 
-		let destinations = self
+		let mut destinations = self
 			.db
 			.queued_badge_refresh_destinations()
 			.try_filter(|dest| futures::future::ready(self.shard_id(dest) == id))
 			.try_collect::<HashSet<_>>()
 			.await?;
+		destinations.extend(
+			self.db
+				.pending_edu_destinations(self.services.globals.current_count())
+				.try_filter(|dest| futures::future::ready(self.shard_id(dest) == id))
+				.try_collect::<Vec<_>>()
+				.await?,
+		);
 
 		for dest in destinations {
-			let msg = Msg {
-				dest,
-				event: SendingEvent::BadgeRefresh,
-				queue_id: Vec::new(),
+			let event = match &dest {
+				| Destination::Federation(_) => SendingEvent::Flush,
+				| _ => SendingEvent::BadgeRefresh,
 			};
+			let msg = Msg { dest, event, queue_id: Vec::new() };
 
 			self.handle_request(msg, futures, statuses)
 				.await?;
@@ -971,41 +995,38 @@ impl Service {
 	async fn select_edus(&self, server_name: &ServerName, budget_used: usize) -> Result<EduVec> {
 		// selection window
 		let since = self.db.get_latest_educount(server_name).await?;
-		let since_upper = self.services.globals.current_count();
+		let since_upper = edu_window_end(since, self.services.globals.current_count())?;
 
 		// Nothing new since the last window: skip the scan and the watermark.
-		if since == since_upper {
+		if since == since_upper || budget_used >= EDU_LIMIT {
 			return Ok(EduVec::new());
 		}
 
 		let batch = (since, since_upper);
 		debug_assert!(batch.0 <= batch.1, "since range must not be negative");
 
-		let events_len = AtomicUsize::new(budget_used);
-		let max_edu_count = AtomicU64::new(since);
-		let device_changes =
-			self.select_edus_device_changes(server_name, batch, &max_edu_count, &events_len);
+		// Reserve presence's one EDU before the durable selectors share their
+		// budget, so advancing a complete window never drops it for lack of a slot.
+		let outgoing_presence = self.server.config.allow_outgoing_presence;
+		let outgoing_receipts = self.server.config.allow_outgoing_read_receipts;
+		let events_len =
+			AtomicUsize::new(budget_used.saturating_add(usize::from(outgoing_presence)));
+		let device_changes = self.select_edus_device_changes(server_name, batch, &events_len);
 
-		let receipts = self
-			.server
-			.config
-			.allow_outgoing_read_receipts
-			.then_async(|| {
-				self.select_edus_receipts(server_name, batch, &max_edu_count, &events_len)
-			});
+		let receipts = outgoing_receipts
+			.then_async(|| self.select_edus_receipts(server_name, batch, &events_len));
 
-		let presence = self
-			.server
-			.config
-			.allow_outgoing_presence
-			.then_async(|| {
-				self.select_edus_presence(server_name, batch, &max_edu_count, &events_len)
-			});
+		let presence =
+			outgoing_presence.then_async(|| self.select_edus_presence(server_name, batch));
 
 		let (device_changes, receipts, presence) =
 			join3(device_changes, receipts, presence).await;
 
-		let receipts = receipts.unwrap_or_default();
+		// All selected sources must complete before persisting any selected row
+		// or watermark. A missing optional source is not a failed source.
+		let device_changes = device_changes?;
+		let receipts = receipts.transpose()?.unwrap_or_default();
+		let presence = presence.transpose()?.flatten();
 		let mut events = device_changes.shipped;
 
 		events.extend(receipts.shipped);
@@ -1014,40 +1035,32 @@ impl Service {
 		// its content is compose-time-relative and regenerates fresh.
 		let durable_len = events.len();
 
-		events.extend(presence.flatten());
+		events.extend(presence);
 		debug_assert!(
 			budget_used.saturating_add(events.len()) <= EDU_LIMIT,
 			"exceeded edus limit"
 		);
 
 		// EDUs past the budget become queued rows drained by later transactions.
-		let overflow: Vec<SendingEvent> = device_changes
+		let overflow: Vec<EduBuf> = device_changes
 			.overflow
 			.into_iter()
 			.chain(receipts.overflow)
-			.map(SendingEvent::Edu)
 			.collect();
 
-		if !overflow.is_empty() {
-			let dest = Destination::Federation(server_name.to_owned());
-			self.db
-				.queue_requests(overflow.iter().map(|event| (event, &dest)))
-				.await?;
-		}
+		self.db
+			.persist_edus(server_name, &events[..durable_len], &overflow, since_upper)
+			.await?;
 
-		// Persist the durable prefix so a failed or restarted transaction
-		// replays it; the ACK deletes these active rows.
-		if durable_len > 0 {
-			self.db
-				.persist_active_edus(server_name, &events[..durable_len])
-				.await?;
-		}
-
-		let last_count = max_edu_count.load(Ordering::Acquire);
-		if last_count > since {
-			self.db
-				.set_latest_educount(server_name, last_count)
-				.await?;
+		// Also continue empty windows: global counters include unrelated writes
+		// and queue identifiers. The persisted watermark reconstructs this wake
+		// at startup if the process stops before it can run.
+		if since_upper < self.services.globals.current_count() {
+			self.dispatch(Msg {
+				dest: Destination::Federation(server_name.to_owned()),
+				event: SendingEvent::Flush,
+				queue_id: Vec::new(),
+			})?;
 		}
 
 		Ok(events)
@@ -1057,37 +1070,42 @@ impl Service {
 	#[tracing::instrument(
 		name = "device_changes",
 		level = "trace",
-		skip(self, server_name, max_edu_count, events_len)
+		skip(self, server_name, events_len)
 	)]
 	async fn select_edus_device_changes(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
-		max_edu_count: &AtomicU64,
 		events_len: &AtomicUsize,
-	) -> Selected {
+	) -> Result<Selected> {
 		let mut selected = Selected::default();
 		let server_rooms = self
 			.services
 			.state_cache
-			.server_rooms(server_name);
+			.server_rooms_fallible(server_name);
 
 		pin_mut!(server_rooms);
 		let mut device_list_changes = HashSet::<OwnedUserId>::new();
-		while let Some(room_id) = server_rooms.next().await {
-			let keys_changed = self
-				.services
-				.users
-				.room_keys_changed(room_id, since.0, Some(since.1))
-				.ready_filter(|(user_id, _)| self.services.globals.user_is_local(user_id));
+		while let Some(room_id) = server_rooms.try_next().await? {
+			let keys_changed =
+				self.services
+					.users
+					.room_keys_changed_fallible(room_id, since.0, Some(since.1));
 
 			pin_mut!(keys_changed);
-			while let Some((user_id, count)) = keys_changed.next().await {
+			while let Some((user_id, count)) = keys_changed.try_next().await? {
 				debug_assert!(count <= since.1, "exceeds upper-bound");
 
-				max_edu_count.fetch_max(count, Ordering::Relaxed);
+				if !self.services.globals.user_is_local(user_id) {
+					continue;
+				}
 				if !device_list_changes.insert(user_id.into()) {
 					continue;
+				}
+				if device_list_changes.len() > SELECT_DEVICE_CHANGE_LIMIT {
+					return Err(Error::bad_database(
+						"Device changes exceed the bounded counter window",
+					));
 				}
 
 				// Empty prev id forces synapse to resync; because synapse resyncs,
@@ -1118,7 +1136,7 @@ impl Service {
 			}
 		}
 
-		selected
+		Ok(selected)
 	}
 
 	/// Look for read receipts in this room
@@ -1133,35 +1151,32 @@ impl Service {
 	#[tracing::instrument(
 		name = "receipts",
 		level = "trace",
-		skip(self, server_name, max_edu_count, events_len)
+		skip(self, server_name, events_len)
 	)]
 	async fn select_edus_receipts(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
-		max_edu_count: &AtomicU64,
 		events_len: &AtomicUsize,
-	) -> Selected {
+	) -> Result<Selected> {
 		let num = AtomicUsize::new(0);
 		let num = &num;
 		let by_room: RoomReceipts = self
 			.services
 			.state_cache
-			.server_rooms(server_name)
-			.map(ToOwned::to_owned)
-			.broad_filter_map(|room_id| async move {
+			.server_rooms_fallible(server_name)
+			.map_ok(ToOwned::to_owned)
+			.map(|room_id| async move {
+				let room_id = room_id?;
 				let ranked = self
-					.select_edus_receipts_room(&room_id, since, max_edu_count, num)
-					.await;
-
-				ranked
-					.is_empty()
-					.is_false()
-					.then_some((room_id, ranked))
+					.select_edus_receipts_room(&room_id, since, num)
+					.await?;
+				Ok::<_, Error>((room_id, ranked))
 			})
-			.collect()
+			.buffer_unordered(EDU_ROOM_READ_CONCURRENCY)
+			.try_collect()
 			.boxed()
-			.await;
+			.await?;
 
 		let max_rank = by_room
 			.iter()
@@ -1203,7 +1218,7 @@ impl Service {
 			}
 		}
 
-		selected
+		Ok(selected)
 	}
 
 	/// Look for read receipts in this room.
@@ -1214,41 +1229,32 @@ impl Service {
 	/// rank 1 the next, and so on. The receipt-limit budget bounds distinct
 	/// users only; subsequent thread receipts for an already-counted user do
 	/// not consume additional budget.
-	#[tracing::instrument(
-		name = "receipts",
-		level = "trace",
-		skip(self, since, max_edu_count)
-	)]
+	#[tracing::instrument(name = "receipts", level = "trace", skip(self, since))]
 	async fn select_edus_receipts_room(
 		&self,
 		room_id: &RoomId,
 		since: (u64, u64),
-		max_edu_count: &AtomicU64,
 		num: &AtomicUsize,
-	) -> RankedReceipts {
-		let receipts =
-			self.services
-				.read_receipt
-				.readreceipts_since(room_id, since.0, Some(since.1));
+	) -> Result<RankedReceipts> {
+		let receipts = self
+			.services
+			.read_receipt
+			.readreceipts_since_fallible(room_id, since.0, Some(since.1));
 
 		pin_mut!(receipts);
 		let mut by_user = BTreeMap::<OwnedUserId, UserReceipts>::new();
-		while let Some((user_id, count, read_receipt)) = receipts.next().await {
+		while let Some((user_id, count, read_receipt)) = receipts.try_next().await? {
 			debug_assert!(count <= since.1, "exceeds upper-bound");
 
-			max_edu_count.fetch_max(count, Ordering::Relaxed);
 			if !self.services.globals.user_is_local(user_id) {
 				continue;
 			}
 
-			let Ok(event) = serde_json::from_str(read_receipt.json().get()) else {
-				error!(?user_id, ?count, ?read_receipt, "Invalid edu event in read_receipts.");
-				continue;
-			};
+			let event = serde_json::from_str(read_receipt.json().get())
+				.map_err(|_| Error::bad_database("Invalid stored receipt JSON"))?;
 
 			let AnySyncEphemeralRoomEvent::Receipt(r) = event else {
-				error!(?user_id, ?count, ?event, "Invalid event type in read_receipts");
-				continue;
+				return Err(Error::bad_database("Invalid stored receipt event type"));
 			};
 
 			let (event_id, mut receipt) = r
@@ -1256,13 +1262,13 @@ impl Service {
 				.0
 				.into_iter()
 				.next()
-				.expect("we only use one event per read receipt");
+				.ok_or_else(|| Error::bad_database("Stored receipt has no event"))?;
 
 			let receipt = receipt
 				.remove(&ReceiptType::Read)
-				.expect("our read receipts always set this")
+				.ok_or_else(|| Error::bad_database("Stored receipt is missing read type"))?
 				.remove(user_id)
-				.expect("our read receipts always have the user here");
+				.ok_or_else(|| Error::bad_database("Stored receipt is missing its owner"))?;
 
 			let receipt_data = ReceiptData { data: receipt, event_ids: vec![event_id] };
 
@@ -1271,7 +1277,9 @@ impl Service {
 					slot.insert(SmallVec::from_buf([receipt_data]));
 					let num = num.fetch_add(1, Ordering::Relaxed);
 					if num >= SELECT_RECEIPT_LIMIT {
-						break;
+						return Err(Error::bad_database(
+							"Receipts exceed the bounded counter window",
+						));
 					}
 				},
 				| Entry::Occupied(mut slot) => {
@@ -1283,7 +1291,7 @@ impl Service {
 		// Pivot per-user count-ordered receipts into rank-major
 		// `RankedReceipts`. Rank 0 carries each user's earliest receipt in
 		// the window, rank 1 the next, and so on.
-		by_user
+		Ok(by_user
 			.into_iter()
 			.fold(RankedReceipts::new(), |mut acc, (user_id, receipts)| {
 				for (rank, receipt_data) in receipts.into_iter().enumerate() {
@@ -1297,33 +1305,26 @@ impl Service {
 				}
 
 				acc
-			})
+			}))
 	}
 
 	/// Look for presence
-	#[tracing::instrument(
-		name = "presence",
-		level = "trace",
-		skip(self, server_name, max_edu_count, events_len)
-	)]
+	#[tracing::instrument(name = "presence", level = "trace", skip(self, server_name))]
 	async fn select_edus_presence(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
-		max_edu_count: &AtomicU64,
-		events_len: &AtomicUsize,
-	) -> Option<EduBuf> {
+	) -> Result<Option<EduBuf>> {
 		let presence_since = self
 			.services
 			.presence
-			.presence_since(since.0, Some(since.1));
+			.presence_since_fallible(since.0, Some(since.1));
 
 		pin_mut!(presence_since);
 		let mut presence_updates = HashMap::<OwnedUserId, PresenceUpdate>::new();
-		while let Some((user_id, count, presence_bytes)) = presence_since.next().await {
+		while let Some((user_id, count, presence_bytes)) = presence_since.try_next().await? {
 			debug_assert!(count <= since.1, "exceeded upper-bound");
 
-			max_edu_count.fetch_max(count, Ordering::Relaxed);
 			if !self.services.globals.user_is_local(user_id) {
 				continue;
 			}
@@ -1331,21 +1332,17 @@ impl Service {
 			if !self
 				.services
 				.state_cache
-				.server_sees_user(server_name, user_id)
-				.await
+				.server_sees_user_fallible(server_name, user_id)
+				.await?
 			{
 				continue;
 			}
 
-			let Ok(presence_event) = self
+			let presence_event = self
 				.services
 				.presence
 				.from_json_bytes_to_event(presence_bytes, user_id)
-				.await
-				.log_err()
-			else {
-				continue;
-			};
+				.await?;
 
 			let update = PresenceUpdate {
 				user_id: user_id.into(),
@@ -1362,18 +1359,13 @@ impl Service {
 			};
 
 			presence_updates.insert(user_id.into(), update);
-			if presence_updates.len() >= SELECT_PRESENCE_LIMIT {
-				break;
+			if presence_updates.len() > SELECT_PRESENCE_LIMIT {
+				return Err(Error::bad_database("Presence exceeds the bounded counter window"));
 			}
 		}
 
 		if presence_updates.is_empty() {
-			return None;
-		}
-
-		// A budget trip drops presence, which self-heals on the next transition.
-		if events_len.fetch_add(1, Ordering::Relaxed) >= EDU_LIMIT {
-			return None;
+			return Ok(None);
 		}
 
 		let presence_content = Edu::Presence(PresenceContent {
@@ -1384,7 +1376,7 @@ impl Service {
 		serde_json::to_writer(&mut buf, &presence_content)
 			.expect("failed to serialize Presence EDU to JSON");
 
-		Some(buf)
+		Ok(Some(buf))
 	}
 
 	fn send_events(&self, dest: Destination, events: Vec<SendingEvent>) -> SendingFuture<'_> {

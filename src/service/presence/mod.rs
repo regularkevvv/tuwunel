@@ -262,6 +262,15 @@ impl Service {
 		self.db.presence_since(since, to)
 	}
 
+	/// Presence range with storage and key-decoding failures preserved.
+	pub fn presence_since_fallible(
+		&self,
+		since: u64,
+		to: Option<u64>,
+	) -> impl Stream<Item = Result<(&UserId, u64, &[u8])>> + Send + '_ {
+		self.db.presence_since_fallible(since, to)
+	}
+
 	#[inline]
 	pub async fn from_json_bytes_to_event(
 		&self,

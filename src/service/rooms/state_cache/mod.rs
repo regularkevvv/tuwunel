@@ -7,7 +7,7 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
-use futures::{Stream, StreamExt, future::join5, pin_mut};
+use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
 use ruma::{
 	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
 	events::{AnyStrippedStateEvent, AnySyncStateEvent, room::member::MembershipState},
@@ -166,12 +166,20 @@ pub fn server_rooms<'a>(
 	&'a self,
 	server: &'a ServerName,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	self.server_rooms_fallible(server).ignore_err()
+}
+
+/// Room enumeration for callers that must not treat storage failure as absence.
+#[implement(Service)]
+pub fn server_rooms_fallible<'a>(
+	&'a self,
+	server: &'a ServerName,
+) -> impl Stream<Item = Result<&'a RoomId>> + Send + 'a {
 	let prefix = (server, Interfix);
 	self.db
 		.serverroomids
 		.keys_prefix(&prefix)
-		.ignore_err()
-		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
+		.map_ok(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
 
 /// Yields every server participating in at least one known room, each name
@@ -215,6 +223,31 @@ pub async fn server_sees_user(&self, server: &ServerName, user_id: &UserId) -> b
 		.map(ToOwned::to_owned)
 		.broad_any(async |room_id| self.is_joined(user_id, &room_id).await)
 		.await
+}
+
+/// Visibility lookup that distinguishes a missing membership from a failed
+/// read.
+#[implement(Service)]
+pub async fn server_sees_user_fallible(
+	&self,
+	server: &ServerName,
+	user_id: &UserId,
+) -> Result<bool> {
+	let rooms = self.server_rooms_fallible(server);
+	pin_mut!(rooms);
+	while let Some(room_id) = rooms.try_next().await? {
+		match self
+			.db
+			.userroomid_joinedcount
+			.qry(&(user_id, room_id))
+			.await
+		{
+			| Ok(_) => return Ok(true),
+			| Err(error) if error.is_not_found() => {},
+			| Err(error) => return Err(error),
+		}
+	}
+	Ok(false)
 }
 
 /// Returns true if user_a and user_b share at least one room.

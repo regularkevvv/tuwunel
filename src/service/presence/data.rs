@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use ruma::{UInt, UserId, events::presence::PresenceEvent, presence::PresenceState};
 use tuwunel_core::{
-	Result, debug_warn, utils,
+	Error, Result, debug_warn, utils,
 	utils::{ReadyExt, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Json, Map};
@@ -174,13 +174,29 @@ impl Data {
 		since: u64,
 		to: Option<u64>,
 	) -> impl Stream<Item = (&UserId, u64, &[u8])> + Send + '_ {
-		self.presenceid_presence
-			.raw_stream()
+		self.presence_since_fallible(since, to)
 			.ignore_err()
-			.ready_filter_map(move |(key, presence)| {
-				let (count, user_id) = presenceid_parse(key).ok()?;
-				(count > since && to.is_none_or(|to| count <= to))
-					.then_some((user_id, count, presence))
+	}
+
+	pub(super) fn presence_since_fallible(
+		&self,
+		since: u64,
+		to: Option<u64>,
+	) -> impl Stream<Item = Result<(&UserId, u64, &[u8])>> + Send + '_ {
+		self.presenceid_presence
+			.raw_stream_from(&since.saturating_add(1).to_be_bytes())
+			.map(|row| {
+				let (key, presence) = row?;
+				let (count, user_id) = presenceid_parse(key)?;
+				Ok((user_id, count, presence))
+			})
+			.ready_take_while(move |row| match row {
+				| Ok((_, count, _)) => to.is_none_or(|to| *count <= to),
+				| Err(_) => true,
+			})
+			.ready_filter(move |row| match row {
+				| Ok((_, count, _)) => *count > since,
+				| Err(_) => true,
 			})
 	}
 }
@@ -196,7 +212,9 @@ fn presenceid_key(count: u64, user_id: &UserId) -> Vec<u8> {
 
 #[inline]
 fn presenceid_parse(key: &[u8]) -> Result<(u64, &UserId)> {
-	let (count, user_id) = key.split_at(8);
+	let (count, user_id) = key
+		.split_at_checked(8)
+		.ok_or_else(|| Error::bad_database("Invalid presence key length"))?;
 	let user_id = user_id_from_bytes(user_id)?;
 	let count = utils::u64_from_u8(count);
 

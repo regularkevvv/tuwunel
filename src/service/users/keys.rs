@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, mem, ops::Deref, sync::Arc};
 
-use futures::{Stream, StreamExt, TryFutureExt, future::join4, pin_mut};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future::join4, pin_mut};
 use ruma::{
 	AnyKeyName, DeviceId, KeyId, OneTimeKeyAlgorithm, OneTimeKeyId, OneTimeKeyName, OwnedKeyId,
 	OwnedOneTimeKeyId, OwnedRoomId, OwnedServerName, RoomId, SigningKeyId, UInt, UserId,
@@ -17,7 +17,7 @@ use tuwunel_core::{
 	debug_error, err, implement,
 	smallvec::SmallVec,
 	utils::{
-		BoolExt, IterStream, ReadyExt,
+		BoolExt, IterStream, ReadyExt, TryReadyExt,
 		result::LogErr,
 		stream::{BroadbandExt, TryIgnore},
 		to_canonical_object,
@@ -894,6 +894,17 @@ pub fn room_keys_changed<'a>(
 	self.keys_changed_user_or_room(room_id.as_str(), from, to)
 }
 
+/// Complete device-change scan for durability-sensitive consumers.
+#[implement(super::Service)]
+pub fn room_keys_changed_fallible<'a>(
+	&'a self,
+	room_id: &'a RoomId,
+	from: u64,
+	to: Option<u64>,
+) -> impl Stream<Item = Result<(&'a UserId, u64)>> + Send + 'a {
+	self.keys_changed_user_or_room_fallible(room_id.as_str(), from, to)
+}
+
 #[implement(super::Service)]
 fn keys_changed_user_or_room<'a>(
 	&'a self,
@@ -901,6 +912,17 @@ fn keys_changed_user_or_room<'a>(
 	from: u64,
 	to: Option<u64>,
 ) -> impl Stream<Item = (&UserId, u64)> + Send + 'a {
+	self.keys_changed_user_or_room_fallible(user_or_room_id, from, to)
+		.ignore_err()
+}
+
+#[implement(super::Service)]
+fn keys_changed_user_or_room_fallible<'a>(
+	&'a self,
+	user_or_room_id: &'a str,
+	from: u64,
+	to: Option<u64>,
+) -> impl Stream<Item = Result<(&'a UserId, u64)>> + Send + 'a {
 	type KeyVal<'a> = ((&'a str, u64), &'a UserId);
 
 	let to = to.unwrap_or(u64::MAX);
@@ -908,11 +930,10 @@ fn keys_changed_user_or_room<'a>(
 	self.db
 		.keychangeid_userid
 		.stream_from(&start)
-		.ignore_err()
-		.ready_take_while(move |((prefix, count), _): &KeyVal<'_>| {
-			*prefix == user_or_room_id && *count <= to
+		.ready_try_take_while(move |((prefix, count), _): &KeyVal<'_>| {
+			Ok(*prefix == user_or_room_id && *count <= to)
 		})
-		.map(|((_, count), user_id): KeyVal<'_>| (user_id, count))
+		.map_ok(|((_, count), user_id): KeyVal<'_>| (user_id, count))
 }
 
 #[implement(super::Service)]
