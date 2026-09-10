@@ -12,7 +12,7 @@ use ruma::{
 };
 use serde::Deserialize;
 use tuwunel_core::{
-	Result, at, err, implement,
+	Error, Result, at, err, implement,
 	matrix::{Event, Pdu, StateKey},
 	pair_of,
 	utils::{
@@ -404,7 +404,9 @@ pub fn state_full_ids_strict(
 				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
 				.zip(shortstatekeys.into_iter().stream())
 				.map(|(event_id, shortstatekey)| {
-					event_id.map(|event_id| (shortstatekey, event_id))
+					event_id
+						.map(|event_id| (shortstatekey, event_id))
+						.map_err(|_| Error::bad_database("Incomplete state event mapping"))
 				})
 				.try_collect::<Vec<_>>()
 				.await

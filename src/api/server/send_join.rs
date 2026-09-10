@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 
 use axum::extract::State;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join4};
+use futures::{FutureExt, TryFutureExt, TryStreamExt, future::try_join};
 use ruma::{
 	CanonicalJsonObject, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId,
 	ServerName, UserId,
@@ -13,13 +13,13 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Err, Result, at, debug_error, err,
+	Err, Error, Result, at, debug_error, err,
 	itertools::Itertools,
 	matrix::{RoomVersionRules, event::gen_event_id_canonical_json, room_version},
 	utils::{
 		BoolExt,
 		future::{BoolExt as _, ReadyBoolExt},
-		stream::{BroadbandExt, IterStream, TryBroadbandExt, TryReadyExt},
+		stream::{IterStream, TryBroadbandExt, TryReadyExt},
 	},
 	warn,
 };
@@ -58,14 +58,22 @@ pub(crate) async fn create_join_event_v2_route(
 
 	// Get the servers in the room BEFORE the join
 	let servers_in_room = members_omitted
-		.then_async(|| {
-			services
+		.then_async(|| async {
+			let servers = services
 				.state_cache
-				.room_servers(room_id)
-				.map(ToOwned::to_owned)
-				.collect::<Vec<_>>()
+				.room_servers_fallible(room_id)
+				.map_ok(ToOwned::to_owned)
+				.try_collect::<Vec<_>>()
+				.await?;
+
+			servers
+				.iter()
+				.any(|server| server == services.globals.server_name())
+				.then_some(servers)
+				.ok_or_else(|| Error::bad_database("Incomplete send_join server membership"))
 		})
-		.await;
+		.await
+		.transpose()?;
 
 	let mut room_state =
 		create_join_event(&services, origin, room_id, &body.pdu, members_omitted)
@@ -159,46 +167,30 @@ async fn create_join_event(
 		.await
 		.unwrap_or_default();
 
-	// Prestart state gather here since it doesn't involve the new join event.
+	// Gather the prior state before accepting the new join event.
 	let state_ids = services
 		.state_accessor
-		.state_full_ids(shortstatehash)
-		.broad_filter_map(async |(ssk, event_id)| {
+		.state_full_ids_strict(shortstatehash)
+		.try_filter_map(async |(ssk, event_id)| {
 			// Filter state: keep all non-member events, the joining user's
-			// member event, and hero member events. If get_statekey_from_short
-			// fails, keep the event (safe default, matching original behavior).
+			// member event, and hero member events. Mapping failure aborts the
+			// response before the join can be accepted.
 			if omit_members
-				&& let Ok((kind, sk)) = services.short.get_statekey_from_short(ssk).await
-				&& kind == StateEventType::RoomMember
+				&& let (kind, sk) = services
+					.short
+					.get_statekey_from_short(ssk)
+					.await? && kind == StateEventType::RoomMember
 				&& let Ok(user_id) = sk.as_str().try_into()
 				&& joining_user != user_id
 				&& !heroes.contains(&user_id)
 			{
-				return None;
+				return Ok(None);
 			}
 
-			Some(event_id)
+			Ok(Some(event_id))
 		})
-		.collect::<Vec<_>>();
-
-	let mutex_lock = services
-		.event_handler
-		.mutex_federation
-		.lock(room_id)
-		.await;
-
-	let pdu_id = services
-		.event_handler
-		.handle_incoming_pdu(&origin, room_id, &event_id, value.clone(), true)
+		.try_collect::<Vec<_>>()
 		.await?
-		.map(at!(0))
-		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;
-
-	drop(mutex_lock);
-
-	// Wait for state gather which the remaining operations depend on.
-	let state_ids = state_ids
-		.await
 		.into_iter()
 		.sorted_unstable()
 		.collect::<Vec<_>>();
@@ -224,6 +216,7 @@ async fn create_join_event(
 			services
 				.timeline
 				.get_pdu_json(&event_id)
+				.map_err(|_| Error::bad_database("Incomplete send_join authentication chain"))
 				.and_then(into_federation_format)
 				.inspect_err(|e| debug_error!(?event_id, "auth_chain event not found: {e}"))
 				.await
@@ -237,30 +230,47 @@ async fn create_join_event(
 			services
 				.timeline
 				.get_pdu_json(event_id)
+				.map_err(|_| Error::bad_database("Incomplete send_join state snapshot"))
 				.and_then(into_federation_format)
 				.inspect_err(|e| debug_error!(?event_id, "state event not found: {e}"))
 				.await
 		})
 		.try_collect();
 
-	// Join event for new server.
+	// Build every database-backed part of the response before accepting the
+	// join. A partial snapshot must never commit a membership event and only
+	// then fail the request.
+	let (auth_chain, state) = try_join(auth_chain, state).await?;
 	let event = services
 		.federation
-		.format_pdu_into(value, Some(&room_version_id))
-		.map(Some)
-		.map(Ok);
+		.format_pdu_into(value.clone(), Some(&room_version_id))
+		.await;
+
+	let mutex_lock = services
+		.event_handler
+		.mutex_federation
+		.lock(room_id)
+		.await;
+
+	let pdu_id = services
+		.event_handler
+		.handle_incoming_pdu(&origin, room_id, &event_id, value, true)
+		.await?
+		.map(at!(0))
+		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;
+
+	drop(mutex_lock);
 
 	// Join event revealed to existing servers.
-	let broadcast = services.sending.send_pdu_room(room_id, &pdu_id);
-
-	let (auth_chain, state, event, ()) = try_join4(auth_chain, state, event, broadcast)
-		.boxed()
+	services
+		.sending
+		.send_pdu_room(room_id, &pdu_id)
 		.await?;
 
 	Ok(create_join_event::v2::RoomState {
 		auth_chain,
 		state,
-		event,
+		event: Some(event),
 		..Default::default()
 	})
 }

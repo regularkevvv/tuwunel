@@ -1,8 +1,8 @@
 use std::{iter::once, time::Instant};
 
-use futures::StreamExt;
+use futures::{TryStreamExt, future::ready};
 use ruma::{CanonicalJsonValue, OwnedEventId, RoomId};
-use tuwunel_core::{Err, Result, err, utils::stream::ReadyExt};
+use tuwunel_core::{Err, Result, err};
 
 use crate::admin_command;
 
@@ -36,9 +36,8 @@ pub(super) async fn get_auth_chain(&self, event_id: OwnedEventId) -> Result {
 		.services
 		.auth_chain
 		.event_ids_iter(room_id, &room_version, once(event_id.as_ref()))
-		.ready_filter_map(Result::ok)
-		.count()
-		.await;
+		.try_fold(0_usize, |count, _| ready(Ok(count.saturating_add(1))))
+		.await?;
 
 	let elapsed = start.elapsed();
 	let out = format!("Loaded auth chain with length {count} in {elapsed:?}");

@@ -1,12 +1,9 @@
 use std::{borrow::Borrow, iter::once};
 
 use axum::extract::State;
-use futures::StreamExt;
+use futures::TryStreamExt;
 use ruma::api::federation::authorization::get_event_authorization;
-use tuwunel_core::{
-	Result,
-	utils::stream::{BroadbandExt, ReadyExt},
-};
+use tuwunel_core::{Error, Result, utils::stream::TryBroadbandExt};
 
 use super::{AccessCheck, utils::require_event_in_room};
 use crate::Ruma;
@@ -39,19 +36,22 @@ pub(crate) async fn get_event_authorization_route(
 	let auth_chain = services
 		.auth_chain
 		.event_ids_iter(&body.room_id, &room_version, once(body.event_id.borrow()))
-		.ready_filter_map(Result::ok)
-		.broad_filter_map(async |id| {
-			let pdu = services.timeline.get_pdu_json(&id).await.ok()?;
+		.broad_and_then(async |id| {
+			let pdu = services
+				.timeline
+				.get_pdu_json(&id)
+				.await
+				.map_err(|_| Error::bad_database("Incomplete federation authentication chain"))?;
 
 			let pdu = services
 				.federation
 				.format_pdu_into(pdu, Some(&room_version))
 				.await;
 
-			Some(pdu)
+			Ok(pdu)
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	Ok(get_event_authorization::v1::Response { auth_chain })
 }

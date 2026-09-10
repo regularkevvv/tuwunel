@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{
-	FutureExt, Stream, StreamExt, TryFutureExt, pin_mut,
+	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, pin_mut,
 	stream::{FuturesUnordered, unfold},
 };
 use ruma::{
@@ -19,7 +19,7 @@ use ruma::{
 };
 use serde::Deserialize;
 use tuwunel_core::{
-	Err, Result, at, debug, debug_error, err, implement,
+	Err, Error, Result, at, debug, debug_error, err, implement,
 	itertools::Itertools,
 	matrix::room_version,
 	pdu::AuthEvents,
@@ -70,6 +70,7 @@ impl crate::Service for Service {
 }
 
 #[implement(Service)]
+/// Returns only complete chain reads; reverse-mapping errors remain errors.
 pub fn event_ids_iter<'a, I>(
 	&'a self,
 	room_id: &'a RoomId,
@@ -84,7 +85,7 @@ where
 			self.services
 				.short
 				.multi_get_eventid_from_short(chain.into_iter().stream())
-				.ready_filter(Result::is_ok)
+				.map_err(|_| Error::bad_database("Incomplete authentication chain mapping"))
 		})
 		.try_flatten_stream()
 }
@@ -141,8 +142,13 @@ where
 {
 	let complete = AtomicBool::new(true);
 
-	self.get_auth_chain_inner(room_id, room_version, starting_events, &complete)
-		.await
+	let chain = self
+		.get_auth_chain_inner(room_id, room_version, starting_events, &complete)
+		.await?;
+	if !complete.load(Ordering::Relaxed) {
+		return Err(Error::bad_database("Incomplete authentication chain"));
+	}
+	Ok(chain)
 }
 
 #[implement(Service)]

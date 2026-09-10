@@ -143,12 +143,19 @@ pub fn room_servers<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &ServerName> + Send + 'a {
+	self.room_servers_fallible(room_id).ignore_err()
+}
+
+#[implement(Service)]
+pub fn room_servers_fallible<'a>(
+	&'a self,
+	room_id: &'a RoomId,
+) -> impl Stream<Item = Result<&ServerName>> + Send + 'a {
 	let prefix = (room_id, Interfix);
 	self.db
 		.roomserverids
 		.keys_prefix(&prefix)
-		.ignore_err()
-		.map(|(_, server): (Ignore, &ServerName)| server)
+		.map_ok(|(_, server): (Ignore, &ServerName)| server)
 }
 
 #[implement(Service)]

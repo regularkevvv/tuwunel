@@ -1,10 +1,10 @@
 use std::{borrow::Borrow, iter::once};
 
 use axum::extract::State;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join};
+use futures::{FutureExt, TryFutureExt, TryStreamExt, future::try_join};
 use ruma::{OwnedEventId, api::federation::event::get_room_state};
 use tuwunel_core::{
-	Result, at, err,
+	Error, Result, at, err,
 	utils::stream::{IterStream, TryBroadbandExt},
 };
 
@@ -37,10 +37,9 @@ pub(crate) async fn get_room_state_route(
 
 	let state_ids = services
 		.state_accessor
-		.state_full_ids(shortstatehash)
-		.map(at!(1))
-		.collect::<Vec<OwnedEventId>>()
-		.map(Ok);
+		.state_full_ids_strict(shortstatehash)
+		.map_ok(at!(1))
+		.try_collect::<Vec<OwnedEventId>>();
 
 	let room_version = services.state.get_room_version(&body.room_id);
 
@@ -60,6 +59,7 @@ pub(crate) async fn get_room_state_route(
 			services
 				.timeline
 				.get_pdu_json(&id)
+				.map_err(|_| Error::bad_database("Incomplete federation authentication chain"))
 				.and_then(into_federation_format)
 				.await
 		})
@@ -72,6 +72,7 @@ pub(crate) async fn get_room_state_route(
 			services
 				.timeline
 				.get_pdu_json(id)
+				.map_err(|_| Error::bad_database("Incomplete federation state snapshot"))
 				.and_then(into_federation_format)
 		})
 		.try_collect();

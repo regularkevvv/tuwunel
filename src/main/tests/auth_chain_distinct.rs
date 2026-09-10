@@ -94,21 +94,28 @@ async fn exercise(services: &Services) -> Result {
 	let torn_key = serialize_key([torn_short].as_slice())?;
 	let cross_key = serialize_key([cross_short].as_slice())?;
 
-	let foreign_chain = walk(services, foreign_room_id, &room_version, once(left)).await?;
-
-	assert!(foreign_chain.is_empty(), "foreign room walk yields nothing");
+	assert!(
+		walk(services, foreign_room_id, &room_version, once(left))
+			.await
+			.is_err(),
+		"a foreign-room chain must not become successful empty state"
+	);
 	assert!(cache.exists(&left_key).await.is_not_found());
 
-	let mut torn_chain = walk(services, room_id, &room_version, once(torn)).await?;
-
-	torn_chain.sort_unstable();
-
-	assert_eq!(torn_chain, [absent.to_owned(), tail.to_owned()]);
+	assert!(
+		walk(services, room_id, &room_version, once(torn))
+			.await
+			.is_err(),
+		"a missing ancestor must not become a successful partial chain"
+	);
 	assert!(cache.exists(&torn_key).await.is_not_found());
 
-	let cross_chain = walk(services, room_id, &room_version, once(cross)).await?;
-
-	assert_eq!(cross_chain, [stray.to_owned()]);
+	assert!(
+		walk(services, room_id, &room_version, once(cross))
+			.await
+			.is_err(),
+		"a cross-room ancestor must not become a successful partial chain"
+	);
 	assert!(cache.exists(&cross_key).await.is_not_found());
 
 	let chain =
@@ -121,6 +128,41 @@ async fn exercise(services: &Services) -> Result {
 		walk(services, room_id, &room_version, [left, right.as_ref()].into_iter()).await?;
 
 	assert_eq!(cached_chain, [tail.to_owned()]);
+
+	// A complete cached short-id chain still needs fallible reverse mapping.
+	let tail_short = services.short.get_shorteventid(tail).await?;
+	let reverse = &services.db["shorteventid_eventid"];
+	reverse.exists(&tail_short.to_be_bytes()).await?;
+	reverse.remove(&tail_short.to_be_bytes()).await?;
+	assert!(
+		walk(services, room_id, &room_version, once(left))
+			.await
+			.is_err(),
+		"a cached chain with a missing reverse row must not silently shrink"
+	);
+	reverse
+		.raw_put(tail_short.to_be_bytes(), tail.as_bytes())
+		.await?;
+	assert_eq!(
+		walk(services, room_id, &room_version, once(left)).await?,
+		[tail.to_owned()],
+		"restoring the fixture mapping must restore the complete chain"
+	);
+
+	services.clear_cache().await;
+	services.db["eventid_outlierpdu"]
+		.raw_put(tail.as_bytes(), b"{")
+		.await?;
+	assert!(
+		walk(services, room_id, &room_version, once(left))
+			.await
+			.is_err(),
+		"malformed ancestor data must not become successful partial state"
+	);
+	assert!(
+		cache.exists(&left_key).await.is_not_found(),
+		"a malformed ancestor walk must not be cached as complete"
+	);
 
 	Ok(())
 }
