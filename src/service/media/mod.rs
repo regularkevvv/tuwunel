@@ -1,6 +1,7 @@
 mod data;
 pub(super) mod migrations;
 mod preview;
+mod quota;
 mod remote;
 mod tests;
 mod thumbnail;
@@ -27,7 +28,7 @@ use ruma::{
 use tokio::sync::Semaphore;
 use tokio::{fs, sync::Notify};
 use tuwunel_core::{
-	Err, Error, Result, debug, debug_error, debug_info, debug_warn, err, trace,
+	Err, Error, Result, debug, debug_error, debug_info, debug_warn, err, info, trace,
 	utils::{
 		self, BoolExt, MutexMap,
 		result::LogDebugErr,
@@ -40,8 +41,8 @@ use url::Url;
 
 #[cfg(feature = "media_thumbnail")]
 use self::video::{FAILURES, Failures, sweep_staging_dir};
-use self::{data::Data, preview::Agent, remote::Fetch};
-pub use self::{data::Metadata, preview::UrlPreviewData, thumbnail::Dim};
+use self::{data::Data, preview::Agent, quota::RETENTION_INTERVAL, remote::Fetch};
+pub use self::{data::Metadata, preview::UrlPreviewData, quota::Owner, thumbnail::Dim};
 use crate::storage::Provider;
 
 #[derive(Debug)]
@@ -86,6 +87,7 @@ pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	url_preview_mutex: MutexMap<String, ()>,
 	federation_mutex: MutexMap<String, ()>,
+	quota_mutex: MutexMap<String, ()>,
 	mxc_state: MXCState,
 	#[cfg(feature = "media_thumbnail")]
 	video_thumbnail_slots: Semaphore,
@@ -113,6 +115,7 @@ impl crate::Service for Service {
 			services: args.services.clone(),
 			url_preview_mutex: MutexMap::new(),
 			federation_mutex: MutexMap::new(),
+			quota_mutex: MutexMap::new(),
 			mxc_state: MXCState {
 				notifiers: Mutex::new(HashMap::new()),
 				ratelimiter: Mutex::new(HashMap::new()),
@@ -132,6 +135,30 @@ impl crate::Service for Service {
 		sweep_staging_dir(&args.server.config);
 
 		Ok(service)
+	}
+
+	async fn worker(self: Arc<Self>) -> Result {
+		if self.services.globals.is_read_only()
+			|| self.services.server.config.media_remote_retention == 0
+		{
+			return Ok(());
+		}
+
+		loop {
+			match self.expire_remote_media().await {
+				| Ok(0) => {},
+				| Ok(count) => info!(count, "Removed remote media past its retention"),
+				| Err(e) => warn!("Failed to remove remote media past its retention: {e}"),
+			}
+
+			let shutdown = self.services.server.until_shutdown();
+			if tokio::time::timeout(RETENTION_INTERVAL, shutdown)
+				.await
+				.is_ok()
+			{
+				return Ok(());
+			}
+		}
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
@@ -243,7 +270,7 @@ impl Service {
 		Ok(())
 	}
 
-	/// Uploads a file.
+	/// Uploads a file, charging it to its uploader's or origin server's quota.
 	pub async fn create(
 		&self,
 		mxc: &Mxc<'_>,
@@ -253,13 +280,46 @@ impl Service {
 		file: &[u8],
 	) -> Result {
 		// Width, Height = 0 if it's not a thumbnail
-		let key = self
-			.db
-			.create_file_metadata(mxc, user, &Dim::default(), content_disposition, content_type)
-			.await?;
+		self.store(mxc, user, &Dim::default(), content_disposition, content_type, file)
+			.await
+	}
 
-		//TODO: Dangling metadata in database if creation fails
-		self.create_media_file(&key, file).await
+	/// Writes one object's record and bytes. The bytes are reserved against
+	/// the quota they count toward first, and returned if the write fails.
+	async fn store(
+		&self,
+		mxc: &Mxc<'_>,
+		user: Option<&UserId>,
+		dim: &Dim,
+		content_disposition: Option<&ContentDisposition>,
+		content_type: Option<&str>,
+		file: &[u8],
+	) -> Result {
+		let original = dim.width == 0 && dim.height == 0;
+		let owner = self.quota_owner(mxc, user, original);
+		let len = u64::try_from(file.len()).unwrap_or(u64::MAX);
+		if let Some(owner) = owner {
+			self.reserve(owner, len).await?;
+		}
+
+		let stored = async {
+			let key = self
+				.db
+				.create_file_metadata(mxc, user, dim, content_disposition, content_type)
+				.await?;
+
+			//TODO: Dangling metadata in database if creation fails
+			self.create_media_file(&key, file).await
+		}
+		.await;
+
+		if stored.is_err()
+			&& let Some(owner) = owner
+		{
+			self.release(owner, len).await;
+		}
+
+		stored
 	}
 
 	/// Deletes a file in the database and from the media directory via an MXC
@@ -279,17 +339,47 @@ impl Service {
 
 		match self.db.search_mxc_metadata_prefix(mxc).await {
 			| Ok(keys) => {
+				let original = self.get_metadata(mxc).await.map(|meta| meta.key);
+				let uploader = self.db.mxc_user(mxc).await;
+
 				for key in keys {
 					trace!(?mxc, "MXC Key: {key:?}");
+					let owner = self.quota_owner(
+						mxc,
+						uploader.as_deref(),
+						original.as_ref() == Some(&key),
+					);
+
+					// sized before removal; an object already gone was never charged
+					// or has been released
+					let charged = match owner {
+						| Some(_) => self
+							.head_meta(&key)
+							.await
+							.map(|object| object.size),
+						| None => None,
+					};
+
+					// The records stay until every object is gone. Dropping them
+					// after a failed removal left objects that no record names and
+					// nothing would ever delete (ADR-0005); keeping them lets the
+					// delete be retried.
 					debug_info!(?mxc, "Deleting from storage provider");
+					self.remove_media_file(&key)
+						.await
+						.inspect_err(|e| {
+							debug_error!(?mxc, "Failed to remove media file: {e}");
+						})?;
 
-					if let Err(e) = self.remove_media_file(&key).await {
-						debug_error!(?mxc, "Failed to remove media file: {e}");
+					if let Some(owner) = owner
+						&& let Some(size) = charged
+					{
+						self.release(owner, size).await;
 					}
-
-					debug_info!(?mxc, "Deleting from database");
-					self.db.delete_file_mxc(mxc).await;
 				}
+
+				debug_info!(?mxc, "Deleting from database");
+				self.db.delete_file_mxc(mxc).await;
 
 				Ok(())
 			},
@@ -756,7 +846,8 @@ impl Service {
 		yes_i_want_to_delete_local_media: bool,
 	) -> Result<usize> {
 		let all_keys = self.db.get_all_media_keys().await;
-		let mut remote_mxcs = Vec::with_capacity(all_keys.len());
+		// one entry per media, not per stored object: its thumbnails share the mxc
+		let mut remote_mxcs = HashSet::with_capacity(all_keys.len());
 
 		for key in all_keys {
 			trace!("Full MXC key from database: {key:?}");
@@ -826,13 +917,13 @@ impl Service {
 					"File is older than user duration, pushing to list of file paths and keys \
 					 to delete."
 				);
-				remote_mxcs.push(mxc.to_string());
+				remote_mxcs.insert(mxc.to_string());
 			} else if file_created_at >= time && newer_than {
 				debug!(
 					"File is newer than user duration, pushing to list of file paths and keys \
 					 to delete."
 				);
-				remote_mxcs.push(mxc.to_string());
+				remote_mxcs.insert(mxc.to_string());
 			}
 		}
 
@@ -884,8 +975,10 @@ impl Service {
 			})
 			.count()
 			.map(|count| {
+				// At least one provider must have deleted (or confirmed absent) the
+				// object; `>= 0` held for every count and hid total failure.
 				count
-					.ge(&0)
+					.gt(&0)
 					.into_option()
 					.ok_or_else(|| err!(Request(NotFound("Failed to remove on any provider."))))
 			})

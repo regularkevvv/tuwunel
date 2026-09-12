@@ -582,7 +582,14 @@ mod tests {
 
 	#[test]
 	fn unknown_maps_are_rejected_on_every_kv_path() {
-		for map in [139, 900, 901, u16::MAX] {
+		// the first identifier past the append-only catalog, whatever its length
+		let next = catalog::MAP_IDS
+			.iter()
+			.map(|(_, id)| id.0)
+			.max()
+			.expect("catalog is not empty")
+			.saturating_add(1);
+		for map in [next, 900, 901, u16::MAX] {
 			let lease = Lease { holder: "map-check".into(), epoch: 1 };
 			let mut requests =
 				vec![Request::Get { map, keys: vec![bytes(b"k")] }, Request::Scan {

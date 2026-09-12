@@ -463,6 +463,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "servername_mediabytes",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "servername_override",
 		cache_disp: CacheDisp::SharedWith("servername_destination"),
 		key_size_hint: Some(48),
@@ -685,6 +689,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "userid_masterkeyid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userid_mediabytes",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {

@@ -126,40 +126,47 @@ fn make_clients(services: &Services) -> Result<Clients> {
 			))
 			.redirect(guarded_redirect(services, 3))),
 
+		// Every client that follows a remote server's own naming — `.well-known`,
+		// SRV and DNS answers, and the redirects it serves — resolves through the
+		// CIDR-validating resolver and follows only guarded redirects. Without
+		// this, a server name, SRV target or redirect pointing at a private or
+		// metadata address made this homeserver send federation requests, and
+		// fetch federation media, to it (ADR-0005). IP-literal destinations are
+		// refused separately before resolution (`validate_dest_address`).
 		well_known: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver))
+			.dns_resolver(validating(services, &services.resolver.resolver))
 			.connect_timeout(Duration::from_secs(
 				services.config.well_known_conn_timeout,
 			))
 			.read_timeout(Duration::from_secs(services.config.well_known_timeout))
 			.timeout(Duration::from_secs(services.config.well_known_timeout))
 			.pool_max_idle_per_host(0)
-			.redirect(Policy::limited(4))),
+			.redirect(guarded_redirect(services, 4))),
 
 		federation: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver.hooked))
+			.dns_resolver(validating(services, &services.resolver.resolver.hooked))
 			.read_timeout(Duration::from_secs(services.config.federation_timeout))
 			.pool_max_idle_per_host(services.config.federation_idle_per_host.into())
 			.pool_idle_timeout(Duration::from_secs(
 				services.config.federation_idle_timeout,
 			))
-			.redirect(Policy::limited(3))),
+			.redirect(guarded_redirect(services, 3))),
 
 		synapse: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver.hooked))
+			.dns_resolver(validating(services, &services.resolver.resolver.hooked))
 			.read_timeout(Duration::from_secs(305))
 			.pool_max_idle_per_host(0)
-			.redirect(Policy::limited(3))),
+			.redirect(guarded_redirect(services, 3))),
 
 		sender: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver.hooked))
+			.dns_resolver(validating(services, &services.resolver.resolver.hooked))
 			.read_timeout(Duration::from_secs(services.config.sender_timeout))
 			.timeout(Duration::from_secs(services.config.sender_timeout))
 			.pool_max_idle_per_host(1)
 			.pool_idle_timeout(Duration::from_secs(
 				services.config.sender_idle_timeout,
 			))
-			.redirect(Policy::limited(2))),
+			.redirect(guarded_redirect(services, 2))),
 
 		appservice: with!(cb => cb
 			.dns_resolver(appservice_resolver(services))
@@ -212,6 +219,15 @@ fn preview_builder(services: &Services, builder: ClientBuilder) -> Result<Client
 		.local_address(bind_addr)
 		.dns_resolver(resolver)
 		.redirect(guarded_redirect(services, 3)))
+}
+
+/// `inner` behind the CIDR denylist, with proxy endpoint names exempt.
+fn validating<R: Resolve + 'static>(services: &Services, inner: &Arc<R>) -> Arc<Validating<R>> {
+	Validating::new(
+		Arc::clone(inner),
+		Arc::clone(&services.client.cidr_range_denylist),
+		services.client.proxy.shared_hosts(),
+	)
 }
 
 fn guarded_redirect(services: &Services, max: usize) -> Policy {

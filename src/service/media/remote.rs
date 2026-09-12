@@ -6,7 +6,7 @@ use ruma::{
 	api::{
 		OutgoingRequest,
 		client::media,
-		error::ErrorKind::{NotFound, Unrecognized},
+		error::ErrorKind::{NotFound, TooLarge, Unrecognized},
 		federation,
 		federation::authenticated_media::{Content, FileOrLocation},
 	},
@@ -216,14 +216,16 @@ async fn handle_thumbnail_file(
 		None,
 	);
 
-	self.upload_thumbnail(
-		mxc,
-		Some(&content_disposition),
-		content.content_type.as_deref(),
-		dim,
-		&content.file,
+	cached_or_quota_full(
+		self.upload_thumbnail(
+			mxc,
+			Some(&content_disposition),
+			content.content_type.as_deref(),
+			dim,
+			&content.file,
+		)
+		.await,
 	)
-	.await
 	.map(|()| Media {
 		content: content.file,
 		content_type: content.content_type.map(Into::into),
@@ -239,14 +241,16 @@ async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<M
 		None,
 	);
 
-	self.create(
-		mxc,
-		None,
-		Some(&content_disposition),
-		content.content_type.as_deref(),
-		&content.file,
+	cached_or_quota_full(
+		self.create(
+			mxc,
+			None,
+			Some(&content_disposition),
+			content.content_type.as_deref(),
+			&content.file,
+		)
+		.await,
 	)
-	.await
 	.map(|()| Media {
 		content: content.file,
 		content_type: content.content_type.map(Into::into),
@@ -417,8 +421,10 @@ pub async fn fetch_remote_thumbnail_legacy(
 		.await?;
 
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
-	self.upload_thumbnail(&mxc, None, response.content_type.as_deref(), &dim, &response.file)
-		.await?;
+	cached_or_quota_full(
+		self.upload_thumbnail(&mxc, None, response.content_type.as_deref(), &dim, &response.file)
+			.await,
+	)?;
 
 	Ok(response)
 }
@@ -451,16 +457,31 @@ pub async fn fetch_remote_content_legacy(
 		None,
 	);
 
-	self.create(
-		mxc,
-		None,
-		Some(&content_disposition),
-		response.content_type.as_deref(),
-		&response.file,
-	)
-	.await?;
+	cached_or_quota_full(
+		self.create(
+			mxc,
+			None,
+			Some(&content_disposition),
+			response.content_type.as_deref(),
+			&response.file,
+		)
+		.await,
+	)?;
 
 	Ok(response)
+}
+
+/// Media a remote server sent is served even when that server's
+/// `media_remote_server_quota` leaves no room to cache it; it is fetched again
+/// on the next request. Any other storage failure still fails the request.
+fn cached_or_quota_full(result: Result) -> Result {
+	match result {
+		| Err(error) if error.kind() == TooLarge => {
+			debug_warn!("Remote media quota full, serving uncached: {error}");
+			Ok(())
+		},
+		| result => result,
+	}
 }
 
 #[implement(super::Service)]

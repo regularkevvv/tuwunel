@@ -61,7 +61,11 @@ use self::{
 };
 use crate::{
 	Err, Result, err, implement, redacted_debug,
-	utils::{self, bytes::deserialize_bytesize_usize, sys},
+	utils::{
+		self,
+		bytes::{deserialize_bytesize_u64, deserialize_bytesize_usize},
+		sys,
+	},
 };
 
 // Later prefixes override earlier ones.
@@ -660,6 +664,33 @@ pub struct Config {
 	/// default: 50
 	#[serde(default = "default_media_rc_create_burst_count")]
 	pub media_rc_create_burst_count: u32,
+
+	/// Bytes of uploaded media each local user may keep. An upload that would
+	/// pass it is refused with M_TOO_LARGE until the user's media is deleted.
+	/// Thumbnails generated from a user's uploads are not counted. Accepts an
+	/// integer byte count or a string with SI/IEC suffix such as "1 GiB"; 0
+	/// sets no quota.
+	///
+	/// default: 0
+	#[serde(default, deserialize_with = "deserialize_bytesize_u64")]
+	pub media_user_quota: u64,
+
+	/// Bytes of media stored for any one remote server, thumbnails included.
+	/// Past it, that server's media is still served to the requesting user
+	/// but not stored. Accepts an integer byte count or a string with SI/IEC
+	/// suffix such as "1 GiB"; 0 sets no quota.
+	///
+	/// default: 0
+	#[serde(default, deserialize_with = "deserialize_bytesize_u64")]
+	pub media_remote_server_quota: u64,
+
+	/// Seconds after which media stored for remote servers is removed; it is
+	/// fetched from its origin again when next requested. Checked every six
+	/// hours. 0 keeps remote media until an admin deletes it.
+	///
+	/// default: 0
+	#[serde(default)]
+	pub media_remote_retention: u64,
 
 	/// reloadable: yes
 	/// default: 1024

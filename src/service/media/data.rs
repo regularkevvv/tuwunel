@@ -15,7 +15,7 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
 
-use super::{Media, preview::CachedPreview, thumbnail::Dim};
+use super::{Media, preview::CachedPreview, quota::Owner, thumbnail::Dim};
 
 pub(crate) struct Data {
 	db: Arc<Database>,
@@ -24,7 +24,9 @@ pub(crate) struct Data {
 	mediaid_lazycontent: Arc<Map>,
 	mediaid_pending: Arc<Map>,
 	mediaid_user: Arc<Map>,
+	servername_mediabytes: Arc<Map>,
 	url_preview: Arc<Map>,
+	userid_mediabytes: Arc<Map>,
 }
 
 #[derive(Debug)]
@@ -77,7 +79,9 @@ impl Data {
 			mediaid_lazycontent: db["mediaid_lazycontent"].clone(),
 			mediaid_pending: db["mediaid_pending"].clone(),
 			mediaid_user: db["mediaid_user"].clone(),
+			servername_mediabytes: db["servername_mediabytes"].clone(),
 			url_preview: db["url_preview"].clone(),
+			userid_mediabytes: db["userid_mediabytes"].clone(),
 		}
 	}
 
@@ -391,6 +395,26 @@ impl Data {
 			.ok()
 			.filter(CachedPreview::valid)
 			.ok_or(err!(Request(NotFound("Expired from cache"))))
+	}
+
+	/// Bytes charged to `owner`, when a counter exists for it.
+	pub(super) async fn quota_usage(&self, owner: Owner<'_>) -> Option<u64> {
+		match owner {
+			| Owner::User(user) => self.userid_mediabytes.get(user).await,
+			| Owner::Server(server) => self.servername_mediabytes.get(server).await,
+		}
+		.deserialized::<u64>()
+		.ok()
+	}
+
+	pub(super) async fn set_quota_usage(&self, owner: Owner<'_>, used: u64) -> Result {
+		match owner {
+			| Owner::User(user) => self.userid_mediabytes.raw_put(user, used).await,
+			| Owner::Server(server) =>
+				self.servername_mediabytes
+					.raw_put(server, used)
+					.await,
+		}
 	}
 
 	/// Streams every (mxc, uploader) pair in the user-media index.

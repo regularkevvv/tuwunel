@@ -487,6 +487,27 @@
 #
 #media_rc_create_burst_count = 50
 
+# Bytes of uploaded media each local user may keep. An upload that would
+# pass it is refused with M_TOO_LARGE until the user's media is deleted.
+# Thumbnails generated from a user's uploads are not counted. Accepts an
+# integer byte count or a string with SI/IEC suffix such as "1 GiB"; 0
+# sets no quota.
+#
+#media_user_quota = 0
+
+# Bytes of media stored for any one remote server, thumbnails included.
+# Past it, that server's media is still served to the requesting user
+# but not stored. Accepts an integer byte count or a string with SI/IEC
+# suffix such as "1 GiB"; 0 sets no quota.
+#
+#media_remote_server_quota = 0
+
+# Seconds after which media stored for remote servers is removed; it is
+# fetched from its origin again when next requested. Checked every six
+# hours. 0 keeps remote media until an admin deletes it.
+#
+#media_remote_retention = 0
+
 # This item is undocumented. Please contribute documentation for it.
 # reloadable: yes
 #
