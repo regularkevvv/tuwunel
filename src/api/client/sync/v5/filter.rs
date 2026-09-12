@@ -47,10 +47,15 @@ pub(super) async fn filter_room(
 	let match_encrypted = filter
 		.is_encrypted
 		.map_async(async |is_encrypted| {
-			services
+			match services
 				.state_accessor
-				.is_encrypted_room(room_id)
-				.await == is_encrypted
+				.is_encrypted_room_strict(room_id)
+				.await
+			{
+				| Ok(encrypted) => encrypted == is_encrypted,
+				// An unreadable event cannot establish either filter result.
+				| Err(_) => false,
+			}
 		});
 
 	let match_space_child = filter

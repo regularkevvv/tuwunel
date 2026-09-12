@@ -173,6 +173,21 @@ impl Service {
 			.await
 			.is_ok()
 	}
+
+	/// Whether the current state proves that this room is encrypted.
+	///
+	/// Unlike [`Self::is_encrypted_room`], this keeps an unreadable state event
+	/// distinct from a normally absent one.
+	pub async fn is_encrypted_room_strict(&self, room_id: &RoomId) -> Result<bool> {
+		match self
+			.room_state_get(room_id, &StateEventType::RoomEncryption, "")
+			.await
+		{
+			| Ok(_) => Ok(true),
+			| Err(error) if error.is_not_found() => Ok(false),
+			| Err(error) => Err(error),
+		}
+	}
 }
 
 /// Resolves an `m.room.topic` to its plain-text rendering: the `m.topic`

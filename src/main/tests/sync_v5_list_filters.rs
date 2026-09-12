@@ -11,7 +11,10 @@ use tokio::time::sleep;
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result, err, implement,
-	ruma::{RoomId, UserId, events::RoomAccountDataEventType},
+	ruma::{
+		RoomId, UserId,
+		events::{RoomAccountDataEventType, StateEventType},
+	},
 	utils::BoolExt,
 };
 use tuwunel_database::serialize_key;
@@ -42,14 +45,15 @@ const POLL_TIMEOUT: u64 = 1_500;
 /// margin being large.
 const SETTLE: Duration = Duration::from_millis(300);
 
-/// Drives the sliding-sync list filters over a direct and a plain room.
+/// Drives the Sliding Sync list filters over a direct and an encrypted plain
+/// room.
 ///
-/// One sync carries five lists whose filters sort the two rooms by `m.direct`
-/// and by room tag, so each room must come back naming exactly the lists it
-/// belongs to. The room payload's own `is_dm` is asserted alongside, since it
-/// answers from the same source.
+/// One sync carries seven lists whose filters sort the two rooms by `m.direct`,
+/// room tag, and encryption state, so each room must come back naming exactly
+/// the lists it belongs to. The room payload's own `is_dm` is asserted
+/// alongside, since it answers from the same source.
 #[test]
-fn list_filters_partition_rooms_by_dm_and_tag() -> Result {
+fn list_filters_partition_rooms_by_dm_tag_and_encryption() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 
@@ -130,6 +134,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	bob.tag_room(&bob_id, &plain, FAVOURITE).await?;
 	bob.tag_room(&bob_id, &direct, LOW_PRIORITY)
 		.await?;
+	alice.set_encryption(&plain).await?;
 
 	let response = bob.sync_lists(None).await?;
 
@@ -141,8 +146,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 			.ok_or_else(|| err!("{room_id} matched {got:?} rather than {want:?}"))
 	};
 
-	matched(&direct, &["directs", "untagged"])?;
-	matched(&plain, &["favourites", "others", "priority"])?;
+	matched(&direct, &["directs", "untagged", "unencrypted"])?;
+	matched(&plain, &["encrypted", "favourites", "others", "priority"])?;
 
 	is_dm(&response, &direct)
 		.unwrap_or_default()
@@ -156,6 +161,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.ok_or_else(|| err!("a plain room's payload reports itself a direct chat"))?;
 
 	corrupt_tag_cannot_match_negative_filter(services, &bob, &bob_id, &plain).await?;
+	corrupt_encryption_cannot_match_negative_filter(services, &bob, &plain).await?;
 
 	woken_poll_sees_the_change(&bob, &bob_id, &alice_id, &response, &direct, &plain).await
 }
@@ -209,6 +215,56 @@ async fn corrupt_tag_cannot_match_negative_filter(
 	assert!(
 		!matched_lists(&restored, room_id).contains("untagged"),
 		"restored favourite room matched a negative tag filter: {restored}"
+	);
+
+	Ok(())
+}
+
+/// An unreadable encryption event is not proof that the room is unencrypted.
+async fn corrupt_encryption_cannot_match_negative_filter(
+	services: &Services,
+	client: &Client<'_>,
+	room_id: &RoomId,
+) -> Result {
+	let event_id = services
+		.state_accessor
+		.room_state_get_id(room_id, &StateEventType::RoomEncryption, "")
+		.await?;
+	let pdu_id = services.timeline.get_pdu_id(&event_id).await?;
+	let pdus = &services.db["pduid_pdu"];
+	let saved = pdus.get(&pdu_id).await?.to_vec();
+
+	pdus.remove(&pdu_id).await?;
+	services.clear_cache().await;
+	assert!(
+		services
+			.state_accessor
+			.get_room_encryption(room_id)
+			.await
+			.is_err(),
+		"fixture did not make the persisted encryption event unreadable"
+	);
+
+	let corrupt = client.sync_lists(None).await?;
+	assert_eq!(
+		list_count(&corrupt, "unencrypted"),
+		1,
+		"unreadable encryption state changed the negative encryption-filter count: {corrupt}"
+	);
+
+	pdus.raw_put(&pdu_id, &saved).await?;
+	services.clear_cache().await;
+
+	let restored = client.sync_lists(None).await?;
+	assert_eq!(
+		list_count(&restored, "unencrypted"),
+		1,
+		"restored encryption state changed the negative encryption-filter count: {restored}"
+	);
+	assert_eq!(
+		list_count(&restored, "encrypted"),
+		1,
+		"restored encryption state no longer matched the encrypted list: {restored}"
 	);
 
 	Ok(())
@@ -309,10 +365,26 @@ async fn tag_room(&self, user_id: &UserId, room_id: &RoomId, tag: &str) -> Resul
 	Ok(())
 }
 
+#[implement(Client, params = "<'_>")]
+async fn set_encryption(&self, room_id: &RoomId) -> Result {
+	self.services
+		.client
+		.clients
+		.default
+		.put(self.url(&format!("rooms/{room_id}/state/m.room.encryption")))
+		.bearer_auth(self.token)
+		.json(&json!({ "algorithm": "m.megolm.v1.aes-sha2" }))
+		.send()
+		.await?
+		.error_for_status()?;
+
+	Ok(())
+}
+
 /// One initial sliding sync carrying every filtered list under test.
 ///
-/// The first four come in complementary pairs, so an omission is as visible as
-/// a spurious match. The fifth names a tag in both `tags` and `not_tags`, which
+/// The first six form complementary pairs, so an omission is as visible as a
+/// spurious match. The seventh names a tag in both `tags` and `not_tags`, which
 /// the proposal resolves in favour of `not_tags`.
 #[implement(Client, params = "<'_>")]
 async fn sync_lists(&self, since: Option<&str>) -> Result<Value> {
@@ -336,6 +408,8 @@ async fn sync_lists(&self, since: Option<&str>) -> Result<Value> {
 			"others": list(json!({ "is_dm": false })),
 			"favourites": list(json!({ "tags": [FAVOURITE] })),
 			"untagged": list(json!({ "not_tags": [FAVOURITE] })),
+			"encrypted": list(json!({ "is_encrypted": true })),
+			"unencrypted": list(json!({ "is_encrypted": false })),
 			"priority": list(priority),
 		},
 	});
