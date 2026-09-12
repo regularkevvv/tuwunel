@@ -82,11 +82,16 @@ pub(super) async fn filter_room(
 
 	// MSC4186: `tags` is a union, and `not_tags` takes priority over it.
 	let match_room_tag = fetch_tags.then_async(async || {
-		let tags = services
+		let tags = match services
 			.account_data
 			.get_room_tags(sender_user, room_id)
 			.await
-			.unwrap_or_default();
+		{
+			| Ok(tags) => tags,
+			| Err(error) if error.is_not_found() => Default::default(),
+			// An unreadable record cannot establish either tag-filter result.
+			| Err(_) => return false,
+		};
 
 		let tagged = |names: &[TagName]| tags.keys().any(|tag| names.contains(tag));
 

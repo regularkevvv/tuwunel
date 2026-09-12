@@ -11,9 +11,10 @@ use tokio::time::sleep;
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result, err, implement,
-	ruma::{RoomId, UserId},
+	ruma::{RoomId, UserId, events::RoomAccountDataEventType},
 	utils::BoolExt,
 };
+use tuwunel_database::serialize_key;
 use tuwunel_service::Services;
 
 use self::client::{Client, field, register, wait_until_ready};
@@ -154,7 +155,63 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.into_option()
 		.ok_or_else(|| err!("a plain room's payload reports itself a direct chat"))?;
 
+	corrupt_tag_cannot_match_negative_filter(services, &bob, &bob_id, &plain).await?;
+
 	woken_poll_sees_the_change(&bob, &bob_id, &alice_id, &response, &direct, &plain).await
+}
+
+/// A persisted tag read failure is not proof that the room lacks a tag. In
+/// particular, it must not turn a favourite room into an `untagged` match.
+async fn corrupt_tag_cannot_match_negative_filter(
+	services: &Services,
+	client: &Client<'_>,
+	user_id: &UserId,
+	room_id: &RoomId,
+) -> Result {
+	let index_key =
+		serialize_key((Some(room_id), user_id, RoomAccountDataEventType::Tag.to_string()))?;
+	let index = &services.db["roomusertype_roomuserdataid"];
+	let data = &services.db["roomuserdataid_accountdata"];
+	let data_key = index.get(&index_key).await?.to_vec();
+	let saved = data.get(&data_key).await?.to_vec();
+
+	data.raw_put(&data_key, b"{").await?;
+	services.clear_cache().await;
+	assert!(
+		services
+			.account_data
+			.get_room_tags(user_id, room_id)
+			.await
+			.is_err(),
+		"fixture did not make the persisted tag record unreadable"
+	);
+
+	let corrupt = client.sync_lists(None).await?;
+	assert_eq!(
+		list_count(&corrupt, "untagged"),
+		1,
+		"corrupt tag record changed the negative tag-filter count: {corrupt}"
+	);
+	assert!(
+		!matched_lists(&corrupt, room_id).contains("untagged"),
+		"corrupt tag record matched a negative tag filter: {corrupt}"
+	);
+
+	data.raw_put(&data_key, &saved).await?;
+	services.clear_cache().await;
+
+	let restored = client.sync_lists(None).await?;
+	assert_eq!(
+		list_count(&restored, "untagged"),
+		1,
+		"restored favourite room changed the negative tag-filter count: {restored}"
+	);
+	assert!(
+		!matched_lists(&restored, room_id).contains("untagged"),
+		"restored favourite room matched a negative tag filter: {restored}"
+	);
+
+	Ok(())
 }
 
 /// A poll already parked must answer from `m.direct` as it stands on waking.
