@@ -11,7 +11,7 @@ use ruma::{EventId, RoomId};
 use tuwunel_core::{
 	Result,
 	arrayvec::ArrayVec,
-	at, checked, err, expected, implement, utils,
+	at, checked, err, implement, utils,
 	utils::{bytes, math::usize_from_f64, stream::IterStream},
 };
 use tuwunel_database::{Map, Txn};
@@ -479,6 +479,7 @@ pub async fn save_state(
 pub(crate) async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Result<StateDiff> {
 	const BUFSIZE: usize = size_of::<ShortStateHash>();
 	const STRIDE: usize = size_of::<ShortStateHash>();
+	const EVENT_STRIDE: usize = size_of::<CompressedStateEvent>();
 
 	let value = self
 		.db
@@ -489,30 +490,50 @@ pub(crate) async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Resu
 			err!(Database("Failed to find StateDiff from short {shortstatehash:?}: {e}"))
 		})?;
 
-	let parent = utils::u64_from_bytes(&value[0..size_of::<u64>()])
-		.ok()
-		.take_if(|parent| *parent != 0);
-
-	debug_assert!(value.len().is_multiple_of(STRIDE), "value not aligned to stride");
-	let _num_values = value.len() / STRIDE;
+	let parent = value
+		.get(..STRIDE)
+		.ok_or_else(|| err!(Database("Malformed StateDiff row: missing parent")))
+		.and_then(|bytes| {
+			utils::u64_from_bytes(bytes)
+				.map_err(|error| err!(Database("Malformed StateDiff row parent: {error}")))
+		})?;
+	let parent = (parent != 0).then_some(parent);
 
 	let mut add_mode = true;
 	let mut added = CompressedState::new();
 	let mut removed = CompressedState::new();
+	let separator = 0_u64.to_be_bytes();
 
 	let mut i = STRIDE;
-	while let Some(v) = value.get(i..expected!(i + 2 * STRIDE)) {
-		if add_mode && v.starts_with(&0_u64.to_be_bytes()) {
+	while i < value.len() {
+		let separator_end = i
+			.checked_add(STRIDE)
+			.ok_or_else(|| err!(Database("Malformed StateDiff row: offset overflow")))?;
+		if add_mode && value.get(i..separator_end) == Some(separator.as_slice()) {
+			let removed_len = value.len().saturating_sub(separator_end);
+			if removed_len == 0 || !removed_len.is_multiple_of(EVENT_STRIDE) {
+				return Err(err!(Database("Malformed StateDiff row: invalid removed-event run")));
+			}
 			add_mode = false;
-			i = expected!(i + STRIDE);
+			i = separator_end;
 			continue;
 		}
+
+		let event_end = i
+			.checked_add(EVENT_STRIDE)
+			.ok_or_else(|| err!(Database("Malformed StateDiff row: offset overflow")))?;
+		let event = value
+			.get(i..event_end)
+			.ok_or_else(|| err!(Database("Malformed StateDiff row: truncated event")))?;
+		let event = event
+			.try_into()
+			.map_err(|error| err!(Database("Malformed StateDiff row event: {error}")))?;
 		if add_mode {
-			added.insert(v.try_into()?);
+			added.insert(event);
 		} else {
-			removed.insert(v.try_into()?);
+			removed.insert(event);
 		}
-		i = expected!(i + 2 * STRIDE);
+		i = event_end;
 	}
 
 	Ok(StateDiff {
