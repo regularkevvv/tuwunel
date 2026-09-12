@@ -50,6 +50,16 @@ pub(super) async fn handle_login(
 		return Err!(Request(Unknown("User ID does not belong to this homeserver")));
 	}
 
+	// With password login off, a break-glass release admits the server account
+	// alone. Anyone else gets the answer a disabled login method gets, before
+	// any password is checked, so the reply says nothing about the password.
+	if !services.config.login_with_password
+		&& user_id != services.globals.server_user
+		&& lowercased_user_id != services.globals.server_user
+	{
+		return Err!(Request(Unknown("Invalid or unsupported login type")));
+	}
+
 	if cfg!(feature = "ldap") && services.config.ldap.enable {
 		ldap_login(services, &user_id, &lowercased_user_id, password)
 			.boxed()

@@ -36,9 +36,24 @@ pub(crate) async fn get_server_keys_route(
 		.remove_entry(active_key_id)
 		.expect("active verify_key is missing");
 
+	// A retired key keeps the expiry recorded when it was retired; any other
+	// non-active key is reported as expiring now.
+	let retired = services
+		.server_keys
+		.signing_keys_for(server_name)
+		.await
+		.map(|keys| keys.old_verify_keys)
+		.unwrap_or_default();
+
 	let old_verify_keys = all_keys
 		.into_iter()
-		.map(|(id, key)| (id, OldVerifyKey::new(expires_ts(), key.key)))
+		.map(|(id, key)| {
+			let expired_ts = retired
+				.get(&id)
+				.map_or_else(expires_ts, |old| old.expired_ts);
+
+			(id, OldVerifyKey::new(expired_ts, key.key))
+		})
 		.collect();
 
 	let server_key = ServerSigningKeys {

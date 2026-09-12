@@ -44,7 +44,8 @@ impl crate::Service for Service {
 		let minimum_valid = Duration::from_hours(1);
 
 		let (keypair, verify_keys) = tokio::task::block_in_place(|| {
-			tokio::runtime::Handle::current().block_on(keypair::init(args.db))
+			tokio::runtime::Handle::current()
+				.block_on(keypair::init(args.db, &args.server.config.server_name))
 		})?;
 		debug_assert!(verify_keys.len() == 1, "only one active verify_key supported");
 
@@ -66,6 +67,14 @@ impl crate::Service for Service {
 #[inline]
 #[must_use]
 pub fn keypair(&self) -> &Ed25519KeyPair { &self.keypair }
+
+/// Stages a new signing keypair and returns its key id. It becomes the active
+/// key at the next start, when the current key is published as an old verify
+/// key expiring then.
+#[implement(Service)]
+pub async fn stage_signing_key(&self) -> Result<OwnedServerSigningKeyId> {
+	keypair::stage_next(&self.services.db).await
+}
 
 #[implement(Service)]
 #[inline]

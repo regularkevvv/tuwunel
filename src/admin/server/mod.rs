@@ -11,6 +11,7 @@ mod reload_config;
 mod reload_mods;
 #[cfg(unix)]
 mod restart;
+mod rotate_signing_key;
 mod show_config;
 mod shutdown;
 mod uptime;
@@ -117,6 +118,10 @@ pub(super) enum ServerCommand {
 		/// Number of most-recent backups to retain; zero deletes every backup.
 		keep: usize,
 	},
+
+	/// - Stage a new server signing key. It becomes the active key at the next
+	///   start; the current key stays published as an old verify key.
+	RotateSigningKey,
 
 	/// - Send a message to the admin room.
 	AdminNotice {
