@@ -4,7 +4,7 @@ use ruma::{
 	events::{
 		StateEventType, TimelineEventType,
 		room::{
-			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
+			history_visibility::HistoryVisibility,
 			member::{MembershipState, RoomMemberEventContent},
 			tombstone::RoomTombstoneEventContent,
 		},
@@ -96,15 +96,17 @@ pub async fn user_can_see_event(
 		.pdu_shortstatehash(event_id)
 		.await
 	else {
-		return true;
+		return self
+			.is_initial_room_create(room_id, event_id)
+			.await;
 	};
 
-	let history_visibility = self
-		.state_get_content(shortstatehash, &StateEventType::RoomHistoryVisibility, "")
+	let Ok(history_visibility) = self
+		.history_visibility_at(room_id, shortstatehash)
 		.await
-		.map_or(HistoryVisibility::Shared, |c: RoomHistoryVisibilityEventContent| {
-			c.history_visibility
-		});
+	else {
+		return false;
+	};
 
 	match history_visibility {
 		| HistoryVisibility::WorldReadable => true,
@@ -183,12 +185,21 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 		return true;
 	}
 
-	let history_visibility = self
-		.room_state_get_content(room_id, &StateEventType::RoomHistoryVisibility, "")
+	let Ok(shortstatehash) = self
+		.services
+		.state
+		.get_room_shortstatehash(room_id)
 		.await
-		.map_or(HistoryVisibility::Shared, |c: RoomHistoryVisibilityEventContent| {
-			c.history_visibility
-		});
+	else {
+		return false;
+	};
+
+	let Ok(history_visibility) = self
+		.history_visibility_at(room_id, shortstatehash)
+		.await
+	else {
+		return false;
+	};
 
 	match history_visibility {
 		| HistoryVisibility::WorldReadable => true,

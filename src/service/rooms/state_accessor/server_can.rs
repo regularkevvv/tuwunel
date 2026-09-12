@@ -1,10 +1,7 @@
 use futures::StreamExt;
 use ruma::{
 	EventId, RoomId, ServerName, UserId,
-	events::{
-		StateEventType,
-		room::history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
-	},
+	events::{StateEventType, room::history_visibility::HistoryVisibility},
 };
 use tuwunel_core::{implement, utils::stream::ReadyExt};
 
@@ -24,15 +21,17 @@ pub async fn server_can_see_event(
 		.pdu_shortstatehash(event_id)
 		.await
 	else {
-		return true;
+		return self
+			.is_initial_room_create(room_id, event_id)
+			.await;
 	};
 
-	let history_visibility = self
-		.state_get_content(shortstatehash, &StateEventType::RoomHistoryVisibility, "")
+	let Ok(history_visibility) = self
+		.history_visibility_at(room_id, shortstatehash)
 		.await
-		.map_or(HistoryVisibility::Shared, |c: RoomHistoryVisibilityEventContent| {
-			c.history_visibility
-		});
+	else {
+		return false;
+	};
 
 	let current_server_members = self
 		.services

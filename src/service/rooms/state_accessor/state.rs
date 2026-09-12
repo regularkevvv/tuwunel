@@ -4,10 +4,13 @@ use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
 };
 use ruma::{
-	OwnedEventId, UserId,
+	EventId, OwnedEventId, RoomId, UserId,
 	events::{
 		StateEventType, TimelineEventType,
-		room::member::{MembershipState, RoomMemberEventContent},
+		room::{
+			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
+			member::{MembershipState, RoomMemberEventContent},
+		},
 	},
 };
 use serde::Deserialize;
@@ -156,11 +159,147 @@ pub async fn state_get(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<Pdu> {
-	let event_id: OwnedEventId = self
-		.state_get_id(shortstatehash, event_type, state_key)
-		.await?;
+	self.state_get_optional(shortstatehash, event_type, state_key)
+		.await?
+		.ok_or(err!(Request(NotFound("Not found in room state"))))
+}
 
-	self.services.timeline.get_pdu(&event_id).await
+/// Returns the current-state PDU for one state cell, or `None` when a complete
+/// snapshot proves the cell is absent. A missing or mismatched compact-key
+/// mapping is not proof of absence, so it falls back to a strict snapshot
+/// lookup.
+#[implement(super::Service)]
+pub async fn state_get_optional(
+	&self,
+	shortstatehash: ShortStateHash,
+	event_type: &StateEventType,
+	state_key: &str,
+) -> Result<Option<Pdu>> {
+	let direct_shortstatekey = match self
+		.services
+		.short
+		.get_shortstatekey(event_type, state_key)
+		.await
+	{
+		| Ok(shortstatekey) => self
+			.services
+			.short
+			.get_statekey_from_short(shortstatekey)
+			.await
+			.ok()
+			.is_some_and(|(candidate_type, candidate_key)| {
+				candidate_type.eq(event_type) && candidate_key.as_str() == state_key
+			})
+			.then_some(shortstatekey),
+
+		| Err(_) => None,
+	};
+
+	let event_id: OwnedEventId = match direct_shortstatekey {
+		| Some(shortstatekey) => {
+			let start = compress_state_event(shortstatekey, 0);
+			let end = compress_state_event(shortstatekey, u64::MAX);
+
+			let shorteventid = self
+				.load_full_state(shortstatehash)
+				.await?
+				.range(start..=end)
+				.next()
+				.copied()
+				.map(parse_compressed_state_event)
+				.map(at!(1));
+			let Some(shorteventid) = shorteventid else {
+				return Ok(None);
+			};
+
+			self.services
+				.short
+				.get_eventid_from_short(shorteventid)
+				.await
+				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
+		},
+
+		| None => {
+			let event_id = self
+				.state_full_entries_strict(shortstatehash)
+				.boxed()
+				.try_collect::<Vec<_>>()
+				.await?
+				.into_iter()
+				.find(|((candidate_type, candidate_key), _)| {
+					candidate_type == event_type && candidate_key.as_str() == state_key
+				})
+				.map(at!(1));
+			let Some(event_id) = event_id else {
+				return Ok(None);
+			};
+
+			event_id
+		},
+	};
+
+	let pdu = self
+		.services
+		.timeline
+		.get_pdu(&event_id)
+		.await
+		.map_err(|_| Error::bad_database("Incomplete state event"))?;
+	if pdu.event_id() != event_id
+		|| pdu.event_type().to_cow_str() != event_type.to_cow_str()
+		|| pdu.state_key() != Some(state_key)
+	{
+		return Err(Error::bad_database("Mismatched state event"));
+	}
+
+	Ok(Some(pdu))
+}
+
+/// Gets history visibility from an event's state without converting corrupt
+/// state into the Matrix default of `shared` visibility.
+#[implement(super::Service)]
+pub async fn history_visibility_at(
+	&self,
+	room_id: &RoomId,
+	shortstatehash: ShortStateHash,
+) -> Result<HistoryVisibility> {
+	let Some(pdu) = self
+		.state_get_optional(shortstatehash, &StateEventType::RoomHistoryVisibility, "")
+		.await?
+	else {
+		return Ok(HistoryVisibility::Shared);
+	};
+
+	if pdu.room_id() != room_id {
+		return Err(Error::bad_database("Mismatched history visibility state event"));
+	}
+
+	pdu.get_content::<RoomHistoryVisibilityEventContent>()
+		.map(|content| content.history_visibility)
+		.map_err(|_| Error::bad_database("Invalid history visibility state event"))
+}
+
+/// The canonical first create event deliberately has no predecessor state
+/// snapshot. It is the sole visibility fallback permitted when a PDU state
+/// hash is absent.
+#[implement(super::Service)]
+pub async fn is_initial_room_create(&self, room_id: &RoomId, event_id: &EventId) -> bool {
+	let Ok(pdu) = self.services.timeline.get_pdu(event_id).await else {
+		return false;
+	};
+
+	if pdu.event_id() != event_id
+		|| pdu.room_id() != room_id
+		|| *pdu.kind() != TimelineEventType::RoomCreate
+		|| pdu.state_key() != Some("")
+	{
+		return false;
+	}
+
+	self.room_state_get(room_id, &StateEventType::RoomCreate, "")
+		.await
+		.is_ok_and(|current_create| {
+			current_create.event_id() == event_id && current_create.room_id() == room_id
+		})
 }
 
 /// Returns a single EventId from `room_id` with key (`event_type`,
