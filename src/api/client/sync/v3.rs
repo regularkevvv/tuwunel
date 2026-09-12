@@ -35,7 +35,7 @@ use ruma::{
 };
 use tokio::time;
 use tuwunel_core::{
-	Result, at,
+	Error, Result, at,
 	debug::INFO_SPAN_LEVEL,
 	debug_error, err,
 	error::{inspect_debug_log, inspect_log},
@@ -2157,12 +2157,11 @@ async fn calculate_state_changes<'a>(
 	let state_get_shorteventid = |user_id: &'a UserId| {
 		services
 			.state_accessor
-			.state_get_shortid(
+			.state_get_shortid_optional(
 				horizon_shortstatehash,
 				&StateEventType::RoomMember,
 				user_id.as_str(),
 			)
-			.ok()
 	};
 
 	let lazy_state_ids = witness.map_async(|witness| {
@@ -2170,14 +2169,16 @@ async fn calculate_state_changes<'a>(
 			.iter()
 			.stream()
 			.ready_filter(|&user_id| user_id != sender_user)
-			.broad_filter_map(|user_id| state_get_shorteventid(user_id))
+			.map(Result::Ok)
+			.broad_and_then(|user_id| state_get_shorteventid(user_id))
+			.ready_try_filter_map(Result::Ok)
 			.into_future()
 	});
 
 	let state_diff_ids = incremental.then_async(|| {
 		services
 			.state_accessor
-			.state_added((since_shortstatehash, horizon_shortstatehash))
+			.state_added_strict((since_shortstatehash, horizon_shortstatehash))
 			.boxed()
 			.into_future()
 	});
@@ -2198,27 +2199,20 @@ async fn calculate_state_changes<'a>(
 		.chain(
 			state_diff_ids
 				.stream()
-				.map(move |ids| Ok((after, ids))),
+				.map_ok(move |ids| (after, ids)),
 		)
 		.broad_and_then(async |(after, (shortstatekey, shorteventid))| {
-			let event_id =
-				lazy_filter(services, sender_user, witness, shortstatekey, shorteventid, after)
-					.await;
-
-			Ok(event_id)
+			lazy_filter(services, sender_user, witness, shortstatekey, shorteventid, after).await
 		})
 		.ready_try_filter_map(Result::Ok)
-		.chain(lazy_state_ids.stream().map(Result::Ok))
+		.chain(lazy_state_ids.stream())
 		.broad_and_then(async |shorteventid| {
-			let pdu = services
+			services
 				.timeline
 				.get_pdu_from_shorteventid(shorteventid)
-				.ok()
-				.await;
-
-			Ok(pdu)
+				.map_err(|_| Error::bad_database("Incomplete sync state event"))
+				.await
 		})
-		.ready_try_filter_map(Result::Ok)
 		.try_collect::<Vec<_>>()
 		.await?;
 
@@ -2247,16 +2241,16 @@ async fn lazy_filter(
 	shortstatekey: ShortStateKey,
 	shorteventid: ShortEventId,
 	after: bool,
-) -> Option<ShortEventId> {
+) -> Result<Option<ShortEventId>> {
 	let Some(witness) = witness else {
-		return Some(shorteventid);
+		return Ok(Some(shorteventid));
 	};
 
 	let (event_type, state_key) = services
 		.short
 		.get_statekey_from_short(shortstatekey)
 		.await
-		.ok()?;
+		.map_err(|_| Error::bad_database("Incomplete sync state key mapping"))?;
 
 	// An MSC4222 delta also keeps changed members the witness will not re-add
 	// (lazy_state_ids covers witnessed ones), avoiding both a miss and a duplicate.
@@ -2264,7 +2258,7 @@ async fn lazy_filter(
 		|| state_key == sender_user.as_str()
 		|| (after && <&UserId>::try_from(state_key.as_str()).is_ok_and(|u| !witness.contains(u)));
 
-	keep.then_some(shorteventid)
+	Ok(keep.then_some(shorteventid))
 }
 
 async fn calculate_counts(

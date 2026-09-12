@@ -330,25 +330,71 @@ pub async fn state_get_shortid(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<ShortEventId> {
-	let shortstatekey = self
+	self.state_get_shortid_optional(shortstatehash, event_type, state_key)
+		.await?
+		.ok_or(err!(Request(NotFound("Not found in room state"))))
+}
+
+/// Returns a compact event ID for one state cell, or `None` only when a
+/// complete snapshot proves the cell is absent. A missing or mismatched
+/// forward state-key mapping falls back to the reverse snapshot scan.
+#[implement(super::Service)]
+pub async fn state_get_shortid_optional(
+	&self,
+	shortstatehash: ShortStateHash,
+	event_type: &StateEventType,
+	state_key: &str,
+) -> Result<Option<ShortEventId>> {
+	let direct_shortstatekey = match self
 		.services
 		.short
 		.get_shortstatekey(event_type, state_key)
-		.await?;
+		.await
+	{
+		| Ok(shortstatekey) => self
+			.services
+			.short
+			.get_statekey_from_short(shortstatekey)
+			.await
+			.ok()
+			.is_some_and(|(candidate_type, candidate_key)| {
+				candidate_type.eq(event_type) && candidate_key.as_str() == state_key
+			})
+			.then_some(shortstatekey),
 
-	let start = compress_state_event(shortstatekey, 0);
-	let end = compress_state_event(shortstatekey, u64::MAX);
-	self.load_full_state(shortstatehash)
-		.map_ok(|full_state| {
-			full_state
-				.range(start..=end)
-				.next()
-				.copied()
-				.map(parse_compressed_state_event)
-				.map(at!(1))
-				.ok_or(err!(Request(NotFound("Not found in room state"))))
-		})
-		.await?
+		| Err(_) => None,
+	};
+
+	if let Some(shortstatekey) = direct_shortstatekey {
+		let start = compress_state_event(shortstatekey, 0);
+		let end = compress_state_event(shortstatekey, u64::MAX);
+		return Ok(self
+			.load_full_state(shortstatehash)
+			.await?
+			.range(start..=end)
+			.next()
+			.copied()
+			.map(parse_compressed_state_event)
+			.map(at!(1)));
+	}
+
+	let full_state = self.load_full_state(shortstatehash).await?;
+	for compressed in full_state.iter().copied() {
+		let (candidate_shortstatekey, candidate_shorteventid) =
+			parse_compressed_state_event(compressed);
+		let (candidate_type, candidate_key) = self
+			.services
+			.short
+			.get_statekey_from_short(candidate_shortstatekey)
+			.await
+			.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+
+		if candidate_type.eq(event_type) && candidate_key.as_str() == state_key {
+			return Ok(Some(candidate_shorteventid));
+		}
+	}
+
+	Ok(None)
 }
 
 /// Iterates the events for an event_type in the state.
@@ -504,6 +550,23 @@ pub fn state_added(
 		.try_flatten_stream()
 		.ignore_err()
 		.map(parse_compressed_state_event)
+}
+
+/// Returns the state events added between the interval (present in .1 but
+/// not in .0), failing instead of yielding an incomplete delta when either
+/// snapshot cannot be reconstructed.
+#[implement(super::Service)]
+pub fn state_added_strict(
+	&self,
+	shortstatehash: pair_of!(ShortStateHash),
+) -> impl Stream<Item = Result<(ShortStateKey, ShortEventId)>> + Send + '_ {
+	let a = self.load_full_state(shortstatehash.0);
+	let b = self.load_full_state(shortstatehash.1);
+	try_join(a, b)
+		.map_ok(|(a, b)| b.difference(&a).copied().collect::<Vec<_>>())
+		.map_ok(IterStream::try_stream)
+		.try_flatten_stream()
+		.map_ok(parse_compressed_state_event)
 }
 
 #[implement(super::Service)]
