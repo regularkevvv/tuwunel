@@ -4,7 +4,7 @@ mod heroes;
 use std::collections::{BTreeMap, HashSet};
 
 use futures::{
-	FutureExt, StreamExt, TryFutureExt,
+	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 	future::{join, join3, join4},
 };
 use ruma::{
@@ -28,13 +28,13 @@ use tuwunel_core::{
 	ref_at,
 	smallstr::SmallString,
 	utils::{
-		BoolExt, IterStream, ReadyExt, TryFutureExtExt,
+		BoolExt, IterStream, TryFutureExtExt,
 		hash::sha256::{
 			Digest as Sha256Digest, delimited as sha256_delimited, hash as sha256_hash,
 		},
 		math::usize_from_ruma,
 		result::FlatOk,
-		stream::{BroadbandExt, WidebandExt},
+		stream::{TryBroadbandExt, WidebandExt},
 	},
 };
 use tuwunel_service::Services;
@@ -180,6 +180,7 @@ pub(super) async fn handle_room(
 	) = join4(meta, events, member_counts, notification_counts)
 		.boxed()
 		.await;
+	let required_state = required_state.map_err(Failure::Payload)?;
 
 	let (heroes, heroes_name, heroes_avatar) = resolve_heroes(
 		services,
@@ -431,7 +432,7 @@ async fn collect_required_state(
 	required_state: &HashSet<(StateEventType, StateKey)>,
 	timeline_pdus: &[(PduCount, PduEvent)],
 	encrypted: bool,
-) -> Vec<Raw<AnySyncStateEvent>> {
+) -> Result<Vec<Raw<AnySyncStateEvent>>> {
 	let lazy = required_state
 		.iter()
 		.any(is_equal_to!(&(StateEventType::RoomMember, "$LAZY".into())));
@@ -466,17 +467,20 @@ async fn collect_required_state(
 	let wildcard_state: Vec<(StateEventType, StateKey)> = wildcard_types
 		.into_iter()
 		.stream()
-		.broad_then(|event_type| wildcard_state_keys(services, room_id, event_type))
-		.concat()
-		.await;
+		.map(Ok::<_, Error>)
+		.broad_and_then(|event_type| wildcard_state_keys(services, room_id, event_type))
+		.try_collect::<Vec<Vec<_>>>()
+		.await?
+		.into_iter()
+		.flatten()
+		.collect();
 
-	let in_timeline = |event: &PduEvent| {
-		timeline_pdus
-			.iter()
-			.map(ref_at!(1))
-			.map(Event::event_id)
-			.any(is_equal_to!(event.event_id()))
-	};
+	let timeline_event_ids = timeline_pdus
+		.iter()
+		.map(ref_at!(1))
+		.map(Event::event_id)
+		.map(ToOwned::to_owned)
+		.collect::<HashSet<_>>();
 
 	required_state
 		.iter()
@@ -484,27 +488,37 @@ async fn collect_required_state(
 		.stream()
 		.chain(wildcard_state.into_iter().stream())
 		.chain(timeline_senders.into_iter().stream())
-		.broad_filter_map(async |state| {
+		.map(Ok::<_, Error>)
+		.broad_and_then(async |state| {
 			let state_key: StateKey = match state.1.as_str() {
-				| "$LAZY" | "*" => return None,
+				| "$LAZY" | "*" => return Ok(None),
 				| "$ME" => sender_user.as_str().into(),
-				| _ => state.1.clone(),
+				| _ => state.1,
 			};
 
-			let mut pdu = services
+			let pdu = match services
 				.state_accessor
 				.room_state_get(room_id, &state.0, &state_key)
-				.map_ok(Event::into_pdu)
-				.ok()
-				.await?;
+				.await
+			{
+				| Ok(pdu) => Some(Event::into_pdu(pdu)),
+				| Err(error) if error.is_not_found() => None,
+				| Err(error) => return Err(error),
+			};
+			let Some(mut pdu) = pdu else {
+				return Ok(None);
+			};
 
 			annotate_membership(services, &mut pdu, sender_user, encrypted).await;
 
-			let pdu = strip_prev_state(pdu, sender_user, in_timeline);
+			let pdu = strip_prev_state(pdu, sender_user, |event| {
+				timeline_event_ids.contains(event.event_id())
+			});
 
-			Some(Event::into_format(pdu))
+			Ok(Some(Event::into_format(pdu)))
 		})
-		.collect()
+		.try_filter_map(async |event| Ok(event))
+		.try_collect()
 		.await
 }
 
@@ -512,13 +526,12 @@ async fn wildcard_state_keys(
 	services: &Services,
 	room_id: &RoomId,
 	event_type: StateEventType,
-) -> Vec<(StateEventType, StateKey)> {
+) -> Result<Vec<(StateEventType, StateKey)>> {
 	services
 		.state_accessor
 		.room_state_keys(room_id, &event_type)
-		.ready_filter_map(Result::ok)
-		.map(|state_key| (event_type.clone(), state_key))
-		.collect()
+		.map_ok(|state_key| (event_type.clone(), state_key))
+		.try_collect()
 		.await
 }
 
