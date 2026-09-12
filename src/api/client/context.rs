@@ -4,19 +4,21 @@ use futures::{
 	future::{OptionFuture, join, join3, try_join3},
 };
 use ruma::{
-	DeviceId, EventId, OwnedEventId, RoomId, UInt, UserId,
+	DeviceId, EventId, RoomId, UInt, UserId,
 	api::client::{context::get_context, filter::RoomEventFilter},
 	events::{AnyStateEvent, StateEventType},
 	serde::Raw,
 };
 use tuwunel_core::{
 	Err, Event, Result, at, debug_warn, err,
-	matrix::pdu::{PduEvent, RawPduId},
+	matrix::{
+		Pdu, StateKey,
+		pdu::{PduEvent, RawPduId},
+	},
 	ref_at,
 	utils::{
-		BoolExt, IterStream,
-		future::TryExtExt,
-		stream::{BroadbandExt, ReadyExt, TryIgnore, WidebandExt},
+		BoolExt,
+		stream::{ReadyExt, TryIgnore, WidebandExt},
 	},
 };
 use tuwunel_service::{
@@ -24,7 +26,7 @@ use tuwunel_service::{
 	rooms::{
 		lazy_loading,
 		lazy_loading::{Options, Witness},
-		short::{ShortRoomId, ShortStateKey},
+		short::ShortRoomId,
 		timeline::PdusIterItem,
 	},
 };
@@ -184,12 +186,12 @@ pub(crate) async fn event_context(
 		.map(ref_at!(1))
 		.map_or_else(|| event_id, |pdu| pdu.event_id.as_ref());
 
-	let (lazy_loading_witnessed, state_ids) =
-		join(lazy_loading_witnessed, load_state_ids(services, room_id, state_at)).await;
+	let (lazy_loading_witnessed, state_pdus) =
+		join(lazy_loading_witnessed, load_state_pdus(services, room_id, state_at)).await;
 
 	let state = build_state_response(
 		services,
-		state_ids?,
+		state_pdus?,
 		lazy_loading_witnessed.unwrap_or_default(),
 		filter,
 		sender_user,
@@ -356,62 +358,69 @@ where
 		.await
 }
 
-async fn load_state_ids(
+async fn load_state_pdus(
 	services: &Services,
 	room_id: &RoomId,
 	state_at: &EventId,
-) -> Result<Vec<(ShortStateKey, OwnedEventId)>> {
-	services
-		.state
-		.pdu_shortstatehash(state_at)
-		.or_else(|_| services.state.get_room_shortstatehash(room_id))
-		.map_ok(|shortstatehash| {
-			services
+) -> Result<Vec<((StateEventType, StateKey), Pdu)>> {
+	let shortstatehash = match services.state.pdu_shortstatehash(state_at).await {
+		| Ok(shortstatehash) => shortstatehash,
+		| Err(_)
+			if services
 				.state_accessor
-				.state_full_ids(shortstatehash)
-				.map(Ok)
-		})
-		.map_err(|e| err!(Database("State not found: {e}")))
-		.try_flatten_stream()
-		.try_collect()
-		.boxed()
-		.await
+				.is_initial_room_create(room_id, state_at)
+				.await =>
+			services
+				.state
+				.get_room_shortstatehash(room_id)
+				.await
+				.map_err(|e| err!(Database("State not found: {e}")))?,
+		| Err(e) => return Err!(Database("State not found: {e}")),
+	};
+
+	let state = services
+		.state_accessor
+		.state_full_pdus_strict(shortstatehash)
+		.try_collect::<Vec<_>>()
+		.await?;
+
+	if state
+		.iter()
+		.any(|(_, pdu)| pdu.room_id() != room_id)
+	{
+		return Err!(Database("Mismatched context state event"));
+	}
+
+	Ok(state)
 }
 
 async fn build_state_response(
 	services: &Services,
-	state_ids: Vec<(ShortStateKey, OwnedEventId)>,
+	state_pdus: Vec<((StateEventType, StateKey), Pdu)>,
 	lazy_loading_witnessed: Witness,
 	filter: &RoomEventFilter,
 	sender_user: &UserId,
 	encrypted: bool,
 ) -> Vec<Raw<AnyStateEvent>> {
-	let shortstatekeys = state_ids.iter().map(at!(0)).stream();
-	let shorteventids = state_ids.iter().map(ref_at!(1)).stream();
+	let mut response = Vec::with_capacity(state_pdus.len());
 
-	services
-		.short
-		.multi_get_statekey_from_short(shortstatekeys)
-		.zip(shorteventids)
-		.ready_filter_map(|item| Some((item.0.ok()?, item.1)))
-		.ready_filter_map(|((event_type, state_key), event_id)| {
-			if filter.lazy_load_options.is_enabled()
-				&& event_type == StateEventType::RoomMember
-				&& state_key
-					.as_str()
-					.try_into()
-					.is_ok_and(|user_id: &UserId| !lazy_loading_witnessed.contains(user_id))
-			{
-				return None;
-			}
+	for ((event_type, state_key), pdu) in state_pdus {
+		if filter.lazy_load_options.is_enabled()
+			&& event_type == StateEventType::RoomMember
+			&& state_key
+				.as_str()
+				.try_into()
+				.is_ok_and(|user_id: &UserId| !lazy_loading_witnessed.contains(user_id))
+		{
+			continue;
+		}
 
-			Some(event_id)
-		})
-		.broad_filter_map(|event_id: &OwnedEventId| {
-			services.timeline.get_pdu(event_id.as_ref()).ok()
-		})
-		.broad_then(|pdu| with_membership(services, pdu, sender_user, encrypted))
-		.map(Event::into_format)
-		.collect()
-		.await
+		response.push(
+			with_membership(services, pdu, sender_user, encrypted)
+				.await
+				.into_format(),
+		);
+	}
+
+	response
 }
