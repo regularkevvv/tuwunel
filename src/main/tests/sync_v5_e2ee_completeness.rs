@@ -33,6 +33,7 @@ fn corrupt_e2ee_membership_delta_fails_closed() -> Result {
 		format!("port={port}"),
 		"listening=true".to_owned(),
 		"log=\"warn\"".to_owned(),
+		"device_key_update_encrypted_rooms_only=true".to_owned(),
 	]);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -79,6 +80,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let corrupt_since = initial_position(&owner, "corrupt-e2ee").await?;
 	let restored_since = initial_position(&owner, "restored-e2ee").await?;
 	let delta_since = initial_position(&owner, "delta-e2ee").await?;
+	let forward_since = initial_position(&owner, "forward-e2ee").await?;
 
 	join_room(&peer, &room).await?;
 	let member = services
@@ -131,6 +133,24 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	assert_e2ee_failure(&owner, "delta-e2ee", &delta_since, &peer_user).await?;
 
 	statediffs.raw_put(&key, &saved).await?;
+	services.clear_cache().await;
+
+	let key = tuwunel_database::serialize_key((&StateEventType::RoomEncryption, ""))?;
+	let forward = &services.db["statekey_shortstatekey"];
+	let saved = forward.get(&key).await?.to_vec();
+	forward.remove(&key).await?;
+	services.clear_cache().await;
+
+	assert_e2ee_changed(
+		&owner,
+		"forward-e2ee",
+		&forward_since,
+		&peer_user,
+		"missing encryption forward key",
+	)
+	.await?;
+
+	forward.raw_put(&key, &saved).await?;
 	services.clear_cache().await;
 
 	Ok(())

@@ -17,8 +17,7 @@ use tuwunel_core::{
 	matrix::{Event, pdu::PduCount},
 	pair_of,
 	utils::{
-		BoolExt, FutureBoolExt, IterStream, ReadyExt, TryFutureExtExt, TryReadyExt,
-		future::{OptionFutureExt, OptionStream, ReadyBoolExt},
+		BoolExt, IterStream, ReadyExt, TryFutureExtExt, TryReadyExt, future::OptionStream,
 		stream::TryBroadbandExt,
 	},
 };
@@ -148,15 +147,17 @@ async fn collect_room(
 	let skip_unencrypted = services
 		.config
 		.device_key_update_encrypted_rooms_only
-		.then_async(|| {
-			services
-				.state_accessor
-				.state_get_shortid(current_shortstatehash, &StateEventType::RoomEncryption, "")
-				.is_err()
-		})
-		.unwrap_or_default();
+		&& services
+			.state_accessor
+			.state_get_shortid_optional(
+				current_shortstatehash,
+				&StateEventType::RoomEncryption,
+				"",
+			)
+			.await?
+			.is_none();
 
-	if skip_unencrypted.await {
+	if skip_unencrypted {
 		return Ok(lists);
 	}
 
@@ -167,15 +168,11 @@ async fn collect_room(
 
 	let since_encrypted = services
 		.state_accessor
-		.state_get_shortid(since_shortstatehash, &StateEventType::RoomEncryption, "")
-		.is_ok();
+		.state_get_shortid_optional(since_shortstatehash, &StateEventType::RoomEncryption, "")
+		.await?
+		.is_some();
 
-	// The keyed membership read leads; the state lookup trails it.
-	let members_burst = joined_since_last_sync
-		.is_false()
-		.and(since_encrypted)
-		.is_false()
-		.await;
+	let members_burst = !joined_since_last_sync.await && !since_encrypted;
 
 	let joined_members_burst = members_burst.then_async(|| {
 		services
