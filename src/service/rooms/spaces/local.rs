@@ -1,4 +1,4 @@
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use ruma::{
 	RoomId, api::federation::space::SpaceHierarchyParentSummary as ParentSummary,
 	events::space::child::HierarchySpaceChildEvent, room::RoomSummary, serde::Raw,
@@ -53,11 +53,11 @@ pub(super) async fn get_summary_and_children_local(
 		return Err!(Request(NotFound("Space room not found locally.")));
 	}
 
-	let children_state: Vec<_> = self
+	let children_state = self
 		.get_space_child_events(current_room)
-		.map(Event::into_format)
-		.collect()
-		.await;
+		.map_ok(Event::into_format)
+		.try_collect()
+		.await?;
 
 	let summary = self
 		.get_room_summary(current_room, children_state, sender)

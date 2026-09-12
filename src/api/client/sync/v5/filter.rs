@@ -1,4 +1,6 @@
-use futures::{StreamExt, pin_mut};
+use std::future::ready;
+
+use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	RoomId,
 	api::client::sync::sync_events::v5::request::ListFilters,
@@ -8,7 +10,7 @@ use ruma::{
 use tuwunel_core::{
 	is_equal_to, is_true,
 	utils::{
-		BoolExt, FutureBoolExt, IterStream, ReadyExt,
+		BoolExt, FutureBoolExt,
 		future::{self, OptionFutureExt, ReadyBoolExt},
 		option::OptionExt,
 	},
@@ -56,13 +58,24 @@ pub(super) async fn filter_room(
 		.is_empty()
 		.is_false()
 		.then_async(async || {
-			filter
-				.spaces
-				.iter()
-				.stream()
-				.flat_map(|room_id| services.spaces.get_space_children(room_id))
-				.ready_any(is_equal_to!(room_id))
-				.await
+			// A corrupt space snapshot cannot prove that this room matches a
+			// space-filtered list, so reject the match rather than using a prefix.
+			for space_id in &filter.spaces {
+				let Ok(matches) = services
+					.spaces
+					.get_space_children(space_id)
+					.try_any(|child| ready(child == room_id))
+					.await
+				else {
+					return false;
+				};
+
+				if matches {
+					return true;
+				}
+			}
+
+			false
 		});
 
 	let fetch_tags = !filter.tags.is_empty() || !filter.not_tags.is_empty();

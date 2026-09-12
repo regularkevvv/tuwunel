@@ -8,9 +8,9 @@ mod tests;
 use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, pin_mut};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, pin_mut};
 use ruma::{
-	OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
+	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
 	api::{
 		client::space::SpaceHierarchyRoomsChunk,
 		federation::space::SpaceHierarchyParentSummary as ParentSummary,
@@ -23,11 +23,8 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Err, Event, Result, implement,
-	utils::{
-		future::{BoolExt, TryExtExt},
-		stream::{BroadbandExt, IterStream, ReadyExt, TryReadyExt},
-	},
+	Err, Error, Event, Result, implement,
+	utils::{future::BoolExt, stream::IterStream},
 };
 use tuwunel_database::Map;
 
@@ -125,46 +122,31 @@ pub async fn get_summary_and_children(
 pub fn get_space_children<'a>(
 	&'a self,
 	room_id: &'a RoomId,
-) -> impl Stream<Item = OwnedRoomId> + Send + 'a {
+) -> impl Stream<Item = Result<OwnedRoomId>> + Send + 'a {
 	self.services
 		.state_accessor
 		.room_state_keys(room_id, &StateEventType::SpaceChild)
-		.ready_and_then(|state_key| OwnedRoomId::parse(state_key.as_str()).map_err(Into::into))
-		.ready_filter_map(Result::ok)
+		.try_filter_map(async |state_key| Ok(OwnedRoomId::parse(state_key.as_str()).ok()))
 }
 
-/// Simply returns the stripped m.space.child events of a room
+/// Returns the complete, valid m.space.child events of a room.
 #[implement(Service)]
 fn get_space_child_events<'a>(
 	&'a self,
 	room_id: &'a RoomId,
-) -> impl Stream<Item = impl Event> + Send + 'a {
+) -> impl Stream<Item = Result<impl Event>> + Send + 'a {
 	self.services
 		.state_accessor
-		.room_state_keys_with_ids(room_id, &StateEventType::SpaceChild)
-		.ready_filter_map(Result::ok)
-		.broad_filter_map(move |(state_key, event_id): (_, OwnedEventId)| async move {
-			self.services
-				.timeline
-				.get_pdu(&event_id)
-				.map_ok(move |pdu| (state_key, pdu))
-				.ok()
-				.await
-		})
-		.ready_filter_map(|(state_key, pdu)| {
-			let Ok(content) = pdu.get_content::<SpaceChildEventContent>() else {
-				return None;
-			};
+		.room_state_type_pdus(room_id, &StateEventType::SpaceChild)
+		.try_filter_map(async |pdu| {
+			let content = pdu
+				.get_content::<SpaceChildEventContent>()
+				.map_err(|_| Error::bad_database("Invalid space child state event"))?;
+			let state_key = pdu
+				.state_key()
+				.ok_or_else(|| Error::bad_database("Space child event without state key"))?;
 
-			if content.via.is_empty() {
-				return None;
-			}
-
-			if RoomId::parse(&state_key).is_err() {
-				return None;
-			}
-
-			Some(pdu)
+			Ok((!content.via.is_empty() && RoomId::parse(state_key).is_ok()).then_some(pdu))
 		})
 }
 
