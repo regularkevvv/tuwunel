@@ -33,12 +33,19 @@ pub fn room_state_type_pdus<'a>(
 	self.services
 		.state
 		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| {
-			self.state_type_pdus(shortstatehash, event_type)
-				.map(Ok)
+		.map_ok(move |shortstatehash| {
+			self.state_type_pdus_strict(shortstatehash, event_type)
+				.map(move |result| {
+					result.and_then(|pdu| {
+						(pdu.room_id() == room_id)
+							.then_some(pdu)
+							.ok_or_else(|| err!(Database("Mismatched room state event")))
+					})
+				})
 		})
 		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
 		.try_flatten_stream()
+		.boxed()
 }
 
 /// Returns the full room state.
@@ -51,9 +58,19 @@ pub fn room_state_full<'a>(
 	self.services
 		.state
 		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| self.state_full(shortstatehash).map(Ok))
+		.map_ok(move |shortstatehash| {
+			self.state_full_pdus_strict(shortstatehash)
+				.map(move |result| {
+					result.and_then(|(state_key, pdu)| {
+						(pdu.room_id() == room_id)
+							.then_some((state_key, pdu))
+							.ok_or_else(|| err!(Database("Mismatched room state event")))
+					})
+				})
+		})
 		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
 		.try_flatten_stream()
+		.boxed()
 }
 
 /// Returns the full room state pdus
@@ -66,9 +83,19 @@ pub fn room_state_full_pdus<'a>(
 	self.services
 		.state
 		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| self.state_full_pdus(shortstatehash).map(Ok))
+		.map_ok(move |shortstatehash| {
+			self.state_full_pdus_strict(shortstatehash)
+				.map(move |result| {
+					result.and_then(|(_, pdu)| {
+						(pdu.room_id() == room_id)
+							.then_some(pdu)
+							.ok_or_else(|| err!(Database("Mismatched room state event")))
+					})
+				})
+		})
 		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
 		.try_flatten_stream()
+		.boxed()
 }
 
 /// Returns a single EventId from `room_id` with key (`event_type`,
@@ -100,12 +127,10 @@ pub fn room_state_keys_with_ids<'a>(
 	self.services
 		.state
 		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| {
-			self.state_keys_with_ids(shortstatehash, event_type)
-				.map(Ok)
-		})
+		.map_ok(|shortstatehash| self.state_keys_with_ids_strict(shortstatehash, event_type))
 		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
 		.try_flatten_stream()
+		.boxed()
 }
 
 /// Iterates the state_keys for an event_type in the state
@@ -119,12 +144,10 @@ pub fn room_state_keys<'a>(
 	self.services
 		.state
 		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| {
-			self.state_keys(shortstatehash, event_type)
-				.map(Ok)
-		})
+		.map_ok(|shortstatehash| self.state_keys_strict(shortstatehash, event_type))
 		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
 		.try_flatten_stream()
+		.boxed()
 }
 
 /// Returns a single PDU from `room_id` with key (`event_type`,

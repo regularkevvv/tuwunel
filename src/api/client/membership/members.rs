@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use axum::extract::State;
-use futures::{FutureExt, StreamExt, pin_mut};
+use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	api::client::membership::{
 		get_member_events::{self},
@@ -14,12 +16,9 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Err, Result, at, is_equal_to, is_not_equal_to,
+	Err, Error, Result, is_equal_to, is_not_equal_to,
 	matrix::Event,
-	utils::{
-		future::{BoolExt, TryExtExt},
-		stream::ReadyExt,
-	},
+	utils::future::{BoolExt, TryExtExt},
 };
 
 use crate::Ruma;
@@ -50,24 +49,26 @@ pub(crate) async fn get_member_events_route(
 		membership.is_none_or(is_equal_to!(&content.membership))
 			&& not_membership.is_none_or(is_not_equal_to!(&content.membership))
 	};
+	let state = services
+		.state_accessor
+		.room_state_full(&body.room_id)
+		.try_collect::<Vec<_>>()
+		.await?;
+	let mut chunk = Vec::new();
+	for ((event_type, _), pdu) in state {
+		if event_type != StateEventType::RoomMember {
+			continue;
+		}
 
-	Ok(get_member_events::v3::Response {
-		chunk: services
-			.state_accessor
-			.room_state_full(&body.room_id)
-			.ready_filter_map(Result::ok)
-			.ready_filter(|((ty, _), _)| *ty == StateEventType::RoomMember)
-			.map(at!(1))
-			.ready_filter(|pdu| {
-				pdu.get_content::<RoomMemberEventContent>()
-					.as_ref()
-					.is_ok_and(membership_filter)
-			})
-			.map(Event::into_format)
-			.collect()
-			.boxed()
-			.await,
-	})
+		let content = pdu
+			.get_content::<RoomMemberEventContent>()
+			.map_err(|_| Error::bad_database("Invalid membership state event"))?;
+		if membership_filter(&content) {
+			chunk.push(pdu.into_format());
+		}
+	}
+
+	Ok(get_member_events::v3::Response { chunk })
 }
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/joined_members`
@@ -96,30 +97,27 @@ pub(crate) async fn joined_members_route(
 		return Err!(Request(Forbidden("You aren't a member of the room.")));
 	}
 
-	Ok(joined_members::v3::Response {
-		joined: services
-			.state_accessor
-			.room_state_full(&body.room_id)
-			.ready_filter_map(Result::ok)
-			.ready_filter(|((ty, _), _)| *ty == StateEventType::RoomMember)
-			.map(at!(1))
-			.ready_filter_map(|pdu| {
-				let content = pdu.get_content::<RoomMemberEventContent>().ok()?;
+	let state = services
+		.state_accessor
+		.room_state_full(&body.room_id)
+		.try_collect::<Vec<_>>()
+		.await?;
+	let mut joined = BTreeMap::new();
+	for ((event_type, _), pdu) in state {
+		if event_type != StateEventType::RoomMember {
+			continue;
+		}
 
-				let matches = content.membership == MembershipState::Join;
+		let content = pdu
+			.get_content::<RoomMemberEventContent>()
+			.map_err(|_| Error::bad_database("Invalid membership state event"))?;
+		if content.membership == MembershipState::Join {
+			joined.insert(pdu.sender().to_owned(), RoomMember {
+				display_name: content.displayname,
+				avatar_url: content.avatar_url,
+			});
+		}
+	}
 
-				matches.then(|| {
-					let sender = pdu.sender().to_owned();
-					let member = RoomMember {
-						display_name: content.displayname,
-						avatar_url: content.avatar_url,
-					};
-
-					(sender, member)
-				})
-			})
-			.collect()
-			.boxed()
-			.await,
-	})
+	Ok(joined_members::v3::Response { joined })
 }

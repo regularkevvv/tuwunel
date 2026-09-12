@@ -94,6 +94,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"configured power levels must deny the low-power member: {}",
 		healthy.1
 	);
+	assert_all_state_routes_succeed(services, base, member_token, &room, "healthy").await?;
 
 	let version = services.state.get_room_version(&room).await?;
 	let rules = room_version::rules(&version)?;
@@ -131,6 +132,15 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	Ok(())
 }
 
+struct CorruptionContext<'a> {
+	services: &'a Services,
+	base: &'a str,
+	member_token: &'a str,
+	room: &'a RoomId,
+	member: &'a UserId,
+	rules: &'a RoomVersionRules,
+}
+
 async fn verify_corruptions(
 	services: &Services,
 	base: &str,
@@ -139,40 +149,72 @@ async fn verify_corruptions(
 	member: &UserId,
 	rules: &RoomVersionRules,
 ) -> Result {
-	let before = forward_extremities(services, room).await;
-	let power_levels = services
+	let context = CorruptionContext {
+		services,
+		base,
+		member_token,
+		room,
+		member,
+		rules,
+	};
+	let power_levels = context
+		.services
 		.state_accessor
-		.room_state_get_id(room, &StateEventType::RoomPowerLevels, "")
+		.room_state_get_id(context.room, &StateEventType::RoomPowerLevels, "")
 		.await?;
-	let pdu_id = services
+
+	verify_missing_or_malformed_storage(&context, &power_levels).await?;
+	let restored = send_message(
+		context.services,
+		context.base,
+		context.member_token,
+		context.room,
+		"restored-denial",
+	)
+	.await?;
+	assert_eq!(restored.0, 403, "restoring storage must restore the original denial");
+	verify_mismatched_state_events(&context, &power_levels).await?;
+	verify_forward_mapping_recovery(&context, &power_levels).await
+}
+
+async fn verify_missing_or_malformed_storage(
+	context: &CorruptionContext<'_>,
+	power_levels: &OwnedEventId,
+) -> Result {
+	let before = forward_extremities(context.services, context.room).await;
+	let pdu_id = context
+		.services
 		.timeline
-		.get_pdu_id(&power_levels)
+		.get_pdu_id(power_levels)
 		.await?;
-	let shorteventid = services
+	let shorteventid = context
+		.services
 		.short
-		.get_shorteventid(&power_levels)
+		.get_shorteventid(power_levels)
 		.await?;
-	let shortstatekey = services
+	let shortstatekey = context
+		.services
 		.short
 		.get_shortstatekey(&StateEventType::RoomPowerLevels, "")
 		.await?;
-	let state = services
+	let state = context
+		.services
 		.state
-		.get_room_shortstatehash(room)
+		.get_room_shortstatehash(context.room)
 		.await?;
 	let targets = [
 		("pduid_pdu", pdu_id.as_ref().to_vec(), true),
 		("shorteventid_eventid", shorteventid.to_be_bytes().to_vec(), true),
 		("shortstatekey_statekey", shortstatekey.to_be_bytes().to_vec(), true),
 		("shortstatehash_statediff", state.to_be_bytes().to_vec(), false),
-		("roomid_shortstatehash", room.as_bytes().to_vec(), false),
+		("roomid_shortstatehash", context.room.as_bytes().to_vec(), false),
 	];
 	for (name, key, check_http) in targets {
-		let map = &services.db[name];
+		let map = &context.services.db[name];
 		let saved = map.get(&key).await?.to_vec();
 		for malformed in [false, true] {
 			assert!(
-				!read_auth(services, room, member, rules)
+				!read_auth(context.services, context.room, context.member, context.rules)
 					.await?
 					.is_empty()
 			);
@@ -181,8 +223,8 @@ async fn verify_corruptions(
 			} else {
 				map.remove(&key).await?;
 			}
-			services.clear_cache().await;
-			if read_auth(services, room, member, rules)
+			context.services.clear_cache().await;
+			if read_auth(context.services, context.room, context.member, context.rules)
 				.await
 				.is_ok()
 			{
@@ -190,53 +232,81 @@ async fn verify_corruptions(
 			}
 			if check_http {
 				let transaction = format!("corrupt-{name}-{malformed}");
-				let response =
-					send_message(services, base, member_token, room, &transaction).await?;
+				let response = send_message(
+					context.services,
+					context.base,
+					context.member_token,
+					context.room,
+					&transaction,
+				)
+				.await?;
 				assert_eq!(response.0, 500, "{name}/{malformed}: {}", response.1);
 				let body: Value = serde_json::from_str(&response.1)?;
 				assert_eq!(body.get("errcode").and_then(Value::as_str), Some("M_UNKNOWN"));
 				assert!(!response.1.contains(power_levels.as_str()));
 				assert!(!response.1.contains(name));
 			}
+			let label = format!("{name}/{malformed}");
+			assert_all_state_routes_fail(
+				context.services,
+				context.base,
+				context.member_token,
+				context.room,
+				power_levels,
+				&label,
+				name,
+			)
+			.await?;
 			assert_eq!(
-				forward_extremities(services, room).await,
+				forward_extremities(context.services, context.room).await,
 				before,
 				"{name}/{malformed}: failed auth loading appended an event"
 			);
 			map.raw_put(&key, &saved).await?;
-			services.clear_cache().await;
+			context.services.clear_cache().await;
 			assert!(
-				!read_auth(services, room, member, rules)
+				!read_auth(context.services, context.room, context.member, context.rules)
 					.await?
 					.is_empty()
 			);
 		}
 	}
-	let map = &services.db["shortstatehash_statediff"];
+	let map = &context.services.db["shortstatehash_statediff"];
 	let key = state.to_be_bytes();
 	let saved = map.get(&key).await?.to_vec();
 	for (name, malformed) in
 		[("truncated-event", vec![0_u8; 9]), ("empty-removed-run", vec![0_u8; 16])]
 	{
 		map.raw_put(&key, &malformed).await?;
-		services.clear_cache().await;
-		if read_auth(services, room, member, rules)
+		context.services.clear_cache().await;
+		if read_auth(context.services, context.room, context.member, context.rules)
 			.await
 			.is_ok()
 		{
 			return Err!("{name}: auth loading accepted malformed StateDiff framing");
 		}
 		assert_eq!(
-			forward_extremities(services, room).await,
+			forward_extremities(context.services, context.room).await,
 			before,
 			"{name}: failed auth loading appended an event"
 		);
 		map.raw_put(&key, &saved).await?;
-		services.clear_cache().await;
+		context.services.clear_cache().await;
 	}
-	let restored = send_message(services, base, member_token, room, "restored-denial").await?;
-	assert_eq!(restored.0, 403, "restoring storage must restore the original denial");
-	let pdus = &services.db["pduid_pdu"];
+
+	Ok(())
+}
+
+async fn verify_mismatched_state_events(
+	context: &CorruptionContext<'_>,
+	power_levels: &OwnedEventId,
+) -> Result {
+	let pdu_id = context
+		.services
+		.timeline
+		.get_pdu_id(power_levels)
+		.await?;
+	let pdus = &context.services.db["pduid_pdu"];
 	let saved = pdus.get(&pdu_id).await?.to_vec();
 	for (field, value) in [
 		("room_id", "!foreign:localhost"),
@@ -248,31 +318,57 @@ async fn verify_corruptions(
 		mismatched[field] = json!(value);
 		pdus.raw_put(&pdu_id, serde_json::to_vec(&mismatched)?)
 			.await?;
-		services.clear_cache().await;
-		if read_auth(services, room, member, rules)
+		context.services.clear_cache().await;
+		if read_auth(context.services, context.room, context.member, context.rules)
 			.await
 			.is_ok()
 		{
 			return Err!("a mismatched {field} entered the auth map");
 		}
+		let label = format!("mismatched {field}");
+		assert_all_state_routes_fail(
+			context.services,
+			context.base,
+			context.member_token,
+			context.room,
+			power_levels,
+			&label,
+			field,
+		)
+		.await?;
 		pdus.raw_put(&pdu_id, &saved).await?;
-		services.clear_cache().await;
+		context.services.clear_cache().await;
 	}
 
+	Ok(())
+}
+
+async fn verify_forward_mapping_recovery(
+	context: &CorruptionContext<'_>,
+	power_levels: &OwnedEventId,
+) -> Result {
 	// A missing forward dictionary row is not proof that the state cell is absent.
 	let key = tuwunel_database::serialize_key((&StateEventType::RoomPowerLevels, ""))?;
-	let map = &services.db["statekey_shortstatekey"];
+	let map = &context.services.db["statekey_shortstatekey"];
 	let saved = map.get(&key).await?.to_vec();
 	map.remove(&key).await?;
-	services.clear_cache().await;
-	let auth = read_auth(services, room, member, rules).await?;
+	context.services.clear_cache().await;
+	let auth = read_auth(context.services, context.room, context.member, context.rules).await?;
 	assert_eq!(
 		auth.get(&(StateEventType::RoomPowerLevels, "".into()))
 			.map(|pdu| &pdu.event_id),
-		Some(&power_levels)
+		Some(power_levels)
 	);
+	assert_all_state_routes_succeed(
+		context.services,
+		context.base,
+		context.member_token,
+		context.room,
+		"a missing forward dictionary row",
+	)
+	.await?;
 	map.raw_put(&key, &saved).await?;
-	services.clear_cache().await;
+	context.services.clear_cache().await;
 
 	Ok(())
 }
@@ -433,6 +529,61 @@ async fn send_message(
 		.await?;
 
 	Ok((response.status().as_u16(), response.text().await?))
+}
+
+async fn get_room_endpoint(
+	services: &Services,
+	base: &str,
+	token: &str,
+	room: &RoomId,
+	endpoint: &str,
+) -> Result<(u16, String)> {
+	let response = services
+		.client
+		.clients
+		.default
+		.get(format!("{base}/_matrix/client/v3/rooms/{room}/{endpoint}"))
+		.bearer_auth(token)
+		.send()
+		.await?;
+
+	Ok((response.status().as_u16(), response.text().await?))
+}
+
+async fn assert_all_state_routes_succeed(
+	services: &Services,
+	base: &str,
+	token: &str,
+	room: &RoomId,
+	label: &str,
+) -> Result {
+	for endpoint in ["state", "members", "joined_members"] {
+		let response = get_room_endpoint(services, base, token, room, endpoint).await?;
+		assert_eq!(response.0, 200, "{label} {endpoint}: {}", response.1);
+	}
+
+	Ok(())
+}
+
+async fn assert_all_state_routes_fail(
+	services: &Services,
+	base: &str,
+	token: &str,
+	room: &RoomId,
+	power_levels: &OwnedEventId,
+	label: &str,
+	forbidden: &str,
+) -> Result {
+	for endpoint in ["state", "members", "joined_members"] {
+		let response = get_room_endpoint(services, base, token, room, endpoint).await?;
+		assert_eq!(response.0, 500, "{endpoint}/{label}: {}", response.1);
+		let body: Value = serde_json::from_str(&response.1)?;
+		assert_eq!(body.get("errcode").and_then(Value::as_str), Some("M_UNKNOWN"));
+		assert!(!response.1.contains(power_levels.as_str()));
+		assert!(!response.1.contains(forbidden));
+	}
+
+	Ok(())
 }
 
 async fn forward_extremities(services: &Services, room: &RoomId) -> Vec<OwnedEventId> {

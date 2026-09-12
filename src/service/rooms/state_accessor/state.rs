@@ -17,7 +17,7 @@ use tuwunel_core::{
 	pair_of,
 	utils::{
 		result::FlatOk,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, TryIgnore},
 	},
 };
 
@@ -230,6 +230,20 @@ pub fn state_type_pdus<'a>(
 		})
 }
 
+/// Iterates every current-state PDU of an event type without treating a
+/// snapshot, dictionary, or PDU read failure as an omitted event.
+#[implement(super::Service)]
+pub fn state_type_pdus_strict<'a>(
+	&'a self,
+	shortstatehash: ShortStateHash,
+	event_type: &'a StateEventType,
+) -> impl Stream<Item = Result<Pdu>> + Send + 'a {
+	self.state_full_pdus_strict(shortstatehash)
+		.try_filter_map(async move |((event_type_, _), pdu)| {
+			Ok(event_type_.eq(event_type).then_some(pdu))
+		})
+}
+
 /// Iterates the state_keys for an event_type in the state; current state
 /// event_id included.
 #[implement(super::Service)]
@@ -248,6 +262,22 @@ pub fn state_keys_with_ids<'a>(
 				.ready_filter_map(|(eid, sk)| eid.map(move |eid| (sk, eid)).ok())
 		})
 		.flatten_stream()
+}
+
+/// Iterates current-state keys and IDs for an event type with complete
+/// snapshot and reverse-dictionary reads.
+#[implement(super::Service)]
+pub fn state_keys_with_ids_strict<'a>(
+	&'a self,
+	shortstatehash: ShortStateHash,
+	event_type: &'a StateEventType,
+) -> impl Stream<Item = Result<(StateKey, OwnedEventId)>> + Send + 'a {
+	self.state_full_entries_strict(shortstatehash)
+		.try_filter_map(async move |((event_type_, state_key), event_id)| {
+			Ok(event_type_
+				.eq(event_type)
+				.then_some((state_key, event_id)))
+		})
 }
 
 /// Iterates the state_keys for an event_type in the state; current state
@@ -295,6 +325,18 @@ pub fn state_keys<'a>(
 		.ready_filter_map(move |(event_type_, state_key)| {
 			event_type_.eq(event_type).then_some(state_key)
 		})
+}
+
+/// Iterates current-state keys for an event type with complete snapshot and
+/// reverse-dictionary reads.
+#[implement(super::Service)]
+pub fn state_keys_strict<'a>(
+	&'a self,
+	shortstatehash: ShortStateHash,
+	event_type: &'a StateEventType,
+) -> impl Stream<Item = Result<StateKey>> + Send + 'a {
+	self.state_keys_with_ids_strict(shortstatehash, event_type)
+		.map_ok(at!(0))
 }
 
 /// Returns the state events removed between the interval (present in .0 but
@@ -356,6 +398,60 @@ pub fn state_full_pdus(
 				.get_pdu(&event_id)
 				.await
 				.ok()
+		})
+}
+
+/// Builds complete current-state entries from the snapshot. Both directions of
+/// the compact-ID dictionaries are required, so no corrupt cell can disappear
+/// from a response merely because its reverse mapping could not be read.
+#[implement(super::Service)]
+pub fn state_full_entries_strict(
+	&self,
+	shortstatehash: ShortStateHash,
+) -> impl Stream<Item = Result<((StateEventType, StateKey), OwnedEventId)>> + Send + '_ {
+	self.state_full_ids_strict(shortstatehash)
+		.try_collect::<Vec<_>>()
+		.and_then(async move |entries| {
+			let (shortstatekeys, event_ids): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+			self.services
+				.short
+				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
+				.zip(event_ids.into_iter().stream())
+				.map(|(state_key, event_id)| {
+					state_key
+						.map(|state_key| (state_key, event_id))
+						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
+				})
+				.try_collect::<Vec<_>>()
+				.await
+		})
+		.map_ok(Vec::into_iter)
+		.map_ok(IterStream::try_stream)
+		.try_flatten_stream()
+}
+
+/// Iterates complete current-state PDUs. Every PDU must bind to its snapshot
+/// event ID, type, and state key before a caller can emit it.
+#[implement(super::Service)]
+pub fn state_full_pdus_strict(
+	&self,
+	shortstatehash: ShortStateHash,
+) -> impl Stream<Item = Result<((StateEventType, StateKey), Pdu)>> + Send + '_ {
+	self.state_full_entries_strict(shortstatehash)
+		.broad_and_then(async |(state_key, event_id)| {
+			let pdu = self
+				.services
+				.timeline
+				.get_pdu(&event_id)
+				.await
+				.map_err(|_| Error::bad_database("Incomplete state event"))?;
+			if pdu.event_id() != event_id
+				|| pdu.event_type().to_cow_str() != state_key.0.to_cow_str()
+				|| pdu.state_key() != Some(state_key.1.as_str())
+			{
+				return Err(Error::bad_database("Mismatched state event"));
+			}
+			Ok((state_key, pdu))
 		})
 }
 
