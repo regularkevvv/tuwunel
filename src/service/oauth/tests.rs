@@ -300,3 +300,150 @@ fn a_rotated_refresh_token_replaces_the_stored_one() {
 
 	assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
 }
+
+fn grant_key(byte: u8) -> String {
+	use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+	URL_SAFE_NO_PAD.encode([byte; super::seal::KEY_LEN])
+}
+
+fn material(refresh: &str) -> super::seal::Material {
+	super::seal::Material {
+		access_token: Some("ACCESS-CANARY".to_owned()),
+		refresh_token: Some(refresh.to_owned()),
+		id_token: None,
+	}
+}
+
+#[test]
+fn a_sealed_grant_hides_its_tokens_and_opens_only_on_its_own_record() {
+	let keys = super::seal::Keys::new(Some(&grant_key(1)), &[]).expect("valid key");
+	let sealed = keys
+		.seal("record-a", &material("REFRESH-CANARY"))
+		.expect("sealing succeeds")
+		.expect("a current key seals");
+
+	let stored = serde_json::to_string(&sealed).expect("sealed form serializes");
+	assert!(!stored.contains("CANARY"), "no token may appear in the stored form");
+
+	let opened = keys
+		.open("record-a", &sealed)
+		.expect("its own record opens it");
+	assert_eq!(opened.refresh_token.as_deref(), Some("REFRESH-CANARY"));
+	assert_eq!(opened.access_token.as_deref(), Some("ACCESS-CANARY"));
+
+	assert!(
+		keys.open("record-b", &sealed).is_err(),
+		"material moved onto another record must not open"
+	);
+
+	let mut tampered = sealed;
+	let first = if tampered.data.starts_with('A') { "B" } else { "A" };
+	tampered.data.replace_range(0..1, first);
+	assert!(keys.open("record-a", &tampered).is_err(), "tampered material must not open");
+}
+
+#[test]
+fn rotation_opens_with_previous_keys_and_seals_with_the_current_one() {
+	let old = super::seal::Keys::new(Some(&grant_key(1)), &[]).expect("valid key");
+	let sealed = old
+		.seal("record", &material("R1"))
+		.expect("sealing succeeds")
+		.expect("a current key seals");
+
+	let rotated =
+		super::seal::Keys::new(Some(&grant_key(2)), &[grant_key(1)]).expect("valid keys");
+	let opened = rotated
+		.open("record", &sealed)
+		.expect("a previous key still opens");
+	assert_eq!(opened.refresh_token.as_deref(), Some("R1"));
+
+	let resealed = rotated
+		.seal("record", &material("R1"))
+		.expect("sealing succeeds")
+		.expect("a current key seals");
+	assert_eq!(Some(resealed.kid.as_str()), rotated.current_kid());
+	assert_ne!(resealed.kid, sealed.kid);
+
+	let forgotten = super::seal::Keys::new(Some(&grant_key(2)), &[]).expect("valid key");
+	assert!(forgotten.open("record", &sealed).is_err(), "a removed key must not open");
+}
+
+#[test]
+fn malformed_grant_keys_are_refused_without_echoing_them() {
+	let short: String = grant_key(1).chars().take(40).collect();
+	for key in ["KEY-CANARY", short.as_str(), "=====", ""] {
+		let error = super::seal::Keys::new(Some(key), &[]).expect_err("malformed key is refused");
+		assert!(!error.to_string().contains("KEY-CANARY"));
+	}
+
+	let unkeyed = super::seal::Keys::new(None, &[]).expect("no key is valid");
+	assert!(
+		unkeyed
+			.seal("record", &material("R1"))
+			.expect("sealing without a key succeeds")
+			.is_none(),
+		"without a key nothing is sealed"
+	);
+}
+
+#[tokio::test]
+async fn a_missing_grant_never_outranks_an_answer_and_never_masks_a_refusal() {
+	let outcome = rechecks(vec![authorization(true), authorization(true)], vec![
+		Recheck::NoGrant("cleared".into()),
+		Recheck::Allowed,
+	])
+	.await;
+	assert!(matches!(outcome, Some(Recheck::Allowed)));
+
+	let outcome =
+		rechecks(vec![authorization(true)], vec![Recheck::NoGrant("cleared".into())]).await;
+	assert!(matches!(outcome, Some(Recheck::NoGrant(_))));
+
+	let outcome = rechecks(vec![authorization(true), authorization(true)], vec![
+		Recheck::NoGrant("cleared".into()),
+		Recheck::Denied("revoked".into()),
+	])
+	.await;
+	assert!(matches!(outcome, Some(Recheck::Denied(_))));
+
+	let outcome = rechecks(vec![authorization(true), authorization(true)], vec![
+		Recheck::Unavailable("outage".into()),
+		Recheck::NoGrant("cleared".into()),
+	])
+	.await;
+	assert!(matches!(outcome, Some(Recheck::Unavailable(_))));
+}
+
+#[test]
+fn clearing_a_grant_keeps_its_identity_and_drops_every_credential() {
+	let session = Session {
+		sess_id: Some("record".to_owned()),
+		idp_id: Some("provider".to_owned()),
+		user_id: Some(ruma::user_id!("@alice:example.test").to_owned()),
+		user_info: Some(super::UserInfo {
+			sub: "subject".to_owned(),
+			..Default::default()
+		}),
+		refresh_token: Some("stored-refresh".to_owned()),
+		code_verifier: Some("verifier".to_owned()),
+		device_id: Some("DEVICE".into()),
+		login_token_hash: Some("hash".to_owned()),
+		..Default::default()
+	};
+	assert!(session.has_grant());
+
+	let cleared = session.cleared();
+	assert!(!cleared.has_grant());
+	assert!(cleared.code_verifier.is_none() && cleared.login_token_hash.is_none());
+	assert!(cleared.device_id.is_none() && cleared.sealed.is_none());
+	assert_eq!(cleared.sess_id.as_deref(), Some("record"));
+	assert_eq!(
+		cleared
+			.user_id
+			.as_deref()
+			.map(ruma::UserId::as_str),
+		Some("@alice:example.test")
+	);
+	assert_eq!(cleared.user_info.map(|info| info.sub).as_deref(), Some("subject"));
+}

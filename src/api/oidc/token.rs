@@ -297,6 +297,10 @@ async fn token_refresh(services: &Services, body: &TokenRequest) -> Result<Respo
 		.await
 	{
 		| RefreshToken::Current { user_id, device_id, expires_at } => {
+			// Same refresh-time upstream re-check as the client-server refresh
+			// endpoint: a second token endpoint must not be the way around it.
+			crate::client::upstream_gate(services, &user_id, &device_id).await?;
+
 			if expires_at.is_some_and(timepoint_has_passed) {
 				services
 					.server
@@ -332,6 +336,8 @@ async fn token_refresh(services: &Services, body: &TokenRequest) -> Result<Respo
 		},
 
 		| RefreshToken::Replayed { user_id, device_id, current, grace } if grace => {
+			crate::client::upstream_gate(services, &user_id, &device_id).await?;
+
 			// Benign double-submit: re-issue an access token for the unchanged
 			// refresh token rather than rotating it.
 			let (access_token, expires_in) = services.users.generate_access_token(true);

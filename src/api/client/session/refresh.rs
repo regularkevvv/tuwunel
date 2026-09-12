@@ -130,39 +130,70 @@ pub(crate) async fn refresh_token_route(
 /// ADR-0004 makes a successful upstream policy re-check a precondition for a
 /// new Matrix access token, which is what turns a short `access_token_ttl`
 /// into a bound on how long a revoked or newly-denied identity keeps a Matrix
-/// session. Providers that do not opt in through `require_upstream_refresh`,
+/// session. The grant re-checked is the one this device's own sign-in
+/// obtained. Providers that do not opt in through `require_upstream_refresh`,
 /// and accounts that never came through SSO, pass straight through.
 ///
-/// A refusal removes the device and answers `M_UNKNOWN_TOKEN` with
-/// `soft_logout: false`: the identity is gone, not merely stale, so the client
-/// must not keep the device and retry. An unreachable provider or unreadable
-/// authorization state answers `M_CONNECTION_FAILED` (HTTP 502) and revokes
-/// nothing. No new access token is issued; existing expiring tokens retain
-/// only their original lifetime, without an outage-based extension.
+/// - A refusal from the provider is a statement about the identity, not the
+///   device: every session of the account is revoked and every stored grant
+///   cleared, then `M_UNKNOWN_TOKEN` with `soft_logout: false` is answered.
+/// - A device that holds no upstream grant of its own is revoked alone.
+/// - An unreachable provider or unreadable authorization state answers
+///   `M_CONNECTION_FAILED` (HTTP 502) and revokes nothing. No new access token
+///   is issued; existing expiring tokens retain only their original lifetime,
+///   without an outage-based extension.
 ///
-/// Audit lines carry the user, device and provider only. No access token,
+/// Audit lines carry the user, device and outcome only. No access token,
 /// refresh token, authorization code or upstream grant is logged (plan.md,
 /// non-negotiable invariant 7).
-async fn upstream_gate(services: &Services, user_id: &UserId, device_id: &DeviceId) -> Result {
-	match services.oauth.recheck_user(user_id).await {
+pub(crate) async fn upstream_gate(
+	services: &Services,
+	user_id: &UserId,
+	device_id: &DeviceId,
+) -> Result {
+	match services
+		.oauth
+		.recheck_device(user_id, device_id)
+		.await
+	{
 		| None | Some(Recheck::Allowed) => Ok(()),
 
 		| Some(Recheck::Denied(reason)) => {
+			let devices = services.oauth.revoke_user_sessions(user_id).await;
+
 			warn!(
+				audit = "upstream_denied",
 				%user_id,
 				%device_id,
+				devices,
 				%reason,
-				"Upstream identity provider refused the session; revoking the device.",
+				"Upstream identity provider refused the grant; revoked every session of the \
+				 account.",
 			);
 
+			Err(Error::BadRequest(
+				ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: false }),
+				"The identity provider no longer authorizes this account.",
+			))
+		},
+
+		| Some(Recheck::NoGrant(reason)) => {
 			services
 				.users
 				.remove_device(user_id, device_id)
 				.await;
 
+			warn!(
+				audit = "grant_missing",
+				%user_id,
+				%device_id,
+				%reason,
+				"Session holds no upstream grant of its own; revoked the device.",
+			);
+
 			Err(Error::BadRequest(
 				ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: false }),
-				"The identity provider no longer authorizes this session.",
+				"This session holds no upstream authorization.",
 			))
 		},
 

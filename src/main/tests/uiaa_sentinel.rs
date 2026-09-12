@@ -79,7 +79,7 @@ async fn exercise(services: &Services) -> Result {
 			user_id: Some(user_id.clone()),
 			..Default::default()
 		})
-		.await;
+		.await?;
 
 	if try_wrong_password(services, &user_id, &info).await? {
 		return Err!("a password sentinel must not satisfy UIAA with an OAuth session");

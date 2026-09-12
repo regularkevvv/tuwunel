@@ -43,7 +43,9 @@ pub fn find_user_association_pending(
 		"Expecting at least one claim from user_info such as `sub`"
 	);
 
-	debug!(?idp_id, ?claiming, "finding pending association",);
+	// Claim values carry personal data such as email addresses; only their
+	// count is recorded.
+	debug!(?idp_id, claims = claiming.len(), "finding pending association");
 	self.association_pending
 		.lock()
 		.expect("locked")
@@ -51,7 +53,7 @@ pub fn find_user_association_pending(
 		.into_iter()
 		.flat_map(Claimants::iter)
 		.find_map(|(user_id, claimant)| {
-			trace!(?user_id, ?claimant, "checking against pending association");
+			trace!(?user_id, claims = claimant.len(), "checking against pending association");
 
 			assert!(
 				!claimant.is_empty(),

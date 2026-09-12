@@ -1827,6 +1827,33 @@ pub struct Config {
 	#[serde(default)]
 	pub refresh_token_required: bool,
 
+	/// Key that seals stored upstream OAuth grants: 32 random bytes as URL-safe
+	/// base64 without padding.
+	///
+	/// With a key set, the access, refresh and ID tokens an identity provider
+	/// issued are sealed with AES-256-GCM, bound to their own record, before
+	/// they are written, so a database export or backup discloses none of them.
+	/// Grants written before a key was set are resealed by their next write
+	/// and by the periodic maintenance pass. Without a key they are stored
+	/// unsealed, and a warning is logged at startup when an identity provider
+	/// is configured.
+	///
+	/// Generate one with `openssl rand 32 | basenc --base64url | tr -d =`.
+	///
+	/// display: sensitive
+	pub oauth_grant_key: Option<String>,
+
+	/// Keys that sealed upstream grants before the current `oauth_grant_key`.
+	///
+	/// They only open grants: every grant opened with one is resealed with the
+	/// current key on its next write. Remove a key once maintenance has
+	/// resealed every grant it sealed.
+	///
+	/// display: sensitive
+	/// default: []
+	#[serde(default)]
+	pub oauth_grant_previous_keys: Vec<String>,
+
 	/// Enable native registration and login on the built-in OIDC provider
 	/// (next-gen auth), authenticating Matrix clients against this server's own
 	/// accounts without a third-party `identity_provider`.

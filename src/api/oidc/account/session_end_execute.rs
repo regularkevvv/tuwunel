@@ -29,6 +29,11 @@ pub(super) async fn session_end_execute_html(
 		.remove_device(user_id, &device_id_owned)
 		.await;
 
+	services
+		.oauth
+		.clear_device_grants(user_id, &device_id_owned)
+		.await;
+
 	info!(?user_id, ?device_id_owned, "Session signed out via account management page");
 
 	Ok(PAGE_HTML

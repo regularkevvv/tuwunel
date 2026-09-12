@@ -27,7 +27,7 @@ use tuwunel_service::users::device::generate_refresh_token;
 use self::{ldap::ldap_login, password::password_login};
 pub(crate) use self::{
 	logout::{logout_all_route, logout_route},
-	refresh::refresh_token_route,
+	refresh::{refresh_token_route, upstream_gate},
 	sso::{
 		sso_callback_route, sso_complete_js_route, sso_css_route, sso_fallback_route,
 		sso_login_route, sso_login_with_provider_route,
@@ -129,10 +129,11 @@ pub(crate) async fn login_route(
 			jwt::handle_login(&services, &body, info).await?,
 		| LoginInfo::ApplicationService(info) =>
 			appservice::handle_login(&services, &body, info)?,
+		// The raw body is never recorded: with password login disabled, a
+		// password attempt lands here and its body carries the password.
 		| _ => {
 			return Err!(Request(Unknown(debug_warn!(
 				?body.login_info,
-				?body.json_body,
 				"Invalid or unsupported login type",
 			))));
 		},
@@ -192,6 +193,25 @@ pub(crate) async fn login_route(
 			)
 			.await?
 	};
+
+	// A token login that finishes an SSO sign-in binds the upstream grant that
+	// sign-in obtained to this device, so the grant's refresh-time re-check,
+	// logout and revocation follow the device (ADR-0004). A device left without
+	// its grant would be revoked at its first refresh, so a failed binding
+	// fails the login rather than issuing that device.
+	if let LoginInfo::Token(info) = &body.login_info
+		&& let Err(error) = services
+			.oauth
+			.bind_login_device(&user_id, &info.token, &device_id)
+			.await
+	{
+		services
+			.users
+			.remove_device(&user_id, &device_id)
+			.await;
+
+		return Err(error);
+	}
 
 	info!("{user_id} logged in");
 

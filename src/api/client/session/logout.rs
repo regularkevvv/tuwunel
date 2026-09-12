@@ -1,24 +1,9 @@
 use axum::extract::State;
 use futures::StreamExt;
-use ruma::{
-	UserId,
-	api::client::session::{logout, logout_all},
-};
-use tuwunel_core::Result;
-use tuwunel_service::Services;
+use ruma::api::client::session::{logout, logout_all};
+use tuwunel_core::{Result, info};
 
 use crate::{ClientIp, Ruma};
-
-/// Drop the upstream OIDC grant a user still has stored.
-///
-/// ADR-0004 requires logout to remove the session *and* the stored grant, so a
-/// signed-out account leaves no refresh token behind that could re-open one.
-/// The identity association survives: it maps `(iss, sub)` to this account, and
-/// deleting it would make the next sign-in look like a new identity and
-/// register a second account.
-async fn clear_upstream_grant(services: &Services, user_id: &UserId) {
-	services.oauth.clear_user_grants(user_id).await;
-}
 
 /// # `POST /_matrix/client/v3/logout`
 ///
@@ -29,27 +14,44 @@ async fn clear_upstream_grant(services: &Services, user_id: &UserId) {
 ///   last seen ts)
 /// - Forgets to-device events
 /// - Triggers device list updates
+/// - Clears the upstream grant this device's sign-in obtained (ADR-0004: logout
+///   removes the session *and* its stored grant)
+///
+/// Other devices hold grants of their own and keep them. The identity
+/// association survives: it maps `(iss, sub)` to this account, and deleting it
+/// would make the next sign-in look like a new identity and register a second
+/// account.
 #[tracing::instrument(skip_all, fields(%client), name = "logout")]
 pub(crate) async fn logout_route(
 	State(services): State<crate::State>,
 	ClientIp(client): ClientIp,
 	body: Ruma<logout::v3::Request>,
 ) -> Result<logout::v3::Response> {
+	let user_id = body.sender_user();
+	let device_id = body.sender_device()?;
+
 	services
 		.users
-		.remove_device(body.sender_user(), body.sender_device()?)
+		.remove_device(user_id, device_id)
 		.await;
 
-	// Only the last device out clears the grant: another device of the same user
-	// still needs it for its own refresh-time policy re-check.
+	services
+		.oauth
+		.clear_device_grants(user_id, device_id)
+		.await;
+
+	// A grant obtained before grants were bound to devices backs every device
+	// that has none of its own, so only the last device out clears it.
 	if services
 		.users
-		.all_device_ids(body.sender_user())
+		.all_device_ids(user_id)
 		.count()
 		.await == 0
 	{
-		clear_upstream_grant(&services, body.sender_user()).await;
+		services.oauth.clear_user_grants(user_id).await;
 	}
+
+	info!(audit = "logout", %user_id, %device_id, "Device signed out.");
 
 	Ok(logout::v3::Response::new())
 }
@@ -63,6 +65,7 @@ pub(crate) async fn logout_route(
 ///   last seen ts)
 /// - Forgets all to-device events
 /// - Triggers device list updates
+/// - Clears every stored upstream grant of the account
 ///
 /// Note: This is equivalent to calling [`GET
 /// /_matrix/client/r0/logout`](fn.logout_route.html) from each device of this
@@ -73,17 +76,17 @@ pub(crate) async fn logout_all_route(
 	ClientIp(client): ClientIp,
 	body: Ruma<logout_all::v3::Request>,
 ) -> Result<logout_all::v3::Response> {
+	let user_id = body.sender_user();
+
 	services
 		.users
-		.all_device_ids(body.sender_user())
-		.for_each(|device_id| {
-			services
-				.users
-				.remove_device(body.sender_user(), device_id)
-		})
+		.all_device_ids(user_id)
+		.for_each(|device_id| services.users.remove_device(user_id, device_id))
 		.await;
 
-	clear_upstream_grant(&services, body.sender_user()).await;
+	services.oauth.clear_user_grants(user_id).await;
+
+	info!(audit = "logout_all", %user_id, "Every device of the account signed out.");
 
 	Ok(logout_all::v3::Response::new())
 }

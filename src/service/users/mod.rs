@@ -169,10 +169,11 @@ impl Service {
 
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
-		// Revoke any SSO authorizations
+		// Revoke and drop every stored upstream grant. The identity association
+		// stays, so the identity cannot provision a second account (ADR-0004).
 		self.services
 			.oauth
-			.revoke_user_tokens(user_id)
+			.clear_user_grants(user_id)
 			.await;
 
 		// Remove all associated devices
@@ -571,7 +572,7 @@ impl Service {
 		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
 
 		if expires_at < utils::millis_since_unix_epoch() {
-			trace!(?user_id, ?token, "Removing expired login token");
+			trace!(?user_id, "Removing expired login token");
 			self.db
 				.logintoken_expiresatuserid
 				.remove(token)
@@ -596,7 +597,7 @@ impl Service {
 		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
 
 		if expires_at < utils::millis_since_unix_epoch() {
-			trace!(?user_id, ?token, "Removing expired login token");
+			trace!(?user_id, "Removing expired login token");
 
 			self.db
 				.logintoken_expiresatuserid

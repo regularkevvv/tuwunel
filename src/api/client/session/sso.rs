@@ -5,7 +5,7 @@ use std::{borrow::Cow, collections::BTreeMap, net::IpAddr, time::Duration};
 use axum::extract::State;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as b64};
-use futures::{FutureExt, TryFutureExt, future::try_join};
+use futures::{TryFutureExt, future::try_join};
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use ruma::{
 	Mxc, OwnedMxcUri, OwnedUserId, ServerName, UserId,
@@ -21,7 +21,6 @@ use tuwunel_core::{
 	itertools::Itertools,
 	utils,
 	utils::{
-		OptionExt,
 		content_disposition::make_content_disposition,
 		hash::sha256,
 		result::{FlatOk, LogErr},
@@ -216,6 +215,18 @@ async fn handle_sso_login(
 	// is both a database filler and a way to farm authorization URLs.
 	services.oauth.check_rate_limit(*client)?;
 
+	// A login token in a sign-in link used to bind the identity that completes
+	// the sign-in to the token's account. Whoever crafts that link chooses the
+	// account a victim's identity is bound to — a login CSRF that silently
+	// re-links the victim — so identities are linked explicitly by an operator
+	// (`query oauth associate`) instead.
+	if login_token.is_some() {
+		return Err!(Request(Forbidden(
+			"Linking an identity through a login token is disabled; an operator links \
+			 identities explicitly."
+		)));
+	}
+
 	let redirect_url: Url = redirect_url.parse().map_err(|e| {
 		err!(Request(InvalidParam(debug_warn!(
 			?e,
@@ -321,16 +332,10 @@ async fn handle_sso_login(
 			.map(timepoint_from_now)
 			.transpose()?,
 
-		user_id: login_token
-			.as_deref()
-			.map_async(|token| services.users.find_from_login_token(token))
-			.map(FlatOk::flat_ok)
-			.await,
-
 		..Default::default()
 	};
 
-	services.oauth.sessions.put(&session).await;
+	services.oauth.sessions.put(&session).await?;
 
 	Ok(sso_login_with_provider::v3::Response {
 		location: location.into(),
@@ -500,9 +505,18 @@ pub(crate) async fn sso_callback_route(
 		.commit_identity_session(&unique_id, complete_identity)
 		.await?;
 
+	// The identity's previous record stays while a device still relies on it:
+	// it is bound to that device, or it predates device binding and backs the
+	// account's unbound devices. Only a record left without a grant goes.
 	if let Some(old_sess_id) = old_sess_id
 		.as_deref()
 		.filter(is_not_equal_to!(&sess_id))
+		&& services
+			.oauth
+			.sessions
+			.get(old_sess_id)
+			.await
+			.is_ok_and(|old| !old.has_grant() && old.device_id.is_none())
 	{
 		services.oauth.sessions.delete(old_sess_id).await;
 	}
@@ -523,6 +537,15 @@ pub(crate) async fn sso_callback_route(
 		.as_ref()
 		.filter(|url| url.scheme() == "uiaa")
 	{
+		// A user-interactive authentication step needs the identity proven, not
+		// a grant kept: no device refreshes through this one, and left in place
+		// it would back the account's unbound devices. The record, and with it
+		// the identity association, stays.
+		services
+			.oauth
+			.clear_session_grant(sess_id)
+			.await?;
+
 		return handle_uiaa(&services, &user_id, cookie, redirect_url).await;
 	}
 
@@ -707,6 +730,16 @@ async fn finalize_login_redirect(
 		.create_login_token(user_id, &login_token)
 		.await;
 
+	// Remember which login token this grant was issued with, so redeeming the
+	// token binds the grant to the device it creates.
+	if let Some(sess_id) = session.sess_id.as_deref() {
+		services
+			.oauth
+			.sessions
+			.bind_login_token(sess_id, &login_token)
+			.await?;
+	}
+
 	let location = next_idp_url
 		.or_else(|| session.redirect_url.clone())
 		.ok_or_else(|| err!(Request(InvalidParam("Missing redirect URL in session data"))))?
@@ -868,12 +901,7 @@ async fn decide_user_id(
 		.sessions
 		.find_user_association_pending(provider.id(), userinfo)
 	{
-		debug_info!(
-			provider = ?provider.id(),
-			?user_id,
-			?userinfo,
-			"Matched pending association"
-		);
+		debug_info!(provider = ?provider.id(), ?user_id, "Matched pending association");
 
 		return Ok(user_id);
 	}
