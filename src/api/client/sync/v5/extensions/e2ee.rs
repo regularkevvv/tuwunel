@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 
 use futures::{
-	FutureExt, StreamExt, TryFutureExt,
+	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 	future::{join, join3},
-	stream::once,
 };
 use ruma::{
 	OwnedUserId, RoomId,
@@ -14,13 +13,13 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Result, error,
+	Error, Result, error,
 	matrix::{Event, pdu::PduCount},
 	pair_of,
 	utils::{
-		BoolExt, FutureBoolExt, IterStream, ReadyExt, TryFutureExtExt,
+		BoolExt, FutureBoolExt, IterStream, ReadyExt, TryFutureExtExt, TryReadyExt,
 		future::{OptionFutureExt, OptionStream, ReadyBoolExt},
-		stream::BroadbandExt,
+		stream::TryBroadbandExt,
 	},
 };
 use tuwunel_service::sync::Connection;
@@ -44,19 +43,19 @@ pub(super) async fn collect(
 		.collect::<HashSet<_>>()
 		.map(|changed| (changed, HashSet::new()));
 
-	let (changed, left) = (HashSet::new(), HashSet::new());
-	let (changed, left) = services
+	let room_changes = services
 		.state_cache
 		.rooms_joined(sender_user)
 		.map(ToOwned::to_owned)
-		.broad_filter_map(async |room_id| collect_room(sync_info, conn, &room_id).await.ok())
-		.chain(once(keys_changed))
-		.ready_fold((changed, left), |(mut changed, mut left), room| {
-			changed.extend(room.0);
-			left.extend(room.1);
-			(changed, left)
-		})
-		.await;
+		.map(Ok::<_, Error>)
+		.broad_and_then(async |room_id| collect_room(sync_info, conn, &room_id).await)
+		.try_collect::<Vec<_>>();
+
+	let (room_changes, (mut changed, mut left)) = join(room_changes, keys_changed).await;
+	for (room_changed, room_left) in room_changes? {
+		changed.extend(room_changed);
+		left.extend(room_left);
+	}
 
 	let left = left
 		.into_iter()
@@ -189,28 +188,57 @@ async fn collect_room(
 			.into_future()
 	});
 
-	services
+	let changed_members = services
 		.state_accessor
-		.state_added((since_shortstatehash, current_shortstatehash))
-		.broad_filter_map(async |(_shortstatekey, shorteventid)| {
-			services
+		.state_added_strict((since_shortstatehash, current_shortstatehash))
+		.map_err(|_| Error::bad_database("Incomplete E2EE state delta"))
+		.broad_and_then(async |(shortstatekey, shorteventid)| {
+			let (event_type, state_key) = services
+				.short
+				.get_statekey_from_short(shortstatekey)
+				.map_err(|_| Error::bad_database("Incomplete E2EE state key mapping"))
+				.await?;
+
+			if event_type != StateEventType::RoomMember
+				|| state_key.as_str() == sender_user.as_str()
+			{
+				return Ok(None);
+			}
+
+			let event = services
 				.timeline
 				.get_pdu_from_shorteventid(shorteventid)
-				.ok()
-				.await
-		})
-		.ready_filter(|event| *event.kind() == TimelineEventType::RoomMember)
-		.ready_filter(|event| {
-			event
-				.state_key()
-				.is_some_and(|state_key| state_key != sender_user)
-		})
-		.ready_filter_map(|event| {
-			let content: RoomMemberEventContent = event.get_content().ok()?;
-			let user_id: OwnedUserId = event.state_key()?.parse().ok()?;
+				.map_err(|_| Error::bad_database("Incomplete E2EE state event"))
+				.await?;
 
-			Some((content.membership, user_id))
+			Ok(Some((state_key, event)))
 		})
+		.ready_try_filter_map(Result::Ok)
+		.try_collect::<Vec<_>>()
+		.await?
+		.into_iter()
+		.map(|(expected_state_key, event)| -> Result<_> {
+			if *event.kind() != TimelineEventType::RoomMember {
+				return Err(Error::bad_database("Mismatched E2EE membership event"));
+			}
+			if event.state_key() != Some(expected_state_key.as_str()) {
+				return Err(Error::bad_database("Mismatched E2EE membership state key"));
+			}
+
+			let content: RoomMemberEventContent = event
+				.get_content()
+				.map_err(|_| Error::bad_database("Malformed E2EE membership event"))?;
+			let user_id: OwnedUserId = expected_state_key
+				.parse()
+				.map_err(|_| Error::bad_database("Malformed E2EE membership state key"))?;
+
+			Ok((content.membership, user_id))
+		})
+		.collect::<Result<Vec<_>>>()?;
+
+	changed_members
+		.into_iter()
+		.stream()
 		.chain(joined_members_burst.stream())
 		.fold(lists, async |(mut changed, mut left), (membership, user_id)| {
 			use MembershipState::*;
