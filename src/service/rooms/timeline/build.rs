@@ -122,6 +122,9 @@ pub async fn build_and_append_pdu_with_txnid(
 	// fail.
 	let statehashid = self.services.state.append_to_state(&pdu).await?;
 
+	// The append makes `statehashid` the room's current state once the pdu is
+	// stored and before its count retires, so a sync never delivers the pdu
+	// without the state it produced.
 	let pdu_id = self
 		.append_pdu_with_txnid(
 			&pdu,
@@ -130,16 +133,10 @@ pub async fn build_and_append_pdu_with_txnid(
 			// of the room
 			once(pdu.event_id()),
 			txnid,
+			Some(statehashid),
 			state_lock,
 		)
 		.boxed()
-		.await?;
-
-	// We set the room state after inserting the pdu, so that we never have a moment
-	// in time where events in the current room state do not exist
-	self.services
-		.state
-		.set_room_state(pdu.room_id(), statehashid, state_lock)
 		.await?;
 
 	let mut servers: HashSet<OwnedServerName> = self

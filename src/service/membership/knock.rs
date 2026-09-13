@@ -287,6 +287,7 @@ async fn finalize_knock_membership(
 			&parsed_knock_pdu,
 			knock_event,
 			once(parsed_knock_pdu.event_id.borrow()),
+			None,
 			state_lock,
 		)
 		.await?;
@@ -379,23 +380,18 @@ async fn knock_room_helper_remote(
 		})
 		.await?;
 
-	info!("Appending room knock event locally");
+	info!("Appending room knock event locally and setting final room state");
+	// The append makes the state after the knock current once the pdu is stored
+	// and before the pdu is published.
 	self.services
 		.timeline
 		.append_pdu(
 			&parsed_knock_pdu,
 			knock_event,
 			once(parsed_knock_pdu.event_id.borrow()),
+			Some(statehash_after_knock),
 			state_lock,
 		)
-		.await?;
-
-	info!("Setting final room state for new room");
-	// We set the room state after inserting the pdu, so that we never have a moment
-	// in time where events in the current room state do not exist
-	self.services
-		.state
-		.set_room_state(room_id, statehash_after_knock, state_lock)
 		.await?;
 
 	Ok(())
