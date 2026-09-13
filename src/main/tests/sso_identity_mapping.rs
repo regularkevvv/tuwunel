@@ -8,7 +8,10 @@
 //! - a returning identity keeps its account when its username and email change;
 //! - a second identity claiming a name already taken gets a distinct,
 //!   deterministic fallback id and never the other account;
-//! - no identity can claim the server account's localpart;
+//! - no identity can claim the server account's localpart, nor any localpart
+//!   the product image reserves for operator, system and recovery accounts
+//!   (`forbidden_usernames` in the template's homeserver/tuwunel.toml): asking
+//!   for one through its username or email gets the identity's generated id;
 //! - the first account created this way is not made an administrator, with
 //!   `grant_admin_to_first_user = false` as the product configures it
 //!   (homeserver/tuwunel.toml);
@@ -47,6 +50,50 @@ const GRANT_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
 
 const REDIRECT: &str = "im.fluffychat.auth:/login";
 
+/// The product image's `forbidden_usernames` (the template's
+/// homeserver/tuwunel.toml): operator, system and recovery names.
+const RESERVED_PATTERNS: [&str; 16] = [
+	"^admin(istrator)?$",
+	"^root$",
+	"^system$",
+	"^server$",
+	"^operator$",
+	"^support$",
+	"^security$",
+	"^abuse$",
+	"^postmaster$",
+	"^hostmaster$",
+	"^webmaster$",
+	"^no-?reply$",
+	"^matrix$",
+	"^tuwunel$",
+	"^recovery$",
+	"^break-?glass$",
+];
+
+/// Every localpart the patterns above match.
+const RESERVED_LOCALPARTS: [&str; 19] = [
+	"admin",
+	"administrator",
+	"root",
+	"system",
+	"server",
+	"operator",
+	"support",
+	"security",
+	"abuse",
+	"postmaster",
+	"hostmaster",
+	"webmaster",
+	"noreply",
+	"no-reply",
+	"matrix",
+	"tuwunel",
+	"recovery",
+	"breakglass",
+	"break-glass",
+];
+
 /// The userinfo the provider fixture answers with, and the grants it issued.
 struct Fixture {
 	userinfo: Value,
@@ -75,6 +122,14 @@ fn sso_identities_map_by_subject_and_never_take_another_account() -> Result {
 		"refresh_token_required=true".to_owned(),
 		// As the product configures it (homeserver/tuwunel.toml).
 		"grant_admin_to_first_user=false".to_owned(),
+		format!(
+			"forbidden_usernames=[{}]",
+			RESERVED_PATTERNS
+				.iter()
+				.map(|pattern| format!("\"{pattern}\""))
+				.collect::<Vec<_>>()
+				.join(", ")
+		),
 		format!("oauth_grant_key=\"{GRANT_KEY}\""),
 		"sso_allowed_redirect_hosts=[\"im.fluffychat.auth\"]".to_owned(),
 		"identity_provider.test.brand=\"test\"".to_owned(),
@@ -177,6 +232,34 @@ async fn exercise(services: &Services, client: &Client, base: &str, fixture: &Sh
 	)
 	.await?;
 	assert_ne!(&third, server_user, "an SSO identity signed in as the server account");
+
+	// No identity can claim a localpart the image reserves, through its username
+	// or its email: each gets its own generated id, and the reserved account is
+	// never created.
+	let server = services.globals.server_name();
+	for (n, reserved) in RESERVED_LOCALPARTS.into_iter().enumerate() {
+		let user = sign_in_as(
+			client,
+			base,
+			fixture,
+			&format!("subject-reserved-{n}"),
+			reserved,
+			&format!("{reserved}@example.test"),
+		)
+		.await?;
+		assert_ne!(user.localpart(), reserved, "an SSO identity claimed the reserved {reserved}");
+		assert!(
+			(15..=23).contains(&user.localpart().len()),
+			"asking for {reserved} must yield the identity's generated id: {}",
+			user.localpart()
+		);
+		let reserved_id = OwnedUserId::try_from(format!("@{reserved}:{server}"))
+			.map_err(|error| err!("invalid user id: {error}"))?;
+		assert!(
+			!services.users.exists(&reserved_id).await,
+			"the reserved account {reserved_id} was created"
+		);
+	}
 
 	init(&services.admin);
 	let linked = operator_association(services, client, base, fixture).await;
