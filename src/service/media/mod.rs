@@ -255,8 +255,19 @@ impl Service {
 			return Err!(Request(NotFound("Pending media ID expired")));
 		}
 
-		self.create(mxc, Some(user), content_disposition, content_type, file)
-			.await?;
+		// The content and its charge commit before the pending entry is removed.
+		// A retry after only the first landed is refused before any charge
+		// (`admit`). It then finishes that removal, so the ID answers as any
+		// other ID with content does.
+		let stored = self
+			.create(mxc, Some(user), content_disposition, content_type, file)
+			.await;
+
+		if let Err(e) = &stored
+			&& e.kind() != ErrorKind::CannotOverwriteMedia
+		{
+			return stored;
+		}
 
 		self.db.remove_pending_mxc(mxc).await?;
 
@@ -267,7 +278,7 @@ impl Service {
 			notifier.notify_waiters();
 		}
 
-		Ok(())
+		stored
 	}
 
 	/// Uploads a file, charging it to its uploader's or origin server's quota.
@@ -307,7 +318,7 @@ impl Service {
 				| None => None,
 			};
 			let charge = match owner {
-				| Some(owner) => Some((owner, self.admit(owner, len).await?)),
+				| Some(owner) => Some((owner, self.admit(owner, mxc, len).await?)),
 				| None => None,
 			};
 

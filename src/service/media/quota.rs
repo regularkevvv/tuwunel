@@ -29,6 +29,8 @@ use tuwunel_core::{
 	utils::stream::{BroadbandExt, IterStream, ReadyExt},
 };
 
+use super::Dim;
+
 /// Whose byte quota a stored object counts against.
 #[derive(Clone, Copy, Debug)]
 pub enum Owner<'a> {
@@ -74,8 +76,23 @@ pub(super) fn quota_owner<'a>(
 /// when that passes the owner's quota; a zero quota counts without limiting.
 /// The caller holds the owner's quota lock and writes the total with the
 /// object's record.
+///
+/// A user is charged once per media ID. When `mxc` already has its original
+/// recorded, the upload is refused with `M_CANNOT_OVERWRITE_MEDIA` rather
+/// than charged again. A retried upload whose first attempt stored the
+/// content, or one racing another to the same ID, is caught here, under the
+/// lock the first attempt charged under.
 #[implement(super::Service)]
-pub(super) async fn admit(&self, owner: Owner<'_>, len: u64) -> Result<u64> {
+pub(super) async fn admit(&self, owner: Owner<'_>, mxc: &Mxc<'_>, len: u64) -> Result<u64> {
+	if matches!(owner, Owner::User(_))
+		&& self
+			.db
+			.file_metadata_exists(mxc, &Dim::default())
+			.await
+	{
+		return Err!(Request(CannotOverwriteMedia("Media ID already has content")));
+	}
+
 	let next = self.usage_locked(owner).await.saturating_add(len);
 	let config = &self.services.server.config;
 	let limit = match owner {
