@@ -136,11 +136,15 @@ pub struct Pdu {
 	pub unsigned: Option<Unsigned>,
 
 	//TODO: https://spec.matrix.org/v1.14/rooms/v11/#rejected-events
-	/// Whether state resolution rejected this event in test fixtures.
+	/// Whether state resolution rejected this event, as set by test fixtures.
 	///
-	/// Production builds derive rejection state outside the serialized PDU.
-	#[cfg(test)]
-	#[serde(default, skip_serializing)]
+	/// Production code never sets it, so it stays false there: rejection state
+	/// is derived outside the PDU. It is never read from or written to the
+	/// wire (outside core's own tests, whose JSON fixtures may carry it), so a
+	/// remote event cannot claim it. It exists in every build so the service's
+	/// state-resolution tests can mark events rejected.
+	#[cfg_attr(test, serde(default, skip_serializing))]
+	#[cfg_attr(not(test), serde(skip))]
 	pub rejected: bool,
 }
 
@@ -333,13 +337,8 @@ where
 	#[inline]
 	fn redacts(&self) -> Option<&EventId> { self.redacts.as_deref() }
 
-	#[cfg(test)]
 	#[inline]
 	fn rejected(&self) -> bool { self.rejected }
-
-	#[cfg(not(test))]
-	#[inline]
-	fn rejected(&self) -> bool { false }
 
 	#[inline]
 	fn room_id(&self) -> &RoomId { &self.room_id }
@@ -404,13 +403,8 @@ where
 	#[inline]
 	fn redacts(&self) -> Option<&EventId> { self.redacts.as_deref() }
 
-	#[cfg(test)]
 	#[inline]
 	fn rejected(&self) -> bool { self.rejected }
-
-	#[cfg(not(test))]
-	#[inline]
-	fn rejected(&self) -> bool { false }
 
 	#[inline]
 	fn room_id(&self) -> &RoomId { &self.room_id }

@@ -488,7 +488,7 @@ pub(super) fn to_init_pdu_event(
 		prev_events: Default::default(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	}
 }
 
@@ -537,7 +537,7 @@ where
 		prev_events,
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	}
 }
 
@@ -591,7 +591,7 @@ where
 		prev_events,
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	}
 }
 
@@ -638,7 +638,7 @@ where
 		prev_events,
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	}
 }
 
@@ -674,7 +674,7 @@ pub(super) fn room_create_hydra_pdu_event(
 		prev_events: Default::default(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	}
 }
 

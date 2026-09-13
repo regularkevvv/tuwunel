@@ -145,6 +145,7 @@ pub async fn create_hash_and_sign_event(
 			})
 			.map(|pdu| pdu.event_id.clone())
 			.collect(),
+		rejected: false,
 	};
 
 	let auth_fetch = async |k: StateEventType, s: StateKey| {

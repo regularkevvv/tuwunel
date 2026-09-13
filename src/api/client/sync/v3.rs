@@ -811,6 +811,7 @@ async fn handle_left_room(
 			hashes: EventHash::default(),
 			auth_events: Default::default(),
 			prev_events: Default::default(),
+			rejected: false,
 		};
 
 		let state = state_after.wrap(StateEvents {

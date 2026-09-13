@@ -169,5 +169,6 @@ fn state_pdu() -> Result<PduEvent> {
 		hashes: Default::default(),
 		origin: None,
 		unsigned: None,
+		rejected: false,
 	})
 }

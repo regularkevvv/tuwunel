@@ -110,6 +110,7 @@ mod tests {
 			hashes: Default::default(),
 			origin: None,
 			unsigned,
+			rejected: false,
 		}
 	}
 

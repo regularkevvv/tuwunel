@@ -761,7 +761,7 @@ async fn auth_event_in_different_room() {
 		prev_events: vec![event_id("IMA")].into(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	};
 	init_events
 		.insert(power_level.event_id.clone(), power_level)
@@ -869,7 +869,6 @@ async fn unexpected_auth_event_type() {
 }
 
 #[tokio::test]
-#[ignore = "PduEvent::rejected not conditionally compiled here"]
 async fn rejected_auth_event() {
 	let _guard = init_subscriber();
 
@@ -899,7 +898,7 @@ async fn rejected_auth_event() {
 		prev_events: vec![event_id("IMA")].into(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: true,
+		rejected: true,
 	};
 	init_events
 		.insert(power_level.event_id.clone(), power_level)
@@ -991,7 +990,7 @@ async fn event_without_room_id() {
 		prev_events: [owned_event_id!("$IPOWER")].into(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		//rejected: false,
+		rejected: false,
 	};
 
 	let init_events = INITIAL_HYDRA_EVENTS();
@@ -1183,7 +1182,6 @@ async fn v12_create_sender_can_bootstrap_join() {
 }
 
 #[tokio::test]
-#[ignore = "PduEvent::rejected not conditionally compiled here"]
 async fn rejected_room_create_in_fetch_event() {
 	let _guard = init_subscriber();
 
@@ -1199,8 +1197,8 @@ async fn rejected_room_create_in_fetch_event() {
 
 	let mut init_events = INITIAL_HYDRA_EVENTS();
 	let create_event_id = owned_event_id!("$CREATE");
-	let create_event = init_events.remove(&create_event_id).unwrap();
-	//create_event.rejected = true;
+	let mut create_event = init_events.remove(&create_event_id).unwrap();
+	create_event.rejected = true;
 	init_events.insert(create_event_id, create_event);
 
 	// Reject event if `m.room.create` was rejected.
