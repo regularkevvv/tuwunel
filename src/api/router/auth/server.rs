@@ -72,7 +72,7 @@ pub(super) async fn auth_server(
 
 	let key = services
 		.server_keys
-		.get_verify_key(origin, &x_matrix.key)
+		.get_request_key(origin, &x_matrix.key)
 		.await
 		.map_err(|e| {
 			err!(Request(Forbidden(debug_warn!("Failed to fetch signing keys: {e}"))))
