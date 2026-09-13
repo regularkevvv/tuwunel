@@ -10,7 +10,7 @@ use tuwunel_core::{
 	warn,
 };
 
-use crate::rooms::state_res::auth_check;
+use crate::rooms::state_res::{AuthCheckOutcome, auth_check};
 
 #[implement(super::Service)]
 #[cfg_attr(unabridged, tracing::instrument(
@@ -99,6 +99,29 @@ pub(super) async fn handle_outlier_pdu(
 		.await;
 	}
 
+	// 5. Reject "due to auth events" if some of the auth events were themselves
+	//    rejected. That record is definitive, unlike an auth event we merely could
+	//    not obtain.
+	let cites_rejected = event
+		.auth_events()
+		.stream()
+		.any(async |auth_event_id| {
+			self.services
+				.timeline
+				.is_pdu_rejected(auth_event_id)
+				.await
+		})
+		.await;
+
+	if cites_rejected {
+		self.services
+			.timeline
+			.add_pdu_rejected(event.event_id(), &pdu_json)
+			.await?;
+
+		return Err!(Request(Forbidden("Event cites a rejected auth event.")));
+	}
+
 	// 6. Reject "due to auth events" if the event doesn't pass auth based on the
 	//    auth events
 	debug!("Checking based on auth events");
@@ -130,7 +153,13 @@ pub(super) async fn handle_outlier_pdu(
 		.collect()
 		.await;
 
-	auth_check(
+	let complete = auth_events.len()
+		== event
+			.auth_events()
+			.count()
+			.saturating_add(usize::from(hydra_create_id.is_some()));
+
+	let outcome = auth_check(
 		&room_rules,
 		&event,
 		&async |event_id| self.event_fetch(&event_id).await,
@@ -144,8 +173,20 @@ pub(super) async fn handle_outlier_pdu(
 				.ok_or_else(|| err!(Request(NotFound("state not found"))))
 		},
 	)
-	.await?
-	.into_result()?;
+	.await?;
+
+	// A denial against every one of the event's own auth events is definitive.
+	// Record it, so the event is never refetched, never counts as a gap below
+	// its children, and rejects the events that cite it. A denial reached with
+	// an auth event missing may only reflect what we could not obtain.
+	if complete && matches!(outcome, AuthCheckOutcome::Deny(_)) {
+		self.services
+			.timeline
+			.add_pdu_rejected(event.event_id(), &pdu_json)
+			.await?;
+	}
+
+	outcome.into_result()?;
 	trace!("Validation successful.");
 
 	// 7. Persist the event as an outlier.

@@ -1,4 +1,10 @@
-use std::{borrow::Borrow, collections::HashMap, iter::once, sync::Arc, time::Instant};
+use std::{
+	borrow::Borrow,
+	collections::{HashMap, HashSet, VecDeque},
+	iter::once,
+	sync::Arc,
+	time::Instant,
+};
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
@@ -388,6 +394,51 @@ async fn soft_fail_standing(
 	Ok(Standing::Evaluate(true))
 }
 
+/// The incoming event as its state derivation sees it when a prev event was
+/// rejected.
+///
+/// A rejected event contributes no state of its own, so the state after it is
+/// the state after its own prev events, which replace it, transitively and
+/// within a bound. A rejected prev past the bound stays, so the derivation
+/// falls through to the other state sources. `None` when no prev event was
+/// rejected.
+#[implement(super::Service)]
+async fn rejected_prevs_replaced(&self, incoming_pdu: &PduEvent) -> Option<PduEvent> {
+	const REJECTED_WALK_LIMIT: usize = 64;
+
+	let timeline = &self.services.timeline;
+	let mut replaced = false;
+	let mut walked = 0_usize;
+	let mut seen = HashSet::new();
+	let mut prev_events: Vec<OwnedEventId> = Vec::new();
+	let mut todo: VecDeque<OwnedEventId> = incoming_pdu
+		.prev_events()
+		.map(ToOwned::to_owned)
+		.collect();
+
+	while let Some(prev_id) = todo.pop_front() {
+		if !seen.insert(prev_id.clone()) {
+			continue;
+		}
+
+		if walked < REJECTED_WALK_LIMIT
+			&& let Ok(rejected) = timeline.get_rejected_pdu(&prev_id).await
+		{
+			walked = walked.saturating_add(1);
+			replaced = true;
+			todo.extend(rejected.prev_events().map(ToOwned::to_owned));
+			continue;
+		}
+
+		prev_events.push(prev_id);
+	}
+
+	(replaced && !prev_events.is_empty()).then(|| PduEvent {
+		prev_events: prev_events.into_iter().collect(),
+		..incoming_pdu.clone()
+	})
+}
+
 #[implement(super::Service)]
 async fn resolve_state_at_incoming_event(
 	&self,
@@ -403,11 +454,14 @@ async fn resolve_state_at_incoming_event(
 	//     These are not timeline events.
 	trace!("Resolving state at event");
 
-	let state_at_incoming_event = if incoming_pdu.prev_events().count() == 1 {
-		self.state_at_incoming_degree_one(incoming_pdu)
+	let replaced = self.rejected_prevs_replaced(incoming_pdu).await;
+	let derive_from = replaced.as_ref().unwrap_or(incoming_pdu);
+
+	let state_at_incoming_event = if derive_from.prev_events().count() == 1 {
+		self.state_at_incoming_degree_one(derive_from)
 			.await?
 	} else {
-		self.state_at_incoming_resolved(incoming_pdu, room_id, room_version)
+		self.state_at_incoming_resolved(derive_from, room_id, room_version)
 			.boxed()
 			.await?
 	};

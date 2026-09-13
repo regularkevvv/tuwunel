@@ -53,6 +53,7 @@ pub struct Service {
 struct Data {
 	eventid_outlierpdu: Arc<Map>,
 	eventid_pduid: Arc<Map>,
+	eventid_rejectedpdu: Arc<Map>,
 	pduid_pdu: Arc<Map>,
 	roomid_tscount_pducount: Arc<Map>,
 	userdevicetxnid_response: Arc<Map>,
@@ -92,6 +93,7 @@ impl crate::Service for Service {
 			db: Data {
 				eventid_outlierpdu: args.db["eventid_outlierpdu"].clone(),
 				eventid_pduid: args.db["eventid_pduid"].clone(),
+				eventid_rejectedpdu: args.db["eventid_rejectedpdu"].clone(),
 				pduid_pdu: args.db["pduid_pdu"].clone(),
 				roomid_tscount_pducount: args.db["roomid_tscount_pducount"].clone(),
 				userdevicetxnid_response: args.db["userdevicetxnid_response"].clone(),
@@ -136,6 +138,43 @@ pub async fn add_pdu_outlier(&self, event_id: &EventId, pdu: &CanonicalJsonObjec
 		.await?;
 
 	Ok(())
+}
+
+/// Records an event this server rejected during authorization.
+///
+/// Rejected events live apart from outliers and the timeline, so ordinary
+/// lookups never return one: it can neither authorize another event nor be
+/// served. The record lets a later event cite it as a known prev event, and
+/// rejects in turn every event that cites it as an auth event.
+#[implement(Service)]
+#[tracing::instrument(skip(self, pdu), level = "debug")]
+pub async fn add_pdu_rejected(&self, event_id: &EventId, pdu: &CanonicalJsonObject) -> Result {
+	self.db
+		.eventid_rejectedpdu
+		.raw_put(event_id, Json(pdu))
+		.await?;
+
+	Ok(())
+}
+
+/// Whether this server rejected the event during authorization.
+#[implement(Service)]
+pub async fn is_pdu_rejected(&self, event_id: &EventId) -> bool {
+	self.db
+		.eventid_rejectedpdu
+		.exists(event_id)
+		.await
+		.is_ok()
+}
+
+/// Returns an event this server rejected, and never an accepted one.
+#[implement(Service)]
+pub async fn get_rejected_pdu(&self, event_id: &EventId) -> Result<PduEvent> {
+	self.db
+		.eventid_rejectedpdu
+		.get(event_id)
+		.await
+		.deserialized()
 }
 
 #[implement(Service)]

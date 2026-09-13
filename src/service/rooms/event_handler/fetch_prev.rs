@@ -54,7 +54,7 @@ where
 	let has_gap = initial_set
 		.clone()
 		.stream()
-		.any(async |event_id| !self.services.timeline.pdu_exists(event_id).await)
+		.any(async |event_id| !self.is_known_prev(event_id).await)
 		.await;
 
 	let wait_ms = self.services.server.config.fetch_prev_wait_ms;
@@ -63,28 +63,30 @@ where
 		.await
 		.unwrap_or(has_gap);
 
-	has_gap
-		.then_async(|| {
-			self.prefetch_missing_events(
-				origin,
-				room_id,
-				incoming_event_id,
-				room_version,
-				recursion_level,
-			)
-		})
-		.await;
+	if has_gap {
+		self.prefetch_missing_events(
+			origin,
+			room_id,
+			incoming_event_id,
+			room_version,
+			recursion_level,
+		)
+		.await?;
+	}
 
+	// A rejected prev is known and contributes no state of its own, so it is
+	// neither fetched nor walked.
 	let mut todo_outlier_stack: FuturesOrdered<_> = initial_set
 		.stream()
 		.map(ToOwned::to_owned)
 		.filter_map(async |event_id| {
-			self.services
-				.timeline
+			let timeline = &self.services.timeline;
+			let unknown = timeline
 				.non_outlier_pdu_exists(&event_id)
 				.await
-				.is_err()
-				.then_some(event_id)
+				.is_err() && !timeline.is_pdu_rejected(&event_id).await;
+
+			unknown.then_some(event_id)
 		})
 		.map(async |event_id| {
 			let events = once(event_id.as_ref());
@@ -221,7 +223,7 @@ where
 		.map(|event_id| (event_id, self.services.timeline.watch_event(event_id)))
 		.stream()
 		.filter_map(async |(event_id, watcher)| {
-			(!self.services.timeline.pdu_exists(event_id).await).then_some(watcher)
+			(!self.is_known_prev(event_id).await).then_some(watcher)
 		})
 		.collect()
 		.await;
@@ -235,12 +237,42 @@ where
 		.is_err()
 }
 
+/// Whether a prev event needs no gap fill: it is in the timeline, it holds a
+/// state snapshot (a soft-failed event), or this server rejected it. An outlier
+/// with none of these was never integrated, so the gap below an event citing
+/// it is still open.
+#[implement(super::Service)]
+async fn is_known_prev(&self, event_id: &EventId) -> bool {
+	let timeline = &self.services.timeline;
+	if timeline
+		.non_outlier_pdu_exists(event_id)
+		.await
+		.is_ok()
+	{
+		return true;
+	}
+
+	if self
+		.services
+		.state
+		.pdu_shortstatehash(event_id)
+		.await
+		.is_ok()
+	{
+		return true;
+	}
+
+	timeline.is_pdu_rejected(event_id).await
+}
+
 /// Fill the prev gap below `incoming_event_id` with one `/get_missing_events`
 /// batch, landing each returned event as a local outlier so the per-event walk
 /// resolves it without a federation fetch. `latest_events` is the held event
 /// the server walks back from, bounded by our forward extremities so it returns
 /// only the gap; best effort, so a failed batch or rejected event just leaves
-/// that id for the walk.
+/// that id for the walk. A batch holding an event that is not even canonical
+/// JSON describes no acceptable history, so it refuses the incoming event
+/// rather than walking past the gap with per-event and state fetches.
 #[implement(super::Service)]
 #[tracing::instrument(name = "missing", level = "debug", skip_all)]
 async fn prefetch_missing_events(
@@ -250,7 +282,7 @@ async fn prefetch_missing_events(
 	incoming_event_id: &EventId,
 	room_version: &RoomVersionId,
 	recursion_level: usize,
-) {
+) -> Result {
 	let boundary: EventWindow = self
 		.services
 		.state
@@ -268,22 +300,30 @@ async fn prefetch_missing_events(
 		.fanout_for_op();
 
 	let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
-		return;
+		return Ok(());
 	};
 
 	let Ok(events) = serde_json::from_slice::<Vec<Box<RawJsonValue>>>(&outcome.bytes) else {
-		return;
+		return Ok(());
 	};
+
+	let events = events
+		.iter()
+		.map(|pdu| serde_json::from_str::<CanonicalJsonObject>(pdu.get()))
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|e| err!(BadServerResponse("missing-events pdu is not canonical json: {e}")))?;
 
 	events
 		.into_iter()
 		.stream()
-		.for_each_concurrent(automatic_width(), async |pdu| {
-			self.land_missing_event(origin, room_id, &pdu, room_version, recursion_level)
+		.for_each_concurrent(automatic_width(), async |value| {
+			self.land_missing_event(origin, room_id, value, room_version, recursion_level)
 				.await
 				.ok();
 		})
 		.await;
+
+	Ok(())
 }
 
 /// Authenticate and persist one event from the missing-events batch as an
@@ -294,13 +334,10 @@ async fn land_missing_event(
 	&self,
 	origin: &ServerName,
 	room_id: &RoomId,
-	pdu: &RawJsonValue,
+	value: CanonicalJsonObject,
 	room_version: &RoomVersionId,
 	recursion_level: usize,
 ) -> Result {
-	let value: CanonicalJsonObject = serde_json::from_str(pdu.get())
-		.map_err(|e| err!(BadServerResponse("missing-events pdu is not canonical json: {e}")))?;
-
 	value
 		.get("room_id")
 		.and_then(CanonicalJsonValue::as_str)

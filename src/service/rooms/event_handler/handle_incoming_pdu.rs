@@ -82,6 +82,17 @@ pub async fn handle_incoming_pdu<'a>(
 		return Ok(Some((pdu_id, false)));
 	}
 
+	// 1.0 Refuse an event already rejected during authorization. The verdict is
+	//     definitive, so the event is neither refetched nor reprocessed.
+	if self
+		.services
+		.timeline
+		.is_pdu_rejected(event_id)
+		.await
+	{
+		return Err!(Request(Forbidden("Event was rejected.")));
+	}
+
 	// 1.1 Check the server is in the room
 	let meta_exists = self.services.metadata.exists(room_id).map(Ok);
 
