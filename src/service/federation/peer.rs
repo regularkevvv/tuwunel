@@ -40,6 +40,12 @@ use tuwunel_database::Interfix;
 /// Backoff ceiling, matching `sender_retry_backoff_limit`'s 24h default.
 pub(super) const MAX_BACKOFF: Duration = Duration::from_hours(24);
 
+/// Span of continuous failure after which the sender gives a peer up: it arms
+/// no more retries for it and keeps its queue for the peer's return. With the
+/// backoff capped at [`MAX_BACKOFF`], this bounds the attempts one failure
+/// streak makes.
+pub(super) const GIVE_UP_AFTER: Duration = Duration::from_hours(7 * 24);
+
 /// Permanence classification supplied alongside a failure.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Classification {
@@ -203,6 +209,17 @@ pub async fn should_attempt(&self, server: &ServerName) -> ShouldAttempt {
 	attempt_verdict(&self.backoff(streak))
 }
 
+/// Whether the sender has given a peer up: its recorded failures span
+/// [`GIVE_UP_AFTER`] with no success or inbound activity clearing them. Its
+/// queue is kept, and delivery resumes once the failure record clears.
+#[implement(super::Service)]
+#[tracing::instrument(skip(self), fields(%server), level = "trace")]
+pub async fn sender_gave_up(&self, server: &ServerName) -> bool {
+	self.peer_streak(server)
+		.await
+		.is_some_and(|streak| gave_up(&streak, self.window_secs))
+}
+
 /// Admin-facing backoff summary for one server, `None` when it has no failure
 /// rows.
 #[implement(super::Service)]
@@ -345,6 +362,16 @@ pub(super) fn attempt_verdict(backoff: &Backoff) -> ShouldAttempt {
 			.checked_add(Duration::from_secs(earliest_secs))
 			.unwrap_or_else(SystemTime::now),
 	}
+}
+
+/// Pure give-up verdict: the newest failure is at least [`GIVE_UP_AFTER`] past
+/// the start of the oldest failure's bucket. A lone failure spans nothing, so a
+/// peer that failed once long ago is still retried.
+#[must_use]
+pub(super) fn gave_up(streak: &Streak, window_secs: u64) -> bool {
+	let oldest_secs = streak.oldest_bucket.saturating_mul(window_secs);
+
+	streak.anchor_secs.saturating_sub(oldest_secs) >= GIVE_UP_AFTER.as_secs()
 }
 
 impl Backoff {
