@@ -10,6 +10,8 @@ pub mod alloc;
 pub mod config;
 pub mod debug;
 pub mod error;
+#[cfg(feature = "failpoints")]
+pub mod failpoint;
 pub mod info;
 pub mod log;
 pub mod matrix;

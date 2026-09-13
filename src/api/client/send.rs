@@ -132,6 +132,9 @@ pub(crate) async fn send_message_event_route(
 	// send leaves both or neither and a retry cannot append a second event.
 	let txnid = transaction_ids::key(sender_user, sender_device, &body.txn_id);
 
+	#[cfg(feature = "failpoints")]
+	tuwunel_core::failpoint::hit("send.before_append");
+
 	let event_id = services
 		.timeline
 		.build_and_append_pdu_with_txnid(
@@ -149,6 +152,11 @@ pub(crate) async fn send_message_event_route(
 			&state_lock,
 		)
 		.await?;
+
+	// The event and its transaction record are durable; the client has not
+	// been told.
+	#[cfg(feature = "failpoints")]
+	tuwunel_core::failpoint::hit("send.after_append");
 
 	drop(state_lock);
 

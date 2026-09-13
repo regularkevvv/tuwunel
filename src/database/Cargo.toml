@@ -21,6 +21,9 @@ crate-type = [
 bzip2_compression = [
 	"rust-rocksdb/bzip2",
 ]
+failpoints = [
+	"tuwunel-core/failpoints",
+]
 io_uring = [
 	"rust-rocksdb/io-uring",
 ]

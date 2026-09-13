@@ -29,6 +29,9 @@ bzip2_compression = [
 element_hacks = [
 	"tuwunel-service/element_hacks",
 ]
+failpoints = [
+	"tuwunel-core/failpoints",
+]
 gzip_compression = [
 	"reqwest/gzip",
 	"tuwunel-core/gzip_compression",
