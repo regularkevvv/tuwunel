@@ -109,6 +109,13 @@ element_hacks = [
 	"tuwunel-api/element_hacks",
 	"tuwunel-service/element_hacks",
 ]
+# Test-only crash points for the fault-injection image; never in a release
+# (tuwunel_core::failpoint).
+failpoints = [
+	"tuwunel-api/failpoints",
+	"tuwunel-core/failpoints",
+	"tuwunel-database/failpoints",
+]
 gzip_compression = [
 	"tuwunel-admin/gzip_compression",
 	"tuwunel-api/gzip_compression",

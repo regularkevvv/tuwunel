@@ -284,10 +284,21 @@ impl Backend {
 		self.drain(&maps).await?;
 		self.writable_lease()?;
 
+		#[cfg(feature = "failpoints")]
+		let transactional = records_transaction(&maps);
+		#[cfg(feature = "failpoints")]
+		if transactional {
+			tuwunel_core::failpoint::hit("commit.before_dispatch");
+		}
+
 		let mut outcome = outcome::CommitOutcome::dispatched(self);
 		let duplicate = match self.client.call(&request, None).await {
 			| Ok(Response::Committed { duplicate }) => {
 				outcome.acknowledged();
+				#[cfg(feature = "failpoints")]
+				if transactional {
+					tuwunel_core::failpoint::hit("commit.after_reply");
+				}
 				duplicate
 			},
 			| Ok(_) => return Err!(Database("bridge commit: unexpected reply")),
@@ -548,6 +559,14 @@ impl Drop for Backend {
 			}
 		});
 	}
+}
+
+/// Whether a batch records a client transaction id (a room send or a
+/// to-device send): the only commits the `commit.*` failpoints count, so a
+/// harness can aim them at one request among the server's background writes.
+#[cfg(feature = "failpoints")]
+fn records_transaction(maps: &BTreeSet<u16>) -> bool {
+	crate::backend::ids::map_id("userdevicetxnid_response").is_some_and(|id| maps.contains(&id.0))
 }
 
 /// Performs the version handshake and refuses an incompatible Worker.

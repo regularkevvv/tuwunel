@@ -22,6 +22,9 @@ brotli_compression = [
 	"reqwest/brotli",
 ]
 console = []
+# Test-only crash points (`failpoint`), armed by TUWUNEL_FAILPOINTS. Built
+# only into the fault-injection image, never into a release.
+failpoints = []
 gzip_compression = [
 	"reqwest/gzip",
 ]
