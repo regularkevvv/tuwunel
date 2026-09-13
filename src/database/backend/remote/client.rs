@@ -329,6 +329,66 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn retries_stop_before_a_backoff_would_cross_the_deadline() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicU32, Ordering},
+		};
+
+		// A bridge that is always unavailable: every attempt is a retryable
+		// transport failure, so only the attempt budget and the deadline stop
+		// the retries.
+		let hits = Arc::new(AtomicU32::new(0));
+		let counter = Arc::clone(&hits);
+		let app = axum::Router::new().route(
+			"/",
+			axum::routing::post(move || {
+				let counter = Arc::clone(&counter);
+				async move {
+					counter.fetch_add(1, Ordering::SeqCst);
+					StatusCode::SERVICE_UNAVAILABLE
+				}
+			}),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("bind");
+		let address = listener.local_addr().expect("address");
+		let task = tokio::spawn(async move {
+			axum::serve(listener, app).await.expect("serve");
+		});
+		let client = Client {
+			http: reqwest::Client::builder()
+				.no_proxy()
+				.build()
+				.expect("client"),
+			endpoint: format!("http://{address}/"),
+			token: "test-only".into(),
+			timeout: Duration::from_secs(5),
+		};
+
+		// Without a deadline, the whole attempt budget is spent.
+		let error = client
+			.call(&Request::Hello, None)
+			.await
+			.expect_err("an unavailable bridge");
+		assert!(error.is_retryable());
+		assert_eq!(hits.swap(0, Ordering::SeqCst), MAX_ATTEMPTS);
+
+		// With a deadline shorter than the first backoff, no retry starts: one
+		// attempt, and the call returns without sleeping past the deadline.
+		let started = Instant::now();
+		let deadline = started + MIN_BACKOFF / 2;
+		client
+			.call(&Request::Hello, Some(deadline))
+			.await
+			.expect_err("an unavailable bridge");
+		assert_eq!(hits.load(Ordering::SeqCst), 1);
+		assert!(started.elapsed() < MIN_BACKOFF, "slept past the deadline");
+		task.abort();
+	}
+
+	#[tokio::test]
 	async fn oversized_request_is_nonretryable_before_transport() {
 		let client = Client {
 			http: reqwest::Client::new(),
