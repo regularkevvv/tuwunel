@@ -1,5 +1,7 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use axum::extract::State;
-use futures::{FutureExt, StreamExt, pin_mut};
+use futures::{FutureExt, Stream, StreamExt, pin_mut};
 use ruma::{
 	UserId,
 	api::client::user_directory::search_users::{self},
@@ -20,6 +22,14 @@ use crate::Ruma;
 const LIMIT_MAX: usize = 500;
 const LIMIT_DEFAULT: usize = 10;
 
+/// Most accounts one search examines.
+///
+/// Accounts are read in id order, and a search stops after this many whether
+/// or not it has found `limit` matches, so a request reads a bounded number
+/// of rows however many accounts exist. `limited` then tells the client its
+/// results may be incomplete, which is what the field is for.
+pub(crate) const EXAMINED_MAX: usize = 1_000;
+
 /// # `POST /_matrix/client/r0/user_directory/search`
 ///
 /// Searches all known users for a match.
@@ -37,9 +47,8 @@ pub(crate) async fn search_users_route(
 		.min(LIMIT_MAX);
 
 	let search_term = body.search_term.to_lowercase();
-	let users = services
-		.users
-		.stream()
+	let examined = AtomicUsize::new(0);
+	let users = examine_at_most(services.users.stream(), EXAMINED_MAX, &examined)
 		.ready_filter(|&user_id| user_id != sender_user)
 		.map(ToOwned::to_owned)
 		.broad_filter_map(async |user_id| {
@@ -63,9 +72,26 @@ pub(crate) async fn search_users_route(
 
 	pin_mut!(users);
 	let results = users.by_ref().take(limit).collect().await;
-	let limited = users.next().await.is_some();
+	let limited =
+		users.next().await.is_some() || examined.load(Ordering::Relaxed) >= EXAMINED_MAX;
 
 	Ok(search_users::v3::Response { results, limited })
+}
+
+/// `candidates`, cut off after `max`, counting into `examined` every one
+/// read: the bound on the rows one directory request reads.
+pub(crate) fn examine_at_most<'a, S>(
+	candidates: S,
+	max: usize,
+	examined: &'a AtomicUsize,
+) -> impl Stream<Item = S::Item> + Send + 'a
+where
+	S: Stream + Send + 'a,
+	S::Item: Send,
+{
+	candidates.take(max).inspect(move |_| {
+		examined.fetch_add(1, Ordering::Relaxed);
+	})
 }
 
 async fn should_show_user(
@@ -122,4 +148,46 @@ async fn should_show_user(
 
 	pin_mut!(user_in_public_room, user_sees_user);
 	user_in_public_room.or(user_sees_user).await
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use futures::{FutureExt, StreamExt, future::ready, stream};
+
+	use super::examine_at_most;
+
+	#[test]
+	fn a_search_reads_no_more_candidates_than_its_cap() {
+		let pulled = AtomicUsize::new(0);
+		let examined = AtomicUsize::new(0);
+		let source = stream::iter(0_u32..10_000).inspect(|_| {
+			pulled.fetch_add(1, Ordering::Relaxed);
+		});
+
+		// A search matching almost nothing still stops at the cap. The source
+		// is always ready, so the search completes on its first poll.
+		let hits: Vec<u32> = examine_at_most(source, 1_000, &examined)
+			.filter(|n| ready(n % 997 == 5))
+			.collect()
+			.now_or_never()
+			.expect("a ready stream completes at once");
+
+		assert_eq!(pulled.load(Ordering::Relaxed), 1_000, "read past the cap");
+		assert_eq!(examined.load(Ordering::Relaxed), 1_000);
+		assert_eq!(hits, vec![5], "a match past the cap was examined");
+	}
+
+	#[test]
+	fn a_search_over_fewer_candidates_than_its_cap_reads_them_all() {
+		let examined = AtomicUsize::new(0);
+		let all: Vec<u32> = examine_at_most(stream::iter(0_u32..10), 1_000, &examined)
+			.collect()
+			.now_or_never()
+			.expect("a ready stream completes at once");
+
+		assert_eq!(all.len(), 10);
+		assert_eq!(examined.load(Ordering::Relaxed), 10);
+	}
 }

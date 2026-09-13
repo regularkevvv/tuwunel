@@ -5,7 +5,8 @@
 //! when deleted; media stored for a remote server, thumbnails included, is
 //! refused past `media_remote_server_quota` and removed after
 //! `media_remote_retention` without touching local media; a counter that does
-//! not exist is measured from the stored objects.
+//! not exist reads as zero until the one-time backfill writes it from the
+//! stored objects, so no request measures one.
 
 use std::{
 	env::temp_dir,
@@ -109,7 +110,16 @@ async fn exercise(services: &Services, media_dir: &Path) -> Result {
 	services.db["userid_mediabytes"]
 		.remove(user.as_str())
 		.await?;
-	usage(services, Owner::User(&user), 600, "measured from storage").await?;
+	usage(services, Owner::User(&user), 0, "with its counter gone").await?;
+	let written = media.backfill_usage().await?;
+	if written != 1 {
+		return Err!("the backfill wrote {written} counters, expected 1");
+	}
+	usage(services, Owner::User(&user), 600, "backfilled from storage").await?;
+	let again = media.backfill_usage().await?;
+	if again != 0 {
+		return Err!("a second backfill wrote {again} counters over existing ones");
+	}
 
 	media
 		.create(&cached, None, None, None, BYTES)

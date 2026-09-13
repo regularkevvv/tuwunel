@@ -40,14 +40,14 @@ use log as _;
 use tuwunel_core::{Result, Server, err};
 
 pub use self::{
-	backend::remote::LeaseStatus,
+	backend::remote::{LeaseStatus, TRUNCATED, is_truncated},
 	cork::Cork,
 	de::{Ignore, IgnoreAll, from_slice as deserialize_from_slice},
 	deserialized::Deserialized,
 	engine::Engine,
 	handle::Handle,
 	keyval::{KeyBuf, KeyVal, Slice, serialize_key, serialize_val},
-	map::{Get, Map, Qry, compact},
+	map::{Get, Map, Qry, Row, compact, successor},
 	ser::{Cbor, Interfix, Json, SEP, Separator, serialize, serialize_to, serialize_to_vec},
 	txn::Txn,
 };

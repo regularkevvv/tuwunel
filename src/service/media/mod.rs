@@ -37,6 +37,7 @@ use tuwunel_core::{
 	},
 	warn,
 };
+use tuwunel_database::successor;
 use url::Url;
 
 #[cfg(feature = "media_thumbnail")]
@@ -44,6 +45,20 @@ use self::video::{FAILURES, Failures, sweep_staging_dir};
 use self::{data::Data, preview::Agent, quota::RETENTION_INTERVAL, remote::Fetch};
 pub use self::{data::Metadata, preview::UrlPreviewData, quota::Owner, thumbnail::Dim};
 use crate::storage::Provider;
+
+/// Media records one batch of [`Service::delete_range`] reads.
+const RANGE_BATCH: usize = 256;
+
+/// The least key past every key that starts with `prefix`, whose last byte
+/// is not `0xFF`: the prefix with its last byte one higher.
+fn past_prefix(prefix: &[u8]) -> Vec<u8> {
+	let mut key = prefix.to_vec();
+	if let Some(last) = key.last_mut() {
+		*last = last.saturating_add(1);
+	}
+
+	key
+}
 
 #[derive(Debug)]
 pub struct Media {
@@ -206,8 +221,10 @@ impl Service {
 		}
 
 		let max_uploads = config.max_pending_media_uploads;
-		let (current_uploads, earliest_expiration) =
-			self.db.count_pending_mxc_for_user(user).await;
+		let (current_uploads, earliest_expiration) = self
+			.db
+			.count_pending_mxc_for_user(user, now_millis(), max_uploads)
+			.await;
 
 		// Check if the user has reached the maximum number of pending media uploads
 		if current_uploads >= max_uploads {
@@ -269,7 +286,9 @@ impl Service {
 			return stored;
 		}
 
-		self.db.remove_pending_mxc(mxc).await?;
+		self.db
+			.remove_pending_mxc(mxc, user, expires_at)
+			.await?;
 
 		let mxc_uri: OwnedMxcUri = mxc.to_string().into();
 		let notifier = self.mxc_state.notifiers.lock()?.remove(&mxc_uri);
@@ -887,111 +906,133 @@ impl Service {
 		newer_than: bool,
 		yes_i_want_to_delete_local_media: bool,
 	) -> Result<usize> {
-		let all_keys = self.db.get_all_media_keys().await;
-		// one entry per media, not per stored object: its thumbnails share the mxc
-		let mut remote_mxcs = HashSet::with_capacity(all_keys.len());
-
-		for key in all_keys {
-			trace!("Full MXC key from database: {key:?}");
-			let mut parts = key.split(|&b| b == 0xFF);
-			let mxc = parts
-				.next()
-				.map(|bytes| {
-					utils::string_from_bytes(bytes).map_err(|e| {
-						err!(Database(error!(
-							"Failed to parse MXC unicode bytes from our database: {e}"
-						)))
-					})
-				})
-				.transpose()?;
-
-			let Some(mxc_s) = mxc else {
-				debug_warn!(
-					?mxc,
-					"Parsed MXC URL unicode bytes from database but is still invalid"
-				);
-				continue;
-			};
-
-			trace!("Parsed MXC key to URL: {mxc_s}");
-			let mxc = OwnedMxcUri::from(mxc_s);
-			if (mxc.server_name() == Ok(self.services.globals.server_name())
-				&& !yes_i_want_to_delete_local_media)
-				|| !mxc.is_valid()
-			{
-				debug!("Ignoring local or broken media MXC: {mxc}");
-				continue;
-			}
-
-			let file_created_at = if let Some(file_metadata) = self
-				.storage_providers()
-				.stream()
-				.filter_map(async |provider| {
-					let path = self.get_media_name_sha256(&key);
-					match provider.head(&path).await {
-						| Ok(file_metadata) => {
-							trace!(%mxc, ?path, "Provider file metadata: {file_metadata:?}");
-							Some(file_metadata)
-						},
-						| Err(e) => {
-							debug_warn!(
-								"Failed to obtain {:?} file metadata for MXC {mxc} at file path \
-								 {path:?}\", skipping: {e}",
-								provider.name,
-							);
-							None
-						},
-					}
-				})
-				.boxed()
-				.next()
-				.await
-			{
-				SystemTime::from(file_metadata.last_modified)
-			} else {
-				continue;
-			};
-
-			debug!("File created at: {file_created_at:?}");
-
-			if file_created_at <= time && older_than {
-				debug!(
-					"File is older than user duration, pushing to list of file paths and keys \
-					 to delete."
-				);
-				remote_mxcs.insert(mxc.to_string());
-			} else if file_created_at >= time && newer_than {
-				debug!(
-					"File is newer than user duration, pushing to list of file paths and keys \
-					 to delete."
-				);
-				remote_mxcs.insert(mxc.to_string());
-			}
-		}
-
-		debug_info!("Deleting media now in the past {time:?}");
-
+		// Records are read in bounded batches from a cursor, each read closed
+		// before its media are deleted. Local media are skipped by resuming
+		// past their keys, unless they are to be deleted too.
+		let local = format!("mxc://{}/", self.services.globals.server_name());
+		let mut from: Option<Vec<u8>> = None;
 		let mut deletion_count: usize = 0;
+		loop {
+			let keys = self
+				.db
+				.media_keys_from(from.as_deref(), RANGE_BATCH)
+				.await?;
 
-		for mxc in remote_mxcs {
-			let Ok(mxc) = mxc.as_str().try_into() else {
-				debug_warn!("Invalid MXC in database, skipping");
-				continue;
-			};
+			let ended = keys.len() < RANGE_BATCH;
+			from = keys.last().map(Vec::as_slice).map(successor);
+			if !yes_i_want_to_delete_local_media
+				&& from
+					.as_deref()
+					.is_some_and(|from| from.starts_with(local.as_bytes()))
+			{
+				from = Some(past_prefix(local.as_bytes()));
+			}
 
-			debug_info!("Deleting MXC {mxc} from database and filesystem");
+			// one entry per media, not per stored object: its thumbnails share the mxc
+			let mut remote_mxcs = HashSet::with_capacity(keys.len());
 
-			match self.delete(&mxc).await {
-				| Ok(()) => {
-					deletion_count = deletion_count.saturating_add(1);
-				},
-				| Err(e) => {
-					warn!("Failed to delete {mxc}, ignoring error and skipping: {e}");
-				},
+			for key in keys {
+				trace!("Full MXC key from database: {key:?}");
+				let mut parts = key.split(|&b| b == 0xFF);
+				let mxc = parts
+					.next()
+					.map(|bytes| {
+						utils::string_from_bytes(bytes).map_err(|e| {
+							err!(Database(error!(
+								"Failed to parse MXC unicode bytes from our database: {e}"
+							)))
+						})
+					})
+					.transpose()?;
+
+				let Some(mxc_s) = mxc else {
+					debug_warn!(
+						?mxc,
+						"Parsed MXC URL unicode bytes from database but is still invalid"
+					);
+					continue;
+				};
+
+				trace!("Parsed MXC key to URL: {mxc_s}");
+				let mxc = OwnedMxcUri::from(mxc_s);
+				if (mxc.server_name() == Ok(self.services.globals.server_name())
+					&& !yes_i_want_to_delete_local_media)
+					|| !mxc.is_valid()
+				{
+					debug!("Ignoring local or broken media MXC: {mxc}");
+					continue;
+				}
+
+				let file_created_at = if let Some(file_metadata) = self
+					.storage_providers()
+					.stream()
+					.filter_map(async |provider| {
+						let path = self.get_media_name_sha256(&key);
+						match provider.head(&path).await {
+							| Ok(file_metadata) => {
+								trace!(%mxc, ?path, "Provider file metadata: {file_metadata:?}");
+								Some(file_metadata)
+							},
+							| Err(e) => {
+								debug_warn!(
+									"Failed to obtain {:?} file metadata for MXC {mxc} at file \
+									 path {path:?}\", skipping: {e}",
+									provider.name,
+								);
+								None
+							},
+						}
+					})
+					.boxed()
+					.next()
+					.await
+				{
+					SystemTime::from(file_metadata.last_modified)
+				} else {
+					continue;
+				};
+
+				debug!("File created at: {file_created_at:?}");
+
+				if file_created_at <= time && older_than {
+					debug!(
+						"File is older than user duration, pushing to list of file paths and \
+						 keys to delete."
+					);
+					remote_mxcs.insert(mxc.to_string());
+				} else if file_created_at >= time && newer_than {
+					debug!(
+						"File is newer than user duration, pushing to list of file paths and \
+						 keys to delete."
+					);
+					remote_mxcs.insert(mxc.to_string());
+				}
+			}
+
+			debug_info!("Deleting media now in the past {time:?}");
+
+			for mxc in remote_mxcs {
+				let Ok(mxc) = mxc.as_str().try_into() else {
+					debug_warn!("Invalid MXC in database, skipping");
+					continue;
+				};
+
+				debug_info!("Deleting MXC {mxc} from database and filesystem");
+
+				match self.delete(&mxc).await {
+					| Ok(()) => {
+						deletion_count = deletion_count.saturating_add(1);
+					},
+					| Err(e) => {
+						warn!("Failed to delete {mxc}, ignoring error and skipping: {e}");
+					},
+				}
+			}
+
+			if ended || !self.services.server.is_running() {
+				return Ok(deletion_count);
 			}
 		}
-
-		Ok(deletion_count)
 	}
 
 	pub async fn create_media_dir(&self) -> Result {

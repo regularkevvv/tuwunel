@@ -35,6 +35,14 @@ use tuwunel_service::Services;
 
 use crate::{ClientIp, Ruma};
 
+/// Most published rooms one directory request examines.
+///
+/// Rooms are read in id order, and a request ranks, filters and pages only
+/// the first this many, so it reads a bounded number of rows however many
+/// rooms are published. `total_room_count_estimate` is then an estimate of
+/// those, which is all the API promises.
+const EXAMINED_MAX: usize = 1_000;
+
 /// # `POST /_matrix/client/v3/publicRooms`
 ///
 /// Lists the public rooms on this server.
@@ -285,11 +293,13 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 		.map(|prefix| services.metadata.public_ids_prefix(prefix))
 		.into_iter()
 		.stream()
-		.flatten();
+		.flatten()
+		.take(EXAMINED_MAX);
 
 	let mut all_rooms: Vec<PublicRoomsChunk> = services
 		.directory
 		.public_rooms()
+		.take(EXAMINED_MAX)
 		.map(ToOwned::to_owned)
 		.chain(meta_public_rooms)
 		.wide_then(|room_id| public_rooms_chunk(services, room_id))

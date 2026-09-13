@@ -63,8 +63,9 @@ pub struct Service {
 /// How often stored grants are maintained (resealed, and cleaned up).
 const MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
 
-/// Most records one maintenance pass examines, bounding its storage reads.
-const MAINTENANCE_BATCH: usize = 4096;
+/// Most records one maintenance batch reads and examines. A pass reads batch
+/// after batch from a cursor until it has visited every record.
+const MAINTENANCE_BATCH: usize = 256;
 
 /// How long past the login-token lifetime an unredeemed grant is kept.
 const UNREDEEMED_GRACE: Duration = Duration::from_mins(10);
@@ -969,8 +970,14 @@ pub async fn bind_login_device(
 	Ok(())
 }
 
-/// One maintenance pass over stored grants, bounded to [`MAINTENANCE_BATCH`]
-/// records.
+/// One maintenance pass over every stored grant, [`MAINTENANCE_BATCH`]
+/// records at a time.
+///
+/// Each batch is read after the last record of the one before, and its read
+/// is closed before its records change, so no batch holds a scan open across
+/// the writes, and the pass reaches every record however many there are. A
+/// failed read ends the pass early; the next pass starts again from the
+/// first record.
 ///
 /// Material stored unsealed, or sealed under a previous key, is resealed with
 /// the current key. Records nothing needs any more are cleared or deleted:
@@ -979,23 +986,36 @@ pub async fn bind_login_device(
 /// are not their identity's association record, which is never deleted.
 #[implement(Service)]
 async fn maintain(&self) {
-	let records: Vec<Session> = self
-		.sessions
-		.stream()
-		.take(MAINTENANCE_BATCH)
-		.collect()
-		.await;
-
 	let current_kid = self.sessions.current_kid().map(ToOwned::to_owned);
 	let (mut resealed, mut cleared, mut deleted) = (0_usize, 0_usize, 0_usize);
 
-	for session in records {
-		match self.upkeep(session, current_kid.as_deref()).await {
-			| Ok(Upkeep::Kept) => {},
-			| Ok(Upkeep::Resealed) => resealed = resealed.saturating_add(1),
-			| Ok(Upkeep::Cleared) => cleared = cleared.saturating_add(1),
-			| Ok(Upkeep::Deleted) => deleted = deleted.saturating_add(1),
-			| Err(error) => warn!("Upstream grant maintenance skipped a record: {error}"),
+	let mut after: Option<String> = None;
+	loop {
+		let (records, next) = match self
+			.sessions
+			.batch_after(after.as_deref(), MAINTENANCE_BATCH)
+			.await
+		{
+			| Ok(batch) => batch,
+			| Err(error) => {
+				warn!("Upstream grant maintenance stopped early: {error}");
+				break;
+			},
+		};
+
+		for session in records {
+			match self.upkeep(session, current_kid.as_deref()).await {
+				| Ok(Upkeep::Kept) => {},
+				| Ok(Upkeep::Resealed) => resealed = resealed.saturating_add(1),
+				| Ok(Upkeep::Cleared) => cleared = cleared.saturating_add(1),
+				| Ok(Upkeep::Deleted) => deleted = deleted.saturating_add(1),
+				| Err(error) => warn!("Upstream grant maintenance skipped a record: {error}"),
+			}
+		}
+
+		match next {
+			| Some(next) if self.services.server.is_running() => after = Some(next),
+			| _ => break,
 		}
 	}
 

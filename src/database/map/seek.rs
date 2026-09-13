@@ -10,7 +10,10 @@ use tuwunel_core::Result;
 
 use super::{Map, cache_iter_options_default, iter_options_default};
 use crate::{
-	backend::{metrics::STATS, remote::scan::RemoteSeek},
+	backend::{
+		metrics::STATS,
+		remote::scan::{Bound, RemoteSeek},
+	},
 	map::Inner,
 	pool::{Seek, into_send_seek},
 	stream,
@@ -37,6 +40,24 @@ where
 	C: From<stream::State<'a>> + Stream<Item = Result<T>> + Send,
 	T: Project<'a> + Send + Unpin + 'a,
 {
+	seek_stream_bounded::<C, T>(map, dir, from, Bound::default())
+}
+
+/// [`seek_stream`] for a reader that declares how far it reads.
+///
+/// The caller must still enforce `bound` itself (a prefix `take_while`, a
+/// `take`): only the remote backend uses it, to stop fetching and draining
+/// pages the reader will never take.
+pub(super) fn seek_stream_bounded<'a, C, T>(
+	map: &'a Arc<Map>,
+	dir: Direction,
+	from: Option<&[u8]>,
+	bound: Bound<'_>,
+) -> impl Stream<Item = Result<T>> + Send + use<'a, C, T>
+where
+	C: From<stream::State<'a>> + Stream<Item = Result<T>> + Send,
+	T: Project<'a> + Send + Unpin + 'a,
+{
 	if let Inner::Mem(mem) = map.inner() {
 		return Metered::new(Either::Right(Either::Left(MemSeek::new(
 			map, &mem.store, dir, from,
@@ -50,6 +71,7 @@ where
 				.expect("remote-backend maps are catalog maps"),
 			matches!(dir, Direction::Reverse),
 			from,
+			bound,
 		))));
 	}
 

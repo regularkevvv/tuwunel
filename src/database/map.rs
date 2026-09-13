@@ -22,6 +22,7 @@ mod rev_keys_prefix;
 mod rev_stream;
 mod rev_stream_from;
 mod rev_stream_prefix;
+mod rows_after;
 mod seek;
 mod stream;
 mod stream_from;
@@ -50,7 +51,11 @@ use self::watch::Watch;
 ///
 /// `Get` accepts raw keys, while `Qry` serializes structured keys before
 /// lookup. Both yield value handles through an asynchronous stream.
-pub use self::{get_batch::Get, qry_batch::Qry};
+pub use self::{
+	get_batch::Get,
+	qry_batch::Qry,
+	rows_after::{Row, successor},
+};
 use crate::{
 	Engine,
 	backend::{MapId, Sink, ids, mem, remote},

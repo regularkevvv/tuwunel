@@ -7,13 +7,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use tuwunel_core::{
 	Err, Result, at, debug, debug_info, err,
-	utils::{
-		ReadyExt, str_from_bytes,
-		stream::{TryExpect, TryIgnore},
-		string_from_bytes,
-	},
+	utils::{ReadyExt, str_from_bytes, stream::TryIgnore, string_from_bytes},
 };
-use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
+use tuwunel_database::{
+	Cbor, Database, Deserialized, Ignore, Interfix, Map, Txn, deserialize_from_slice,
+	serialize_key,
+};
 
 use super::{Media, preview::CachedPreview, quota::Owner, thumbnail::Dim};
 
@@ -119,7 +118,8 @@ impl Data {
 		Ok(key.to_vec())
 	}
 
-	/// Insert a pending MXC URI into the database
+	/// Records a pending upload: its row, keyed by MXC, and its row in the
+	/// uploader's index ([`pending_index_key`]), in one transaction.
 	pub(super) async fn insert_pending_mxc(
 		&self,
 		mxc: &Mxc<'_>,
@@ -129,35 +129,70 @@ impl Data {
 		let value = (unused_expires_at, user);
 		debug!(?mxc, ?user, ?unused_expires_at, "Inserting pending");
 
-		self.mediaid_pending
-			.raw_put(mxc.to_string(), value)
-			.await?;
+		let mxc = mxc.to_string();
+		let mut txn = self.db.txn();
+		txn.raw_put(&self.mediaid_pending, &mxc, value);
+		txn.insert_raw(
+			&self.mediaid_pending,
+			pending_index_key(user, unused_expires_at, &mxc),
+			[],
+		);
 
-		Ok(())
+		txn.execute().await
 	}
 
-	/// Remove a pending MXC URI from the database
-	pub(super) async fn remove_pending_mxc(&self, mxc: &Mxc<'_>) -> Result {
-		self.mediaid_pending
-			.remove(&mxc.to_string())
-			.await
+	/// Removes a pending upload's row and its index row, in one transaction.
+	pub(super) async fn remove_pending_mxc(
+		&self,
+		mxc: &Mxc<'_>,
+		user: &UserId,
+		expires_at: u64,
+	) -> Result {
+		let mxc = mxc.to_string();
+		let mut txn = self.db.txn();
+		txn.del_raw(&self.mediaid_pending, &mxc);
+		txn.del_raw(&self.mediaid_pending, pending_index_key(user, expires_at, &mxc));
+
+		txn.execute().await
 	}
 
-	/// Count the number of pending MXC URIs for a specific user
-	pub(super) async fn count_pending_mxc_for_user(&self, user_id: &UserId) -> (usize, u64) {
-		type KeyVal<'a> = (Ignore, (u64, &'a UserId));
+	/// The user's live pending uploads, at most `max` of them, and the
+	/// earliest expiry among those counted (`u64::MAX` when none).
+	///
+	/// Reads the user's rows of the pending-upload index newest expiry first,
+	/// and stops at the first expired one or after `max`. So a request reads
+	/// at most `max` + 1 index rows, whoever else has uploads pending. A
+	/// pending upload recorded before the index existed is not counted; it
+	/// expires on its own.
+	pub(super) async fn count_pending_mxc_for_user(
+		&self,
+		user_id: &UserId,
+		now: u64,
+		max: usize,
+	) -> (usize, u64) {
+		let prefix = pending_index_prefix(user_id);
+		let mut last = prefix.clone();
+		last.extend_from_slice(&[0xFF; 9]);
 
-		self.mediaid_pending
-			.stream()
-			.expect_ok()
-			.ready_filter(|(_, (_, pending_user_id)): &KeyVal<'_>| user_id == *pending_user_id)
-			.ready_fold(
-				(0_usize, u64::MAX),
-				|(count, earliest_expiration), (_, (expires_at, _))| {
-					(count.saturating_add(1), earliest_expiration.min(expires_at))
-				},
-			)
-			.await
+		let keys = self.mediaid_pending.rev_raw_keys_from(&last);
+		pin_mut!(keys);
+
+		let (mut count, mut earliest) = (0_usize, u64::MAX);
+		while count < max {
+			let Some(Ok(key)) = keys.next().await else {
+				break;
+			};
+
+			let expires_at = pending_index_expiry(key, prefix.len());
+			if !key.starts_with(&prefix) || expires_at <= now {
+				break;
+			}
+
+			count = count.saturating_add(1);
+			earliest = earliest.min(expires_at);
+		}
+
+		(count, earliest)
 	}
 
 	/// Search for a pending MXC URI in the database
@@ -459,6 +494,55 @@ impl Data {
 		.ok()
 	}
 
+	/// Writes `owner`'s usage total on its own.
+	pub(super) async fn put_usage(&self, owner: Owner<'_>, total: u64) -> Result {
+		let mut txn = self.db.txn();
+		self.set_usage(&mut txn, owner, total);
+
+		txn.execute().await
+	}
+
+	/// At most `limit` media record keys from `from`, inclusive, or from the
+	/// first. The read is closed before this returns.
+	pub(super) async fn media_keys_from(
+		&self,
+		from: Option<&[u8]>,
+		limit: usize,
+	) -> Result<Vec<Vec<u8>>> {
+		self.mediaid_file
+			.raw_keys_capped(from, limit)
+			.await
+	}
+
+	/// At most `limit` (MXC, uploader) pairs of the uploader index after the
+	/// key `after`, or from the first, and the key to pass next, `None` once
+	/// the index ends. The read is closed before this returns.
+	pub(super) async fn uploads_after(
+		&self,
+		after: Option<&[u8]>,
+		limit: usize,
+	) -> Result<(Vec<(OwnedMxcUri, OwnedUserId)>, Option<Vec<u8>>)> {
+		let rows = self
+			.mediaid_user
+			.raw_rows_after(after, limit)
+			.await?;
+
+		let next = rows
+			.last()
+			.filter(|_| rows.len() >= limit)
+			.map(|(key, _)| key.clone());
+
+		let uploads = rows
+			.iter()
+			.filter_map(|(key, _)| {
+				let (mxc, user): (&str, &UserId) = deserialize_from_slice(key).ok()?;
+				Some((mxc.into(), user.to_owned()))
+			})
+			.collect();
+
+		Ok((uploads, next))
+	}
+
 	/// Writes `owner`'s usage total as part of `txn`.
 	fn set_usage(&self, txn: &mut Txn, owner: Owner<'_>, total: u64) {
 		match owner {
@@ -475,6 +559,69 @@ impl Data {
 			.keys()
 			.ignore_err()
 			.map(|(mxc, user): (&str, &UserId)| (mxc.into(), user.to_owned()))
+	}
+}
+
+/// The start of a user's rows in the pending-upload index.
+///
+/// Those rows share `mediaid_pending` with the pending rows themselves, which
+/// are keyed by MXC: user IDs start with `@` and MXCs with `mxc://`, so the
+/// two never meet, and `0xFF`, which no user ID contains, ends the user's
+/// part.
+fn pending_index_prefix(user: &UserId) -> Vec<u8> {
+	let mut key = Vec::with_capacity(user.as_bytes().len().saturating_add(1));
+	key.extend_from_slice(user.as_bytes());
+	key.push(0xFF);
+	key
+}
+
+/// One pending upload's index row: [`pending_index_prefix`], then its expiry
+/// as eight big-endian bytes, so a user's rows sort by expiry, then its MXC.
+fn pending_index_key(user: &UserId, expires_at: u64, mxc: &str) -> Vec<u8> {
+	let mut key = pending_index_prefix(user);
+	key.extend_from_slice(&expires_at.to_be_bytes());
+	key.extend_from_slice(mxc.as_bytes());
+	key
+}
+
+/// The expiry an index row carries after its `prefix` bytes; zero, so
+/// expired, when the row is too short to carry one.
+fn pending_index_expiry(key: &[u8], prefix: usize) -> u64 {
+	key.get(prefix..prefix.saturating_add(8))
+		.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+		.map_or(0, u64::from_be_bytes)
+}
+
+#[cfg(test)]
+mod pending_index_tests {
+	use ruma::user_id;
+
+	use super::{pending_index_expiry, pending_index_key, pending_index_prefix};
+
+	#[test]
+	fn a_users_index_rows_sort_by_expiry_and_meet_no_one_elses() {
+		let alice = user_id!("@alice:example.org");
+		let longer = user_id!("@alice:example.org2");
+		let prefix = pending_index_prefix(alice);
+
+		let soon = pending_index_key(alice, 10, "mxc://example.org/zzz");
+		let late = pending_index_key(alice, 20, "mxc://example.org/aaa");
+		assert!(soon < late, "a user's rows do not sort by expiry");
+		assert!(soon.starts_with(&prefix) && late.starts_with(&prefix));
+		assert_eq!(pending_index_expiry(&late, prefix.len()), 20);
+
+		// The reverse seek a count starts from lies past every row of the
+		// user, and a user whose id extends this one sorts before it.
+		let mut last = prefix.clone();
+		last.extend_from_slice(&[0xFF; 9]);
+		let max = pending_index_key(alice, u64::MAX, "mxc://example.org/zzz");
+		assert!(max < last);
+		let other = pending_index_key(longer, u64::MAX, "mxc://example.org/zzz");
+		assert!(other < soon && !other.starts_with(&prefix));
+
+		// Index rows and pending rows share the map without meeting.
+		assert!(soon.as_slice() < b"mxc://".as_slice());
+		assert_eq!(pending_index_expiry(&prefix, prefix.len()), 0);
 	}
 }
 
