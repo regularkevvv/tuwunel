@@ -8,13 +8,21 @@
 //! [`ENV`] arms points as a comma-separated list of `name=N`: the N-th time
 //! this process passes `name`, it aborts. A bare `name` is `name=1`. Abort
 //! runs no destructor, flushes nothing, and releases no lease, which is the
-//! closest a process gets to being killed at that instruction. A restarted
-//! process counts from zero again, so the harness arms a point only for the
-//! first Container it starts.
+//! closest a process gets to being killed at that instruction.
+//!
+//! A point fires once per container filesystem. Before it aborts it leaves a
+//! mark in the temporary directory, and a process that finds the mark starts
+//! with that point disarmed. The local Container runtime restarts a failed
+//! container in place, with the same environment (workerd sets Docker's
+//! `on-failure` restart policy), and without the mark the restarted process
+//! would crash at the same point again. A fresh container has no mark.
 
-use std::sync::{
-	LazyLock,
-	atomic::{AtomicU64, Ordering::SeqCst},
+use std::{
+	path::PathBuf,
+	sync::{
+		LazyLock,
+		atomic::{AtomicU64, Ordering::SeqCst},
+	},
 };
 
 /// The environment variable that arms failpoints.
@@ -46,6 +54,7 @@ static ARMED: LazyLock<Vec<Armed>> = LazyLock::new(|| {
 	match parse(&spec) {
 		| Ok(points) => points
 			.into_iter()
+			.filter(|(name, _)| !mark(name).exists())
 			.map(|(name, at)| Armed { name, at, hits: AtomicU64::new(0) })
 			.collect(),
 		| Err(error) => {
@@ -54,6 +63,12 @@ static ARMED: LazyLock<Vec<Armed>> = LazyLock::new(|| {
 		},
 	}
 });
+
+/// Where a fired point leaves its mark.
+#[must_use]
+pub fn mark(name: &str) -> PathBuf {
+	std::env::temp_dir().join(format!("tuwunel-failpoint-{name}"))
+}
 
 /// Parses an arming list into `(point, hit)` pairs.
 ///
@@ -98,6 +113,11 @@ pub fn hit(name: &'static str) {
 
 	let hits = point.hits.fetch_add(1, SeqCst).saturating_add(1);
 	if hits == point.at {
+		if let Err(error) = std::fs::write(mark(name), b"") {
+			eprintln!(
+				"failpoint {name}: no mark left ({error}); a restart in place meets it again"
+			);
+		}
 		eprintln!("failpoint {name} fired at hit {hits}; aborting");
 		std::process::abort();
 	}
@@ -105,7 +125,7 @@ pub fn hit(name: &'static str) {
 
 #[cfg(test)]
 mod tests {
-	use super::parse;
+	use super::{mark, parse};
 
 	#[test]
 	fn arming_lists_name_declared_points_and_positive_hits() {
@@ -124,5 +144,12 @@ mod tests {
 		] {
 			assert!(parse(refused).is_err(), "{refused}");
 		}
+	}
+
+	#[test]
+	fn a_mark_is_one_file_per_point_in_the_temporary_directory() {
+		let path = mark("send.after_append");
+		assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+		assert_ne!(path, mark("send.before_append"));
 	}
 }
