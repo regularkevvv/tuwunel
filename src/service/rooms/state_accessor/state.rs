@@ -219,10 +219,27 @@ pub async fn state_get_optional(
 				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
 		},
 
+		// Proving the cell absent needs every entry's compact key mapped, since an
+		// unmapped one could be this cell, but only the matching entry's event
+		// id: another entry's missing event mapping cannot hide it.
 		| None => {
-			let event_id = self
-				.state_full_entries_strict(shortstatehash)
-				.boxed()
+			let (shortstatekeys, shorteventids): (Vec<_>, Vec<_>) = self
+				.state_full_shortids(shortstatehash)
+				.try_collect::<Vec<_>>()
+				.await?
+				.into_iter()
+				.unzip();
+
+			let shorteventid = self
+				.services
+				.short
+				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
+				.zip(shorteventids.into_iter().stream())
+				.map(|(state_key, shorteventid)| {
+					state_key
+						.map(|state_key| (state_key, shorteventid))
+						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
+				})
 				.try_collect::<Vec<_>>()
 				.await?
 				.into_iter()
@@ -230,11 +247,15 @@ pub async fn state_get_optional(
 					candidate_type == event_type && candidate_key.as_str() == state_key
 				})
 				.map(at!(1));
-			let Some(event_id) = event_id else {
+			let Some(shorteventid) = shorteventid else {
 				return Ok(None);
 			};
 
-			event_id
+			self.services
+				.short
+				.get_eventid_from_short(shorteventid)
+				.await
+				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
 		},
 	};
 

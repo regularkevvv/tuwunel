@@ -553,12 +553,13 @@ async fn missing_state_key_reverse(
 	suppress_upgrade(services, left.event_id.as_ref()).await?;
 	suppress_upgrade(services, right.event_id.as_ref()).await?;
 	assert_unevaluable(services, top.event_id.as_ref(), "missing state key reverse map").await?;
-	assert_fetches(
+	// While a state key's mapping is missing, the room's ACL check cannot prove
+	// the room has no ACL, so it refuses the event before any walk.
+	assert_refused_before_walk(
 		services,
 		&room_id,
 		&top,
 		top_json,
-		ExpectedWalkOutcome::Unevaluable,
 		"missing state key reverse map",
 	)
 	.await
@@ -1278,6 +1279,65 @@ async fn assert_no_memo(services: &Services, event_id: &EventId) -> Result {
 			.await
 			.is_err_and(|error| error.is_not_found()),
 		"failed fork {event_id} wrote a resolved-state memo"
+	);
+
+	Ok(())
+}
+
+/// The incoming path refuses `incoming` on a state read error before any local
+/// walk, and it never reaches the timeline.
+async fn assert_refused_before_walk(
+	services: &Services,
+	room_id: &RoomId,
+	incoming: &PduEvent,
+	incoming_json: CanonicalJsonObject,
+	context: &str,
+) -> Result {
+	let room_version = match services.state.get_room_version(room_id).await {
+		| Ok(room_version) => room_version,
+		| Err(error) => return Err!("{context} failed to load the room version: {error}"),
+	};
+
+	let incoming_json = into_outgoing_federation(incoming_json, &room_version);
+	let before = services.event_handler.state_local_metrics();
+
+	let result = services
+		.event_handler
+		.handle_incoming_pdu(
+			services.globals.server_name(),
+			room_id,
+			incoming.event_id.as_ref(),
+			incoming_json,
+			true,
+		)
+		.await;
+
+	let after = services.event_handler.state_local_metrics();
+
+	assert_eq!(
+		walk_metrics_delta(&before, &after, context),
+		StateLocalMetrics::default(),
+		"{context} reached the local walk"
+	);
+
+	let Err(error) = result else {
+		return Err!("{context} was not refused");
+	};
+
+	if !error
+		.to_string()
+		.contains("Incomplete state key mapping")
+	{
+		return Err!("{context} was refused for another reason: {error}");
+	}
+
+	assert!(
+		services
+			.timeline
+			.non_outlier_pdu_exists(incoming.event_id.as_ref())
+			.await
+			.is_err_and(|error| error.is_not_found()),
+		"{context} reached the timeline"
 	);
 
 	Ok(())
