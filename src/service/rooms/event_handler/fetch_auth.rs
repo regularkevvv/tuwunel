@@ -170,6 +170,18 @@ async fn fetch_auth_chain(
 			continue;
 		}
 
+		// A rejected event is never refetched; the events citing it are rejected
+		// on its record instead.
+		if self
+			.services
+			.timeline
+			.is_pdu_rejected(&next_id)
+			.await
+		{
+			trace!(?next_id, "Rejected");
+			continue;
+		}
+
 		if self.services.server.check_running().is_err() {
 			debug_warn!(?next_id, "Server shutting down");
 			break;

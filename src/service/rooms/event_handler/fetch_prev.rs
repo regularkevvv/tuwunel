@@ -11,7 +11,7 @@ use ruma::{
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::time::{Instant, timeout_at};
 use tuwunel_core::{
-	Result, debug_warn, err, implement,
+	Err, Result, debug_warn, err, implement,
 	matrix::{
 		Event, PduEvent,
 		event::gen_event_id,
@@ -54,7 +54,7 @@ where
 	let has_gap = initial_set
 		.clone()
 		.stream()
-		.any(async |event_id| !self.services.timeline.pdu_exists(event_id).await)
+		.any(async |event_id| !self.is_known_prev(event_id).await)
 		.await;
 
 	let wait_ms = self.services.server.config.fetch_prev_wait_ms;
@@ -63,28 +63,47 @@ where
 		.await
 		.unwrap_or(has_gap);
 
-	has_gap
-		.then_async(|| {
-			self.prefetch_missing_events(
-				origin,
-				room_id,
-				incoming_event_id,
-				room_version,
-				recursion_level,
-			)
-		})
+	if has_gap {
+		self.prefetch_missing_events(
+			origin,
+			room_id,
+			incoming_event_id,
+			room_version,
+			recursion_level,
+		)
 		.await;
 
+		// A prev still absent after the gap fill refuses the event, as the
+		// reference server does: its sender is not divulging the history it
+		// builds on, and walking past the gap with per-event and state fetches
+		// would let the sender name that history for us. The deeper ancestry of
+		// a prev the fill did return is still walked below.
+		let absent = initial_set
+			.clone()
+			.stream()
+			.any(async |event_id| !self.is_known_prev(event_id).await)
+			.await;
+
+		if absent {
+			return Err!(Request(Forbidden(
+				"Prev events are unavailable after filling the gap."
+			)));
+		}
+	}
+
+	// A rejected prev is known and contributes no state of its own, so it is
+	// neither fetched nor walked.
 	let mut todo_outlier_stack: FuturesOrdered<_> = initial_set
 		.stream()
 		.map(ToOwned::to_owned)
 		.filter_map(async |event_id| {
-			self.services
-				.timeline
+			let timeline = &self.services.timeline;
+			let unknown = timeline
 				.non_outlier_pdu_exists(&event_id)
 				.await
-				.is_err()
-				.then_some(event_id)
+				.is_err() && !timeline.is_pdu_rejected(&event_id).await;
+
+			unknown.then_some(event_id)
 		})
 		.map(async |event_id| {
 			let events = once(event_id.as_ref());
@@ -221,7 +240,7 @@ where
 		.map(|event_id| (event_id, self.services.timeline.watch_event(event_id)))
 		.stream()
 		.filter_map(async |(event_id, watcher)| {
-			(!self.services.timeline.pdu_exists(event_id).await).then_some(watcher)
+			(!self.is_known_prev(event_id).await).then_some(watcher)
 		})
 		.collect()
 		.await;
@@ -233,6 +252,15 @@ where
 	timeout_at(deadline, pending.count())
 		.await
 		.is_err()
+}
+
+/// Whether a prev event opens no gap: this server stores it, as a timeline
+/// event or an outlier, or it rejected it.
+#[implement(super::Service)]
+async fn is_known_prev(&self, event_id: &EventId) -> bool {
+	let timeline = &self.services.timeline;
+
+	timeline.pdu_exists(event_id).await || timeline.is_pdu_rejected(event_id).await
 }
 
 /// Fill the prev gap below `incoming_event_id` with one `/get_missing_events`

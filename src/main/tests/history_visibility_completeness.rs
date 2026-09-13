@@ -7,7 +7,11 @@ use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result,
-	ruma::{OwnedEventId, RoomId, ServerName, events::StateEventType},
+	pdu::PduBuilder,
+	ruma::{
+		CanonicalJsonValue, OwnedEventId, RoomId, ServerName, UserId,
+		events::{StateEventType, room::message::RoomMessageEventContent},
+	},
 };
 use tuwunel_service::{Services, rooms::short::ShortStateHash};
 
@@ -66,7 +70,7 @@ fn corrupt_history_visibility_never_grants_event_access() -> Result {
 async fn exercise(services: &Services, base: &str) -> Result {
 	wait_until_ready(services, base).await?;
 
-	let _owner = register(services, "historyvisibilityowner", OWNER_TOKEN).await?;
+	let owner_id = register(services, "historyvisibilityowner", OWNER_TOKEN).await?;
 	let former_member_id =
 		register(services, "historyvisibilityformer", FORMER_MEMBER_TOKEN).await?;
 	let owner = Client { services, base, token: OWNER_TOKEN };
@@ -86,6 +90,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	assert_event_hidden(&former_member, &room, &event, "healthy joined history").await?;
 	verify_mismatched_history_mapping(&owner, &former_member, &room, &event).await?;
 	verify_foreign_state_hash(services, &owner, &former_member, &room, &event).await?;
+	verify_missing_timeline_snapshot(services, &owner, &former_member, &room, &event).await?;
+	verify_outlier_uses_current_state(services, &owner, &former_member, &room, &owner_id).await?;
 	let create = services
 		.state_accessor
 		.room_state_get_id(&room, &StateEventType::RoomCreate, "")
@@ -220,6 +226,70 @@ async fn verify_foreign_state_hash(
 	);
 
 	Ok(())
+}
+
+/// A normal timeline event always has a state snapshot, so losing it must not
+/// fall back to any other state.
+async fn verify_missing_timeline_snapshot(
+	services: &Services,
+	owner: &Client<'_>,
+	former_member: &Client<'_>,
+	room: &RoomId,
+	event: &OwnedEventId,
+) -> Result {
+	let shorteventid = services.short.get_shorteventid(event).await?;
+	let key = shorteventid.to_be_bytes();
+	let event_states = &services.db["shorteventid_shortstatehash"];
+	let saved = event_states.get(&key).await?.to_vec();
+	event_states.remove(&key).await?;
+	services.clear_cache().await;
+
+	assert_event_hidden(owner, room, event, "missing timeline snapshot").await?;
+	assert_event_hidden(former_member, room, event, "missing timeline snapshot").await?;
+
+	event_states.raw_put(&key, &saved).await?;
+	services.clear_cache().await;
+	assert_event_visible(owner, room, event, "restored timeline snapshot").await
+}
+
+/// An outlier never had a snapshot, so it is judged by the room's current
+/// state: visible to a current member under `joined` history, hidden from a
+/// former one.
+async fn verify_outlier_uses_current_state(
+	services: &Services,
+	owner: &Client<'_>,
+	former_member: &Client<'_>,
+	room: &RoomId,
+	owner_id: &UserId,
+) -> Result {
+	let state_lock = services.state.mutex.lock(room).await;
+	let (pdu, mut json) = services
+		.timeline
+		.create_hash_and_sign_event(
+			PduBuilder::timeline(&RoomMessageEventContent::text_plain(SECRET)),
+			owner_id,
+			room,
+			&state_lock,
+		)
+		.await?;
+	drop(state_lock);
+
+	json.insert("event_id".into(), CanonicalJsonValue::String(pdu.event_id.as_str().into()));
+	services
+		.timeline
+		.add_pdu_outlier(&pdu.event_id, &json)
+		.await?;
+	assert!(
+		services
+			.state
+			.pdu_shortstatehash(&pdu.event_id)
+			.await
+			.is_err(),
+		"an outlier must have no state snapshot"
+	);
+
+	assert_event_visible(owner, room, &pdu.event_id, "outlier by current state").await?;
+	assert_event_hidden(former_member, room, &pdu.event_id, "outlier by current state").await
 }
 
 async fn set_history_visibility(client: &Client<'_>, room: &RoomId) -> Result {
