@@ -459,6 +459,18 @@ impl Data {
 		.ok()
 	}
 
+	/// At most `limit` media record keys from `from`, inclusive, or from the
+	/// first. The read is closed before this returns.
+	pub(super) async fn media_keys_from(
+		&self,
+		from: Option<&[u8]>,
+		limit: usize,
+	) -> Result<Vec<Vec<u8>>> {
+		self.mediaid_file
+			.raw_keys_capped(from, limit)
+			.await
+	}
+
 	/// Writes `owner`'s usage total as part of `txn`.
 	fn set_usage(&self, txn: &mut Txn, owner: Owner<'_>, total: u64) {
 		match owner {
