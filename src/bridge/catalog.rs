@@ -167,6 +167,7 @@ pub static MAP_IDS: &[(&str, MapId)] = &[
 	("uiaasessionid_metadata", MapId(138)),
 	("userid_mediabytes", MapId(139)),
 	("servername_mediabytes", MapId(140)),
+	("oauthidpuserid_pendingclaims", MapId(141)),
 ];
 
 /// Looks up the immutable id for a catalog map name.

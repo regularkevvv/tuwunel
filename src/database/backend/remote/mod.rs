@@ -34,7 +34,7 @@ use std::{
 	collections::BTreeSet,
 	sync::{
 		Arc, Mutex, PoisonError,
-		atomic::{AtomicU64, Ordering::Relaxed},
+		atomic::{AtomicU64, Ordering::SeqCst},
 	},
 	time::Duration,
 };
@@ -151,7 +151,7 @@ impl Backend {
 
 		STATS.remote_cache_miss.record(0);
 
-		let stamp = self.commits.load(Relaxed);
+		let stamp = self.commits.load(SeqCst);
 		let request = Request::Get {
 			map: map.0,
 			keys: vec![ByteBuf::from(key.to_vec())],
@@ -159,9 +159,8 @@ impl Backend {
 
 		let mut vals = self.got(&request).await?;
 		let val = vals.pop().flatten();
-		if self.commits.load(Relaxed) == stamp {
-			self.cache.insert(map, key, val.as_deref());
-		}
+		self.cache
+			.insert_if(map, key, val.as_deref(), || self.commits.load(SeqCst) == stamp);
 
 		Ok(val)
 	}
@@ -204,7 +203,7 @@ impl Backend {
 			}
 			let (vals, stamp) = loop {
 				let (chunk, _) = remaining.split_at(count);
-				let stamp = self.commits.load(Relaxed);
+				let stamp = self.commits.load(SeqCst);
 				let request = Request::Get {
 					map: map.0,
 					keys: chunk
@@ -233,12 +232,12 @@ impl Backend {
 				return Err!(Database("bridge get: reply length does not match the request"));
 			}
 
-			let fill = self.commits.load(Relaxed) == stamp;
 			for (at, val) in chunk.iter().zip(vals) {
 				let val = val.map(|val| val.into_vec().into_boxed_slice());
-				if fill {
-					self.cache.insert(map, keys[*at], val.as_deref());
-				}
+				self.cache
+					.insert_if(map, keys[*at], val.as_deref(), || {
+						self.commits.load(SeqCst) == stamp
+					});
 
 				out[*at] = val;
 			}
@@ -301,7 +300,9 @@ impl Backend {
 			},
 		};
 
-		self.commits.fetch_add(1, Relaxed);
+		// The counter moves before any key is invalidated: a fill checks it
+		// under the same shard lock as the invalidation (`Cache::insert_if`).
+		self.commits.fetch_add(1, SeqCst);
 		for op in ops {
 			self.cache.invalidate(MapId(op.map()), op.key());
 		}

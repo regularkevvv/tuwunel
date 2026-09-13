@@ -3,7 +3,7 @@ pub mod association;
 
 use std::{
 	iter::once,
-	sync::{Arc, Mutex},
+	sync::Arc,
 	time::{Duration, SystemTime},
 };
 
@@ -35,7 +35,6 @@ use crate::SelfServices;
 
 pub struct Sessions {
 	services: SelfServices,
-	association_pending: Mutex<association::Pending>,
 
 	/// Serializes probes and writes for each unique identity.
 	///
@@ -54,6 +53,7 @@ pub struct Sessions {
 
 struct Data {
 	oauthid_session: Arc<Map>,
+	oauthidpuserid_pendingclaims: Arc<Map>,
 	oauthuniqid_oauthid: Arc<Map>,
 	userid_oauthid: Arc<Map>,
 	database: Arc<Database>,
@@ -277,12 +277,12 @@ pub(super) fn build(args: &crate::Args<'_>, providers: Arc<Providers>) -> Result
 
 	Ok(Self {
 		services: args.services.clone(),
-		association_pending: Default::default(),
 		write_locks: MutexMap::new(),
 		providers,
 		keys,
 		db: Data {
 			oauthid_session: args.db["oauthid_session"].clone(),
+			oauthidpuserid_pendingclaims: args.db["oauthidpuserid_pendingclaims"].clone(),
 			oauthuniqid_oauthid: args.db["oauthuniqid_oauthid"].clone(),
 			userid_oauthid: args.db["userid_oauthid"].clone(),
 			database: args.db.clone(),

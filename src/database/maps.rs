@@ -243,6 +243,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "oauthidpuserid_pendingclaims",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "oauthuniqid_oauthid",
 		..descriptor::RANDOM_SMALL
 	},

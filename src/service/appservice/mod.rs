@@ -113,6 +113,13 @@ impl Service {
 	}
 
 	pub async fn load_appservice(&self, registration: Registration) -> Result {
+		self.admit(registration, None).await
+	}
+
+	/// Validates a registration and makes it live. One being added (`persist`)
+	/// is written to D1 first, under the registry's write lock, so it is never
+	/// usable before it is durable.
+	async fn admit(&self, registration: Registration, persist: Option<String>) -> Result {
 		//TODO: Check for collisions between exclusive appservice namespaces
 
 		let registration_info =
@@ -145,6 +152,13 @@ impl Service {
 				.await?;
 		}
 
+		if let Some(yaml) = persist {
+			self.db
+				.id_appserviceregistrations
+				.insert(id, yaml)
+				.await?;
+		}
+
 		registrations.insert(id.clone(), registration_info);
 
 		Ok(())
@@ -153,18 +167,10 @@ impl Service {
 	pub async fn register_appservice(&self, registration: Registration) -> Result {
 		self.loaded().await;
 
-		let id = registration.id.clone();
-
 		let appservice_yaml = serde_yaml::to_string(&registration)?;
 
-		self.load_appservice(registration).await?;
-
-		self.db
-			.id_appserviceregistrations
-			.insert(&id, appservice_yaml)
-			.await?;
-
-		Ok(())
+		self.admit(registration, Some(appservice_yaml))
+			.await
 	}
 
 	pub async fn unregister_appservice(&self, appservice_id: &str) -> Result {
@@ -186,16 +192,16 @@ impl Service {
 			return Err!("Cannot unregister config appservice");
 		}
 
-		// removes the appservice registration info
-		registrations
-			.remove(appservice_id)
-			.ok_or_else(|| err!("Appservice not found"))?;
-
-		// remove the appservice from the database
+		// Durable first: a failed removal leaves the registration live and
+		// persisted alike, and a restart never brings a removed one back.
 		self.db
 			.id_appserviceregistrations
 			.remove(appservice_id)
 			.await?;
+
+		registrations
+			.remove(appservice_id)
+			.ok_or_else(|| err!("Appservice not found"))?;
 
 		// deletes all active requests for the appservice if there are any so we stop
 		// sending to the URL

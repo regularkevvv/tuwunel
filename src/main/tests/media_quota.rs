@@ -7,7 +7,13 @@
 //! `media_remote_retention` without touching local media; a counter that does
 //! not exist is measured from the stored objects.
 
-use std::{env::temp_dir, fs::remove_dir_all, process::id as process_id, time::Duration};
+use std::{
+	env::temp_dir,
+	fs::{read_dir, remove_dir_all, remove_file},
+	path::Path,
+	process::id as process_id,
+	time::Duration,
+};
 
 use tokio::time::sleep;
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
@@ -39,7 +45,7 @@ fn media_quotas_and_remote_retention() -> Result {
 	let server = Server::new(Some(&args), Some(&runtime))?;
 	let result: Result = runtime.block_on(async {
 		let services = async_start(&server).await?;
-		let outcome = exercise(&services).await;
+		let outcome = exercise(&services, &db_path.join("media")).await;
 
 		server.server.shutdown()?;
 		drop(services);
@@ -55,7 +61,7 @@ fn media_quotas_and_remote_retention() -> Result {
 	result
 }
 
-async fn exercise(services: &Services) -> Result {
+async fn exercise(services: &Services, media_dir: &Path) -> Result {
 	let media = &services.media;
 	let ours = services.globals.server_name();
 	let user = UserId::parse(format!("@quota:{ours}"))?;
@@ -133,6 +139,32 @@ async fn exercise(services: &Services) -> Result {
 	}
 	if media.get_metadata(&second).await.is_none() {
 		return Err!("retention removed local media");
+	}
+
+	// A delete whose objects are already gone, as a retry after a kill between
+	// removing the objects and removing their records would find them, still
+	// releases exactly the bytes the records carry.
+	let lost = Mxc {
+		server_name: remote,
+		media_id: "cachedlost",
+	};
+	media
+		.create(&lost, None, None, None, &BYTES[..500])
+		.await?;
+	usage(services, Owner::Server(remote), 500, "after storing media about to be lost").await?;
+	for entry in read_dir(media_dir)? {
+		remove_file(entry?.path())?;
+	}
+	media.delete(&lost).await?;
+	usage(
+		services,
+		Owner::Server(remote),
+		0,
+		"after deleting media whose objects were gone",
+	)
+	.await?;
+	if media.get_metadata(&lost).await.is_some() {
+		return Err!("a delete whose objects were gone kept the record");
 	}
 
 	Ok(())

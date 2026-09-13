@@ -900,6 +900,7 @@ async fn decide_user_id(
 		.oauth
 		.sessions
 		.find_user_association_pending(provider.id(), userinfo)
+		.await
 	{
 		debug_info!(provider = ?provider.id(), ?user_id, "Matched pending association");
 

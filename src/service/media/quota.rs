@@ -8,10 +8,14 @@
 //! local upload are not charged to the uploader: they derive from media
 //! already counted and stay within `media_thumbnail_max_pixels`.
 //!
-//! Usage is one counter per owner. Bytes are reserved before an object is
-//! written, returned if the write fails, and released when the object is
-//! deleted. A counter missing when first needed is measured from the stored
-//! objects, so media written before the counters existed are counted too.
+//! Usage is one counter per owner, changed only in the same D1 transaction as
+//! the records it counts, under the owner's quota lock. An object's record
+//! carries its byte length: it is charged when the record is written, and
+//! released from that length when the records are removed. So a kill at any
+//! point leaves counter and records agreeing, and a retried delete whose
+//! objects are already gone still releases exactly once. A counter missing
+//! when first needed is measured from the records, and from storage for
+//! records older than their length.
 
 use std::{
 	str::from_utf8,
@@ -23,7 +27,6 @@ use ruma::{Mxc, OwnedMxcUri, ServerName, UserId};
 use tuwunel_core::{
 	Err, Result, implement,
 	utils::stream::{BroadbandExt, IterStream, ReadyExt},
-	warn,
 };
 
 /// Whose byte quota a stored object counts against.
@@ -39,7 +42,7 @@ pub enum Owner<'a> {
 pub(super) const RETENTION_INTERVAL: Duration = Duration::from_hours(6);
 
 impl Owner<'_> {
-	fn lock_key(self) -> String {
+	pub(super) fn lock_key(self) -> String {
 		match self {
 			| Self::User(user) => format!("user:{user}"),
 			| Self::Server(server) => format!("server:{server}"),
@@ -67,13 +70,13 @@ pub(super) fn quota_owner<'a>(
 	uploader.filter(|_| original).map(Owner::User)
 }
 
-/// Reserves `len` bytes against `owner`, refusing with `M_TOO_LARGE` when
-/// that would pass the owner's quota. A zero quota counts without limiting.
+/// `owner`'s usage total with `len` more bytes, refusing with `M_TOO_LARGE`
+/// when that passes the owner's quota; a zero quota counts without limiting.
+/// The caller holds the owner's quota lock and writes the total with the
+/// object's record.
 #[implement(super::Service)]
-pub(super) async fn reserve(&self, owner: Owner<'_>, len: u64) -> Result {
-	let _lock = self.quota_mutex.lock(&owner.lock_key()).await;
-	let used = self.usage_locked(owner).await;
-	let next = used.saturating_add(len);
+pub(super) async fn admit(&self, owner: Owner<'_>, len: u64) -> Result<u64> {
+	let next = self.usage_locked(owner).await.saturating_add(len);
 	let config = &self.services.server.config;
 	let limit = match owner {
 		| Owner::User(_) => config.media_user_quota,
@@ -84,25 +87,14 @@ pub(super) async fn reserve(&self, owner: Owner<'_>, len: u64) -> Result {
 		return Err!(Request(TooLarge("Media storage quota exceeded.")));
 	}
 
-	self.db.set_quota_usage(owner, next).await
+	Ok(next)
 }
 
-/// Returns `len` bytes to `owner` once an object charged to it is deleted or
-/// failed to store. An owner without a counter is left to be measured.
+/// `owner`'s usage total with `len` bytes released. The caller holds the
+/// owner's quota lock and writes the total as it removes the records.
 #[implement(super::Service)]
-pub(super) async fn release(&self, owner: Owner<'_>, len: u64) {
-	let _lock = self.quota_mutex.lock(&owner.lock_key()).await;
-	let Some(used) = self.db.quota_usage(owner).await else {
-		return;
-	};
-
-	if let Err(e) = self
-		.db
-		.set_quota_usage(owner, used.saturating_sub(len))
-		.await
-	{
-		warn!(?owner, "Failed to release media quota: {e}");
-	}
+pub(super) async fn released(&self, owner: Owner<'_>, len: u64) -> u64 {
+	self.usage_locked(owner).await.saturating_sub(len)
 }
 
 /// Bytes stored against `owner`, measured from the stored objects when no
@@ -122,7 +114,8 @@ async fn usage_locked(&self, owner: Owner<'_>) -> u64 {
 	}
 }
 
-/// Sums the stored size of every object `owner` is charged for.
+/// Sums the size of every object `owner` is charged for: the length its
+/// record carries, or its stored size for an older record.
 #[implement(super::Service)]
 async fn measure(&self, owner: Owner<'_>) -> u64 {
 	let keys: Vec<Vec<u8>> = match owner {
@@ -152,13 +145,22 @@ async fn measure(&self, owner: Owner<'_>) -> u64 {
 
 	keys.into_iter()
 		.stream()
-		.broad_filter_map(async |key| {
-			self.head_meta(&key)
-				.await
-				.map(|object| object.size)
-		})
+		.broad_filter_map(async |key| self.object_len(&key).await)
 		.ready_fold(0_u64, u64::saturating_add)
 		.await
+}
+
+/// The length an object's record carries, or its stored size for a record
+/// written before records carried one.
+#[implement(super::Service)]
+pub(super) async fn object_len(&self, key: &[u8]) -> Option<u64> {
+	match self.db.file_len(key).await {
+		| Some(len) => Some(len),
+		| None => self
+			.head_meta(key)
+			.await
+			.map(|object| object.size),
+	}
 }
 
 /// Removes media cached from remote servers for longer than

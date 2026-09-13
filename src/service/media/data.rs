@@ -85,6 +85,10 @@ impl Data {
 		}
 	}
 
+	/// Records one stored object. The record carries its byte length, and a
+	/// charged object's owner gets its new usage total in the same transaction,
+	/// so the counter never disagrees with the records it counts.
+	#[expect(clippy::too_many_arguments)]
 	pub(super) async fn create_file_metadata(
 		&self,
 		mxc: &Mxc<'_>,
@@ -92,17 +96,22 @@ impl Data {
 		dim: &Dim,
 		content_disposition: Option<&ContentDisposition>,
 		content_type: Option<&str>,
+		len: u64,
+		charge: Option<(Owner<'_>, u64)>,
 	) -> Result<Vec<u8>> {
 		let dim: &[u32] = &[dim.width, dim.height];
 		let key = (mxc, dim, content_disposition, content_type);
 		let key = serialize_key(key)?;
 		let mut txn = self.db.txn();
 
-		txn.insert_raw(&self.mediaid_file, &key, []);
+		txn.insert_raw(&self.mediaid_file, &key, len.to_be_bytes());
 		if let Some(user) = user {
 			let key = (mxc, user);
 
 			txn.put_raw(&self.mediaid_user, key, user);
+		}
+		if let Some((owner, total)) = charge {
+			self.set_usage(&mut txn, owner, total);
 		}
 
 		txn.execute().await?;
@@ -230,7 +239,45 @@ impl Data {
 		txn.del_raw(&self.mediaid_lazycontent, mxc);
 	}
 
-	pub(super) async fn delete_file_mxc(&self, mxc: &Mxc<'_>) {
+	/// Removes one object's record after its object could not be written,
+	/// returning its charge in the same transaction.
+	pub(super) async fn remove_file_metadata(
+		&self,
+		mxc: &Mxc<'_>,
+		key: &[u8],
+		uploader: Option<&UserId>,
+		charge: Option<(Owner<'_>, u64)>,
+	) -> Result {
+		let mut txn = self.db.txn();
+
+		txn.del_raw(&self.mediaid_file, key);
+		if let Some(user) = uploader {
+			txn.del_raw(&self.mediaid_user, serialize_key((mxc, user))?);
+		}
+		if let Some((owner, total)) = charge {
+			self.set_usage(&mut txn, owner, total);
+		}
+
+		txn.execute().await
+	}
+
+	/// The byte length an object's record carries; `None` for a record written
+	/// before records carried one.
+	pub(super) async fn file_len(&self, key: &[u8]) -> Option<u64> {
+		let val = self.mediaid_file.get(key).await.ok()?;
+
+		<[u8; 8]>::try_from(&*val)
+			.ok()
+			.map(u64::from_be_bytes)
+	}
+
+	/// Removes every record of `mxc`, and applies `release` (the owner's new
+	/// usage total) in the same transaction.
+	pub(super) async fn delete_file_mxc(
+		&self,
+		mxc: &Mxc<'_>,
+		release: Option<(Owner<'_>, u64)>,
+	) -> Result {
 		debug!("MXC URI: {mxc}");
 
 		let prefix = (mxc, Interfix);
@@ -264,7 +311,12 @@ impl Data {
 			})
 			.await;
 
-		txn.execute().await.expect("database write error");
+		let mut txn = txn;
+		if let Some((owner, total)) = release {
+			self.set_usage(&mut txn, owner, total);
+		}
+
+		txn.execute().await
 	}
 
 	/// Searches for all files with the given MXC
@@ -407,13 +459,11 @@ impl Data {
 		.ok()
 	}
 
-	pub(super) async fn set_quota_usage(&self, owner: Owner<'_>, used: u64) -> Result {
+	/// Writes `owner`'s usage total as part of `txn`.
+	fn set_usage(&self, txn: &mut Txn, owner: Owner<'_>, total: u64) {
 		match owner {
-			| Owner::User(user) => self.userid_mediabytes.raw_put(user, used).await,
-			| Owner::Server(server) =>
-				self.servername_mediabytes
-					.raw_put(server, used)
-					.await,
+			| Owner::User(user) => txn.raw_put(&self.userid_mediabytes, user, total),
+			| Owner::Server(server) => txn.raw_put(&self.servername_mediabytes, server, total),
 		}
 	}
 

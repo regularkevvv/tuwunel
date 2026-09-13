@@ -59,18 +59,21 @@ pub(super) async fn oauth_associate(
 		);
 	}
 
+	// The claim is durable before any session is removed: a restart between
+	// the two leaves the claim, never an account with neither.
+	let replaced = self
+		.services
+		.oauth
+		.sessions
+		.set_user_association_pending(provider.id(), &user_id, claim)
+		.await?;
+
 	if committed > 0 {
 		self.services
 			.oauth
 			.delete_user_sessions(&user_id)
 			.await;
 	}
-
-	let replaced = self
-		.services
-		.oauth
-		.sessions
-		.set_user_association_pending(provider.id(), &user_id, claim);
 
 	let lead = match committed {
 		| 0 => format!("Pending association {}", replaced.map_or("added", |_| "replaced")),

@@ -92,10 +92,26 @@ impl Cache {
 		Some(slot.val.clone())
 	}
 
-	/// Records one read result; `None` records an absence.
-	///
-	/// An entry larger than one shard's budget is never cached.
+	/// Records one read result unconditionally; the backend always fills
+	/// through [`Cache::insert_if`].
+	#[cfg(test)]
 	pub(crate) fn insert(&self, map: MapId, key: &[u8], val: Option<&[u8]>) {
+		self.insert_if(map, key, val, || true);
+	}
+
+	/// Records one read result (`None` records an absence) only if
+	/// `still_current` holds when checked under the shard lock. A commit
+	/// advances its counter before it invalidates, and invalidation takes the
+	/// same lock, so a read that overlapped a commit either sees the moved
+	/// counter here and is dropped, or is recorded before the invalidation
+	/// that then removes it.
+	pub(crate) fn insert_if(
+		&self,
+		map: MapId,
+		key: &[u8],
+		val: Option<&[u8]>,
+		still_current: impl FnOnce() -> bool,
+	) {
 		let composite = composite(map, key);
 		let size = entry_size(composite.len(), val.map_or(0, <[u8]>::len));
 		if self.budget == 0 || size > self.budget {
@@ -103,6 +119,9 @@ impl Cache {
 		}
 
 		let mut shard = self.shard(&composite);
+		if !still_current() {
+			return;
+		}
 		let composite: Arc<[u8]> = composite.as_slice().into();
 		let slot = Slot {
 			val: val.map(Into::into),
@@ -195,6 +214,29 @@ fn composite(map: MapId, key: &[u8]) -> KeyBuf {
 	buf.extend_from_slice(&map.0.to_be_bytes());
 	buf.extend_from_slice(key);
 	buf
+}
+
+#[cfg(test)]
+mod fill_tests {
+	use super::{Cache, MapId};
+
+	/// Both orders of a fill against a commit that touched the same key leave
+	/// no stale entry behind.
+	#[test]
+	fn a_fill_that_overlapped_a_commit_is_never_kept() {
+		let cache = Cache::new(1 << 20);
+		let map = MapId(1);
+
+		// The commit moved its counter before the fill checked it: dropped.
+		cache.insert_if(map, b"k", Some(b"old"), || false);
+		assert!(cache.get(map, b"k").is_none());
+
+		// The fill checked before the commit: the invalidation removes it.
+		cache.insert_if(map, b"k", Some(b"old"), || true);
+		assert!(cache.get(map, b"k").is_some());
+		cache.invalidate(map, b"k");
+		assert!(cache.get(map, b"k").is_none());
+	}
 }
 
 /// Bytes accounted to one entry.

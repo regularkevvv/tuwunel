@@ -284,8 +284,10 @@ impl Service {
 			.await
 	}
 
-	/// Writes one object's record and bytes. The bytes are reserved against
-	/// the quota they count toward first, and returned if the write fails.
+	/// Writes one object's record and bytes. A charged object's record, which
+	/// carries its length, and its owner's new usage are one transaction under
+	/// the owner's quota lock. An object that then fails to store takes its
+	/// record and charge back out, so no record outlives a missing object.
 	async fn store(
 		&self,
 		mxc: &Mxc<'_>,
@@ -298,28 +300,50 @@ impl Service {
 		let original = dim.width == 0 && dim.height == 0;
 		let owner = self.quota_owner(mxc, user, original);
 		let len = u64::try_from(file.len()).unwrap_or(u64::MAX);
-		if let Some(owner) = owner {
-			self.reserve(owner, len).await?;
+
+		let key = {
+			let _lock = match owner {
+				| Some(owner) => Some(self.quota_mutex.lock(&owner.lock_key()).await),
+				| None => None,
+			};
+			let charge = match owner {
+				| Some(owner) => Some((owner, self.admit(owner, len).await?)),
+				| None => None,
+			};
+
+			self.db
+				.create_file_metadata(
+					mxc,
+					user,
+					dim,
+					content_disposition,
+					content_type,
+					len,
+					charge,
+				)
+				.await?
+		};
+
+		if let Err(e) = self.create_media_file(&key, file).await {
+			let _lock = match owner {
+				| Some(owner) => Some(self.quota_mutex.lock(&owner.lock_key()).await),
+				| None => None,
+			};
+			let charge = match owner {
+				| Some(owner) => Some((owner, self.released(owner, len).await)),
+				| None => None,
+			};
+
+			self.db
+				.remove_file_metadata(mxc, &key, user.filter(|_| original), charge)
+				.await
+				.inspect_err(|e| debug_error!(?mxc, "Failed to remove an unstored record: {e}"))
+				.ok();
+
+			return Err(e);
 		}
 
-		let stored = async {
-			let key = self
-				.db
-				.create_file_metadata(mxc, user, dim, content_disposition, content_type)
-				.await?;
-
-			//TODO: Dangling metadata in database if creation fails
-			self.create_media_file(&key, file).await
-		}
-		.await;
-
-		if stored.is_err()
-			&& let Some(owner) = owner
-		{
-			self.release(owner, len).await;
-		}
-
-		stored
+		Ok(())
 	}
 
 	/// Deletes a file in the database and from the media directory via an MXC
@@ -342,46 +366,49 @@ impl Service {
 				let original = self.get_metadata(mxc).await.map(|meta| meta.key);
 				let uploader = self.db.mxc_user(mxc).await;
 
-				for key in keys {
+				// Every charged object is sized from its record, so a retry whose
+				// objects are already gone still releases exactly what was charged.
+				let mut owner = None;
+				let mut charged = 0_u64;
+				for key in &keys {
 					trace!(?mxc, "MXC Key: {key:?}");
-					let owner = self.quota_owner(
+					let key_owner = self.quota_owner(
 						mxc,
 						uploader.as_deref(),
-						original.as_ref() == Some(&key),
+						original.as_ref() == Some(key),
 					);
 
-					// sized before removal; an object already gone was never charged
-					// or has been released
-					let charged = match owner {
-						| Some(_) => self
-							.head_meta(&key)
-							.await
-							.map(|object| object.size),
-						| None => None,
-					};
+					if key_owner.is_some() {
+						owner = key_owner;
+						let len = self.object_len(key).await.unwrap_or(0);
+						charged = charged.saturating_add(len);
+					}
+				}
 
-					// The records stay until every object is gone. Dropping them
-					// after a failed removal left objects that no record names and
-					// nothing would ever delete (ADR-0005); keeping them lets the
-					// delete be retried.
+				// The records stay until every object is gone. Dropping them
+				// after a failed removal left objects that no record names and
+				// nothing would ever delete (ADR-0005); keeping them lets the
+				// delete be retried.
+				for key in &keys {
 					debug_info!(?mxc, "Deleting from storage provider");
-					self.remove_media_file(&key)
+					self.remove_media_file(key)
 						.await
 						.inspect_err(|e| {
 							debug_error!(?mxc, "Failed to remove media file: {e}");
 						})?;
-
-					if let Some(owner) = owner
-						&& let Some(size) = charged
-					{
-						self.release(owner, size).await;
-					}
 				}
 
-				debug_info!(?mxc, "Deleting from database");
-				self.db.delete_file_mxc(mxc).await;
+				let _lock = match owner {
+					| Some(owner) => Some(self.quota_mutex.lock(&owner.lock_key()).await),
+					| None => None,
+				};
+				let release = match owner {
+					| Some(owner) => Some((owner, self.released(owner, charged).await)),
+					| None => None,
+				};
 
-				Ok(())
+				debug_info!(?mxc, "Deleting from database");
+				self.db.delete_file_mxc(mxc, release).await
 			},
 			| _ if had_lazy => Ok(()),
 			| _ => Err!(Database(error!(
@@ -588,7 +615,11 @@ impl Service {
 		{
 			// a failed promotion leaves metadata without bytes, masking the lazy
 			// fallback on every later read; drop it so the next read retries
-			self.db.delete_file_mxc(mxc).await;
+			self.db
+				.delete_file_mxc(mxc, None)
+				.await
+				.inspect_err(|e| debug_error!(?mxc, "Failed to drop a failed promotion: {e}"))
+				.ok();
 
 			return Err(e);
 		}
@@ -967,9 +998,13 @@ impl Service {
 					"Deleting media file from provider",
 				);
 
+				// A provider that no longer holds the object has confirmed it
+				// absent: a retried delete must not be stuck on an object an
+				// earlier attempt already removed.
 				provider
 					.delete_one(&path)
 					.await
+					.or_else(|e| if absent(&e) { Ok(()) } else { Err(e) })
 					.log_debug_err()
 					.ok()
 			})
@@ -1085,6 +1120,12 @@ impl Service {
 #[inline]
 #[must_use]
 pub fn encode_key(key: &[u8]) -> String { general_purpose::URL_SAFE_NO_PAD.encode(key) }
+
+/// Whether a storage error says the object is not there.
+fn absent(error: &Error) -> bool {
+	matches!(error, Error::ObjectStore(object_store::Error::NotFound { .. }))
+		|| error.is_not_found()
+}
 
 fn mtime_millis(object: &ObjectMeta) -> u64 {
 	u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0)
