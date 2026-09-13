@@ -456,21 +456,30 @@ fn validate_self_destination(&self, dest: &ServerName, allow_self: bool) -> Resu
 
 #[implement(super::Service)]
 fn validate_dest_address(&self, dest: &ServerName) -> Result {
-	if dest.is_ip_literal() || IPAddress::is_valid(dest.host()) {
+	if dest.is_ip_literal() || IPAddress::is_valid(ip_literal_host(dest.host())) {
 		self.validate_dest_ip_literal(dest)?;
 	}
 
 	Ok(())
 }
 
+/// The address inside a server name's host: an IPv6 literal is written in
+/// brackets (`[::1]`), which no address parser accepts, so they are removed.
+pub(super) fn ip_literal_host(host: &str) -> &str {
+	host.strip_prefix('[')
+		.and_then(|inner| inner.strip_suffix(']'))
+		.unwrap_or(host)
+}
+
 #[implement(super::Service)]
 fn validate_dest_ip_literal(&self, dest: &ServerName) -> Result {
 	trace!("Destination is an IP literal, checking against IP range denylist.",);
+	let host = ip_literal_host(dest.host());
 	debug_assert!(
-		dest.is_ip_literal() || !IPAddress::is_valid(dest.host()),
+		dest.is_ip_literal() || IPAddress::is_valid(host),
 		"Destination is not an IP literal."
 	);
-	let ip = IPAddress::parse(dest.host()).map_err(|e| {
+	let ip = IPAddress::parse(host).map_err(|e| {
 		err!(BadServerResponse(debug_error!("Failed to parse IP literal from string: {e}")))
 	})?;
 

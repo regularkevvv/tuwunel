@@ -10,9 +10,24 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tuwunel_core::config::proxy::ProxyHosts;
 
 use super::{
+	actual::ip_literal_host,
 	dns::{Resolver, Validating},
 	fed::{FedDest, add_port_to_hostname, get_ip_with_port},
 };
+
+#[test]
+fn bracketed_ipv6_server_names_parse_as_ip_literals() {
+	let name = ruma::server_name!("[::1]:19001");
+	assert!(name.is_ip_literal());
+	// A server name keeps the brackets, which no address parser accepts.
+	assert!(IPAddress::parse(name.host()).is_err());
+	assert!(IPAddress::parse(ip_literal_host(name.host())).is_ok());
+
+	assert_eq!(ip_literal_host("[2001:db8::1]"), "2001:db8::1");
+	for host in ["127.0.0.1", "matrix.example.com", "[::1", "::1]"] {
+		assert_eq!(ip_literal_host(host), host);
+	}
+}
 
 #[derive(Debug)]
 struct FixedResolver(SocketAddr);
