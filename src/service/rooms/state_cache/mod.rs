@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod tests;
 mod update;
 mod via;
 
@@ -54,14 +56,65 @@ struct Data {
 	userroomid_knockedstate: Arc<Map>,
 }
 
-type AppServiceInRoomCache = RwLock<HashMap<OwnedRoomId, HashMap<String, bool>>>;
+type AppServiceInRoomCache = RwLock<InRoomCache>;
+
+/// Which appservices are in which rooms, as last computed.
+///
+/// A pure cache of membership. Every membership commit invalidates its room,
+/// and `generation` counts invalidations. A fill that read membership before an
+/// invalidation and would insert after it is refused, so an overlapping commit
+/// never leaves a stale answer behind (docs/inventory/process-local-state.md).
+#[derive(Default)]
+struct InRoomCache {
+	rooms: HashMap<OwnedRoomId, HashMap<String, bool>>,
+	generation: u64,
+}
+
+impl InRoomCache {
+	fn get(&self, room_id: &RoomId, appservice: &str) -> Option<bool> {
+		self.rooms
+			.get(room_id)
+			.and_then(|map| map.get(appservice))
+			.copied()
+	}
+
+	/// Keeps a fill only if nothing was invalidated since `seen` was read.
+	fn insert_if(
+		&mut self,
+		seen: u64,
+		room_id: &RoomId,
+		appservice: &str,
+		in_room: bool,
+	) -> bool {
+		if self.generation != seen {
+			return false;
+		}
+
+		self.rooms
+			.entry(room_id.into())
+			.or_default()
+			.insert(appservice.to_owned(), in_room);
+
+		true
+	}
+
+	fn invalidate(&mut self, room_id: &RoomId) {
+		self.generation = self.generation.wrapping_add(1);
+		self.rooms.remove(room_id);
+	}
+
+	fn clear(&mut self) {
+		self.generation = self.generation.wrapping_add(1);
+		self.rooms.clear();
+	}
+}
 type StrippedStateEventItem = (OwnedRoomId, Vec<Raw<AnyStrippedStateEvent>>);
 type SyncStateEventItem = (OwnedRoomId, Vec<Raw<AnySyncStateEvent>>);
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			appservice_in_room_cache: RwLock::new(HashMap::new()),
+			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),
@@ -89,13 +142,14 @@ impl crate::Service for Service {
 #[implement(Service)]
 #[tracing::instrument(level = "trace", skip_all)]
 pub async fn appservice_in_room(&self, room_id: &RoomId, appservice: &RegistrationInfo) -> bool {
-	let cached = self
-		.appservice_in_room_cache
-		.read()
-		.expect("locked")
-		.get(room_id)
-		.and_then(|map| map.get(&appservice.registration.id))
-		.copied();
+	let (cached, seen) = {
+		let cache = self
+			.appservice_in_room_cache
+			.read()
+			.expect("locked");
+
+		(cache.get(room_id, &appservice.registration.id), cache.generation)
+	};
 
 	if let Some(cached) = cached {
 		return cached;
@@ -110,9 +164,7 @@ pub async fn appservice_in_room(&self, room_id: &RoomId, appservice: &Registrati
 	self.appservice_in_room_cache
 		.write()
 		.expect("locked")
-		.entry(room_id.into())
-		.or_default()
-		.insert(appservice.registration.id.clone(), in_room);
+		.insert_if(seen, room_id, &appservice.registration.id, in_room);
 
 	in_room
 }
@@ -124,7 +176,7 @@ pub fn get_appservice_in_room_cache_usage(&self) -> (usize, usize) {
 		.read()
 		.expect("locked");
 
-	(cache.len(), cache.capacity())
+	(cache.rooms.len(), cache.rooms.capacity())
 }
 
 #[implement(Service)]
