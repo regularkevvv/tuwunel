@@ -20,6 +20,9 @@ impl<'a> CommitOutcome<'a> {
 		use tuwunel_bridge::Error;
 		// Storage errors can follow a lost batch response and a failed digest
 		// lookup. They are not evidence that the original batch never applied.
+		// The exception is a class SQLite itself decided (a constraint, the
+		// schema, a read-only database): the batch was refused whole and did not
+		// apply, so the outcome is known and the writer stays.
 		self.resolved = matches!(
 			error,
 			CallError::Bridge(
@@ -28,7 +31,7 @@ impl<'a> CommitOutcome<'a> {
 					| Error::TooLarge { .. }
 					| Error::Invalid(_)
 			)
-		);
+		) || matches!(error, CallError::Bridge(error) if error.is_storage_rejection());
 	}
 }
 

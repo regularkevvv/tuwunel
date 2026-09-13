@@ -63,6 +63,9 @@ pub(crate) struct Faults {
 	pub(crate) reject_commit: bool,
 	/// Apply, then fail the batch-response/digest recovery path in band.
 	pub(crate) ambiguous_commit: bool,
+	/// Refuse the batch after the fence, as SQLite refuses a constraint
+	/// violation: nothing applies and the storage class decides the outcome.
+	pub(crate) storage_rejection: bool,
 	/// Lose every commit response, including deduplicated retry replies.
 	pub(crate) lose_all_commit_replies: bool,
 	/// Return a valid but wrong reply variant after applying the commit.
@@ -451,6 +454,10 @@ fn commit(
 
 	if let Err(error) = fence(tables, lease, now, faults) {
 		return Ok(Response::Error(error));
+	}
+
+	if faults.storage_rejection {
+		return Ok(Response::Error(BridgeError::Storage("constraint".into())));
 	}
 
 	for op in ops {
@@ -895,6 +902,30 @@ async fn known_commit_refusal_reopens_admission_but_storage_ambiguity_stops_the_
 			.await
 			.is_err()
 	);
+	assert_eq!(fake.applied(), 1);
+	backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
+async fn a_storage_rejection_sqlite_decided_keeps_the_writer() -> Result {
+	let (fake, _server, backend) = rig(2, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	fake.faults(Faults {
+		storage_rejection: true,
+		..Faults::default()
+	});
+	assert!(
+		map.insert(&b"key".to_vec(), b"rejected")
+			.await
+			.is_err()
+	);
+	// Nothing applied and the outcome is known, so the writer stays: unlike
+	// the undecided storage failure above, which stops it.
+	assert_eq!(fake.applied(), 0);
+	assert!(backend.is_writable());
+	fake.faults(Faults::default());
+	map.insert(&b"key".to_vec(), b"accepted").await?;
 	assert_eq!(fake.applied(), 1);
 	backend.close().await;
 	Ok(())

@@ -327,6 +327,26 @@ pub enum Error {
 	Storage(String),
 }
 
+/// Storage classes the Worker names only when SQLite itself refused a commit
+/// batch: a constraint, the schema, or a read-only database.
+///
+/// D1 runs a batch as one transaction, so a batch SQLite refused did not
+/// apply, and its outcome is known. A timeout or a lost connection leaves it
+/// unknown, because the batch may still land. The Worker names one of these
+/// classes only after reading back that no commit row exists and the lease
+/// still holds. `limit` is not one: its message match can also catch a
+/// timeout.
+pub const REJECTED_STORAGE_CLASSES: [&str; 3] = ["constraint", "schema", "read-only"];
+
+impl Error {
+	/// Whether this is a storage failure SQLite decided: the batch did not
+	/// apply.
+	#[must_use]
+	pub fn is_storage_rejection(&self) -> bool {
+		matches!(self, Self::Storage(class) if REJECTED_STORAGE_CLASSES.contains(&class.as_str()))
+	}
+}
+
 impl core::fmt::Display for Error {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
@@ -706,6 +726,18 @@ mod tests {
 			let back: Response = decode(&wire).expect("decode");
 			assert_eq!(back, resp);
 		}
+	}
+
+	#[test]
+	fn only_sqlite_decided_storage_classes_are_rejections() {
+		for class in REJECTED_STORAGE_CLASSES {
+			assert!(Error::Storage(class.into()).is_storage_rejection(), "{class}");
+		}
+		for class in ["network", "timeout", "contention", "limit", "recovery", "fence", "unknown"]
+		{
+			assert!(!Error::Storage(class.into()).is_storage_rejection(), "{class}");
+		}
+		assert!(!Error::Invalid("constraint".into()).is_storage_rejection());
 	}
 
 	#[test]
