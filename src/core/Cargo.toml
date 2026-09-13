@@ -22,8 +22,11 @@ brotli_compression = [
 	"reqwest/brotli",
 ]
 console = []
-# Test-only crash points (`failpoint`), armed by TUWUNEL_FAILPOINTS. Built
-# only into the fault-injection image, never into a release.
+# Test-only crash points (`failpoint`), armed through the environment
+# variable that `failpoint::ENV` names. Built only into the fault-injection
+# image, never into a release. Every build embeds this manifest
+# (`info::cargo`), so it must not spell that variable out: the template's
+# `container-verify` refuses a release binary that contains it.
 failpoints = []
 gzip_compression = [
 	"reqwest/gzip",
