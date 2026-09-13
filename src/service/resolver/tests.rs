@@ -20,8 +20,8 @@ fn bracketed_ipv6_server_names_parse_as_ip_literals() {
 	let name = ruma::server_name!("[::1]:19001");
 	assert!(name.is_ip_literal());
 	// A server name keeps the brackets, which no address parser accepts.
-	assert!(IPAddress::parse(name.host()).is_err());
-	assert!(IPAddress::parse(ip_literal_host(name.host())).is_ok());
+	IPAddress::parse(name.host()).expect_err("brackets are not part of an address");
+	IPAddress::parse(ip_literal_host(name.host())).expect("the unwrapped address parses");
 
 	assert_eq!(ip_literal_host("[2001:db8::1]"), "2001:db8::1");
 	for host in ["127.0.0.1", "matrix.example.com", "[::1", "::1]"] {
