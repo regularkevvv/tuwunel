@@ -13,21 +13,20 @@
 //! carries its byte length: it is charged when the record is written, and
 //! released from that length when the records are removed. So a kill at any
 //! point leaves counter and records agreeing, and a retried delete whose
-//! objects are already gone still releases exactly once. A counter missing
-//! when first needed is measured from the records, and from storage for
-//! records older than their length.
+//! objects are already gone still releases exactly once. Owners charged
+//! before counters existed get theirs from a one-time backfill, run as a
+//! migration before the server serves (`Service::backfill_usage`). So a
+//! missing counter means nothing is charged, and no request ever measures.
 
 use std::{
+	collections::HashMap,
 	str::from_utf8,
 	time::{Duration, SystemTime},
 };
 
-use futures::StreamExt;
-use ruma::{Mxc, OwnedMxcUri, ServerName, UserId};
-use tuwunel_core::{
-	Err, Result, implement,
-	utils::stream::{BroadbandExt, IterStream, ReadyExt},
-};
+use ruma::{Mxc, OwnedMxcUri, OwnedServerName, OwnedUserId, ServerName, UserId};
+use tuwunel_core::{Err, Result, implement};
+use tuwunel_database::successor;
 
 /// Whose byte quota a stored object counts against.
 #[derive(Clone, Copy, Debug)]
@@ -97,8 +96,7 @@ pub(super) async fn released(&self, owner: Owner<'_>, len: u64) -> u64 {
 	self.usage_locked(owner).await.saturating_sub(len)
 }
 
-/// Bytes stored against `owner`, measured from the stored objects when no
-/// counter exists yet.
+/// Bytes stored against `owner`; zero when it has no counter.
 #[implement(super::Service)]
 pub async fn quota_usage(&self, owner: Owner<'_>) -> u64 {
 	let _lock = self.quota_mutex.lock(&owner.lock_key()).await;
@@ -106,48 +104,138 @@ pub async fn quota_usage(&self, owner: Owner<'_>) -> u64 {
 	self.usage_locked(owner).await
 }
 
+/// `owner`'s usage counter. None means nothing is charged to `owner`: every
+/// charged record is written with its owner's counter, and the backfill
+/// wrote one for every owner charged before counters existed.
 #[implement(super::Service)]
 async fn usage_locked(&self, owner: Owner<'_>) -> u64 {
-	match self.db.quota_usage(owner).await {
-		| Some(used) => used,
-		| None => self.measure(owner).await,
-	}
+	self.db.quota_usage(owner).await.unwrap_or(0)
 }
 
-/// Sums the size of every object `owner` is charged for: the length its
-/// record carries, or its stored size for an older record.
+/// Media records one batch of `Service::backfill_usage` reads.
+const BACKFILL_BATCH: usize = 256;
+
+/// Writes a usage counter for every owner charged for stored media that has
+/// none: the lengths of its charged records, summed, or their stored sizes
+/// for records older than their length. Returns how many counters it wrote.
+///
+/// Run once, as a migration, before the server serves. Local originals are
+/// found through the uploader index and remote media through the records;
+/// both are read in batches of [`BACKFILL_BATCH`] from a cursor, so no read
+/// is ever the size of a map. An owner that already has a counter keeps it.
 #[implement(super::Service)]
-async fn measure(&self, owner: Owner<'_>) -> u64 {
-	let keys: Vec<Vec<u8>> = match owner {
-		| Owner::User(user) =>
-			self.db
-				.get_all_user_mxcs(user)
-				.await
-				.into_iter()
-				.stream()
-				.broad_filter_map(async |mxc| {
-					let parts = mxc.parts().ok()?;
-
-					self.get_metadata(&parts)
-						.await
-						.map(|meta| meta.key)
-				})
-				.collect()
-				.await,
-		| Owner::Server(server) => self
+pub async fn backfill_usage(&self) -> Result<usize> {
+	let mut users: HashMap<OwnedUserId, u64> = HashMap::new();
+	let mut after: Option<Vec<u8>> = None;
+	loop {
+		let (uploads, next) = self
 			.db
-			.get_all_media_keys()
-			.await
-			.into_iter()
-			.filter(|key| from_server(key, server))
-			.collect(),
-	};
+			.uploads_after(after.as_deref(), BACKFILL_BATCH)
+			.await?;
 
-	keys.into_iter()
-		.stream()
-		.broad_filter_map(async |key| self.object_len(&key).await)
-		.ready_fold(0_u64, u64::saturating_add)
-		.await
+		for (mxc, user) in uploads {
+			if self
+				.db
+				.quota_usage(Owner::User(&user))
+				.await
+				.is_some()
+			{
+				continue;
+			}
+
+			let Ok(parts) = mxc.parts() else {
+				continue;
+			};
+
+			let Some(meta) = self.get_metadata(&parts).await else {
+				continue;
+			};
+
+			let len = self.object_len(&meta.key).await.unwrap_or(0);
+			let total = users.entry(user).or_default();
+			*total = total.saturating_add(len);
+		}
+
+		match next {
+			| Some(next) => after = Some(next),
+			| None => break,
+		}
+	}
+
+	let local = format!("mxc://{}/", self.services.globals.server_name());
+	let mut servers: HashMap<OwnedServerName, u64> = HashMap::new();
+	let mut from: Option<Vec<u8>> = None;
+	loop {
+		let keys = self
+			.db
+			.media_keys_from(from.as_deref(), BACKFILL_BATCH)
+			.await?;
+
+		let ended = keys.len() < BACKFILL_BATCH;
+		from = keys.last().map(Vec::as_slice).map(successor);
+		if from
+			.as_deref()
+			.is_some_and(|from| from.starts_with(local.as_bytes()))
+		{
+			from = Some(super::past_prefix(local.as_bytes()));
+		}
+
+		for key in keys {
+			let Some(server) = record_server(&key) else {
+				continue;
+			};
+
+			if self.services.globals.server_is_ours(&server)
+				|| self
+					.db
+					.quota_usage(Owner::Server(&server))
+					.await
+					.is_some()
+			{
+				continue;
+			}
+
+			let len = self.object_len(&key).await.unwrap_or(0);
+			let total = servers.entry(server).or_default();
+			*total = total.saturating_add(len);
+		}
+
+		if ended {
+			break;
+		}
+	}
+
+	let mut written: usize = 0;
+	for (user, total) in &users {
+		let wrote = self
+			.write_usage_if_missing(Owner::User(user), *total)
+			.await?;
+
+		written = written.saturating_add(usize::from(wrote));
+	}
+
+	for (server, total) in &servers {
+		let wrote = self
+			.write_usage_if_missing(Owner::Server(server), *total)
+			.await?;
+
+		written = written.saturating_add(usize::from(wrote));
+	}
+
+	Ok(written)
+}
+
+/// Writes `owner`'s counter under its quota lock, unless one exists.
+#[implement(super::Service)]
+async fn write_usage_if_missing(&self, owner: Owner<'_>, total: u64) -> Result<bool> {
+	let _lock = self.quota_mutex.lock(&owner.lock_key()).await;
+	if self.db.quota_usage(owner).await.is_some() {
+		return Ok(false);
+	}
+
+	self.db.put_usage(owner, total).await?;
+
+	Ok(true)
 }
 
 /// The length an object's record carries, or its stored size for a record
@@ -181,11 +269,11 @@ pub async fn expire_remote_media(&self) -> Result<usize> {
 		.await
 }
 
-/// Whether the media record `key` belongs to media originating on `server`.
-fn from_server(key: &[u8], server: &ServerName) -> bool {
+/// The server whose media the record `key` stores.
+fn record_server(key: &[u8]) -> Option<OwnedServerName> {
 	key.split(|&b| b == 0xFF)
 		.next()
 		.and_then(|mxc| from_utf8(mxc).ok())
 		.map(OwnedMxcUri::from)
-		.is_some_and(|mxc| mxc.server_name().is_ok_and(|name| name == server))
+		.and_then(|mxc| mxc.server_name().ok().map(ToOwned::to_owned))
 }

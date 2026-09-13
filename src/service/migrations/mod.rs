@@ -263,6 +263,9 @@ async fn fresh(services: &Services) -> Result {
 	db["global"]
 		.insert(b"adopt_foreign_email_bindings", [])
 		.await?;
+	db["global"]
+		.insert(b"media_usage_counters", [])
+		.await?;
 	mark_clean_injectivity(services).await?;
 
 	// Create the admin room and server user on first run
@@ -462,6 +465,22 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 
 		db["global"]
 			.insert(b"adopt_foreign_email_bindings", [])
+			.await?;
+	}
+
+	// Media charged before usage counters existed gets its owners' counters
+	// here, once, so that a missing counter means nothing is charged and no
+	// request ever measures one from the records.
+	if db["global"]
+		.get(b"media_usage_counters")
+		.await
+		.is_not_found()
+	{
+		let written = services.media.backfill_usage().await?;
+		info!(written, "Wrote media usage counters for owners charged before they existed.");
+
+		db["global"]
+			.insert(b"media_usage_counters", [])
 			.await?;
 	}
 

@@ -9,7 +9,10 @@ use tuwunel_core::{
 	Err, Result, at, debug, debug_info, err,
 	utils::{ReadyExt, str_from_bytes, stream::TryIgnore, string_from_bytes},
 };
-use tuwunel_database::{Cbor, Database, Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
+use tuwunel_database::{
+	Cbor, Database, Deserialized, Ignore, Interfix, Map, Txn, deserialize_from_slice,
+	serialize_key,
+};
 
 use super::{Media, preview::CachedPreview, quota::Owner, thumbnail::Dim};
 
@@ -491,6 +494,14 @@ impl Data {
 		.ok()
 	}
 
+	/// Writes `owner`'s usage total on its own.
+	pub(super) async fn put_usage(&self, owner: Owner<'_>, total: u64) -> Result {
+		let mut txn = self.db.txn();
+		self.set_usage(&mut txn, owner, total);
+
+		txn.execute().await
+	}
+
 	/// At most `limit` media record keys from `from`, inclusive, or from the
 	/// first. The read is closed before this returns.
 	pub(super) async fn media_keys_from(
@@ -501,6 +512,35 @@ impl Data {
 		self.mediaid_file
 			.raw_keys_capped(from, limit)
 			.await
+	}
+
+	/// At most `limit` (MXC, uploader) pairs of the uploader index after the
+	/// key `after`, or from the first, and the key to pass next, `None` once
+	/// the index ends. The read is closed before this returns.
+	pub(super) async fn uploads_after(
+		&self,
+		after: Option<&[u8]>,
+		limit: usize,
+	) -> Result<(Vec<(OwnedMxcUri, OwnedUserId)>, Option<Vec<u8>>)> {
+		let rows = self
+			.mediaid_user
+			.raw_rows_after(after, limit)
+			.await?;
+
+		let next = rows
+			.last()
+			.filter(|_| rows.len() >= limit)
+			.map(|(key, _)| key.clone());
+
+		let uploads = rows
+			.iter()
+			.filter_map(|(key, _)| {
+				let (mxc, user): (&str, &UserId) = deserialize_from_slice(key).ok()?;
+				Some((mxc.into(), user.to_owned()))
+			})
+			.collect();
+
+		Ok((uploads, next))
 	}
 
 	/// Writes `owner`'s usage total as part of `txn`.
