@@ -140,6 +140,14 @@ pub async fn add_pdu_outlier(&self, event_id: &EventId, pdu: &CanonicalJsonObjec
 	Ok(())
 }
 
+/// Forgets an outlier stored for an event this server then refused, so the
+/// refused event is not mistaken later for known history.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub async fn remove_pdu_outlier(&self, event_id: &EventId) -> Result {
+	self.db.eventid_outlierpdu.remove(event_id).await
+}
+
 /// Records an event this server rejected during authorization.
 ///
 /// Rejected events live apart from outliers and the timeline, so ordinary

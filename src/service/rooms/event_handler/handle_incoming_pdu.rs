@@ -156,6 +156,15 @@ pub async fn handle_incoming_pdu<'a>(
 	let room_version = from_create_event(&create_event)?;
 	let recursion_level = 0;
 
+	// Whether an outlier was stored before this delivery, so a refusal below
+	// forgets only the outlier this delivery stored.
+	let was_outlier = self
+		.services
+		.timeline
+		.outlier_pdu_exists(event_id)
+		.await
+		.is_ok();
+
 	let (incoming_pdu, pdu) = self
 		.handle_outlier_pdu(origin, room_id, event_id, pdu, &room_version, recursion_level, false)
 		.await?;
@@ -188,7 +197,7 @@ pub async fn handle_incoming_pdu<'a>(
 
 	// 9. Fetch any missing prev events doing all checks listed here starting at 1.
 	//    These are timeline events
-	let (sorted_prev_events, eventid_info) = self
+	let fetched = self
 		.fetch_prev(
 			origin,
 			room_id,
@@ -198,7 +207,18 @@ pub async fn handle_incoming_pdu<'a>(
 			recursion_level,
 			first_ts_in_room,
 		)
-		.await?;
+		.await;
+
+	// A pushed event refused for its history leaves no outlier behind, so a later
+	// event citing it still opens the gap it names.
+	if fetched.is_err() && !was_outlier {
+		self.services
+			.timeline
+			.remove_pdu_outlier(event_id)
+			.await?;
+	}
+
+	let (sorted_prev_events, eventid_info) = fetched?;
 
 	self.handle_prev_events(
 		origin,

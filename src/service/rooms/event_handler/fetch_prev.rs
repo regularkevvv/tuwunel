@@ -11,7 +11,7 @@ use ruma::{
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::time::{Instant, timeout_at};
 use tuwunel_core::{
-	Result, debug_warn, err, implement,
+	Err, Result, debug_warn, err, implement,
 	matrix::{
 		Event, PduEvent,
 		event::gen_event_id,
@@ -71,7 +71,24 @@ where
 			room_version,
 			recursion_level,
 		)
-		.await?;
+		.await;
+
+		// A prev still absent after the gap fill refuses the event, as the
+		// reference server does: its sender is not divulging the history it
+		// builds on, and walking past the gap with per-event and state fetches
+		// would let the sender name that history for us. The deeper ancestry of
+		// a prev the fill did return is still walked below.
+		let absent = initial_set
+			.clone()
+			.stream()
+			.any(async |event_id| !self.is_known_prev(event_id).await)
+			.await;
+
+		if absent {
+			return Err!(Request(Forbidden(
+				"Prev events are unavailable after filling the gap."
+			)));
+		}
 	}
 
 	// A rejected prev is known and contributes no state of its own, so it is
@@ -237,32 +254,13 @@ where
 		.is_err()
 }
 
-/// Whether a prev event needs no gap fill: it is in the timeline, it holds a
-/// state snapshot (a soft-failed event), or this server rejected it. An outlier
-/// with none of these was never integrated, so the gap below an event citing
-/// it is still open.
+/// Whether a prev event opens no gap: this server stores it, as a timeline
+/// event or an outlier, or it rejected it.
 #[implement(super::Service)]
 async fn is_known_prev(&self, event_id: &EventId) -> bool {
 	let timeline = &self.services.timeline;
-	if timeline
-		.non_outlier_pdu_exists(event_id)
-		.await
-		.is_ok()
-	{
-		return true;
-	}
 
-	if self
-		.services
-		.state
-		.pdu_shortstatehash(event_id)
-		.await
-		.is_ok()
-	{
-		return true;
-	}
-
-	timeline.is_pdu_rejected(event_id).await
+	timeline.pdu_exists(event_id).await || timeline.is_pdu_rejected(event_id).await
 }
 
 /// Fill the prev gap below `incoming_event_id` with one `/get_missing_events`
@@ -270,9 +268,7 @@ async fn is_known_prev(&self, event_id: &EventId) -> bool {
 /// resolves it without a federation fetch. `latest_events` is the held event
 /// the server walks back from, bounded by our forward extremities so it returns
 /// only the gap; best effort, so a failed batch or rejected event just leaves
-/// that id for the walk. A batch holding an event that is not even canonical
-/// JSON describes no acceptable history, so it refuses the incoming event
-/// rather than walking past the gap with per-event and state fetches.
+/// that id for the walk.
 #[implement(super::Service)]
 #[tracing::instrument(name = "missing", level = "debug", skip_all)]
 async fn prefetch_missing_events(
@@ -282,7 +278,7 @@ async fn prefetch_missing_events(
 	incoming_event_id: &EventId,
 	room_version: &RoomVersionId,
 	recursion_level: usize,
-) -> Result {
+) {
 	let boundary: EventWindow = self
 		.services
 		.state
@@ -300,30 +296,22 @@ async fn prefetch_missing_events(
 		.fanout_for_op();
 
 	let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
-		return Ok(());
+		return;
 	};
 
 	let Ok(events) = serde_json::from_slice::<Vec<Box<RawJsonValue>>>(&outcome.bytes) else {
-		return Ok(());
+		return;
 	};
-
-	let events = events
-		.iter()
-		.map(|pdu| serde_json::from_str::<CanonicalJsonObject>(pdu.get()))
-		.collect::<Result<Vec<_>, _>>()
-		.map_err(|e| err!(BadServerResponse("missing-events pdu is not canonical json: {e}")))?;
 
 	events
 		.into_iter()
 		.stream()
-		.for_each_concurrent(automatic_width(), async |value| {
-			self.land_missing_event(origin, room_id, value, room_version, recursion_level)
+		.for_each_concurrent(automatic_width(), async |pdu| {
+			self.land_missing_event(origin, room_id, &pdu, room_version, recursion_level)
 				.await
 				.ok();
 		})
 		.await;
-
-	Ok(())
 }
 
 /// Authenticate and persist one event from the missing-events batch as an
@@ -334,10 +322,13 @@ async fn land_missing_event(
 	&self,
 	origin: &ServerName,
 	room_id: &RoomId,
-	value: CanonicalJsonObject,
+	pdu: &RawJsonValue,
 	room_version: &RoomVersionId,
 	recursion_level: usize,
 ) -> Result {
+	let value: CanonicalJsonObject = serde_json::from_str(pdu.get())
+		.map_err(|e| err!(BadServerResponse("missing-events pdu is not canonical json: {e}")))?;
+
 	value
 		.get("room_id")
 		.and_then(CanonicalJsonValue::as_str)
