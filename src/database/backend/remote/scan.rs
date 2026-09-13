@@ -11,9 +11,22 @@
 //! (`del_prefix`, `for_clear`) can never deadlock: the drain runs inside
 //! the commit, never inside the stream.
 //!
+//! The drain is budgeted (`remote::DRAIN_ROWS`, `remote::DRAIN_BYTES`). A
+//! scan whose remainder does not fit is *truncated*: it keeps every row the
+//! drain read, which are all pre-commit rows, fetches nothing more, and, if
+//! its reader wants a row past them, fails with [`truncated`], a retryable
+//! `M_LIMIT_EXCEEDED`. The reader then restarts or pages again; it never
+//! silently sees a shorter or a mixed snapshot, and the commit never waits
+//! on an unbounded read.
+//!
+//! A scan can say up front how far its reader goes ([`Bound`]): a key prefix
+//! the reader stops outside of, and a row cap. Page fetches and the drain
+//! then stop there instead of at the end of the map, so a prefix read or a
+//! capped batch is never truncated by a write elsewhere in its map.
+//!
 //! Lock order, everywhere: the backend's commit barrier first, then one
 //! scan's state. The stream's page fetch takes both (barrier shared); the
-//! commit takes the barrier exclusively and then each drained scan's state.
+//! commit takes the barrier exclusively and then the drained scans' states.
 //! A stream never holds either lock across a yield, so the committing task
 //! may be the task iterating the scan.
 
@@ -73,10 +86,59 @@ fn busy() -> Error {
 	)
 }
 
+/// The message of [`truncated`], so a reader can tell it from other refusals.
+pub const TRUNCATED: &str = "A write changed this map while it was read; retry the operation.";
+
+/// A scan the pre-commit drain could not finish within its budget has no
+/// further rows it may yield: they could show the later commit. Retryable
+/// by restarting the read, which then sees the post-commit state.
+pub(crate) fn truncated() -> Error {
+	Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData {
+			retry_after: Some(RetryAfter::Delay(std::time::Duration::from_millis(100))),
+		}),
+		TRUNCATED.into(),
+		StatusCode::TOO_MANY_REQUESTS,
+	)
+}
+
+/// Whether `error` is a truncated scan's refusal ([`truncated`]).
+#[must_use]
+pub fn is_truncated(error: &Error) -> bool {
+	matches!(
+		error,
+		Error::Request(ErrorKind::LimitExceeded(_), message, StatusCode::TOO_MANY_REQUESTS)
+			if message == TRUNCATED
+	)
+}
+
+/// How far a scan's reader will read, when it knows up front. Every backend
+/// but this one ignores it; here it stops page fetches, and the drain, at
+/// the reader's end rather than the map's.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Bound<'a> {
+	/// The reader stops at the first key without this prefix.
+	pub(crate) within: Option<&'a [u8]>,
+	/// The reader takes at most this many rows.
+	pub(crate) cap: Option<usize>,
+}
+
+impl<'a> Bound<'a> {
+	/// A reader that stops at the first key without `prefix`.
+	#[inline]
+	pub(crate) fn within(prefix: &'a [u8]) -> Self { Self { within: Some(prefix), cap: None } }
+
+	/// A reader that takes at most `rows` rows.
+	#[inline]
+	pub(crate) fn cap(rows: usize) -> Self { Self { within: None, cap: Some(rows) } }
+}
+
 /// One open scan: its position and the rows fetched but not yet yielded.
 pub(crate) struct Scan {
 	pub(crate) map: MapId,
 	pub(crate) reverse: bool,
+	/// The reader's key prefix ([`Bound::within`]), if it declared one.
+	pub(crate) within: Option<Box<[u8]>>,
 	pub(crate) state: tokio::sync::Mutex<State>,
 }
 
@@ -89,17 +151,33 @@ pub(crate) struct State {
 	pub(crate) from: Option<Box<[u8]>>,
 	/// Whether `from` itself may be returned (true for the first page only).
 	pub(crate) inclusive: bool,
-	/// No further page exists.
+	/// No further page will be fetched.
 	pub(crate) exhausted: bool,
+	/// Rows the reader may still take ([`Bound::cap`]), when it declared a
+	/// cap; no page asks for more.
+	pub(crate) rows_left: Option<usize>,
+	/// The drain gave up before the end: once `buffer` is empty the scan
+	/// fails with [`truncated`] instead of ending.
+	pub(crate) truncated: bool,
+}
+
+impl State {
+	/// Stops the scan after the rows already buffered; see [`truncated`].
+	pub(crate) fn truncate(&mut self) {
+		self.exhausted = true;
+		self.truncated = true;
+	}
 }
 
 impl Registry {
-	/// Registers a new scan positioned at `from` (seek semantics).
+	/// Registers a new scan positioned at `from` (seek semantics), reading
+	/// no further than `bound`.
 	pub(crate) fn register(
 		&self,
 		map: MapId,
 		reverse: bool,
 		from: Option<&[u8]>,
+		bound: Bound<'_>,
 	) -> Result<(u64, Arc<Scan>)> {
 		let mut state = self.lock();
 		if state.closed {
@@ -111,11 +189,14 @@ impl Registry {
 		let scan = Arc::new(Scan {
 			map,
 			reverse,
+			within: bound.within.map(Into::into),
 			state: tokio::sync::Mutex::new(State {
 				buffer: VecDeque::new(),
 				from: from.map(Into::into),
 				inclusive: true,
-				exhausted: false,
+				exhausted: bound.cap == Some(0),
+				rows_left: bound.cap,
+				truncated: false,
 			}),
 		});
 
@@ -175,6 +256,8 @@ enum Buffered {
 	Row(Entry),
 	/// The scan is finished.
 	End,
+	/// The drain truncated the scan and its buffered rows are spent.
+	Truncated,
 	/// The lock was busy, or a page is needed.
 	Unknown,
 }
@@ -206,12 +289,15 @@ impl<T> RemoteSeek<'_, T> {
 		map: MapId,
 		reverse: bool,
 		from: Option<&[u8]>,
+		bound: Bound<'_>,
 	) -> Self {
-		let (id, scan, pending): (_, _, Option<Advance>) =
-			match backend.scans().register(map, reverse, from) {
-				| Ok((id, scan)) => (Some(id), Some(scan), None),
-				| Err(error) => (None, None, Some(Box::pin(async move { Err(error) }))),
-			};
+		let (id, scan, pending): (_, _, Option<Advance>) = match backend
+			.scans()
+			.register(map, reverse, from, bound)
+		{
+			| Ok((id, scan)) => (Some(id), Some(scan), None),
+			| Err(error) => (None, None, Some(Box::pin(async move { Err(error) }))),
+		};
 
 		Self {
 			backend,
@@ -240,8 +326,12 @@ async fn advance(backend: Arc<Backend>, scan: Arc<Scan>) -> Result<Option<Entry>
 	}
 
 	// A page may come back empty; the buffer then stays empty, the scan is
-	// exhausted, and the `None` below ends the stream.
-	Ok(state.buffer.pop_front())
+	// exhausted, and the `None` below ends the stream, unless the drain
+	// truncated it, which is a refusal and never an end.
+	match state.buffer.pop_front() {
+		| None if state.truncated => Err(truncated()),
+		| next => Ok(next),
+	}
 }
 
 impl<'a, T> Stream for RemoteSeek<'a, T>
@@ -284,6 +374,7 @@ where
 			let buffered = match scan.state.try_lock() {
 				| Ok(mut state) => match state.buffer.pop_front() {
 					| Some(entry) => Buffered::Row(entry),
+					| None if state.truncated => Buffered::Truncated,
 					| None if state.exhausted => Buffered::End,
 					| None => Buffered::Unknown,
 				},
@@ -295,6 +386,10 @@ where
 				| Buffered::End => {
 					this.done = true;
 					return Poll::Ready(None);
+				},
+				| Buffered::Truncated => {
+					this.done = true;
+					return Poll::Ready(Some(Err(truncated())));
 				},
 				| Buffered::Unknown => {},
 			}
@@ -365,32 +460,40 @@ mod tests {
 	fn write_admission_is_map_scoped_reopens_and_stays_closed_after_poison() {
 		let registry = Registry::default();
 		let (old, _) = registry
-			.register(MapId(0), false, None)
+			.register(MapId(0), false, None, Bound::default())
 			.expect("initial scan");
 		let writing = registry
 			.begin_write(&BTreeSet::from([0]))
 			.expect("write admission");
 		let error = registry
-			.register(MapId(0), false, None)
+			.register(MapId(0), false, None, Bound::default())
 			.err()
 			.expect("refused touching scan");
 		assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
 		assert!(matches!(error.kind(), ErrorKind::LimitExceeded(_)));
 		let (other, _) = registry
-			.register(MapId(1), false, None)
+			.register(MapId(1), false, None, Bound::default())
 			.expect("unrelated scan");
 		assert_eq!(registry.touching(&BTreeSet::from([0])).len(), 1);
 		drop(writing);
 		let (after, _) = registry
-			.register(MapId(0), false, None)
+			.register(MapId(0), false, None, Bound::default())
 			.expect("admission reopened");
 		let writing = registry
 			.begin_write(&BTreeSet::from([0]))
 			.expect("next write");
 		registry.close();
 		drop(writing);
-		assert!(registry.register(MapId(0), false, None).is_err());
-		assert!(registry.register(MapId(1), false, None).is_err());
+		assert!(
+			registry
+				.register(MapId(0), false, None, Bound::default())
+				.is_err()
+		);
+		assert!(
+			registry
+				.register(MapId(1), false, None, Bound::default())
+				.is_err()
+		);
 		for id in [old, other, after] {
 			registry.unregister(id);
 		}

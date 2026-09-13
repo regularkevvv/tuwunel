@@ -77,6 +77,9 @@ pub(crate) struct Stats {
 	pub(crate) remote_page: OpStat,
 	/// Remote backend: open scans drained by a commit (rows materialized).
 	pub(crate) remote_drain: OpStat,
+	/// Remote backend: drained scans truncated at the drain budget (rows
+	/// materialized before the budget ran out).
+	pub(crate) remote_drain_truncated: OpStat,
 	/// Remote backend: point reads answered from the process-local read cache
 	/// (result size; a cached absence records 0).
 	pub(crate) remote_cache_hit: OpStat,
@@ -96,6 +99,7 @@ pub(crate) static STATS: Stats = Stats {
 	watch: OpStat::new(),
 	remote_page: OpStat::new(),
 	remote_drain: OpStat::new(),
+	remote_drain_truncated: OpStat::new(),
 	remote_cache_hit: OpStat::new(),
 	remote_cache_miss: OpStat::new(),
 };
@@ -126,6 +130,7 @@ pub(crate) fn snapshot() -> serde_json::Value {
 		"watch": STATS.watch.json(),
 		"remote_page": STATS.remote_page.json(),
 		"remote_drain": STATS.remote_drain.json(),
+		"remote_drain_truncated": STATS.remote_drain_truncated.json(),
 		"remote_cache_hit": STATS.remote_cache_hit.json(),
 		"remote_cache_miss": STATS.remote_cache_miss.json(),
 	})

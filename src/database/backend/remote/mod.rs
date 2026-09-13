@@ -15,7 +15,9 @@
 //!   coherent because this process is the only writer;
 //! - the open-scan registry of [`scan`], which gives paged scans
 //!   snapshot-at-creation semantics: [`Backend::commit`] drains every open scan
-//!   on the maps it touches *before* it sends the batch.
+//!   on the maps it touches *before* it sends the batch, within one budget of
+//!   [`DRAIN_ROWS`] rows and [`DRAIN_BYTES`] bytes; a scan that does not fit is
+//!   truncated and fails retryably past the rows it kept.
 //!
 //! Failure is returned, never panicked. A [`tuwunel_bridge::Error::StaleLease`]
 //! anywhere means another process took the lease: the backend goes read-only,
@@ -44,16 +46,39 @@ use tokio::task::JoinHandle;
 use tuwunel_bridge::{self as bridge, MAX_SCAN_PAGE, REQUEST_ID_LEN, Request, Response};
 use tuwunel_core::{Err, Result, Server, debug, err, error, info, warn};
 
-pub use self::lease::LeaseStatus;
 use self::{
 	client::{Client, database_error},
 	lease::Lease,
 	scan::{Registry, Scan, State},
 };
+pub use self::{
+	lease::LeaseStatus,
+	scan::{TRUNCATED, is_truncated},
+};
 use crate::backend::{MapId, metrics::STATS};
 
 /// Bytes of one megabyte, the unit `d1_read_cache_mb` is expressed in.
 const MEGABYTE: usize = 1024 * 1024;
+
+/// Rows one commit's drain may read, across every open scan it drains.
+///
+/// Eight default pages. A reader that needs at most this many rows past its
+/// position when a commit lands never notices the commit; a longer one is
+/// truncated and restarts.
+pub(crate) const DRAIN_ROWS: usize = 2048;
+
+/// Key and value bytes one commit's drain may read, and so the most a drain
+/// adds to the process's buffered rows.
+pub(crate) const DRAIN_BYTES: usize = 8 * MEGABYTE;
+
+/// What one page fetch added to a scan's buffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Page {
+	/// Rows fetched.
+	pub(crate) rows: usize,
+	/// Their key and value bytes.
+	pub(crate) bytes: usize,
+}
 
 /// The remote D1 backend: one bridge endpoint, one writer lease, one read
 /// cache, one open-scan registry.
@@ -250,7 +275,8 @@ impl Backend {
 	///
 	/// The order is the ADR's: refuse when the lease is not writable, then
 	/// take the commit barrier and **drain every open scan on a map this
-	/// batch touches**, then wait for an in-flight slot, then send one
+	/// batch touches**, within the drain budget ([`Backend::drain`]), then
+	/// wait for an in-flight slot, then send one
 	/// `Commit`. A transport failure re-sends the same `request_id`, so a
 	/// reply lost after the batch applied comes back as `duplicate` and is
 	/// reported to the caller as the single success it is.
@@ -339,6 +365,10 @@ impl Backend {
 
 	/// Fetches one page into a scan's buffer.
 	///
+	/// A page never asks for more rows than the scan's cap leaves, and the
+	/// scan is exhausted as soon as a page passes its reader's prefix: the
+	/// reader stops there, so nothing past it is fetched or drained.
+	///
 	/// The caller holds the scan's state lock and either the shared barrier
 	/// (a stream poll) or the exclusive barrier (a commit drain); this
 	/// function never takes the barrier itself, which is what keeps the
@@ -348,10 +378,14 @@ impl Backend {
 		scan: &Scan,
 		state: &mut State,
 		limit: u32,
-	) -> Result<usize> {
+	) -> Result<Page> {
 		if state.exhausted {
-			return Ok(0);
+			return Ok(Page::default());
 		}
+
+		let limit = state
+			.rows_left
+			.map_or(limit, |left| limit.min(u32::try_from(left).unwrap_or(u32::MAX)));
 
 		let mut request = Request::Scan {
 			map: scan.map.0,
@@ -393,39 +427,85 @@ impl Backend {
 			state.inclusive = false;
 		}
 
-		state.exhausted = !more || items.is_empty();
+		let past_prefix = scan.within.as_deref().is_some_and(|within| {
+			items
+				.last()
+				.is_some_and(|(key, _)| !key.starts_with(within))
+		});
 
-		let fetched = items.len();
+		if let Some(left) = state.rows_left.as_mut() {
+			*left = left.saturating_sub(items.len());
+		}
+
+		state.exhausted = !more || items.is_empty() || past_prefix || state.rows_left == Some(0);
+
+		let mut page = Page { rows: items.len(), bytes: 0 };
 		for (key, val) in items {
+			page.bytes = page
+				.bytes
+				.saturating_add(key.len())
+				.saturating_add(val.len());
+
 			state
 				.buffer
 				.push_back((key.into_vec().into(), val.into_vec().into()));
 		}
 
-		Ok(fetched)
+		Ok(page)
 	}
 
-	/// Materializes every open scan on `maps` (ADR-0012, snapshot
-	/// semantics).
+	/// Materializes the open scans on `maps` (ADR-0012, snapshot semantics)
+	/// within one budget of [`DRAIN_ROWS`] rows and [`DRAIN_BYTES`] bytes.
+	///
+	/// The scans are read a page at a time in turn, so short ones finish
+	/// before a long one spends the budget. A scan still unfinished when it
+	/// is spent is truncated ([`State::truncate`]): it keeps the rows read,
+	/// all of them pre-commit, and fails retryably if its reader wants more.
+	/// So a commit waits on at most the budget's pages, never on the size of
+	/// a map.
 	///
 	/// Called with the exclusive barrier held, so no page fetch is in flight
 	/// and no scan's state lock can be held by a stream.
 	async fn drain(&self, maps: &BTreeSet<u16>) -> Result {
-		for scan in self.scans.touching(maps) {
-			let mut state = scan.state.lock().await;
-			if state.exhausted {
-				continue;
+		let scans = self.scans.touching(maps);
+		let mut open = Vec::with_capacity(scans.len());
+		for scan in &scans {
+			let state = scan.state.lock().await;
+			if !state.exhausted {
+				open.push((scan, state, 0_usize));
+			}
+		}
+
+		let (mut rows_left, mut bytes_left) = (DRAIN_ROWS, DRAIN_BYTES);
+		while !open.is_empty() && rows_left > 0 && bytes_left > 0 {
+			for (scan, state, rows) in &mut open {
+				if state.exhausted || rows_left == 0 || bytes_left == 0 {
+					continue;
+				}
+
+				let limit = u32::try_from(rows_left)
+					.unwrap_or(u32::MAX)
+					.min(self.scan_page);
+
+				let page = self.fetch_page(scan, state, limit).await?;
+				rows_left = rows_left.saturating_sub(page.rows);
+				bytes_left = bytes_left.saturating_sub(page.bytes);
+				*rows = rows.saturating_add(page.rows);
 			}
 
-			let mut rows: usize = 0;
-			while !state.exhausted {
-				rows = rows.saturating_add(
-					self.fetch_page(&scan, &mut state, self.scan_page)
-						.await?,
-				);
-			}
+			open.retain(|(_, state, rows)| {
+				if state.exhausted {
+					STATS.remote_drain.record(*rows);
+				}
 
+				!state.exhausted
+			});
+		}
+
+		for (_, mut state, rows) in open {
+			state.truncate();
 			STATS.remote_drain.record(rows);
+			STATS.remote_drain_truncated.record(rows);
 		}
 
 		Ok(())

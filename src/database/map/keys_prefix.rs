@@ -1,10 +1,16 @@
 use std::{fmt::Debug, sync::Arc};
 
 use futures::{Stream, StreamExt, TryStreamExt, future};
+use rocksdb::Direction;
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{Result, implement};
 
-use crate::keyval::{Key, result_deserialize_key, serialize_key};
+use super::seek::seek_stream_bounded;
+use crate::{
+	backend::remote::scan::Bound,
+	keyval::{Key, result_deserialize_key, serialize_key},
+	stream,
+};
 
 /// Streams deserialized keys matching a serialized prefix in ascending order.
 ///
@@ -46,8 +52,13 @@ where
 	P: Serialize + ?Sized + Debug,
 {
 	let key = serialize_key(prefix).expect("failed to serialize query key");
-	self.raw_keys_from(&key)
-		.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
+	seek_stream_bounded::<stream::Keys<'_>, _>(
+		self,
+		Direction::Forward,
+		Some(&*key),
+		Bound::within(&key),
+	)
+	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
 }
 
 /// Streams deserialized keys matching a raw prefix in ascending order.
@@ -79,6 +90,11 @@ pub fn raw_keys_prefix<'a, P>(
 where
 	P: AsRef<[u8]> + ?Sized + Debug + Sync + 'a,
 {
-	self.raw_keys_from(prefix)
-		.try_take_while(|k: &Key<'_>| future::ok(k.starts_with(prefix.as_ref())))
+	seek_stream_bounded::<stream::Keys<'_>, _>(
+		self,
+		Direction::Forward,
+		Some(prefix.as_ref()),
+		Bound::within(prefix.as_ref()),
+	)
+	.try_take_while(|k: &Key<'_>| future::ok(k.starts_with(prefix.as_ref())))
 }

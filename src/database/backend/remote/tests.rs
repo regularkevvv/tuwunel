@@ -36,7 +36,7 @@ use tuwunel_bridge::{
 };
 use tuwunel_core::{Result, Server, config::Figment};
 
-use super::Backend;
+use super::{Backend, DRAIN_BYTES, DRAIN_ROWS, is_truncated};
 use crate::{Map, Txn, backend::Sink};
 
 /// The bearer token every fake-bridge test presents.
@@ -70,6 +70,9 @@ pub(crate) struct Faults {
 	pub(crate) lose_all_commit_replies: bool,
 	/// Return a valid but wrong reply variant after applying the commit.
 	pub(crate) wrong_commit_reply: bool,
+	/// Fill scan pages by a running byte sum, like the bounded Worker.
+	/// Off exercises compatibility with an older, row-count-only Worker.
+	pub(crate) bounded_scan: bool,
 }
 
 /// The fake's durable state: the kv table, the lease row, the commits table.
@@ -80,6 +83,8 @@ struct Tables {
 	commits: HashMap<Vec<u8>, Vec<u8>>,
 	/// Commits that actually applied; the duplicate test asserts it stays 1.
 	applied: u32,
+	/// Rows every scan page has returned; the scan-bound cases count reads.
+	served: usize,
 }
 
 /// Shared handler state.
@@ -157,6 +162,29 @@ impl Fake {
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner)
 			.applied
+	}
+
+	/// Rows every scan page so far has returned.
+	pub(crate) fn served(&self) -> usize {
+		self.shared
+			.tables
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.served
+	}
+
+	/// Writes rows straight into the kv table, as an earlier writer would
+	/// have, without a commit per row.
+	pub(crate) fn fill(&self, map: u16, rows: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) {
+		let mut tables = self
+			.shared
+			.tables
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+
+		for (key, val) in rows {
+			tables.kv.insert((map, key), val);
+		}
 	}
 
 	/// Every row of one map, in bytewise key order.
@@ -305,7 +333,7 @@ fn apply(shared: &Shared, request: &Request) -> Result<Response, StatusCode> {
 			limit,
 			lease,
 		} => Ok(scan(
-			&tables,
+			&mut tables,
 			&ScanArgs {
 				map: *map,
 				reverse: *reverse,
@@ -372,7 +400,7 @@ struct ScanArgs {
 /// Selection and ordering are done over a materialized copy of the map: at
 /// test scale that is obviously correct, which is the point of an oracle.
 fn scan(
-	tables: &Tables,
+	tables: &mut Tables,
 	args: &ScanArgs,
 	lease: Option<&Lease>,
 	now: u64,
@@ -408,8 +436,29 @@ fn scan(
 	}
 
 	let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
-	let more = items.len() > limit;
+	let mut more = items.len() > limit;
 	items.truncate(limit);
+
+	if faults.bounded_scan {
+		let mut bytes: usize = 0;
+		let fit = items
+			.iter()
+			.take_while(|(key, val)| {
+				bytes = bytes
+					.saturating_add(bridge::response::ROW_OVERHEAD)
+					.saturating_add(key.len())
+					.saturating_add(val.len());
+
+				bytes <= bridge::response::DATA_BYTES
+			})
+			.count()
+			.max(1);
+
+		more |= fit < items.len();
+		items.truncate(fit);
+	}
+
+	tables.served = tables.served.saturating_add(items.len());
 
 	Response::Scanned {
 		items: items
@@ -1034,11 +1083,7 @@ async fn commit_during_an_open_scan_sees_the_pre_commit_snapshot() -> Result {
 
 	// `for_clear` deletes each row its scan yields, which is every row that
 	// existed when the scan began.
-	let cleared: Vec<Vec<u8>> = map
-		.for_clear()
-		.map_ok(<[u8]>::to_vec)
-		.try_collect()
-		.await?;
+	let cleared: Vec<Vec<u8>> = map.for_clear().try_collect().await?;
 
 	assert_eq!(cleared.len(), seen.len().saturating_add(1), "for_clear missed rows");
 	assert!(fake.rows(map_id()).is_empty(), "clear left rows behind");
@@ -1445,6 +1490,249 @@ async fn a_saturated_bound_refuses_unsent_and_the_lease_still_renews() -> Result
 	drop(held);
 	map.insert(&b"key".to_vec(), b"accepted").await?;
 	assert_eq!(fake.applied(), 1);
+	backend.close().await;
+
+	Ok(())
+}
+
+/// Row key `n` as four big-endian bytes, so keys sort in number order.
+fn numbered(n: usize) -> Vec<u8> {
+	u32::try_from(n)
+		.expect("a test-sized count")
+		.to_be_bytes()
+		.to_vec()
+}
+
+/// Reads a scan to its end or its first refusal: the keys, then the error.
+async fn read_until_refused<S, K>(stream: &mut S) -> (Vec<Vec<u8>>, Option<tuwunel_core::Error>)
+where
+	S: futures::Stream<Item = Result<K>> + Unpin,
+	K: AsRef<[u8]>,
+{
+	let mut keys = Vec::new();
+	while let Some(key) = stream.next().await {
+		match key {
+			| Ok(key) => keys.push(key.as_ref().to_vec()),
+			| Err(error) => return (keys, Some(error)),
+		}
+	}
+
+	(keys, None)
+}
+
+#[tokio::test]
+async fn a_drain_past_its_row_budget_truncates_the_scan_and_the_commit_reads_no_more() -> Result {
+	let page: usize = 256;
+	let (fake, _server, backend) = rig(256, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let total = DRAIN_ROWS.saturating_mul(3);
+	fake.fill(map_id(), (0..total).map(|n| (numbered(n), b"x".to_vec())));
+
+	let mut stream = Box::pin(map.raw_keys());
+	let first = stream
+		.next()
+		.await
+		.expect("the map has rows")?
+		.to_vec();
+
+	// A commit on the map lands while the scan is open. Its drain reads the
+	// budget, not the other two thirds of the map.
+	let late = b"\xFF-late".to_vec();
+	let before = fake.served();
+	map.insert(&late, b"late").await?;
+	let drained = fake.served().saturating_sub(before);
+	assert_eq!(drained, DRAIN_ROWS, "the drain did not stop at its row budget");
+
+	// The reader keeps every pre-commit row the drain read, then is refused
+	// in a typed, retryable way; it never ends as if the map were shorter.
+	let (rest, error) = read_until_refused(&mut stream).await;
+	let error = error.expect("a truncated scan ended as if it were complete");
+	assert!(is_truncated(&error), "{error}");
+	assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+
+	let mut seen = vec![first];
+	seen.extend(rest);
+	assert_eq!(seen.len(), page.saturating_add(drained));
+	assert_eq!(seen, (0..seen.len()).map(numbered).collect::<Vec<_>>());
+	assert!(stream.next().await.is_none(), "a refused scan yielded more");
+	drop(stream);
+
+	// Restarting reads the post-commit map, the late row included.
+	let again: Vec<Vec<u8>> = map
+		.raw_keys()
+		.map_ok(<[u8]>::to_vec)
+		.try_collect()
+		.await?;
+	assert_eq!(again.len(), total.saturating_add(1));
+	assert_eq!(again.last(), Some(&late));
+
+	backend.close().await;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn a_drain_past_its_byte_budget_truncates_the_scan() -> Result {
+	let (fake, _server, backend) = rig(256, 0).await?;
+	fake.faults(Faults { bounded_scan: true, ..Faults::default() });
+	let map = Map::open_remote(&backend, MAP);
+	let value = vec![0x5A_u8; 64 * 1024];
+	let row_bytes = value.len().saturating_add(4);
+	let total = DRAIN_BYTES
+		.saturating_div(value.len())
+		.saturating_mul(3);
+	fake.fill(map_id(), (0..total).map(|n| (numbered(n), value.clone())));
+
+	let mut stream = Box::pin(map.raw_keys());
+	stream.next().await.expect("the map has rows")?;
+	let first_page = fake.served();
+
+	map.insert(&b"\xFF-late".to_vec(), b"late")
+		.await?;
+	let drained = fake.served().saturating_sub(first_page);
+	let bytes = drained.saturating_mul(row_bytes);
+	assert!(drained < DRAIN_ROWS, "the row budget stopped this drain, not the byte budget");
+	assert!(bytes >= DRAIN_BYTES, "the drain stopped short of its byte budget");
+	assert!(
+		bytes <= DRAIN_BYTES.saturating_add(bridge::response::DATA_BYTES),
+		"the drain read {bytes} bytes, more than its budget and one page"
+	);
+
+	let (rest, error) = read_until_refused(&mut stream).await;
+	assert!(error.as_ref().is_some_and(is_truncated), "{error:?}");
+	assert_eq!(rest.len().saturating_add(1), first_page.saturating_add(drained));
+
+	backend.close().await;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn a_drain_stops_at_its_readers_prefix_and_never_truncates_it() -> Result {
+	// Four-row pages, so the prefix's rows span several.
+	let (fake, _server, backend) = rig(4, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let keyed = |lead: &[u8], n: usize| [lead, numbered(n).as_slice()].concat();
+	let short: Vec<Vec<u8>> = (0..10).map(|n| keyed(b"a", n)).collect();
+	fake.fill(
+		map_id(),
+		short
+			.iter()
+			.map(|key| (key.clone(), b"x".to_vec())),
+	);
+	fake.fill(
+		map_id(),
+		(0..DRAIN_ROWS.saturating_mul(2)).map(|n| (keyed(b"b", n), b"x".to_vec())),
+	);
+
+	let mut stream = Box::pin(map.raw_keys_prefix(&b"a"[..]));
+	let first = stream.next().await.expect("a row")?.to_vec();
+
+	let before = fake.served();
+	map.insert(&b"b-late".to_vec(), b"late").await?;
+	let drained = fake.served().saturating_sub(before);
+	assert!(
+		drained < short.len().saturating_add(4),
+		"the drain read {drained} rows, past its reader's prefix"
+	);
+
+	let (rest, error) = read_until_refused(&mut stream).await;
+	assert!(error.is_none(), "a prefix read was truncated: {error:?}");
+	let mut seen = vec![first];
+	seen.extend(rest);
+	assert_eq!(seen, short);
+
+	backend.close().await;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn capped_batches_read_no_more_than_their_cap_and_resume_after_their_cursor() -> Result {
+	let (fake, _server, backend) = rig(256, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let total: usize = 1000;
+	let cap: usize = 100;
+	fake.fill(map_id(), (0..total).map(|n| (numbered(n), b"x".to_vec())));
+
+	let mut after: Option<Vec<u8>> = None;
+	let mut visited = Vec::new();
+	let mut batches: usize = 0;
+	loop {
+		let before = fake.served();
+		let rows = map.raw_rows_after(after.as_deref(), cap).await?;
+		assert!(fake.served().saturating_sub(before) <= cap, "a batch read past its cap");
+		assert_eq!(backend.scans().len(), 0, "a batch left its scan open");
+
+		batches = batches.saturating_add(1);
+		if batches == 1 {
+			// Writes between batches: the one behind the cursor is not
+			// visited, the one ahead of it is.
+			map.insert(&[numbered(0), vec![0xAA]].concat(), b"behind")
+				.await?;
+			map.insert(&numbered(total), b"ahead").await?;
+		}
+
+		let ended = rows.len() < cap;
+		after = rows.last().map(|(key, _)| key.clone());
+		visited.extend(rows.into_iter().map(|(key, _)| key));
+		if ended {
+			break;
+		}
+	}
+
+	assert_eq!(visited, (0..=total).map(numbered).collect::<Vec<_>>());
+	assert_eq!(batches, total.saturating_div(cap).saturating_add(1));
+
+	let tail = map
+		.raw_keys_after(Some(&numbered(total.saturating_sub(2))), cap)
+		.await?;
+	assert_eq!(tail, vec![numbered(total.saturating_sub(1)), numbered(total)]);
+
+	let under = map
+		.raw_rows_prefix_after(&numbered(0), None, cap)
+		.await?;
+	assert_eq!(under.len(), 2, "a prefix batch left its prefix");
+
+	backend.close().await;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn del_prefix_and_clear_past_the_drain_budget_remove_every_row() -> Result {
+	let (fake, _server, backend) = rig(256, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let doomed = DRAIN_ROWS.saturating_add(300);
+	let under = |n: usize| [DOOMED.to_be_bytes().as_slice(), numbered(n).as_slice()].concat();
+	let fill = || {
+		fake.fill(map_id(), (0..doomed).map(|n| (under(n), b"x".to_vec())));
+		fake.fill(
+			map_id(),
+			edge_keys()
+				.into_iter()
+				.map(|key| (key, b"x".to_vec())),
+		);
+	};
+
+	// Each removal commits while more rows than the drain budget remain under
+	// the prefix; removing batch by batch never leaves a scan to drain.
+	fill();
+	map.del_prefix(&DOOMED).await?;
+	let left = fake.rows(map_id());
+	assert!(
+		left.iter()
+			.all(|(key, _)| !key.starts_with(&DOOMED.to_be_bytes())),
+		"del_prefix left rows under its prefix"
+	);
+	assert_eq!(left.len(), edge_keys().len(), "del_prefix took rows outside its prefix");
+
+	fill();
+	let cleared: Vec<Vec<u8>> = map.for_clear().try_collect().await?;
+	assert_eq!(cleared.len(), doomed.saturating_add(edge_keys().len()));
+	assert!(fake.rows(map_id()).is_empty(), "clear left rows behind");
+	assert_eq!(backend.scans().len(), 0, "a batch left its scan open");
+
 	backend.close().await;
 
 	Ok(())
