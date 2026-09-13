@@ -15,7 +15,7 @@
 //! protocol or schema version.
 
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	net::SocketAddr,
 	sync::{Arc, Mutex, PoisonError},
 	time::{SystemTime, UNIX_EPOCH},
@@ -1385,6 +1385,67 @@ async fn a_second_writer_is_refused_the_lease() -> Result {
 	let third = Backend::open(&server).await?;
 	assert!(third.lease_status().epoch > epoch, "the fencing epoch did not increase");
 	third.close().await;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn a_saturated_bound_refuses_unsent_and_the_lease_still_renews() -> Result {
+	// The request timeout bounds how long a data call waits for a slot.
+	let fake = Fake::start().await?;
+	let raw_config = Figment::new()
+		.merge(("server_name", "localhost"))
+		.merge(("database_backend", "d1"))
+		.merge(("d1_bridge_url", &fake.url))
+		.merge(("d1_bridge_token", TOKEN))
+		.merge(("d1_read_cache_mb", 0))
+		.merge(("d1_request_timeout_ms", 200))
+		.merge(("test", ["fresh", "cleanup"]));
+
+	let server = crate::tests::test_server(&raw_config)?;
+	let backend = Backend::open(&server).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let slots = backend.client.in_flight();
+	let held = slots
+		.acquire_many(u32::try_from(slots.available_permits()).expect("slot count"))
+		.await
+		.expect("every slot");
+
+	// A refused commit sent nothing: its outcome is known, the error is the
+	// retryable limit, and the writer stays.
+	let error = map
+		.insert(&b"key".to_vec(), b"refused")
+		.await
+		.expect_err("no slot for the commit");
+	assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS, "{error}");
+	assert!(backend.is_writable(), "a refused commit stopped the writer");
+
+	// So is a commit cancelled while it queues for a slot, past its drain.
+	let maps = BTreeSet::from([map_id()]);
+	let key = b"queued".to_vec();
+	let mut commit = Box::pin(map.insert(&key, b"cancelled"));
+	assert!(futures::poll!(&mut commit).is_pending());
+	assert!(backend.scans().begin_write(&maps).is_err(), "the commit is not queued");
+	drop(commit);
+	assert!(backend.is_writable(), "a cancelled queued commit stopped the writer");
+	drop(backend.scans().begin_write(&maps)?);
+
+	// Reads are refused the same way; the lease renews regardless.
+	let Err(error) = map.get(&b"key".to_vec()).await else {
+		panic!("no slot for the read");
+	};
+	assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS, "{error}");
+	backend
+		.lease
+		.renew()
+		.await
+		.expect("renewal takes no slot");
+	assert_eq!(fake.applied(), 0);
+
+	drop(held);
+	map.insert(&b"key".to_vec(), b"accepted").await?;
+	assert_eq!(fake.applied(), 1);
+	backend.close().await;
 
 	Ok(())
 }
