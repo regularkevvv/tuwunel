@@ -358,8 +358,16 @@ impl Service {
 
 				match dest {
 					| Destination::Federation(server) => {
-						// Arm a one-shot retry at the destination's earliest-retry time.
-						if let ShouldAttempt::No { earliest_retry } = self
+						// Arm a one-shot retry at the destination's earliest-retry time,
+						// unless it has failed so long that delivery waits for its return.
+						if self
+							.services
+							.federation
+							.sender_gave_up(&server)
+							.await
+						{
+							self.report_given_up(&server).await;
+						} else if let ShouldAttempt::No { earliest_retry } = self
 							.services
 							.federation
 							.should_attempt(&server)
@@ -442,6 +450,22 @@ fn record_push_failure(dest: &Destination, error: &Error, tries: u32, retry_in: 
 			"Push transaction failed",
 		),
 	}
+}
+
+/// Reports a federation peer given up, with the events kept for its return.
+#[implement(Service)]
+async fn report_given_up(&self, server: &ServerName) {
+	let dest = Destination::Federation(server.to_owned());
+	let active = self.db.active_requests_for(&dest).count().await;
+	let queued = self.db.queued_requests(&dest).count().await;
+
+	error!(
+		%server,
+		active,
+		queued,
+		"Federation to this server has failed for a week; it is not retried until it is \
+		 reachable again. Its events are kept.",
+	);
 }
 
 #[implement(Service)]
@@ -721,6 +745,17 @@ impl Service {
 
 		match dest {
 			| Destination::Federation(server) => {
+				// A wake left for a peer since given up does nothing: its queue
+				// waits for the peer's return.
+				if self
+					.services
+					.federation
+					.sender_gave_up(&server)
+					.await
+				{
+					return Ok(());
+				}
+
 				let should_attempt = self
 					.services
 					.federation
@@ -976,6 +1011,8 @@ impl Service {
 		retry_action: RetryAction,
 	) -> Result<(bool, bool)> {
 		// peer_status gates federation only; appservice and push fall through.
+		// A peer given up is not attempted until its failure record clears; its
+		// events stay queued meanwhile.
 		if let Destination::Federation(server) = dest {
 			let should_attempt = self
 				.services
@@ -983,7 +1020,13 @@ impl Service {
 				.should_attempt(server)
 				.await;
 
-			if matches!(should_attempt, ShouldAttempt::No { .. }) {
+			if matches!(should_attempt, ShouldAttempt::No { .. })
+				|| self
+					.services
+					.federation
+					.sender_gave_up(server)
+					.await
+			{
 				return Ok((false, false));
 			}
 		}

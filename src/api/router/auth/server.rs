@@ -25,6 +25,14 @@ pub(super) async fn auth_server(
 	let x_matrix = parse_x_matrix(request).await?;
 	auth_server_checks(services, &x_matrix)?;
 
+	// The signature covers the request body as canonical JSON (server-server
+	// API, "Request Authentication"). A body that is present but is not
+	// canonical JSON has no canonical form to verify, and checking the signature
+	// as if the request had no body would leave that body unauthenticated.
+	if body.is_none() && !request.body.iter().all(u8::is_ascii_whitespace) {
+		return Err!(Request(BadJson("Request body is not canonical JSON.")));
+	}
+
 	let destination = services.globals.server_name();
 	let origin = &x_matrix.origin;
 	let signature_uri = request
@@ -64,7 +72,7 @@ pub(super) async fn auth_server(
 
 	let key = services
 		.server_keys
-		.get_verify_key(origin, &x_matrix.key)
+		.get_request_key(origin, &x_matrix.key)
 		.await
 		.map_err(|e| {
 			err!(Request(Forbidden(debug_warn!("Failed to fetch signing keys: {e}"))))

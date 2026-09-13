@@ -1,6 +1,6 @@
 use std::pin::pin;
 
-use futures::{FutureExt, StreamExt, future::join3};
+use futures::{StreamExt, future::join3};
 use ruma::{EventId, OwnedRoomId, RoomId, ServerName};
 use serde::Deserialize;
 use tuwunel_core::{
@@ -21,8 +21,7 @@ pub(super) async fn check(&self) -> Result {
 	let acl_check = self
 		.services
 		.event_handler
-		.acl_check(self.origin, self.room_id)
-		.map(|result| result.is_ok());
+		.acl_check(self.origin, self.room_id);
 
 	let server_in_room = self
 		.services
@@ -60,9 +59,9 @@ pub(super) async fn check(&self) -> Result {
 	let (acl_check, room_unreachable, server_can_see) =
 		join3(acl_check, room_unreachable, server_can_see).await;
 
-	if !acl_check {
-		return Err!(Request(Forbidden("Server access denied.")));
-	}
+	// A denial is refused as forbidden; an ACL that cannot be read refuses the
+	// request with its own error.
+	acl_check?;
 
 	if room_unreachable {
 		return Err!(Request(Forbidden("Server is not in room.")));

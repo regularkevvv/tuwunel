@@ -8,6 +8,8 @@ use tuwunel_core::{
 	matrix::{event::gen_event_id_canonical_json, room_version},
 };
 
+use super::{KeyUse, event_key_use};
+
 #[implement(super::Service)]
 pub async fn validate_and_add_event_id(
 	&self,
@@ -96,8 +98,11 @@ pub async fn verify_json(
 	let room_version_id = room_version_id.unwrap_or(&RoomVersionId::V11);
 	let room_version_rules = room_version::rules(room_version_id)?;
 
+	// Any signed JSON may be checked here, not only an event: without an
+	// `origin_server_ts` the keys are checked whatever their validity.
+	let usage = event_key_use(event, &room_version_rules).unwrap_or(KeyUse::Event(None));
 	let event_keys = self
-		.get_event_keys(event, &room_version_rules)
+		.get_keys_for(event, &room_version_rules, usage)
 		.await?;
 
 	ruma::signatures::verify_json(&event_keys, event).map_err(Into::into)

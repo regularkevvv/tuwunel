@@ -6,8 +6,8 @@ use std::{
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use ruma::{
-	CanonicalJsonObject, OwnedServerName, OwnedServerSigningKeyId, ServerName,
-	ServerSigningKeyId, api::federation::discovery::ServerSigningKeys, serde::Raw,
+	CanonicalJsonObject, MilliSecondsSinceUnixEpoch, OwnedServerName, OwnedServerSigningKeyId,
+	ServerName, ServerSigningKeyId, api::federation::discovery::ServerSigningKeys, serde::Raw,
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::time::{Instant, timeout_at};
@@ -15,9 +15,12 @@ use tuwunel_core::{
 	debug, debug_error, debug_warn, error, implement, info, result::FlatOk, trace, warn,
 };
 
-use super::key_exists;
+use super::{KeyUse, key_exists};
 
 type Batch = BTreeMap<OwnedServerName, Vec<OwnedServerSigningKeyId>>;
+
+/// The newest `origin_server_ts` among the events each server signed.
+type ValidAt = BTreeMap<OwnedServerName, MilliSecondsSinceUnixEpoch>;
 
 #[implement(super::Service)]
 pub async fn acquire_events_pubkeys<'a, I>(&self, events: I)
@@ -28,28 +31,49 @@ where
 	type Signatures = BTreeMap<OwnedServerName, BTreeMap<OwnedServerSigningKeyId, String>>;
 
 	let mut batch = Batch::new();
+	let mut valid_at = ValidAt::new();
 	events
 		.cloned()
 		.map(Raw::<CanonicalJsonObject>::from_json)
-		.map(|event| event.get_field::<Signatures>("signatures"))
-		.filter_map(FlatOk::flat_ok)
-		.flat_map(IntoIterator::into_iter)
-		.for_each(|(server, sigs)| {
-			batch
-				.entry(server)
-				.or_default()
-				.extend(sigs.into_keys());
+		.filter_map(|event| {
+			let signatures = event
+				.get_field::<Signatures>("signatures")
+				.flat_ok()?;
+
+			let origin_server_ts = event
+				.get_field::<MilliSecondsSinceUnixEpoch>("origin_server_ts")
+				.flat_ok();
+
+			Some((signatures, origin_server_ts))
+		})
+		.for_each(|(signatures, origin_server_ts)| {
+			for (server, sigs) in signatures {
+				if let Some(origin_server_ts) = origin_server_ts {
+					valid_at
+						.entry(server.clone())
+						.and_modify(|at| *at = (*at).max(origin_server_ts))
+						.or_insert(origin_server_ts);
+				}
+
+				batch
+					.entry(server)
+					.or_default()
+					.extend(sigs.into_keys());
+			}
 		});
 
 	let batch = batch
 		.iter()
 		.map(|(server, keys)| (server.borrow(), keys.iter().map(Borrow::borrow)));
 
-	self.acquire_pubkeys(batch).await;
+	self.acquire_pubkeys(batch, &valid_at).await;
 }
 
+/// Acquires the keys in `batch` which are not cached. A key of a server in
+/// `valid_at` counts as cached only if it is valid for the events the server
+/// signed then, so a stale key is refreshed with the batch.
 #[implement(super::Service)]
-pub async fn acquire_pubkeys<'a, S, K>(&self, batch: S)
+pub async fn acquire_pubkeys<'a, S, K>(&self, batch: S, valid_at: &ValidAt)
 where
 	S: Iterator<Item = (&'a ServerName, K)> + Send + Clone,
 	K: Iterator<Item = &'a ServerSigningKeyId> + Send + Clone,
@@ -77,7 +101,7 @@ where
 
 	debug!("acquire {requested_keys} keys from {requested_servers}");
 
-	let mut missing = self.acquire_locals(batch).await;
+	let mut missing = self.acquire_locals(batch, valid_at).await;
 	let mut missing_keys = keys_count(&missing);
 	let mut missing_servers = missing.len();
 	if missing_servers == 0 {
@@ -136,15 +160,19 @@ where
 }
 
 #[implement(super::Service)]
-async fn acquire_locals<'a, S, K>(&self, batch: S) -> Batch
+async fn acquire_locals<'a, S, K>(&self, batch: S, valid_at: &ValidAt) -> Batch
 where
 	S: Iterator<Item = (&'a ServerName, K)> + Send,
 	K: Iterator<Item = &'a ServerSigningKeyId> + Send,
 {
 	let mut missing = Batch::new();
 	for (server, key_ids) in batch {
+		let usage = KeyUse::Event(valid_at.get(server).copied());
 		for key_id in key_ids {
-			if !self.verify_key_exists(server, key_id).await {
+			if !self
+				.verify_key_exists(server, key_id, usage)
+				.await
+			{
 				missing
 					.entry(server.into())
 					.or_default()

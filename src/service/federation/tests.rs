@@ -9,11 +9,11 @@ use bytes::Bytes;
 use http::StatusCode;
 use ruma::{OwnedServerName, api::error::ErrorBody};
 use serde_json::Value;
-use tuwunel_core::{Error, err};
+use tuwunel_core::{Error, err, utils::exponential_backoff_streak_cap};
 
 use super::peer::{
-	Backoff, Classification, MAX_BACKOFF, ShouldAttempt, attempt_verdict, classify,
-	classify_error, failure_secs, fold_streak,
+	Backoff, Classification, GIVE_UP_AFTER, MAX_BACKOFF, ShouldAttempt, Streak, attempt_verdict,
+	classify, classify_error, failure_secs, fold_streak, gave_up,
 };
 
 fn federation_error(status: StatusCode) -> Error {
@@ -245,4 +245,72 @@ fn fold_streak_tracks_anchor_and_oldest() {
 	assert_eq!(second.oldest_bucket, 10);
 	assert_eq!(second.latest_bucket, 12);
 	assert!(matches!(second.class, Classification::Permanent));
+}
+
+/// A nine-byte transient failure row recorded at `secs`.
+fn failure_row(secs: u64) -> [u8; 9] {
+	let mut row = [0_u8; 9];
+	row[0] = u8::from(Classification::Transient);
+	row[1..].copy_from_slice(&secs.to_be_bytes());
+
+	row
+}
+
+#[test]
+fn giving_up_needs_failures_spanning_the_horizon() {
+	let window_secs = 180;
+	let horizon = GIVE_UP_AFTER.as_secs();
+	let streak = |oldest_bucket: u64, anchor_secs: u64| Streak {
+		class: Classification::Transient,
+		anchor_secs,
+		oldest_bucket,
+		latest_bucket: anchor_secs / window_secs,
+	};
+
+	// A lone failure, however long ago, spans nothing: the peer is retried.
+	assert!(!gave_up(&streak(10, 10 * window_secs), window_secs));
+	assert!(!gave_up(&streak(10, 10 * window_secs + horizon - 1), window_secs));
+	assert!(gave_up(&streak(10, 10 * window_secs + horizon), window_secs));
+}
+
+#[test]
+fn a_dead_peer_is_retried_a_bounded_number_of_times() {
+	// Every attempt fails and the next waits for the verdict's earliest retry,
+	// as the sender's wake does, until the failures span the give-up horizon.
+	let window_secs = 180;
+	let n_max = exponential_backoff_streak_cap(Duration::from_secs(window_secs), MAX_BACKOFF);
+	let mut attempts = 1;
+	let mut run = fold_streak(window_secs, None, 0, &failure_row(0));
+	while !gave_up(&run, window_secs) {
+		let span = run
+			.latest_bucket
+			.saturating_sub(run.oldest_bucket)
+			.saturating_add(1);
+
+		let verdict = attempt_verdict(&Backoff {
+			class: Classification::Transient,
+			anchor_secs: run.anchor_secs,
+			streak: u32::try_from(span).unwrap_or(u32::MAX).min(n_max),
+			now: run.anchor_secs,
+			window_secs,
+			grace_secs: 15,
+		});
+
+		let ShouldAttempt::No { earliest_retry } = verdict else {
+			panic!("a peer that just failed is attemptable at once");
+		};
+
+		let now = earliest_retry
+			.duration_since(UNIX_EPOCH)
+			.expect("retry after the epoch")
+			.as_secs();
+
+		attempts += 1;
+		run = fold_streak(window_secs, Some(run), now / window_secs, &failure_row(now));
+	}
+
+	// The grace tier retries every 15 seconds within the first window (12
+	// attempts), the quadratic curve reaches its daily cap in three more, and
+	// then one a day: 22 attempts over seven days, then none.
+	assert_eq!(attempts, 22, "attempts before giving up");
 }
