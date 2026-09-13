@@ -221,8 +221,10 @@ impl Service {
 		}
 
 		let max_uploads = config.max_pending_media_uploads;
-		let (current_uploads, earliest_expiration) =
-			self.db.count_pending_mxc_for_user(user).await;
+		let (current_uploads, earliest_expiration) = self
+			.db
+			.count_pending_mxc_for_user(user, now_millis(), max_uploads)
+			.await;
 
 		// Check if the user has reached the maximum number of pending media uploads
 		if current_uploads >= max_uploads {
@@ -273,7 +275,9 @@ impl Service {
 		self.create(mxc, Some(user), content_disposition, content_type, file)
 			.await?;
 
-		self.db.remove_pending_mxc(mxc).await?;
+		self.db
+			.remove_pending_mxc(mxc, user, expires_at)
+			.await?;
 
 		let mxc_uri: OwnedMxcUri = mxc.to_string().into();
 		let notifier = self.mxc_state.notifiers.lock()?.remove(&mxc_uri);
