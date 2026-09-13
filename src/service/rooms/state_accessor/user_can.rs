@@ -90,15 +90,23 @@ pub async fn user_can_see_event(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> bool {
-	let Ok(shortstatehash) = self
+	let shortstatehash = match self
 		.services
 		.state
 		.pdu_shortstatehash(event_id)
 		.await
-	else {
-		return self
-			.is_initial_room_create(room_id, event_id)
-			.await;
+	{
+		| Ok(shortstatehash) => Some(shortstatehash),
+		| Err(_)
+			if self
+				.is_initial_room_create(room_id, event_id)
+				.await =>
+			return true,
+		| Err(_) => self.snapshotless_state(room_id, event_id).await,
+	};
+
+	let Some(shortstatehash) = shortstatehash else {
+		return false;
 	};
 
 	let Ok(history_visibility) = self

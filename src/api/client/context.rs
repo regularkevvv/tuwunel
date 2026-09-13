@@ -375,7 +375,11 @@ async fn load_state_pdus(
 				.get_room_shortstatehash(room_id)
 				.await
 				.map_err(|e| err!(Database("State not found: {e}")))?,
-		| Err(e) => return Err!(Database("State not found: {e}")),
+		| Err(e) => services
+			.state_accessor
+			.snapshotless_state(room_id, state_at)
+			.await
+			.ok_or_else(|| err!(Database("State not found: {e}")))?,
 	};
 
 	let state = services
