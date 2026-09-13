@@ -38,7 +38,7 @@ use std::{
 		Arc, Mutex, PoisonError,
 		atomic::{AtomicU64, Ordering::SeqCst},
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use serde_bytes::ByteBuf;
@@ -658,17 +658,36 @@ fn records_transaction(maps: &BTreeSet<u16>) -> bool {
 	crate::backend::ids::map_id("userdevicetxnid_response").is_some_and(|id| maps.contains(&id.0))
 }
 
+/// How long start-up retries a handshake the bridge does not answer. A
+/// Container can start before its Worker routes the bridge host: a rollout
+/// starts the new image itself, and the Worker installs outbound interception
+/// on its next request or lifecycle alarm. Staging release 34782751062
+/// exited on its first failed connect instead.
+const HELLO_PATIENCE: Duration = Duration::from_secs(120);
+
+/// Pause between handshake calls while the bridge does not answer.
+const HELLO_RETRY: Duration = Duration::from_secs(2);
+
 /// Performs the version handshake and refuses an incompatible Worker.
+///
+/// A transport failure is retried for [`HELLO_PATIENCE`]; a reply is final.
 ///
 /// N/N-1 interoperability (ADR-0006): the Worker activates before the
 /// Container rollout completes, so a Worker one major version ahead is
 /// accepted with a warning. Anything else, and any schema-version mismatch,
 /// refuses to start.
 async fn hello(client: &Client) -> Result {
-	let response = client
-		.call(&Request::Hello, None)
-		.await
-		.map_err(|error| database_error("hello", &error))?;
+	let started = Instant::now();
+	let response = loop {
+		match client.call(&Request::Hello, None).await {
+			| Ok(response) => break response,
+			| Err(error) if error.is_retryable() && started.elapsed() < HELLO_PATIENCE => {
+				warn!(%error, "the bridge did not answer the handshake; retrying");
+				tokio::time::sleep(HELLO_RETRY).await;
+			},
+			| Err(error) => return Err(database_error("hello", &error)),
+		}
+	};
 
 	let Response::Hello { protocol, schema_version, .. } = response else {
 		return Err!(Database("bridge hello: unexpected reply"));

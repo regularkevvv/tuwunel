@@ -73,6 +73,9 @@ pub(crate) struct Faults {
 	/// Fill scan pages by a running byte sum, like the bounded Worker.
 	/// Off exercises compatibility with an older, row-count-only Worker.
 	pub(crate) bounded_scan: bool,
+	/// Answer this many further handshakes with `503`, like a bridge host the
+	/// Worker has not routed yet.
+	pub(crate) fail_hellos: u32,
 }
 
 /// The fake's durable state: the kv table, the lease row, the commits table.
@@ -230,6 +233,16 @@ async fn kv(
 	let Ok(request) = bridge::decode::<Request>(&body) else {
 		return StatusCode::BAD_REQUEST.into_response();
 	};
+	if matches!(request, Request::Hello) {
+		let mut faults = shared
+			.faults
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		if faults.fail_hellos > 0 {
+			faults.fail_hellos = faults.fail_hellos.saturating_sub(1);
+			return StatusCode::SERVICE_UNAVAILABLE.into_response();
+		}
+	}
 	if matches!(request, Request::Commit { .. }) {
 		let gate = shared
 			.commit_gate
@@ -703,6 +716,25 @@ async fn hello_mismatch_refuses_to_open() -> Result {
 	let backend = Backend::open(&server)
 		.await
 		.expect("the next protocol version is accepted with a warning");
+	backend.close().await;
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn hello_waits_for_a_bridge_that_does_not_answer_yet() -> Result {
+	let fake = Fake::start().await?;
+	let server = remote_server(&fake.url, 256, 1)?;
+
+	// More failures than one call retries: a Container can start before its
+	// Worker routes the bridge host, and must wait for it rather than exit.
+	fake.faults(Faults {
+		fail_hellos: super::client::MAX_ATTEMPTS.saturating_mul(2),
+		..Faults::default()
+	});
+	let backend = Backend::open(&server)
+		.await
+		.expect("the handshake is retried until the bridge answers");
 	backend.close().await;
 
 	Ok(())
