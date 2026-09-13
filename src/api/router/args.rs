@@ -187,8 +187,13 @@ fn take_body(
 		UserId::parse_with_server_name(EMPTY, server_name).expect("valid user_id")
 	});
 
-	let uiaa_request = json_body
-		.get("auth")
+	// A server-signed body reaches the handler exactly as its signature covered
+	// it; no stored request is merged in after authentication.
+	let uiaa_request = auth
+		.origin
+		.is_none()
+		.then_some(&*json_body)
+		.and_then(|json_body| json_body.get("auth"))
 		.and_then(CanonicalJsonValue::as_object)
 		.and_then(|auth| auth.get("session"))
 		.and_then(CanonicalJsonValue::as_str)
