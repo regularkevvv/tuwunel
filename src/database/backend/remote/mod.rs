@@ -663,7 +663,7 @@ fn records_transaction(maps: &BTreeSet<u16>) -> bool {
 /// starts the new image itself, and the Worker installs outbound interception
 /// on its next request or lifecycle alarm. Staging release 34782751062
 /// exited on its first failed connect instead.
-const HELLO_PATIENCE: Duration = Duration::from_secs(120);
+const HELLO_PATIENCE: Duration = Duration::from_mins(2);
 
 /// Pause between handshake calls while the bridge does not answer.
 const HELLO_RETRY: Duration = Duration::from_secs(2);
