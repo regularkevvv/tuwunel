@@ -22,7 +22,7 @@ use tuwunel_core::{
 	},
 	warn,
 };
-use tuwunel_database::{Cbor, Database, Deserialized, Handle, Map};
+use tuwunel_database::{Cbor, Database, Deserialized, Handle, Map, deserialize_from_slice};
 use url::Url;
 
 pub use self::adopt::Counts;
@@ -718,6 +718,48 @@ pub fn stream(&self) -> impl Stream<Item = Session> + Send {
 		.stream()
 		.expect_ok()
 		.map(|(sess_id, session): (&str, Cbor<Session>)| self.opened(sess_id, session.0))
+}
+
+/// At most `limit` records in id order after the id `after`, or from the
+/// first when it is `None`, and the id to pass next, `None` once the records
+/// end.
+///
+/// The read is closed before this returns, so the caller may update or
+/// delete the records it got without its commits draining an open scan. A
+/// record that does not decode is skipped with a warning, and the cursor
+/// still moves past it.
+#[implement(Sessions)]
+pub async fn batch_after(
+	&self,
+	after: Option<&str>,
+	limit: usize,
+) -> Result<(Vec<Session>, Option<String>)> {
+	let rows = self
+		.db
+		.oauthid_session
+		.raw_rows_after(after.map(str::as_bytes), limit)
+		.await?;
+
+	let next = rows
+		.last()
+		.filter(|_| rows.len() >= limit)
+		.map(|(sess_id, _)| String::from_utf8_lossy(sess_id).into_owned());
+
+	let sessions = rows
+		.iter()
+		.filter_map(|(sess_id, session)| {
+			let sess_id = std::str::from_utf8(sess_id).ok()?;
+			match deserialize_from_slice::<Cbor<Session>>(session) {
+				| Ok(session) => Some(self.opened(sess_id, session.0)),
+				| Err(error) => {
+					warn!(%sess_id, "Stored upstream grant does not decode: {error}");
+					None
+				},
+			}
+		})
+		.collect();
+
+	Ok((sessions, next))
 }
 
 #[implement(Sessions)]
