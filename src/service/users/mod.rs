@@ -379,6 +379,41 @@ impl Service {
 			.ready_filter_map(|(u, p): (&UserId, &[u8])| (!p.is_empty()).then_some(u))
 	}
 
+	/// The local accounts ([`Service::list_local_users`]) among at most
+	/// `limit` accounts after the key `after` in id order, and the key to pass
+	/// next, `None` once the accounts end.
+	///
+	/// The read is closed before this returns, so work over every account
+	/// reads it in bounded batches and may write as it goes.
+	pub async fn local_users_after(
+		&self,
+		after: Option<&[u8]>,
+		limit: usize,
+	) -> Result<(Vec<OwnedUserId>, Option<Vec<u8>>)> {
+		let rows = self
+			.db
+			.userid_password
+			.raw_rows_after(after, limit)
+			.await?;
+
+		let next = rows
+			.last()
+			.filter(|_| rows.len() >= limit)
+			.map(|(user_id, _)| user_id.clone());
+
+		let users = rows
+			.into_iter()
+			.filter(|(_, password)| !password.is_empty())
+			.filter_map(|(user_id, _)| {
+				std::str::from_utf8(&user_id)
+					.ok()
+					.and_then(|user_id| UserId::parse(user_id).ok())
+			})
+			.collect();
+
+		Ok((users, next))
+	}
+
 	/// Returns the origin of the user (password/LDAP/...).
 	pub async fn origin(&self, user_id: &UserId) -> Result<String> {
 		self.db

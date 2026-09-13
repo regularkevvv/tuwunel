@@ -29,6 +29,9 @@ use tuwunel_core::{
 use self::{aggregate::PresenceAggregator, data::Data};
 use crate::appservice::RegistrationInfo;
 
+/// Accounts one batch of the start-up presence reset reads.
+const RESET_BATCH: usize = 256;
+
 #[derive(Default)]
 pub struct Ping<'a> {
 	pub device_id: Option<&'a DeviceId>,
@@ -208,47 +211,64 @@ impl Service {
 
 		let _cork = self.services.db.cork();
 
-		for user_id in &self
-			.services
-			.users
-			.list_local_users()
-			.map(UserId::to_owned)
-			.collect::<Vec<_>>()
-			.await
-		{
-			let presence = self.db.get_presence(user_id).await;
-
-			let presence = match presence {
-				| Ok((_, ref presence)) => &presence.content,
-				| _ => continue,
+		// Accounts are read in bounded batches from a cursor, each read closed
+		// before its presence is written, so the reset never holds a scan of
+		// every account open, nor every account in memory.
+		let mut after: Option<Vec<u8>> = None;
+		loop {
+			let (users, next) = match self
+				.services
+				.users
+				.local_users_after(after.as_deref(), RESET_BATCH)
+				.await
+			{
+				| Ok(batch) => batch,
+				| Err(e) => {
+					debug_warn!("Start-up presence reset stopped early: {e}");
+					return;
+				},
 			};
 
-			if !matches!(
-				presence.presence,
-				PresenceState::Unavailable | PresenceState::Online | PresenceState::Busy
-			) {
-				trace!(?user_id, ?presence, "Skipping user");
-				continue;
+			for user_id in &users {
+				let presence = self.db.get_presence(user_id).await;
+
+				let presence = match presence {
+					| Ok((_, ref presence)) => &presence.content,
+					| _ => continue,
+				};
+
+				if !matches!(
+					presence.presence,
+					PresenceState::Unavailable | PresenceState::Online | PresenceState::Busy
+				) {
+					trace!(?user_id, ?presence, "Skipping user");
+					continue;
+				}
+
+				trace!(?user_id, ?presence, "Resetting presence to offline");
+
+				_ = self
+					.set_presence(
+						user_id,
+						&PresenceState::Offline,
+						Some(false),
+						presence.last_active_ago,
+						presence.status_msg.clone(),
+					)
+					.await
+					.inspect_err(|e| {
+						debug_warn!(
+							?presence,
+							"{user_id} has invalid presence in database and failed to reset it \
+							 to offline: {e}"
+						);
+					});
 			}
 
-			trace!(?user_id, ?presence, "Resetting presence to offline");
-
-			_ = self
-				.set_presence(
-					user_id,
-					&PresenceState::Offline,
-					Some(false),
-					presence.last_active_ago,
-					presence.status_msg.clone(),
-				)
-				.await
-				.inspect_err(|e| {
-					debug_warn!(
-						?presence,
-						"{user_id} has invalid presence in database and failed to reset it to \
-						 offline: {e}"
-					);
-				});
+			match next {
+				| Some(next) => after = Some(next),
+				| None => return,
+			}
 		}
 	}
 
