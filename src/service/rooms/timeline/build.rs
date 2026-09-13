@@ -117,13 +117,13 @@ pub async fn build_and_append_pdu_with_txnid(
 		.boxed()
 		.await?;
 
-	// We append to state before appending the pdu, so we don't have a moment in
-	// time with the pdu without it's state. This is okay because append_pdu can't
-	// fail.
+	// The state after the pdu is built first but made current only by the commit
+	// that stores the pdu, so a failed append leaves it unreferenced, never
+	// current beside a pdu that was not stored.
 	let statehashid = self.services.state.append_to_state(&pdu).await?;
 
-	// The append makes `statehashid` the room's current state once the pdu is
-	// stored and before its count retires, so a sync never delivers the pdu
+	// The append stores the pdu and makes `statehashid` the room's current state
+	// in one commit, before its count retires, so a sync never delivers the pdu
 	// without the state it produced.
 	let pdu_id = self
 		.append_pdu_with_txnid(

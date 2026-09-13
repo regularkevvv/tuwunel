@@ -28,7 +28,7 @@ use tuwunel_core::{
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn};
+use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
 
 use crate::{
 	rooms::{
@@ -392,6 +392,20 @@ pub async fn set_room_state(
 		.await?;
 
 	Ok(())
+}
+
+/// Queues `shortstatehash` as the room's current state in `txn`, so it
+/// becomes current in the same commit as the writes it accompanies. Like
+/// [`Self::set_room_state`], it does not update state_cache.
+#[implement(Service)]
+pub fn set_room_state_txn(
+	&self,
+	txn: &mut Txn,
+	room_id: &RoomId,
+	shortstatehash: ShortStateHash,
+	_mutex_lock: &RoomMutexGuard,
+) {
+	txn.raw_put(&self.db.roomid_shortstatehash, room_id, shortstatehash);
 }
 
 /// This fetches auth events from the current state.
@@ -776,6 +790,52 @@ pub async fn set_forward_extremities<'a, I>(
 			.put_raw(key, event_id)
 			.await
 			.expect("database write error");
+	}
+}
+
+/// Queues `event_ids` as the room's forward extremities into `txn`, so the
+/// frontier moves in the same commit as the event that forms it.
+///
+/// A current leaf not in `event_ids` is deleted, and each of `event_ids` is
+/// written once, so no key is both deleted and written in one batch.
+#[implement(Service)]
+pub async fn set_forward_extremities_txn<'a, I>(
+	&'a self,
+	txn: &mut Txn,
+	room_id: &'a RoomId,
+	event_ids: I,
+	_state_lock: &'a RoomMutexGuard,
+) where
+	I: Iterator<Item = &'a EventId> + Send + 'a,
+{
+	let leaves: Vec<_> = event_ids
+		.map(|event_id| {
+			let key = serialize_key((room_id, event_id)).expect("failed to serialize leaf key");
+
+			(key, event_id)
+		})
+		.collect();
+
+	let prefix = (room_id, Interfix);
+	let current: Vec<Vec<u8>> = self
+		.db
+		.roomid_pduleaves
+		.keys_prefix_raw(&prefix)
+		.ignore_err()
+		.map(<[u8]>::to_vec)
+		.collect()
+		.await;
+
+	for key in current.iter().filter(|key| {
+		!leaves
+			.iter()
+			.any(|(leaf, _)| leaf.as_ref() == key.as_slice())
+	}) {
+		txn.del_raw(&self.db.roomid_pduleaves, key);
+	}
+
+	for (key, event_id) in &leaves {
+		txn.insert_raw(&self.db.roomid_pduleaves, key, event_id.as_bytes());
 	}
 }
 

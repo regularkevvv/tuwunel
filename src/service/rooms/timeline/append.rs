@@ -105,12 +105,14 @@ where
 /// happens in `append_pdu`.
 ///
 /// `room_state` is the room state after the event, for a caller that has not
-/// made it current yet. It becomes current once the event is stored and
-/// before the event's count retires. Sync bounds its timeline by the retired
-/// count while `required_state` and `/members` read current state, so the
-/// state has to be current by the time any sync can deliver the event. A
+/// made it current yet. It becomes current in the commit that stores the
+/// event, before the event's count retires. Sync bounds its timeline by the
+/// retired count while `required_state` and `/members` read current state, so
+/// the state has to be current by the time any sync can deliver the event. A
 /// caller that set the state after this returned let a sync pair a membership
-/// change in its timeline with the membership it replaced.
+/// change in its timeline with the membership it replaced. A state commit
+/// that followed the event's, and failed, did the same: the count still
+/// retired, and the stale pointer stayed across restarts.
 ///
 /// Returns pdu id
 #[implement(super::Service)]
@@ -203,17 +205,6 @@ where
 		}
 	}
 
-	// We must keep track of all events that have been referenced.
-	self.services
-		.pdu_metadata
-		.mark_as_referenced(pdu.room_id(), pdu.prev_events().map(AsRef::as_ref))
-		.await?;
-
-	self.services
-		.state
-		.set_forward_extremities(pdu.room_id(), leafs, state_lock)
-		.await;
-
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
 	let next_count = self.services.globals.next_count().await?;
 
@@ -244,9 +235,32 @@ where
 	let count = PduCount::Normal(*next_count);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
-	// Insert pdu
-	self.append_pdu_json(&pdu_id, pdu, &pdu_json, txnid)
-		.await?;
+	// One commit stores the pdu, marks the events it references, and makes it
+	// the room's frontier. When `room_state` is given, the same commit makes
+	// that state current. A failed commit leaves none of them, so the pdu is
+	// never visible beside the state it replaced, and the frontier never names
+	// a pdu that was not stored.
+	let mut txn = self.append_pdu_txn(
+		&pdu_id,
+		pdu,
+		&pdu_json,
+		txnid,
+		room_state.map(|room_state| (room_state, state_lock)),
+	);
+
+	// We must keep track of all events that have been referenced.
+	self.services.pdu_metadata.mark_as_referenced_txn(
+		&mut txn,
+		pdu.room_id(),
+		pdu.prev_events().map(AsRef::as_ref),
+	);
+
+	self.services
+		.state
+		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
+		.await;
+
+	txn.execute().await?;
 
 	drop(insert_lock);
 
@@ -278,14 +292,6 @@ where
 		.await
 		.log_err()
 		.ok();
-
-	// Current state before publication; see `append_pdu`.
-	if let Some(room_state) = room_state {
-		self.services
-			.state
-			.set_room_state(pdu.room_id(), room_state, state_lock)
-			.await?;
-	}
 
 	drop(next_count);
 
@@ -480,25 +486,15 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 	Ok(())
 }
 
-#[implement(super::Service)]
-async fn append_pdu_json(
-	&self,
-	pdu_id: &RawPduId,
-	pdu: &PduEvent,
-	json: &CanonicalJsonObject,
-	txnid: Option<&[u8]>,
-) -> Result {
-	self.append_pdu_txn(pdu_id, pdu, json, txnid)
-		.execute()
-		.await
-}
-
 /// The single commit that makes an accepted event durable.
 ///
-/// It carries the event, its id and timestamp indexes, the outlier removal,
-/// and, when `txnid` is given, the sending client's transaction record with
-/// the event id as its value. Returned unexecuted so the commit's contents
-/// can be inspected; [`Self::append_pdu`] executes it.
+/// It carries the event, its id and timestamp indexes, and the outlier
+/// removal. When `txnid` is given, it also carries the sending client's
+/// transaction record, with the event id as its value. When `room_state` is
+/// given, it makes that state the room's current state, under the room's
+/// state lock. Returned unexecuted so the commit's contents can be inspected.
+/// [`Self::append_pdu`] adds the events the pdu references and the room's new
+/// frontier, then executes it.
 #[implement(super::Service)]
 pub fn append_pdu_txn(
 	&self,
@@ -506,6 +502,7 @@ pub fn append_pdu_txn(
 	pdu: &PduEvent,
 	json: &CanonicalJsonObject,
 	txnid: Option<&[u8]>,
+	room_state: Option<(ShortStateHash, &RoomMutexGuard)>,
 ) -> Txn {
 	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
@@ -522,6 +519,12 @@ pub fn append_pdu_txn(
 
 	if let Some(txnid) = txnid {
 		txn.insert_raw(&self.db.userdevicetxnid_response, txnid, pdu.event_id.as_bytes());
+	}
+
+	if let Some((room_state, state_lock)) = room_state {
+		self.services
+			.state
+			.set_room_state_txn(&mut txn, pdu.room_id(), room_state, state_lock);
 	}
 
 	txn

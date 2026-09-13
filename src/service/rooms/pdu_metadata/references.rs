@@ -9,7 +9,7 @@ use tuwunel_core::{
 		u64_from_u8,
 	},
 };
-use tuwunel_database::Interfix;
+use tuwunel_database::{Interfix, Txn};
 
 use super::{
 	Service,
@@ -84,6 +84,18 @@ where
 	}
 
 	Ok(())
+}
+
+/// Queues the marks [`Self::mark_as_referenced`] writes into `txn`, so they
+/// commit with the event that references them.
+#[implement(Service)]
+pub fn mark_as_referenced_txn<'a, I>(&self, txn: &mut Txn, room_id: &RoomId, event_ids: I)
+where
+	I: Iterator<Item = &'a EventId>,
+{
+	for event_id in event_ids {
+		txn.put_raw(&self.db.referencedevents, (room_id, event_id), []);
+	}
 }
 
 #[implement(Service)]

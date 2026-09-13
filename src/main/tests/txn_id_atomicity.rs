@@ -143,7 +143,7 @@ async fn room_send(
 	let json = services.timeline.get_pdu_json(&committed).await?;
 	let txn = services
 		.timeline
-		.append_pdu_txn(&pdu_id, &pdu, &json, Some(&txnid));
+		.append_pdu_txn(&pdu_id, &pdu, &json, Some(&txnid), None);
 
 	let keys: Vec<(String, Vec<u8>)> = txn
 		.keys()
