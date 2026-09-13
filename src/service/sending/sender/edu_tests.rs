@@ -140,8 +140,7 @@ async fn selected_overflow_and_watermark_share_the_persistence_operation() -> Re
 	services
 		.sending
 		.db
-		.pending_edu_destinations(36)
-		.try_collect::<Vec<_>>()
+		.pending_edu_destinations(36, None, 256)
 		.await
 		.expect_err("startup must not silently ignore a cursor beyond retired writes");
 	fixture.finish().await;
@@ -305,13 +304,13 @@ async fn startup_reconstructs_an_empty_window_wake_from_the_durable_cursor() -> 
 		.db
 		.persist_edus(server, &[], &[], 0)
 		.await?;
-	let pending = services
+	let (pending, next) = services
 		.sending
 		.db
-		.pending_edu_destinations(services.globals.current_count())
-		.try_collect::<Vec<_>>()
+		.pending_edu_destinations(services.globals.current_count(), None, 256)
 		.await?;
 	assert_eq!(pending, vec![destination.clone()]);
+	assert!(next.is_none(), "one watermark is a whole batch's end");
 	let id = services.sending.shard_id(&destination);
 	let mut futures = SendingFutures::new();
 	let mut statuses = CurTransactionStatus::new();

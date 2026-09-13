@@ -207,6 +207,9 @@ impl PushFailures {
 const SELECT_PRESENCE_LIMIT: usize = 256;
 const SELECT_RECEIPT_LIMIT: usize = 256;
 const SELECT_DEVICE_CHANGE_LIMIT: usize = 256;
+
+/// Rows one start-up netburst batch reads from the send queues.
+const NETBURST_BATCH: usize = 256;
 /// Global source counts are unique across update producers. A complete window
 /// stays below the per-source caps without taking another source's larger
 /// cursor.
@@ -794,21 +797,34 @@ impl Service {
 		let keep =
 			usize::try_from(self.server.config.startup_netburst_keep).unwrap_or(usize::MAX);
 
+		// The queue is read in bounded batches from a cursor, each read closed
+		// before the batch's surplus is deleted, so no deletion drains a scan
+		// of the queue this start-up holds open.
 		let mut txns = HashMap::<Destination, Vec<SendingEvent>>::new();
-		let active = self.db.active_requests();
+		let mut after: Option<Vec<u8>> = None;
+		loop {
+			let (active, next) = self
+				.db
+				.active_requests_after(after.as_deref(), NETBURST_BATCH)
+				.await?;
 
-		pin_mut!(active);
-		while let Some((key, event, dest)) = active.try_next().await? {
-			if self.shard_id(&dest) != id {
-				continue;
+			for (key, event, dest) in active {
+				if self.shard_id(&dest) != id {
+					continue;
+				}
+
+				let entry = txns.entry(dest.clone()).or_default();
+				if self.server.config.startup_netburst_keep >= 0 && entry.len() >= keep {
+					warn!("Dropping unsent event {dest:?} {:?}", String::from_utf8_lossy(&key));
+					self.db.delete_active_request(&key).await?;
+				} else {
+					entry.push(event);
+				}
 			}
 
-			let entry = txns.entry(dest.clone()).or_default();
-			if self.server.config.startup_netburst_keep >= 0 && entry.len() >= keep {
-				warn!("Dropping unsent event {dest:?} {:?}", String::from_utf8_lossy(&key));
-				self.db.delete_active_request(&key).await?;
-			} else {
-				entry.push(event);
+			match next {
+				| Some(next) => after = Some(next),
+				| None => break,
 			}
 		}
 
@@ -825,19 +841,45 @@ impl Service {
 			return Ok(());
 		}
 
-		let mut destinations = self
-			.db
-			.queued_badge_refresh_destinations()
-			.try_filter(|dest| futures::future::ready(self.shard_id(dest) == id))
-			.try_collect::<HashSet<_>>()
-			.await?;
-		destinations.extend(
-			self.db
-				.pending_edu_destinations(self.services.globals.current_count())
-				.try_filter(|dest| futures::future::ready(self.shard_id(dest) == id))
-				.try_collect::<Vec<_>>()
-				.await?,
-		);
+		let mut destinations = HashSet::new();
+		let mut after: Option<Vec<u8>> = None;
+		loop {
+			let (found, next) = self
+				.db
+				.queued_badge_refresh_destinations(after.as_deref(), NETBURST_BATCH)
+				.await?;
+
+			destinations.extend(
+				found
+					.into_iter()
+					.filter(|dest| self.shard_id(dest) == id),
+			);
+
+			match next {
+				| Some(next) => after = Some(next),
+				| None => break,
+			}
+		}
+
+		let retired = self.services.globals.current_count();
+		let mut after: Option<Vec<u8>> = None;
+		loop {
+			let (found, next) = self
+				.db
+				.pending_edu_destinations(retired, after.as_deref(), NETBURST_BATCH)
+				.await?;
+
+			destinations.extend(
+				found
+					.into_iter()
+					.filter(|dest| self.shard_id(dest) == id),
+			);
+
+			match next {
+				| Some(next) => after = Some(next),
+				| None => break,
+			}
+		}
 
 		for dest in destinations {
 			let event = match &dest {

@@ -6,7 +6,7 @@ mod tests;
 use futures::{Stream, StreamExt, TryStreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
 use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
-use tuwunel_database::{Database, Deserialized, Map, Txn};
+use tuwunel_database::{Database, Deserialized, Map, Row, Txn, deserialize_from_slice};
 
 use super::{
 	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED, TAG_TO_DEVICE,
@@ -123,6 +123,28 @@ impl Data {
 			.map(decode_outgoing)
 	}
 
+	/// At most `limit` in-flight requests after the key `after`, or from the
+	/// first, and the key to pass next, `None` once the queue ends. The read
+	/// is closed before this returns, so the caller may delete what it got.
+	pub(super) async fn active_requests_after(
+		&self,
+		after: Option<&[u8]>,
+		limit: usize,
+	) -> Result<(Vec<OutgoingItem>, Option<Key>)> {
+		let rows = self
+			.servercurrentevent_data
+			.raw_rows_after(after, limit)
+			.await?;
+
+		let next = next_cursor(&rows, limit);
+		let items = rows
+			.iter()
+			.map(|(key, value)| decode_outgoing(Ok((key.as_slice(), value.as_slice()))))
+			.collect::<Result<_>>()?;
+
+		Ok((items, next))
+	}
+
 	#[inline]
 	pub fn active_requests_for(
 		&self,
@@ -202,16 +224,29 @@ impl Data {
 			.map(decode_sending)
 	}
 
-	/// Streams queued push destinations with a pending badge refresh.
-	///
-	/// Returned destinations are owned and may safely cross cursor advances.
-	pub(super) fn queued_badge_refresh_destinations(
+	/// Queued push destinations with a pending badge refresh, among at most
+	/// `limit` queued push rows after the key `after`, and the key to pass
+	/// next, `None` once the push queue ends. The read is closed before this
+	/// returns.
+	pub(super) async fn queued_badge_refresh_destinations(
 		&self,
-	) -> impl Stream<Item = Result<Destination>> + Send + '_ {
-		self.servernameevent_data
-			.raw_stream_from(b"$")
-			.ready_take_while(|row| within_prefix(row, b"$"))
-			.ready_filter_map(decode_badge_destination)
+		after: Option<&[u8]>,
+		limit: usize,
+	) -> Result<(Vec<Destination>, Option<Key>)> {
+		let rows = self
+			.servernameevent_data
+			.raw_rows_prefix_after(b"$", after, limit)
+			.await?;
+
+		let next = next_cursor(&rows, limit);
+		let destinations = rows
+			.iter()
+			.filter_map(|(key, value)| {
+				decode_badge_destination(Ok((key.as_slice(), value.as_slice())))
+			})
+			.collect::<Result<_>>()?;
+
+		Ok((destinations, next))
 	}
 
 	pub async fn get_latest_educount(&self, server_name: &ServerName) -> Result<u64> {
@@ -223,27 +258,46 @@ impl Data {
 		)
 	}
 
-	/// Reconstruct unfinished source-window wakes after process replacement.
-	pub(super) fn pending_edu_destinations(
+	/// Reconstruct unfinished source-window wakes after process replacement:
+	/// the destinations among at most `limit` EDU watermarks after the key
+	/// `after`, and the key to pass next, `None` once the watermarks end. The
+	/// read is closed before this returns.
+	pub(super) async fn pending_edu_destinations(
 		&self,
 		retired: u64,
-	) -> impl Stream<Item = Result<Destination>> + Send + '_ {
-		self.servername_educount
-			.stream()
-			.map(move |row: Result<(&ServerName, u64)>| {
-				let (server, count) = row?;
-				if count > retired {
-					return Err(Error::bad_database(
-						"Outgoing EDU watermark exceeds the retired counter",
-					));
-				}
-				Ok((server, count))
-			})
-			.try_filter(move |(_, count): &(&ServerName, u64)| {
-				futures::future::ready(*count < retired)
-			})
-			.map_ok(|(server, _)| Destination::Federation(server.to_owned()))
+		after: Option<&[u8]>,
+		limit: usize,
+	) -> Result<(Vec<Destination>, Option<Key>)> {
+		let rows = self
+			.servername_educount
+			.raw_rows_after(after, limit)
+			.await?;
+
+		let next = next_cursor(&rows, limit);
+		let mut destinations = Vec::new();
+		for (key, value) in &rows {
+			let server: &ServerName = deserialize_from_slice(key)?;
+			let count: u64 = deserialize_from_slice(value)?;
+			if count > retired {
+				return Err(Error::bad_database(
+					"Outgoing EDU watermark exceeds the retired counter",
+				));
+			}
+			if count < retired {
+				destinations.push(Destination::Federation(server.to_owned()));
+			}
+		}
+
+		Ok((destinations, next))
 	}
+}
+
+/// The key a batch of at most `limit` rows resumes after, `None` when the
+/// batch was short and so reached the end of what it reads.
+fn next_cursor(rows: &[Row], limit: usize) -> Option<Key> {
+	rows.last()
+		.filter(|_| rows.len() >= limit)
+		.map(|(key, _)| key.clone())
 }
 
 // A scan error is an item, never an end-of-prefix marker or an absent row.
