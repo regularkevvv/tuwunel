@@ -25,6 +25,8 @@ pub mod keyval;
 mod map;
 pub mod maps;
 mod pool;
+#[cfg(feature = "commit_refusals")]
+pub mod refusal;
 mod ser;
 mod stream;
 #[cfg(test)]

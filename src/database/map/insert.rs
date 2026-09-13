@@ -28,6 +28,9 @@ where
 	K: AsRef<[u8]> + ?Sized + Sync,
 	V: AsRef<[u8]> + Send,
 {
+	#[cfg(feature = "commit_refusals")]
+	crate::refusal::check([self.name()])?;
+
 	STATS.write.record(
 		key.as_ref()
 			.len()

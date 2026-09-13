@@ -164,7 +164,7 @@ pub(super) async fn force_set_room_state_from_server(
 	self.services
 		.state_cache
 		.update_joined_count(&room_id)
-		.await;
+		.await?;
 
 	self.write_str("Successfully forced the room state from the requested remote server.")
 		.await

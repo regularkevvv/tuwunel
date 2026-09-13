@@ -4,9 +4,9 @@ mod update;
 mod via;
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	convert::identity,
-	sync::{Arc, RwLock},
+	sync::{Arc, Mutex, RwLock},
 };
 
 use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
@@ -34,6 +34,9 @@ use crate::appservice::RegistrationInfo;
 
 pub struct Service {
 	appservice_in_room_cache: AppServiceInRoomCache,
+	/// Rooms whose last recount failed to commit; the room's next event
+	/// recounts it ([`Service::repair_joined_count`]).
+	stale_counts: Mutex<HashSet<OwnedRoomId>>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -60,8 +63,9 @@ type AppServiceInRoomCache = RwLock<InRoomCache>;
 
 /// Which appservices are in which rooms, as last computed.
 ///
-/// A pure cache of membership. Every membership commit invalidates its room,
-/// and `generation` counts invalidations. A fill that read membership before an
+/// A pure cache of membership. Every membership commit invalidates its room
+/// whatever the commit's outcome (`commit_membership`), and `generation`
+/// counts invalidations. A fill that read membership before an
 /// invalidation and would insert after it is refused, so an overlapping commit
 /// never leaves a stale answer behind (docs/inventory/process-local-state.md).
 #[derive(Default)]
@@ -115,6 +119,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
+			stale_counts: Mutex::new(HashSet::new()),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),
@@ -898,9 +903,7 @@ pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Re
 		})
 		.await;
 
-	txn.execute().await?;
-
-	Ok(())
+	self.commit_membership(room_id, txn).await
 }
 
 /// A sibling conduwuit-lineage server writes the leave event itself into this

@@ -19,7 +19,7 @@ use tuwunel_core::{
 	matrix::PduCount,
 	utils::{ReadyExt, result::LogErr},
 };
-use tuwunel_database::{Json, serialize_key, serialize_val};
+use tuwunel_database::{Json, Txn, serialize_key, serialize_val};
 
 /// Optional stripped room state attached to invite and knock transitions.
 pub type StrippedRoomState = Option<Vec<Raw<AnyStrippedStateEvent>>>;
@@ -120,7 +120,7 @@ pub async fn update_membership(
 				.await?;
 		},
 		| MembershipState::Leave | MembershipState::Ban => {
-			self.handle_leave(room_id, user_id, count).await;
+			self.handle_leave(room_id, user_id, count).await?;
 
 			// A departure drops the room from the account-wide badge total.
 			if self.services.globals.user_is_local(user_id) {
@@ -139,16 +139,31 @@ pub async fn update_membership(
 		| _ => {},
 	}
 
+	// The membership is durable and the room's cached appservice answers are
+	// gone (`commit_membership`), so a failed recount leaves the aggregates
+	// behind but no cached answer that contradicts the membership.
 	if update_joined_count {
-		self.update_joined_count(room_id).await;
+		self.update_joined_count(room_id).await?;
 	}
 
 	Ok(())
 }
 
+/// Recounts a room's aggregates: its joined, invited and knocked counts and
+/// the servers in it.
+///
+/// They derive from the membership indexes and are recomputed whole, so any
+/// later recount of the room repairs a failed one. A failed recount also marks
+/// the room, and the room's next event recounts it
+/// ([`Self::repair_joined_count`]). The servers an event goes to then need not
+/// wait for the room's next membership change. The mark is process-local, so
+/// after a restart the room's next membership change is what recounts it.
+///
+/// This commit changes no membership index, so it invalidates nothing in the
+/// appservice-in-room cache; the membership commit before it did.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn update_joined_count(&self, room_id: &RoomId) {
+pub async fn update_joined_count(&self, room_id: &RoomId) -> Result {
 	let mut joinedcount = 0_u64;
 	let mut invitedcount = 0_u64;
 	let mut knockedcount = 0_u64;
@@ -215,14 +230,58 @@ pub async fn update_joined_count(&self, room_id: &RoomId) {
 		txn.insert_raw(&self.db.serverroomids, serverroom_id, []);
 	}
 
-	txn.execute()
-		.await
-		.expect("database transaction execute error");
+	let committed = txn.execute().await;
+
+	if committed.is_ok() {
+		self.stale_counts
+			.lock()
+			.expect("locked")
+			.remove(room_id);
+	} else {
+		self.stale_counts
+			.lock()
+			.expect("locked")
+			.insert(room_id.to_owned());
+	}
+
+	committed
+}
+
+/// Recounts `room_id` if its last recount failed to commit.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip(self))]
+pub async fn repair_joined_count(&self, room_id: &RoomId) -> Result {
+	let stale = self
+		.stale_counts
+		.lock()
+		.expect("locked")
+		.contains(room_id);
+
+	if !stale {
+		return Ok(());
+	}
+
+	self.update_joined_count(room_id).await
+}
+
+/// Commits one change to a room's membership indexes, then drops the room's
+/// cached appservice answers.
+///
+/// They are dropped whatever the outcome: a failed commit is no proof that
+/// nothing applied, and an answer that outlived a membership change would
+/// stand until the room's next one. Dropping them here rather than after the
+/// recount that follows means a failed recount cannot leave the cache
+/// contradicting durable membership.
+#[implement(super::Service)]
+pub(super) async fn commit_membership(&self, room_id: &RoomId, txn: Txn) -> Result {
+	let committed = txn.execute().await;
 
 	self.appservice_in_room_cache
 		.write()
 		.expect("locked")
 		.invalidate(room_id);
+
+	committed
 }
 
 /// Direct DB function to directly mark a user as joined. It is not
@@ -253,7 +312,7 @@ pub(crate) async fn mark_as_joined(
 	txn.del_raw(&self.db.roomuserid_leftcount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_knockedstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_knockedcount, &roomuser_id);
-	txn.execute().await
+	self.commit_membership(room_id, txn).await
 }
 
 /// Direct DB function to directly mark a user as left. It is not
@@ -287,7 +346,7 @@ pub(crate) async fn mark_as_left(
 	txn.del_raw(&self.db.roomuserid_invitecount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_knockedstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_knockedcount, &roomuser_id);
-	txn.execute().await
+	self.commit_membership(room_id, txn).await
 }
 
 /// Direct DB function to directly mark a user as knocked. It is not
@@ -322,7 +381,7 @@ pub(crate) async fn mark_as_knocked(
 	txn.del_raw(&self.db.roomuserid_invitecount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_leftstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_leftcount, &roomuser_id);
-	txn.execute().await
+	self.commit_membership(room_id, txn).await
 }
 
 /// Makes a user forget a room.
@@ -385,7 +444,7 @@ pub(crate) async fn mark_as_invited(
 			.await;
 	}
 
-	txn.execute().await
+	self.commit_membership(room_id, txn).await
 }
 
 #[implement(super::Service)]
@@ -507,18 +566,16 @@ async fn copy_predecessor_direct(
 
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) {
-	self.mark_as_left(user_id, room_id, count)
-		.await
-		.expect("database write error");
+async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) -> Result {
+	self.mark_as_left(user_id, room_id, count).await?;
 
 	if self.services.globals.user_is_local(user_id)
 		&& (self.services.config.forget_forced_upon_leave
 			|| self.services.metadata.is_banned(room_id).await
 			|| self.services.metadata.is_disabled(room_id).await)
 	{
-		self.forget(room_id, user_id)
-			.await
-			.expect("database write error");
+		self.forget(room_id, user_id).await?;
 	}
+
+	Ok(())
 }

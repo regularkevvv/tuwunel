@@ -270,6 +270,15 @@ where
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
 		.await?;
 
+	// A recount an earlier event in this room failed to commit is retried
+	// here, before this event goes to the room's servers.
+	self.services
+		.state_cache
+		.repair_joined_count(pdu.room_id())
+		.await
+		.log_err()
+		.ok();
+
 	// Current state before publication; see `append_pdu`.
 	if let Some(room_state) = room_state {
 		self.services

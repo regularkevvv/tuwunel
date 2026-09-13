@@ -740,9 +740,7 @@ async fn apply_send_join_state(
 	self.services
 		.state_cache
 		.update_joined_count(room_id)
-		.await;
-
-	Ok(())
+		.await
 }
 
 #[implement(Service)]

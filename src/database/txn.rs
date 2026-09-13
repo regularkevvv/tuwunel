@@ -364,6 +364,9 @@ pub async fn execute(self) -> Result {
 		return Ok(());
 	}
 
+	#[cfg(feature = "commit_refusals")]
+	crate::refusal::check(self.ops.iter().map(|(map, _)| map.name()))?;
+
 	STATS.txn_ops.record(self.len());
 	STATS.txn_bytes.record(self.size_in_bytes());
 

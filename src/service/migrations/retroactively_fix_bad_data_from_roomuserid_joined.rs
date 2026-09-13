@@ -59,7 +59,8 @@ pub(super) async fn retroactively_fix_bad_data_from_roomuserid_joined(
 			services
 				.state_cache
 				.update_joined_count(room_id)
-				.await;
+				.await
+				.expect("database transaction execute error");
 		})
 		.await;
 

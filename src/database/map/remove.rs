@@ -22,6 +22,9 @@ pub async fn remove<K>(&self, key: &K) -> Result
 where
 	K: AsRef<[u8]> + ?Sized + Debug + Sync,
 {
+	#[cfg(feature = "commit_refusals")]
+	crate::refusal::check([self.name()])?;
+
 	STATS.write.record(key.as_ref().len());
 
 	match self.inner() {

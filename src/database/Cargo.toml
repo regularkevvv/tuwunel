@@ -21,6 +21,9 @@ crate-type = [
 bzip2_compression = [
 	"rust-rocksdb/bzip2",
 ]
+# Test-only commit refusals (`refusal`), enabled by the tuwunel package's
+# dev-dependencies for its integration tests; never in a release.
+commit_refusals = []
 failpoints = [
 	"tuwunel-core/failpoints",
 ]

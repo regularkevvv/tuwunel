@@ -162,7 +162,7 @@ pub async fn force_state(
 	self.services
 		.state_cache
 		.update_joined_count(room_id)
-		.await;
+		.await?;
 
 	self.set_room_state(room_id, shortstatehash, state_lock)
 		.await?;
