@@ -26,8 +26,11 @@ use tuwunel_database::{Json, Txn};
 
 use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
 use crate::rooms::{
-	read_receipt::PrivateRead, short::ShortRoomId, state_accessor::plain_text_topic,
-	state_cache::MembershipUpdate, state_compressor::CompressedState,
+	read_receipt::PrivateRead,
+	short::{ShortRoomId, ShortStateHash},
+	state_accessor::plain_text_topic,
+	state_cache::MembershipUpdate,
+	state_compressor::CompressedState,
 };
 
 type Band<'a> = SmallVec<[&'a EventId; 1]>;
@@ -79,8 +82,9 @@ where
 		return Ok(None);
 	}
 
+	// The event handler made the resolved state current before this call.
 	let pdu_id = self
-		.append_pdu(pdu, pdu_json, new_room_leafs, state_lock)
+		.append_pdu(pdu, pdu_json, new_room_leafs, None, state_lock)
 		.await?;
 
 	Ok(Some(pdu_id))
@@ -100,6 +104,14 @@ where
 /// By this point the incoming event should be fully authenticated, no auth
 /// happens in `append_pdu`.
 ///
+/// `room_state` is the room state after the event, for a caller that has not
+/// made it current yet. It becomes current once the event is stored and
+/// before the event's count retires. Sync bounds its timeline by the retired
+/// count while `required_state` and `/members` read current state, so the
+/// state has to be current by the time any sync can deliver the event. A
+/// caller that set the state after this returned let a sync pair a membership
+/// change in its timeline with the membership it replaced.
+///
 /// Returns pdu id
 #[implement(super::Service)]
 #[inline]
@@ -108,12 +120,13 @@ pub async fn append_pdu<'a, Leafs>(
 	pdu: &'a PduEvent,
 	pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
+	room_state: Option<ShortStateHash>,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<RawPduId>
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
 {
-	self.append_pdu_with_txnid(pdu, pdu_json, leafs, None, state_lock)
+	self.append_pdu_with_txnid(pdu, pdu_json, leafs, None, room_state, state_lock)
 		.await
 }
 
@@ -130,6 +143,7 @@ pub async fn append_pdu_with_txnid<'a, Leafs>(
 	mut pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
 	txnid: Option<&'a [u8]>,
+	room_state: Option<ShortStateHash>,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<RawPduId>
 where
@@ -255,6 +269,14 @@ where
 
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
 		.await?;
+
+	// Current state before publication; see `append_pdu`.
+	if let Some(room_state) = room_state {
+		self.services
+			.state
+			.set_room_state(pdu.room_id(), room_state, state_lock)
+			.await?;
+	}
 
 	drop(next_count);
 

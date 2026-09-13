@@ -379,21 +379,17 @@ async fn join_remote(
 		"Appending new room join event..."
 	);
 
+	// The append makes the state after the join current once the pdu is stored
+	// and before the pdu is published.
 	self.services
 		.timeline
 		.append_pdu(
 			&parsed_join_pdu,
 			join_event,
 			once(parsed_join_pdu.event_id.borrow()),
+			Some(statehash_after_join),
 			&state_lock,
 		)
-		.await?;
-
-	// We set the room state after inserting the pdu, so that we never have a moment
-	// in time where events in the current room state do not exist
-	self.services
-		.state
-		.set_room_state(room_id, statehash_after_join, &state_lock)
 		.await?;
 
 	info!(
