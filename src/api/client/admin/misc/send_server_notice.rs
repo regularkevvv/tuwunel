@@ -27,7 +27,7 @@ use tuwunel_core::{
 	matrix::{Event, pdu::PduBuilder, room_version::rules as get_room_version_rules},
 	utils::{FutureBoolExt, future::ReadyBoolExt, stream::ReadyExt, string_from_bytes},
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, transaction_ids};
 
 use crate::{Ruma, client::admin::require_admin};
 
@@ -51,6 +51,7 @@ pub(crate) async fn admin_send_server_notice_route(
 		request.event_type,
 		request.state_key,
 		request.content,
+		None,
 	)
 	.await
 	.map(Response::new)
@@ -80,29 +81,32 @@ pub(crate) async fn admin_send_server_notice_txn_route(
 		return response;
 	}
 
+	// The transaction record commits with the notice event itself, so an
+	// interrupted send leaves both or neither.
+	let txnid = transaction_ids::key(&sender_user, sender_device.as_deref(), &request.txn_id);
+
 	let event_id = send_notice(
 		&services,
 		&request.user_id,
 		request.event_type,
 		request.state_key,
 		request.content,
+		Some(&txnid),
 	)
 	.await?;
-
-	services
-		.transaction_ids
-		.add_txnid(&sender_user, sender_device.as_deref(), &request.txn_id, event_id.as_bytes())
-		.await?;
 
 	Ok(Response::new(event_id))
 }
 
+/// Send one notice, recording `txnid` (a [`transaction_ids::key`]) in the
+/// notice event's own commit when given.
 async fn send_notice(
 	services: &Services,
 	target: &UserId,
 	event_type: Option<String>,
 	state_key: Option<String>,
 	content: Raw<RoomMessageEventContent>,
+	txnid: Option<&[u8]>,
 ) -> Result<OwnedEventId> {
 	if !services.globals.user_is_local(target) {
 		return Err!(Request(InvalidParam("Server notices can only be sent to local users")));
@@ -154,7 +158,7 @@ async fn send_notice(
 
 	let event_id = services
 		.timeline
-		.build_and_append_pdu(pdu, server_user, &room_id, &state_lock)
+		.build_and_append_pdu_with_txnid(pdu, server_user, &room_id, txnid, &state_lock)
 		.await?;
 
 	drop(state_lock);

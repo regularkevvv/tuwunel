@@ -1,6 +1,5 @@
 use std::{
 	collections::BTreeMap,
-	iter::once,
 	net::IpAddr,
 	sync::atomic::{AtomicBool, Ordering},
 	time::{Duration, Instant},
@@ -9,8 +8,8 @@ use std::{
 use axum::extract::State;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
-	OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName, TransactionId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedEventId,
+	OwnedRoomId, RoomId, ServerName, TransactionId, UserId,
 	api::{
 		error::ErrorKind,
 		federation::transactions::{
@@ -23,10 +22,7 @@ use ruma::{
 		},
 	},
 	events::receipt::{ReceiptEvent, ReceiptEventContent, ReceiptType},
-	int,
-	serde::Raw,
-	to_device::DeviceIdOrAllDevices,
-	uint,
+	int, uint,
 };
 use tuwunel_core::{
 	Err, Error, Result, debug,
@@ -48,6 +44,8 @@ use tuwunel_service::{
 	Services,
 	rooms::state_res::{is_topologically_sorted_in_place, topological_sort},
 	sending::{EDU_LIMIT, PDU_LIMIT},
+	transaction_ids,
+	users::ToDeviceTarget,
 };
 
 use crate::{ClientIp, Ruma};
@@ -57,10 +55,6 @@ type RoomsPdus = SmallVec<[RoomPdus; 1]>;
 type RoomPdus = (OwnedRoomId, TxnPdus);
 type TxnPdus = SmallVec<[(usize, Pdu); 1]>;
 type Pdu = (OwnedRoomId, OwnedEventId, CanonicalJsonObject);
-
-/// Recipient devices of one `AllDevices` to-device send paired with their
-/// inbox counts.
-type Deliveries = SmallVec<[(OwnedDeviceId, u64); 1]>;
 
 /// # `PUT /_matrix/federation/v1/send/{txnId}`
 ///
@@ -673,6 +667,17 @@ async fn handle_edu_direct_to_device(
 		return;
 	}
 
+	let txnid = transaction_ids::key(sender, None, message_id);
+
+	// A transaction's EDUs are handled concurrently, and a retried sender can
+	// carry the same message twice; the second waits here and then finds the
+	// record the first committed.
+	let _txnid_lock = services
+		.transaction_ids
+		.mutex
+		.lock(txnid.as_slice())
+		.await;
+
 	// Check if this is a new transaction id
 	if services
 		.transaction_ids
@@ -683,9 +688,7 @@ async fn handle_edu_direct_to_device(
 		return;
 	}
 
-	let ev_type = ev_type.to_string();
-
-	messages
+	let recipients: Vec<_> = messages
 		.into_iter()
 		.stream()
 		.broad_filter_map(async |(target_user_id, map)| {
@@ -693,15 +696,30 @@ async fn handle_edu_direct_to_device(
 				.await
 				.then_some((target_user_id, map))
 		})
-		.for_each_concurrent(automatic_width(), |(target_user_id, map)| {
-			handle_edu_direct_to_device_user(services, target_user_id, sender, &ev_type, map)
-		})
+		.collect()
 		.await;
 
-	// Save transaction id with empty data
+	let targets: Vec<ToDeviceTarget> = recipients
+		.into_iter()
+		.flat_map(|(user_id, map)| {
+			map.into_iter()
+				.map(move |(device, raw)| (user_id.clone(), device, raw))
+		})
+		.filter_map(|(user_id, device, raw)| {
+			raw.deserialize_as()
+				.map_err(|e| {
+					err!(Request(InvalidParam(error!("To-Device event is invalid: {e}"))))
+				})
+				.ok()
+				.map(|content| ToDeviceTarget { user_id, device, content })
+		})
+		.collect();
+
+	// Every delivery and the message id's record commit together, so a
+	// redelivered EDU finds the record instead of delivering twice.
 	services
-		.transaction_ids
-		.add_txnid(sender, None, message_id, &[])
+		.users
+		.deliver_to_device(sender, &ev_type.to_string(), &targets, Some(&txnid))
 		.await
 		.expect("database insert error");
 }
@@ -716,108 +734,6 @@ async fn to_device_deliverable(services: &Services, user_id: &UserId) -> bool {
 				.appservice
 				.is_interested_in_user(user_id)
 				.await)
-}
-
-async fn handle_edu_direct_to_device_user<Event: Send + Sync>(
-	services: &Services,
-	target_user_id: OwnedUserId,
-	sender: &UserId,
-	ev_type: &str,
-	map: BTreeMap<DeviceIdOrAllDevices, Raw<Event>>,
-) {
-	map.into_iter()
-		.stream()
-		.ready_filter_map(|(tid, raw)| {
-			raw.deserialize_as()
-				.map_err(|e| {
-					err!(Request(InvalidParam(error!("To-Device event is invalid: {e}"))))
-				})
-				.ok()
-				.map(|ev| (tid, ev))
-		})
-		.for_each_concurrent(automatic_width(), |(tid, ev)| {
-			handle_edu_direct_to_device_event(services, &target_user_id, sender, tid, ev_type, ev)
-		})
-		.await;
-}
-
-async fn handle_edu_direct_to_device_event(
-	services: &Services,
-	target_user_id: &UserId,
-	sender: &UserId,
-	target_device_id_maybe: DeviceIdOrAllDevices,
-	ev_type: &str,
-	event: serde_json::Value,
-) {
-	match target_device_id_maybe {
-		| DeviceIdOrAllDevices::DeviceId(ref target_device_id) => {
-			let count = services
-				.users
-				.add_to_device_event(sender, target_user_id, target_device_id, ev_type, &event)
-				.await;
-
-			services
-				.sending
-				.send_to_device_appservices(
-					sender,
-					target_user_id,
-					once((&**target_device_id, count)),
-					ev_type,
-					&event,
-				)
-				.await
-				.log_err()
-				.ok();
-		},
-
-		| DeviceIdOrAllDevices::AllDevices => {
-			let interested = services
-				.appservice
-				.is_interested_in_user(target_user_id)
-				.await;
-
-			let event = &event;
-			let deliveries: Deliveries = services
-				.users
-				.all_device_ids(target_user_id)
-				.then(move |target_device_id| async move {
-					let count = services
-						.users
-						.add_to_device_event(
-							sender,
-							target_user_id,
-							target_device_id,
-							ev_type,
-							event,
-						)
-						.await;
-
-					(target_device_id.to_owned(), count)
-				})
-				.ready_filter_map(|(target_device_id, count)| {
-					interested.then_some((target_device_id, count))
-				})
-				.collect()
-				.await;
-
-			if !deliveries.is_empty() {
-				services
-					.sending
-					.send_to_device_appservices(
-						sender,
-						target_user_id,
-						deliveries
-							.iter()
-							.map(|(device_id, count)| (device_id.as_ref(), *count)),
-						ev_type,
-						event,
-					)
-					.await
-					.log_err()
-					.ok();
-			}
-		},
-	}
 }
 
 async fn handle_edu_signing_key_update(

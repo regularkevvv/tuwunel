@@ -25,7 +25,10 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
-pub use self::{dehydrated_device::DehydratedDevice, keys::parse_master_key, register::Register};
+pub use self::{
+	dehydrated_device::DehydratedDevice, device::ToDeviceTarget, keys::parse_master_key,
+	register::Register,
+};
 
 pub const PASSWORD_SENTINEL: &str = "*";
 pub const PASSWORD_DISABLED: &str = "";
@@ -62,6 +65,7 @@ struct Data {
 	userdeviceid_refresh: Arc<Map>,
 	userdeviceid_spentrefresh: Arc<Map>,
 	userdeviceidalgorithm_fallback: Arc<Map>,
+	userdevicetxnid_response: Arc<Map>,
 	oidcdevice_userdeviceid: Arc<Map>,
 	oidccskeybypass_userid: Arc<Map>,
 	userfilterid_filter: Arc<Map>,
@@ -100,6 +104,7 @@ impl crate::Service for Service {
 				userdeviceid_refresh: args.db["userdeviceid_refresh"].clone(),
 				userdeviceid_spentrefresh: args.db["userdeviceid_spentrefresh"].clone(),
 				userdeviceidalgorithm_fallback: args.db["userdeviceidalgorithm_fallback"].clone(),
+				userdevicetxnid_response: args.db["userdevicetxnid_response"].clone(),
 				userfilterid_filter: args.db["userfilterid_filter"].clone(),
 				userid_dehydrateddevice: args.db["userid_dehydrateddevice"].clone(),
 				userid_devicelistversion: args.db["userid_devicelistversion"].clone(),

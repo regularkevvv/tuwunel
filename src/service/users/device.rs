@@ -1,4 +1,5 @@
 use std::{
+	iter::once,
 	net::IpAddr,
 	sync::Arc,
 	time::{Duration, SystemTime},
@@ -8,12 +9,14 @@ use futures::{FutureExt, Stream, StreamExt, future::join};
 use ruma::{
 	DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::device::Device, events::AnyToDeviceEvent, serde::Raw,
+	to_device::DeviceIdOrAllDevices,
 };
 use serde_json::json;
 use tuwunel_core::{
 	Err, Result, at, implement, trace,
 	utils::{
 		self, BoolExt, ReadyExt, random_string,
+		result::LogErr,
 		stream::{IterStream, TryIgnore},
 		string::to_small_string,
 		time::{
@@ -587,6 +590,15 @@ pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
 #[must_use]
 pub fn generate_refresh_token() -> String { format!("refresh_{}", random_string(TOKEN_LENGTH)) }
 
+/// One to-device message for a local recipient: a single device, or every
+/// device the user has when the message is delivered.
+pub struct ToDeviceTarget {
+	pub user_id: OwnedUserId,
+	pub device: DeviceIdOrAllDevices,
+	pub content: serde_json::Value,
+}
+
+/// Store one to-device message in one device's inbox, returning its count.
 #[implement(super::Service)]
 pub async fn add_to_device_event(
 	&self,
@@ -603,17 +615,9 @@ pub async fn add_to_device_event(
 		.await
 		.expect("failed to obtain next sequence number");
 
-	let key = (target_user_id, target_device_id, *count);
-	self.db
-		.todeviceid_events
-		.put(
-			key,
-			Json(json!({
-				"type": event_type,
-				"sender": sender,
-				"content": content,
-			})),
-		)
+	let delivery = (target_user_id, target_device_id, *count, content);
+	self.to_device_txn(sender, event_type, once(delivery), None)
+		.execute()
 		.await
 		.expect("database insert error");
 
@@ -627,6 +631,141 @@ pub async fn add_to_device_event(
 	);
 
 	*count
+}
+
+/// Deliver one request's local to-device messages, then forward them to the
+/// appservices interested in each recipient.
+///
+/// Every inbox write and the request's transaction record (`txnid`, a
+/// [`crate::transaction_ids::key`], recorded with an empty response) land in
+/// one commit. An interrupted request therefore delivers to all of its
+/// recipients or none, and a retry that finds the record delivers nothing
+/// again. `AllDevices` resolves to the devices the user has now.
+///
+/// Appservice forwarding follows the commit and reuses its counts. A failure
+/// there is logged rather than returned, as the delivery already stands.
+#[implement(super::Service)]
+pub async fn deliver_to_device(
+	&self,
+	sender: &UserId,
+	event_type: &str,
+	targets: &[ToDeviceTarget],
+	txnid: Option<&[u8]>,
+) -> Result {
+	// Resolve every addressed device, and draw each delivery's count, before
+	// anything is written. The permits stay held until the commit lands so no
+	// reader advances past a count whose inbox row is still in flight.
+	let mut resolved = Vec::with_capacity(targets.len());
+	for target in targets {
+		let (device_ids, forward) = match &target.device {
+			| DeviceIdOrAllDevices::DeviceId(device_id) => (vec![device_id.clone()], true),
+			| DeviceIdOrAllDevices::AllDevices => (
+				self.all_device_ids(&target.user_id)
+					.map(ToOwned::to_owned)
+					.collect()
+					.await,
+				self.services
+					.appservice
+					.is_interested_in_user(&target.user_id)
+					.await,
+			),
+		};
+
+		let mut deliveries = Vec::with_capacity(device_ids.len());
+		for device_id in device_ids {
+			deliveries.push((device_id, self.services.globals.next_count().await?));
+		}
+
+		resolved.push((target, deliveries, forward));
+	}
+
+	let rows = resolved
+		.iter()
+		.flat_map(|(target, deliveries, _)| {
+			deliveries.iter().map(move |(device_id, count)| {
+				(&*target.user_id, &**device_id, **count, &target.content)
+			})
+		});
+
+	self.to_device_txn(sender, event_type, rows, txnid)
+		.execute()
+		.await?;
+
+	trace!(
+		%sender,
+		%event_type,
+		deliveries = resolved.iter().map(|(_, deliveries, _)| deliveries.len()).sum::<usize>(),
+		"to_device deliver",
+	);
+
+	for (target, deliveries, forward) in resolved {
+		let deliveries: Vec<(OwnedDeviceId, u64)> = deliveries
+			.into_iter()
+			.map(|(device_id, count)| (device_id, *count))
+			.collect();
+
+		if !forward || deliveries.is_empty() {
+			continue;
+		}
+
+		self.services
+			.sending
+			.send_to_device_appservices(
+				sender,
+				&target.user_id,
+				deliveries
+					.iter()
+					.map(|(device_id, count)| (&**device_id, *count)),
+				event_type,
+				&target.content,
+			)
+			.await
+			.log_err()
+			.ok();
+	}
+
+	Ok(())
+}
+
+/// The single commit that stores to-device messages in their recipients'
+/// inboxes, with the sending request's transaction record when `txnid` is
+/// given.
+///
+/// Each delivery is (recipient user, recipient device, count, content).
+/// Returned unexecuted so the commit's contents can be inspected;
+/// [`Self::deliver_to_device`] executes it.
+#[implement(super::Service)]
+pub fn to_device_txn<'a, I>(
+	&self,
+	sender: &UserId,
+	event_type: &str,
+	deliveries: I,
+	txnid: Option<&[u8]>,
+) -> Txn
+where
+	I: IntoIterator<Item = (&'a UserId, &'a DeviceId, u64, &'a serde_json::Value)>,
+{
+	let mut txn = self.services.db.txn();
+
+	for (target_user_id, target_device_id, count, content) in deliveries {
+		txn.put(
+			&self.db.todeviceid_events,
+			(target_user_id, target_device_id, count),
+			Json(json!({
+				"type": event_type,
+				"sender": sender,
+				"content": content,
+			})),
+		);
+	}
+
+	// An empty response marks a to-device transaction; the room send routes
+	// refuse its reuse as an incompatible endpoint.
+	if let Some(txnid) = txnid {
+		txn.insert_raw(&self.db.userdevicetxnid_response, txnid, []);
+	}
+
+	txn
 }
 
 #[implement(super::Service)]

@@ -21,17 +21,39 @@ use super::RoomMutexGuard;
 /// takes a roomid_mutex_state, meaning that only this function is able to
 /// mutate the room state.
 #[implement(super::Service)]
+#[inline]
+pub async fn build_and_append_pdu(
+	&self,
+	pdu_builder: PduBuilder,
+	sender: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result<OwnedEventId> {
+	self.build_and_append_pdu_with_txnid(pdu_builder, sender, room_id, None, state_lock)
+		.await
+}
+
+/// Creates a new persisted data unit and adds it to a room, recording the
+/// client transaction that sent it in the same commit as the event.
+///
+/// `txnid` is the `userdevicetxnid_response` key from
+/// [`crate::transaction_ids::key`]; the record's value is the new event id.
+/// Committing both together leaves no point at which the event is durable but
+/// its transaction is not, so a client retry after an interruption finds the
+/// record and gets the same event id back instead of sending a second event.
+#[implement(super::Service)]
 #[tracing::instrument(
 	name = "build_and_append"
 	level = "debug",
-	skip(self, state_lock),
+	skip(self, txnid, state_lock),
 	ret,
 )]
-pub async fn build_and_append_pdu(
+pub async fn build_and_append_pdu_with_txnid(
 	&self,
 	mut pdu_builder: PduBuilder,
 	sender: &UserId,
 	room_id: &RoomId,
+	txnid: Option<&[u8]>,
 	state_lock: &RoomMutexGuard,
 ) -> Result<OwnedEventId> {
 	if pdu_builder.event_type == TimelineEventType::RoomMember {
@@ -101,12 +123,13 @@ pub async fn build_and_append_pdu(
 	let statehashid = self.services.state.append_to_state(&pdu).await?;
 
 	let pdu_id = self
-		.append_pdu(
+		.append_pdu_with_txnid(
 			&pdu,
 			pdu_json,
 			// Since this PDU references all pdu_leaves we can update the leaves
 			// of the room
 			once(pdu.event_id()),
+			txnid,
 			state_lock,
 		)
 		.boxed()

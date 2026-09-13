@@ -22,7 +22,7 @@ use tuwunel_core::{
 	smallvec::SmallVec,
 	utils::{self, result::LogErr},
 };
-use tuwunel_database::Json;
+use tuwunel_database::{Json, Txn};
 
 use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
 use crate::rooms::{
@@ -102,12 +102,34 @@ where
 ///
 /// Returns pdu id
 #[implement(super::Service)]
-#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
+#[inline]
 pub async fn append_pdu<'a, Leafs>(
+	&'a self,
+	pdu: &'a PduEvent,
+	pdu_json: CanonicalJsonObject,
+	leafs: Leafs,
+	state_lock: &'a RoomMutexGuard,
+) -> Result<RawPduId>
+where
+	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
+{
+	self.append_pdu_with_txnid(pdu, pdu_json, leafs, None, state_lock)
+		.await
+}
+
+/// [`Self::append_pdu`], also recording a client transaction id in the same
+/// commit as the event.
+///
+/// `txnid` is a `userdevicetxnid_response` key from
+/// [`crate::transaction_ids::key`], written with the event id as its value.
+#[implement(super::Service)]
+#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
+pub async fn append_pdu_with_txnid<'a, Leafs>(
 	&'a self,
 	pdu: &'a PduEvent,
 	mut pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
+	txnid: Option<&'a [u8]>,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<RawPduId>
 where
@@ -209,7 +231,7 @@ where
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
 	// Insert pdu
-	self.append_pdu_json(&pdu_id, pdu, &pdu_json)
+	self.append_pdu_json(&pdu_id, pdu, &pdu_json, txnid)
 		.await?;
 
 	drop(insert_lock);
@@ -433,7 +455,27 @@ async fn append_pdu_json(
 	pdu_id: &RawPduId,
 	pdu: &PduEvent,
 	json: &CanonicalJsonObject,
+	txnid: Option<&[u8]>,
 ) -> Result {
+	self.append_pdu_txn(pdu_id, pdu, json, txnid)
+		.execute()
+		.await
+}
+
+/// The single commit that makes an accepted event durable.
+///
+/// It carries the event, its id and timestamp indexes, the outlier removal,
+/// and, when `txnid` is given, the sending client's transaction record with
+/// the event id as its value. Returned unexecuted so the commit's contents
+/// can be inspected; [`Self::append_pdu`] executes it.
+#[implement(super::Service)]
+pub fn append_pdu_txn(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &PduEvent,
+	json: &CanonicalJsonObject,
+	txnid: Option<&[u8]>,
+) -> Txn {
 	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
 	let mut txn = self.db.db.txn();
@@ -447,7 +489,11 @@ async fn append_pdu_json(
 	let key = (pdu.room_id(), ts, count_key);
 	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
 
-	txn.execute().await
+	if let Some(txnid) = txnid {
+		txn.insert_raw(&self.db.userdevicetxnid_response, txnid, pdu.event_id.as_bytes());
+	}
+
+	txn
 }
 
 #[cfg(test)]

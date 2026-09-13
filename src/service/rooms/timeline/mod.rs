@@ -55,6 +55,7 @@ struct Data {
 	eventid_pduid: Arc<Map>,
 	pduid_pdu: Arc<Map>,
 	roomid_tscount_pducount: Arc<Map>,
+	userdevicetxnid_response: Arc<Map>,
 	db: Arc<Database>,
 }
 
@@ -93,6 +94,7 @@ impl crate::Service for Service {
 				eventid_pduid: args.db["eventid_pduid"].clone(),
 				pduid_pdu: args.db["pduid_pdu"].clone(),
 				roomid_tscount_pducount: args.db["roomid_tscount_pducount"].clone(),
+				userdevicetxnid_response: args.db["userdevicetxnid_response"].clone(),
 				db: args.db.clone(),
 			},
 			mutex_insert: RoomMutexMap::new(),

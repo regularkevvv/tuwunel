@@ -20,7 +20,7 @@ use tuwunel_core::{
 	utils::{self},
 	warn,
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, transaction_ids};
 
 use crate::{Ruma, client::utils::is_self_redaction};
 
@@ -128,9 +128,13 @@ pub(crate) async fn send_message_event_route(
 	let content = from_str(body.body.body.json().get())
 		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
 
+	// The transaction record commits with the event itself, so an interrupted
+	// send leaves both or neither and a retry cannot append a second event.
+	let txnid = transaction_ids::key(sender_user, sender_device, &body.txn_id);
+
 	let event_id = services
 		.timeline
-		.build_and_append_pdu(
+		.build_and_append_pdu_with_txnid(
 			PduBuilder {
 				event_type: body.event_type.clone().into(),
 				content,
@@ -141,13 +145,9 @@ pub(crate) async fn send_message_event_route(
 			},
 			sender_user,
 			&body.room_id,
+			Some(&txnid),
 			&state_lock,
 		)
-		.await?;
-
-	services
-		.transaction_ids
-		.add_txnid(sender_user, sender_device, &body.txn_id, event_id.as_bytes())
 		.await?;
 
 	drop(state_lock);
