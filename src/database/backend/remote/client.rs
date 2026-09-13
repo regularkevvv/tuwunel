@@ -9,6 +9,11 @@
 //! [`MAX_ATTEMPTS`] and an optional deadline; the request is re-sent
 //! unchanged, which for commits means the same `request_id`.
 //!
+//! At most [`MAX_IN_FLIGHT`] data calls are in flight at once. A data call
+//! that finds no free slot within its deadline or timeout is refused as
+//! [`BACKPRESSURE`] before anything is sent; lease and handshake calls never
+//! queue behind data calls.
+//!
 //! Nothing here logs keys, values, or the bearer token.
 
 use std::{
@@ -18,11 +23,17 @@ use std::{
 
 use futures::future::BoxFuture;
 use reqwest::{StatusCode, header::CONTENT_TYPE};
-use tokio::time::sleep;
+use tokio::{
+	sync::{Semaphore, SemaphorePermit},
+	time::sleep,
+};
 use tuwunel_bridge::{
 	self as bridge, DEFAULT_HOST, ENV_TOKEN, ENV_URL, PATH_KV, Request, Response,
 };
-use tuwunel_core::{Config, Error, Result, debug, err};
+use tuwunel_core::{
+	Config, Error, Result, debug, err,
+	ruma::api::error::{ErrorKind, LimitExceededErrorData, RetryAfter},
+};
 
 /// Attempts per logical call, including the first.
 pub(crate) const MAX_ATTEMPTS: u32 = 5;
@@ -33,12 +44,40 @@ pub(crate) const MIN_BACKOFF: Duration = Duration::from_millis(50);
 /// Backoff ceiling.
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Data calls (`Get`, `Scan`, `Commit`) in flight at once, per process.
+///
+/// No task holds more than one: commits are serialized by the backend's
+/// barrier and drain scans one page at a time, a scan fetches its next page
+/// under its own lock, and a batched read sends its chunks in turn. Load
+/// comes only from concurrent tasks, and one service stream fans out to
+/// `stream_width_default` (32) of them; twice that lets a full-width stream
+/// run beside another without queueing here. More would not go faster: one
+/// D1 database runs its queries one at a time, so the excess would queue in
+/// the Worker instead, ahead of the lease renewal, where a timeout or an
+/// overload on a commit is an unknown outcome that stops the writer. Waiting
+/// here, before sending, is a known one.
+pub(crate) const MAX_IN_FLIGHT: usize = 64;
+
+/// Transport class of a data call refused because no in-flight slot freed
+/// within its deadline or timeout. Nothing was sent. It is not retryable:
+/// the wait already spent the patience a retry would need.
+pub(crate) const BACKPRESSURE: &str = "backpressure";
+
 /// The bridge endpoint, credentials, and per-request deadline.
 pub(crate) struct Client {
 	http: reqwest::Client,
 	endpoint: String,
 	token: String,
 	timeout: Duration,
+	/// Slots for data calls, [`MAX_IN_FLIGHT`] of them; lease and handshake
+	/// calls never take one.
+	in_flight: Semaphore,
+}
+
+/// A call's admission: an in-flight slot for a data call, none for a lease
+/// or handshake call. The slot frees when this drops.
+pub(crate) struct Admitted<'a> {
+	_slot: Option<SemaphorePermit<'a>>,
 }
 
 /// Why one bridge call failed.
@@ -48,7 +87,7 @@ pub(crate) enum CallError {
 	/// payload and `retryable` is the retry policy's verdict.
 	Transport {
 		/// Failure class: `connect`, `timeout`, `request`, `status`, `body`,
-		/// `encode`, or `decode`.
+		/// `encode`, `decode`, or [`BACKPRESSURE`].
 		class: &'static str,
 		/// Human-readable detail without user data.
 		detail: String,
@@ -86,6 +125,13 @@ impl CallError {
 	#[inline]
 	pub(crate) fn is_retryable(&self) -> bool {
 		matches!(self, Self::Transport { retryable: true, .. })
+	}
+
+	/// Whether the call was refused before anything was sent, so a refused
+	/// commit certainly did not apply.
+	#[inline]
+	pub(crate) fn is_backpressure(&self) -> bool {
+		matches!(self, Self::Transport { class: BACKPRESSURE, .. })
 	}
 }
 
@@ -130,7 +176,47 @@ impl Client {
 			.build()
 			.map_err(|error| err!(Database("bridge client: {error}")))?;
 
-		Ok(Self { http, endpoint, token, timeout })
+		Ok(Self {
+			http,
+			endpoint,
+			token,
+			timeout,
+			in_flight: Semaphore::new(MAX_IN_FLIGHT),
+		})
+	}
+
+	/// Admits one call against the in-flight bound.
+	///
+	/// A data call waits for a slot until its deadline or the per-request
+	/// timeout, whichever comes first, and is refused as [`BACKPRESSURE`]
+	/// without sending anything when none frees up. A lease or handshake
+	/// call is admitted at once: a saturated bound must never delay a
+	/// renewal into a lost lease.
+	pub(crate) async fn admit(
+		&self,
+		request: &Request,
+		deadline: Option<Instant>,
+	) -> Result<Admitted<'_>, CallError> {
+		if !is_data(request) {
+			return Ok(Admitted { _slot: None });
+		}
+
+		let patience = deadline.map_or(self.timeout, |deadline| {
+			deadline
+				.saturating_duration_since(Instant::now())
+				.min(self.timeout)
+		});
+
+		// A free slot is taken even with no patience left, as the first
+		// attempt is always sent. The semaphore is never closed.
+		match tokio::time::timeout(patience, self.in_flight.acquire()).await {
+			| Ok(Ok(slot)) => Ok(Admitted { _slot: Some(slot) }),
+			| Ok(Err(_)) | Err(_) => Err(CallError::Transport {
+				class: BACKPRESSURE,
+				detail: format!("no in-flight slot freed within {} ms", patience.as_millis()),
+				retryable: false,
+			}),
+		}
 	}
 
 	/// Sends one request once and classifies the outcome.
@@ -195,11 +281,14 @@ impl Client {
 		}
 	}
 
-	/// Sends one request, retrying transport failures with backoff.
+	/// Admits one request, then sends it, retrying transport failures with
+	/// backoff.
 	///
 	/// At most [`MAX_ATTEMPTS`] attempts are made; with a `deadline`, no
 	/// attempt starts once its backoff would cross it. The request is
-	/// re-sent byte-for-byte, so a commit keeps its idempotency key.
+	/// re-sent byte-for-byte, so a commit keeps its idempotency key. The
+	/// admission ([`Client::admit`]) is held across every attempt, so a
+	/// retry never queues behind later calls.
 	///
 	/// The future is boxed deliberately. It holds an HTTP request/response
 	/// future and a retry loop, and it is awaited from every facade read and
@@ -214,13 +303,35 @@ impl Client {
 		request: &'a Request,
 		deadline: Option<Instant>,
 	) -> BoxFuture<'a, Result<Response, CallError>> {
-		Box::pin(self.call_inner(request, deadline))
+		Box::pin(async move {
+			let admitted = self.admit(request, deadline).await?;
+			self.call_inner(request, deadline, admitted).await
+		})
 	}
+
+	/// [`Client::call`] for a request already admitted.
+	///
+	/// A commit admits first, so a refusal or a cancellation while it
+	/// queues is known to have sent nothing, and only then counts itself
+	/// dispatched.
+	pub(crate) fn send<'a>(
+		&'a self,
+		request: &'a Request,
+		deadline: Option<Instant>,
+		admitted: Admitted<'a>,
+	) -> BoxFuture<'a, Result<Response, CallError>> {
+		Box::pin(self.call_inner(request, deadline, admitted))
+	}
+
+	/// The data-call slots, for tests that saturate them.
+	#[cfg(test)]
+	pub(crate) fn in_flight(&self) -> &Semaphore { &self.in_flight }
 
 	async fn call_inner(
 		&self,
 		request: &Request,
 		deadline: Option<Instant>,
+		_admitted: Admitted<'_>,
 	) -> Result<Response, CallError> {
 		let mut backoff = MIN_BACKOFF;
 		let mut attempt: u32 = 1;
@@ -250,6 +361,20 @@ impl Client {
 	}
 }
 
+/// Whether `request` is a data call, bounded by [`MAX_IN_FLIGHT`].
+///
+/// Lease and handshake calls are exempt. Every variant is named, so a new
+/// request has to be placed on one side.
+fn is_data(request: &Request) -> bool {
+	match request {
+		| Request::Get { .. } | Request::Scan { .. } | Request::Commit { .. } => true,
+		| Request::Hello
+		| Request::LeaseAcquire { .. }
+		| Request::LeaseRenew { .. }
+		| Request::LeaseRelease { .. } => false,
+	}
+}
+
 /// Classifies a reqwest failure for the retry policy.
 fn classify(error: reqwest::Error) -> CallError {
 	let (class, retryable) = if error.is_timeout() {
@@ -274,8 +399,24 @@ fn classify(error: reqwest::Error) -> CallError {
 
 /// Lifts a bridge failure into the facade's database error.
 ///
-/// `op` names the operation; the message carries the failure class only.
+/// `op` names the operation; the message carries the failure class only. A
+/// backpressure refusal sent nothing and changed nothing, so it is the
+/// retryable limit error of the scan-admission refusal, not a database
+/// failure.
 pub(crate) fn database_error(op: &str, error: &CallError) -> Error {
+	if error.is_backpressure() {
+		return Error::Request(
+			ErrorKind::LimitExceeded(LimitExceededErrorData {
+				retry_after: Some(RetryAfter::Delay(MAX_BACKOFF)),
+			}),
+			format!(
+				"The database bridge is saturated; the {op} was not sent. Retry the operation."
+			)
+			.into(),
+			StatusCode::TOO_MANY_REQUESTS,
+		);
+	}
+
 	err!(Database("bridge {op} failed: {error}"))
 }
 
@@ -317,6 +458,7 @@ mod tests {
 				endpoint: format!("http://{address}/"),
 				token: "test-only".into(),
 				timeout: Duration::from_secs(5),
+				in_flight: Semaphore::new(MAX_IN_FLIGHT),
 			};
 			let error = client
 				.call_once(&Request::Hello)
@@ -329,12 +471,74 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn retries_stop_before_a_backoff_would_cross_the_deadline() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicU32, Ordering},
+		};
+
+		// A bridge that is always unavailable: every attempt is a retryable
+		// transport failure, so only the attempt budget and the deadline stop
+		// the retries.
+		let hits = Arc::new(AtomicU32::new(0));
+		let counter = Arc::clone(&hits);
+		let app = axum::Router::new().route(
+			"/",
+			axum::routing::post(move || {
+				let counter = Arc::clone(&counter);
+				async move {
+					counter.fetch_add(1, Ordering::SeqCst);
+					StatusCode::SERVICE_UNAVAILABLE
+				}
+			}),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("bind");
+		let address = listener.local_addr().expect("address");
+		let task = tokio::spawn(async move {
+			axum::serve(listener, app).await.expect("serve");
+		});
+		let client = Client {
+			http: reqwest::Client::builder()
+				.no_proxy()
+				.build()
+				.expect("client"),
+			endpoint: format!("http://{address}/"),
+			token: "test-only".into(),
+			timeout: Duration::from_secs(5),
+			in_flight: Semaphore::new(MAX_IN_FLIGHT),
+		};
+
+		// Without a deadline, the whole attempt budget is spent.
+		let error = client
+			.call(&Request::Hello, None)
+			.await
+			.expect_err("an unavailable bridge");
+		assert!(error.is_retryable());
+		assert_eq!(hits.swap(0, Ordering::SeqCst), MAX_ATTEMPTS);
+
+		// With a deadline shorter than the first backoff, no retry starts: one
+		// attempt, and the call returns without sleeping past the deadline.
+		let started = Instant::now();
+		let deadline = started + MIN_BACKOFF / 2;
+		client
+			.call(&Request::Hello, Some(deadline))
+			.await
+			.expect_err("an unavailable bridge");
+		assert_eq!(hits.load(Ordering::SeqCst), 1);
+		assert!(started.elapsed() < MIN_BACKOFF, "slept past the deadline");
+		task.abort();
+	}
+
+	#[tokio::test]
 	async fn oversized_request_is_nonretryable_before_transport() {
 		let client = Client {
 			http: reqwest::Client::new(),
 			endpoint: "invalid://must-not-reach-transport".into(),
 			token: "test-only".into(),
 			timeout: Duration::from_millis(1),
+			in_flight: Semaphore::new(MAX_IN_FLIGHT),
 		};
 		let request = Request::Get {
 			map: 0,
@@ -348,5 +552,220 @@ mod tests {
 		assert!(
 			matches!(error, CallError::Bridge(bridge::Error::TooLarge { what, .. }) if what == "request bytes")
 		);
+	}
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicU32, Ordering::SeqCst},
+	};
+
+	use axum::response::IntoResponse;
+	use serde_bytes::ByteBuf;
+	use tokio::task::JoinHandle;
+
+	use super::*;
+
+	/// A bridge that answers each request by its variant and counts every
+	/// request it receives. A `Get` answers only once it takes a permit of
+	/// `parked`, so a test can keep data calls in flight.
+	async fn serve(hits: Arc<AtomicU32>, parked: Arc<Semaphore>) -> (String, JoinHandle<()>) {
+		let app = axum::Router::new().route(
+			"/",
+			axum::routing::post(move |body: axum::body::Bytes| {
+				let hits = Arc::clone(&hits);
+				let parked = Arc::clone(&parked);
+				async move {
+					hits.fetch_add(1, SeqCst);
+					let Ok(request) = bridge::decode::<Request>(&body) else {
+						return StatusCode::BAD_REQUEST.into_response();
+					};
+					let response = match request {
+						| Request::Get { keys, .. } => {
+							let _released = parked.acquire().await.expect("parked gate");
+							Response::Got { vals: vec![None; keys.len()] }
+						},
+						| Request::Hello => Response::Hello {
+							protocol: bridge::PROTOCOL_VERSION,
+							schema_version: bridge::SCHEMA_VERSION,
+							lease: None,
+							now_ms: 0,
+						},
+						| Request::LeaseAcquire { .. } | Request::LeaseRenew { .. } =>
+							Response::Leased { epoch: 1, expires_at_ms: 1, now_ms: 0 },
+						| Request::LeaseRelease { .. } => Response::Released,
+						| Request::Scan { .. } | Request::Commit { .. } =>
+							return StatusCode::NOT_IMPLEMENTED.into_response(),
+					};
+					bridge::encode(&response)
+						.expect("reply")
+						.into_response()
+				}
+			}),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("bind");
+		let address = listener.local_addr().expect("address");
+		let task = tokio::spawn(async move {
+			axum::serve(listener, app).await.expect("serve");
+		});
+
+		(format!("http://{address}/"), task)
+	}
+
+	/// A client of `endpoint` with room for `slots` data calls.
+	fn client(endpoint: String, timeout: Duration, slots: usize) -> Client {
+		Client {
+			http: reqwest::Client::builder()
+				.no_proxy()
+				.build()
+				.expect("client"),
+			endpoint,
+			token: "test-only".into(),
+			timeout,
+			in_flight: Semaphore::new(slots),
+		}
+	}
+
+	fn get() -> Request {
+		Request::Get {
+			map: 0,
+			keys: vec![ByteBuf::from(b"key".to_vec())],
+		}
+	}
+
+	#[tokio::test]
+	async fn a_saturated_bound_refuses_data_calls_unsent_within_their_patience() {
+		let hits = Arc::new(AtomicU32::new(0));
+		let (endpoint, task) = serve(Arc::clone(&hits), Arc::new(Semaphore::new(1))).await;
+		let timeout = Duration::from_millis(300);
+		let client = client(endpoint, timeout, 2);
+		let held = client
+			.in_flight
+			.acquire_many(2)
+			.await
+			.expect("every slot");
+
+		// Without a deadline, the wait is the per-request timeout.
+		let started = Instant::now();
+		let error = client
+			.call(&get(), None)
+			.await
+			.expect_err("a saturated bound");
+		let waited = started.elapsed();
+		assert!(error.is_backpressure(), "{error}");
+		assert!(!error.is_retryable());
+		assert!(waited >= timeout, "refused before the timeout: {waited:?}");
+		assert!(waited < timeout.saturating_mul(3), "waited past the timeout: {waited:?}");
+
+		// A deadline shorter than the timeout ends the wait first; one already
+		// passed ends it at once.
+		for patience in [Duration::from_millis(20), Duration::ZERO] {
+			let started = Instant::now();
+			let deadline = started.checked_add(patience).expect("deadline");
+			let error = client
+				.call(&get(), Some(deadline))
+				.await
+				.expect_err("a saturated bound");
+			assert!(error.is_backpressure(), "{error}");
+			assert!(started.elapsed() < timeout, "waited past the deadline");
+		}
+
+		assert_eq!(hits.load(SeqCst), 0, "a refused call reached the bridge");
+		drop(held);
+		task.abort();
+	}
+
+	#[tokio::test]
+	async fn lease_and_handshake_calls_pass_a_bound_saturated_by_slow_calls() {
+		let hits = Arc::new(AtomicU32::new(0));
+		let parked = Arc::new(Semaphore::new(0));
+		let (endpoint, task) = serve(Arc::clone(&hits), Arc::clone(&parked)).await;
+		let client = Arc::new(client(endpoint, Duration::from_secs(5), 2));
+
+		// Two reads reach the bridge and stay there, holding both slots.
+		let slow: Vec<_> = std::iter::repeat_with(|| {
+			let client = Arc::clone(&client);
+			tokio::spawn(async move { client.call(&get(), None).await.map(drop) })
+		})
+		.take(2)
+		.collect();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while hits.load(SeqCst) < 2 {
+				sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("both reads in flight");
+		assert_eq!(client.in_flight.available_permits(), 0);
+
+		// A third read is refused at its deadline without reaching the bridge.
+		let deadline = Instant::now()
+			.checked_add(Duration::from_millis(50))
+			.expect("deadline");
+		let error = client
+			.call(&get(), Some(deadline))
+			.await
+			.expect_err("a saturated bound");
+		assert!(error.is_backpressure(), "{error}");
+		assert_eq!(hits.load(SeqCst), 2);
+
+		// Every lease and handshake call goes straight through.
+		let lease = || bridge::Lease { holder: "test".into(), epoch: 1 };
+		for request in [
+			Request::Hello,
+			Request::LeaseAcquire { holder: "test".into(), ttl_ms: 1_000 },
+			Request::LeaseRenew { lease: lease(), ttl_ms: 1_000 },
+			Request::LeaseRelease { lease: lease() },
+		] {
+			tokio::time::timeout(Duration::from_secs(1), client.call(&request, None))
+				.await
+				.expect("a lease call queued behind data calls")
+				.expect("a lease call answered");
+		}
+		assert_eq!(hits.load(SeqCst), 6);
+
+		// Released, the parked reads complete and give their slots back.
+		parked.add_permits(1);
+		for read in slow {
+			read.await
+				.expect("read task")
+				.expect("read answered");
+		}
+		assert_eq!(client.in_flight.available_permits(), 2);
+		task.abort();
+	}
+
+	#[tokio::test]
+	async fn data_calls_below_the_bound_proceed_as_before() {
+		let hits = Arc::new(AtomicU32::new(0));
+		let (endpoint, task) = serve(Arc::clone(&hits), Arc::new(Semaphore::new(1))).await;
+		let client = client(endpoint, Duration::from_secs(5), 2);
+
+		// One slot held, one free: a read proceeds, even with its deadline
+		// already passed, as the first attempt always did.
+		let held = client
+			.in_flight
+			.acquire()
+			.await
+			.expect("one slot");
+		client
+			.call(&get(), Some(Instant::now()))
+			.await
+			.expect("a free slot");
+		assert_eq!(hits.load(SeqCst), 1);
+		drop(held);
+
+		// The whole bound runs at once, and every slot comes back.
+		let (first, second) = (get(), get());
+		let (first, second) = tokio::join!(client.call(&first, None), client.call(&second, None));
+		first.expect("first read");
+		second.expect("second read");
+		assert_eq!(hits.load(SeqCst), 3);
+		assert_eq!(client.in_flight.available_permits(), 2);
+		task.abort();
 	}
 }

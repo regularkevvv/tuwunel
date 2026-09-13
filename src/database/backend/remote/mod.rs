@@ -250,10 +250,10 @@ impl Backend {
 	///
 	/// The order is the ADR's: refuse when the lease is not writable, then
 	/// take the commit barrier and **drain every open scan on a map this
-	/// batch touches**, then send one `Commit`. A transport failure re-sends
-	/// the same `request_id`, so a reply lost after the batch applied comes
-	/// back as `duplicate` and is reported to the caller as the single
-	/// success it is.
+	/// batch touches**, then wait for an in-flight slot, then send one
+	/// `Commit`. A transport failure re-sends the same `request_id`, so a
+	/// reply lost after the batch applied comes back as `duplicate` and is
+	/// reported to the caller as the single success it is.
 	pub(crate) async fn commit(&self, ops: Vec<bridge::Mutation>) -> Result {
 		if ops.is_empty() {
 			return Ok(());
@@ -282,6 +282,15 @@ impl Backend {
 		let maps: BTreeSet<u16> = ops.iter().map(bridge::Mutation::map).collect();
 		let admission = self.scans.begin_write(&maps)?;
 		self.drain(&maps).await?;
+
+		// The in-flight slot is taken after the drain, whose page fetches take
+		// their own, and before the commit counts as dispatched: a refusal or
+		// a cancellation while it queues sent nothing, so the writer stays.
+		let admitted = self
+			.client
+			.admit(&request, None)
+			.await
+			.map_err(|error| database_error("commit", &error))?;
 		self.writable_lease()?;
 
 		#[cfg(feature = "failpoints")]
@@ -292,7 +301,7 @@ impl Backend {
 		}
 
 		let mut outcome = outcome::CommitOutcome::dispatched(self);
-		let duplicate = match self.client.call(&request, None).await {
+		let duplicate = match self.client.send(&request, None, admitted).await {
 			| Ok(Response::Committed { duplicate }) => {
 				outcome.acknowledged();
 				#[cfg(feature = "failpoints")]
