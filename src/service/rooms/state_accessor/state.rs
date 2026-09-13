@@ -16,7 +16,7 @@ use ruma::{
 use serde::Deserialize;
 use tuwunel_core::{
 	Error, Result, at, err, implement,
-	matrix::{Event, Pdu, StateKey},
+	matrix::{Event, Pdu, PduCount, StateKey},
 	pair_of,
 	utils::{
 		result::FlatOk,
@@ -300,6 +300,47 @@ pub async fn is_initial_room_create(&self, room_id: &RoomId, event_id: &EventId)
 		.is_ok_and(|current_create| {
 			current_create.event_id() == event_id && current_create.room_id() == room_id
 		})
+}
+
+/// The state to judge an event by when it has no state snapshot of its own.
+///
+/// Two kinds of stored event never had one: an outlier, which was stored but
+/// never integrated, and an event backfilled into the timeline's negative
+/// range. Both are judged by the room's current state. A normal timeline event
+/// always carries a snapshot, so a missing one is incomplete state and yields
+/// `None`, as does an unreadable or foreign event.
+#[implement(super::Service)]
+pub async fn snapshotless_state(
+	&self,
+	room_id: &RoomId,
+	event_id: &EventId,
+) -> Option<ShortStateHash> {
+	let pdu = self
+		.services
+		.timeline
+		.get_pdu(event_id)
+		.await
+		.ok()?;
+	if pdu.event_id() != event_id || pdu.room_id() != room_id {
+		return None;
+	}
+
+	match self
+		.services
+		.timeline
+		.get_pdu_count(event_id)
+		.await
+	{
+		| Ok(PduCount::Backfilled(_)) => {},
+		| Err(error) if error.is_not_found() => {},
+		| Ok(PduCount::Normal(_)) | Err(_) => return None,
+	}
+
+	self.services
+		.state
+		.get_room_shortstatehash(room_id)
+		.await
+		.ok()
 }
 
 /// Returns a single EventId from `room_id` with key (`event_type`,

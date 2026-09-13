@@ -171,6 +171,12 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
+		name: "eventid_rejectedpdu",
+		key_size_hint: Some(48),
+		val_size_hint: Some(1488),
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "eventid_resolvedstate",
 		ttl: 60 * 60 * 24 * 7, // refetch-avoidance only; safe to evict
 		..descriptor::RANDOM_SMALL_CACHE

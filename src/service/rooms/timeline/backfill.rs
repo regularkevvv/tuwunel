@@ -7,7 +7,8 @@ use futures::{
 use rand::seq::SliceRandom;
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, ServerName,
-	api::Direction, events::TimelineEventType,
+	api::Direction,
+	events::{StateEventType, TimelineEventType},
 };
 use serde::Deserialize;
 use serde_json::value::RawValue as RawJsonValue;
@@ -345,6 +346,22 @@ pub async fn fetch_remote_event(&self, room_id: &RoomId, event_id: &EventId) -> 
 	Ok(())
 }
 
+/// Whether `event_id` is the room's create event as our current state names
+/// it, stored as an outlier but not yet placed in the timeline.
+#[implement(super::Service)]
+async fn is_unplaced_room_create(&self, room_id: &RoomId, event_id: &EventId) -> bool {
+	let is_create = self
+		.services
+		.state_accessor
+		.room_state_get_id(room_id, &StateEventType::RoomCreate, "")
+		.await
+		.is_ok_and(|create_id| create_id == event_id);
+
+	is_create
+		&& self.get_pdu_id(event_id).await.is_err()
+		&& self.outlier_pdu_exists(event_id).await.is_ok()
+}
+
 #[implement(super::Service)]
 #[tracing::instrument(skip(self, pdu), level = "debug")]
 pub async fn backfill_pdu(
@@ -368,13 +385,32 @@ pub async fn backfill_pdu(
 
 	let ((_, event_id, value), mutex_lock) = try_join(parsed, mutex_lock).await?;
 
-	let existed = self
+	let handled = match self
 		.services
 		.event_handler
 		.handle_incoming_pdu(origin, room_id, &event_id, value, false)
-		.await?
-		.map(at!(1))
-		.is_some_and(is_false!());
+		.await
+	{
+		| Ok(handled) => handled,
+		| Err(error) => {
+			warn!(%room_id, %event_id, %error, "Backfilled event refused.");
+
+			// The room's create event is already authoritative in our state. A
+			// backfilled copy that fails validation still shows the timeline has
+			// reached the room's start, so the copy we hold is placed there rather
+			// than leaving backfill asking for the start forever.
+			if !self
+				.is_unplaced_room_create(room_id, &event_id)
+				.await
+			{
+				return Err(error);
+			}
+
+			None
+		},
+	};
+
+	let existed = handled.map(at!(1)).is_some_and(is_false!());
 
 	// Bail if the PDU already exists; a duplicate insertion is not good.
 	if existed {
