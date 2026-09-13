@@ -11,7 +11,11 @@
 //! - no identity can claim the server account's localpart;
 //! - the first account created this way is not made an administrator, with
 //!   `grant_admin_to_first_user = false` as the product configures it
-//!   (homeserver/tuwunel.toml).
+//!   (homeserver/tuwunel.toml);
+//! - an operator links an identity to an existing account only explicitly
+//!   (`query oauth associate`, gate A3): never to an account that does not
+//!   exist, and never over the account's committed SSO sessions without
+//!   `--force`.
 //!
 //! The provider is a local fixture whose userinfo reply the test sets before
 //! each sign-in.
@@ -34,6 +38,7 @@ use tokio::{
 	time::{sleep, timeout},
 };
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
+use tuwunel_admin::{fini, init};
 use tuwunel_core::{Err, Result, err, ruma::OwnedUserId};
 use tuwunel_service::Services;
 
@@ -173,7 +178,83 @@ async fn exercise(services: &Services, client: &Client, base: &str, fixture: &Sh
 	.await?;
 	assert_ne!(&third, server_user, "an SSO identity signed in as the server account");
 
+	init(&services.admin);
+	let linked = operator_association(services, client, base, fixture).await;
+	fini(&services.admin);
+	linked
+}
+
+/// An operator links an upstream identity to an existing account (A3). The
+/// link is explicit, names an account that exists, and never replaces the
+/// account's committed SSO sessions unless forced.
+async fn operator_association(
+	services: &Services,
+	client: &Client,
+	base: &str,
+	fixture: &Shared,
+) -> Result {
+	let server = services.globals.server_name();
+	let dave = OwnedUserId::try_from(format!("@dave:{server}"))
+		.map_err(|error| err!("invalid user id: {error}"))?;
+	// An existing password account, as an operator would link to SSO. An
+	// account without a password reads as deactivated.
+	services
+		.users
+		.create(&dave, Some("dave-password"), None)
+		.await?;
+
+	let missing = admin(
+		services,
+		format!("query oauth associate test-client @nobody:{server} --claim sub=subject-x"),
+	)
+	.await;
+	assert!(missing.is_err(), "an account that does not exist was linked");
+
+	admin(
+		services,
+		format!("query oauth associate test-client {dave} --claim sub=subject-d"),
+	)
+	.await?;
+	let linked =
+		sign_in_as(client, base, fixture, "subject-d", "someone-else", "d@example.test").await?;
+	assert_eq!(linked, dave, "the operator's link was not honoured");
+
+	// The account now has a committed session: a new link is refused without
+	// --force, and the refusal leaves the linked identity where it was.
+	let refused = admin(
+		services,
+		format!("query oauth associate test-client {dave} --claim sub=subject-e"),
+	)
+	.await;
+	assert!(refused.is_err(), "a link replaced committed sessions without --force");
+	let unchanged =
+		sign_in_as(client, base, fixture, "subject-d", "someone-else", "d@example.test").await?;
+	assert_eq!(unchanged, dave, "a refused link moved the linked identity");
+
+	admin(
+		services,
+		format!("query oauth associate test-client {dave} --claim sub=subject-e --force"),
+	)
+	.await?;
+	let relinked =
+		sign_in_as(client, base, fixture, "subject-e", "another-name", "e@example.test").await?;
+	assert_eq!(relinked, dave, "the forced link was not honoured");
+
 	Ok(())
+}
+
+/// Runs an admin command in place, as the admin room would.
+async fn admin(services: &Services, command: String) -> Result<String> {
+	match services
+		.admin
+		.command_in_place(command, None)
+		.await
+	{
+		| Ok(output) => Ok(output
+			.map(|output| output.as_str().to_owned())
+			.unwrap_or_default()),
+		| Err(output) => Err!("admin command refused: {}", output.as_str()),
+	}
 }
 
 /// Sets the provider's identity, then signs in through the SSO redirect and
@@ -214,7 +295,11 @@ async fn sign_in_as(
 		.header("cookie", cookie)
 		.send()
 		.await?;
-	assert_eq!(callback.status().as_u16(), 302, "SSO callback failed");
+	let status = callback.status().as_u16();
+	if status != 302 {
+		let body = callback.text().await.unwrap_or_default();
+		return Err!("SSO callback for {sub} failed with {status}: {body}");
+	}
 	let token = query_value(&location(&callback)?, "loginToken")?;
 	let login = client
 		.post(format!("{base}/_matrix/client/v3/login"))
