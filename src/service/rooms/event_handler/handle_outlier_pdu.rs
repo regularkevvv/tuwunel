@@ -85,9 +85,6 @@ pub(super) async fn handle_outlier_pdu(
 	if !auth_events_known {
 		// 4. fetch any missing auth events doing all checks listed here starting at 1.
 		//    These are not timeline events
-		// 5. Reject "due to auth events" if can't get all the auth events or some of
-		//    the auth events are also rejected "due to auth events"
-		// NOTE: Step 5 is not applied anymore because it failed too often
 		debug!("Fetching auth events");
 		Box::pin(self.fetch_auth(
 			origin,
@@ -99,9 +96,11 @@ pub(super) async fn handle_outlier_pdu(
 		.await;
 	}
 
-	// 5. Reject "due to auth events" if some of the auth events were themselves
-	//    rejected. That record is definitive, unlike an auth event we merely could
-	//    not obtain.
+	// 5. Reject "due to auth events" if we can't get all the auth events or some of
+	//    them were themselves rejected. An auth event recorded as rejected rejects
+	//    the event here: that record is definitive. One we could not obtain refuses
+	//    it at the auth check below, whose rules fail on a missing auth event, but
+	//    is not recorded as a rejection: it may yet be obtained.
 	let cites_rejected = event
 		.auth_events()
 		.stream()
