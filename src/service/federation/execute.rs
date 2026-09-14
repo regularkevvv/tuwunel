@@ -9,6 +9,7 @@ use ruma::{
 		EndpointError, IncomingResponse, MatrixVersion, OutgoingRequest, OutgoingRequestExt,
 		SupportedVersions,
 		error::{Error as RumaError, ErrorBody},
+		federation::transactions::send_transaction_message,
 	},
 };
 use tokio::time::timeout;
@@ -18,8 +19,8 @@ use tuwunel_core::{
 };
 
 use super::{
-	ShouldAttempt,
-	peer::classify_error,
+	Classification, ShouldAttempt,
+	peer::{classify_error, classify_transaction_error},
 	scheme::{FedAuth, FedPath},
 };
 use crate::{client::read_response_capped, resolver::actual::ActualDest};
@@ -102,13 +103,33 @@ where
 		.execute_uncounted(client, dest, request)
 		.await;
 
-	match &result {
-		| Ok(_) => self.record_success(dest).await,
-		| Err(error) =>
-			if let Some(class) = classify_error(error) {
-				self.record_failure(dest, class).await?;
-			},
-	}
+	self.record_outcome(dest, result.as_ref().err(), classify_error)
+		.await?;
+
+	result
+}
+
+/// Sends one outbound transaction (`PUT /send/{txnId}`). Unlike
+/// [`execute_on`], every failure counts against the destination, a JSON 4xx
+/// included: a peer answers a transaction it processed with 200 and per-PDU
+/// results, so a 4xx refused the whole transaction, and re-sending it unchanged
+/// at once would be refused again. The sender's backoff and give-up pace the
+/// retries instead.
+#[implement(super::Service)]
+pub async fn execute_transaction(
+	&self,
+	client: &Client,
+	dest: &ServerName,
+	request: send_transaction_message::v1::Request,
+) -> Result<send_transaction_message::v1::Response> {
+	let result = self
+		.execute_uncounted(client, dest, request)
+		.await;
+
+	self.record_outcome(dest, result.as_ref().err(), |error| {
+		Some(classify_transaction_error(error))
+	})
+	.await?;
 
 	result
 }
@@ -133,15 +154,32 @@ where
 		.execute_uncounted_allow_self(client, dest, request)
 		.await;
 
-	match &result {
-		| Ok(_) => self.record_success(dest).await,
-		| Err(error) =>
-			if let Some(class) = classify_error(error) {
+	self.record_outcome(dest, result.as_ref().err(), classify_error)
+		.await?;
+
+	result
+}
+
+/// Records one request's outcome in the peer-reachability store: a success
+/// (no `error`) clears the peer's failures, and a failure is recorded when
+/// `classify` finds a signal in it. Only the error is borrowed, so the caller's
+/// future stays `Send` for any response type.
+#[implement(super::Service)]
+async fn record_outcome(
+	&self,
+	dest: &ServerName,
+	error: Option<&Error>,
+	classify: fn(&Error) -> Option<Classification>,
+) -> Result {
+	match error {
+		| None => self.record_success(dest).await,
+		| Some(error) =>
+			if let Some(class) = classify(error) {
 				self.record_failure(dest, class).await?;
 			},
 	}
 
-	result
+	Ok(())
 }
 
 /// Like [`execute_on`] but leaves peer-status untouched, for callers that

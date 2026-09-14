@@ -358,7 +358,9 @@ impl Service {
 
 				match dest {
 					| Destination::Federation(server) => {
-						// Arm a one-shot retry at the destination's earliest-retry time,
+						// Every failed transaction, a JSON 4xx refusal included, is
+						// recorded against the destination, so the gate holds its queued
+						// events back. Arm a one-shot retry at its earliest-retry time,
 						// unless it has failed so long that delivery waits for its return.
 						if self
 							.services
@@ -2246,7 +2248,7 @@ impl Service {
 		let result = self
 			.services
 			.federation
-			.execute_on(&self.services.client.sender, &server, request)
+			.execute_transaction(&self.services.client.sender, &server, request)
 			.await;
 
 		for (event_id, result) in result.iter().flat_map(|resp| resp.pdus.iter()) {

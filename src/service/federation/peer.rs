@@ -445,7 +445,8 @@ pub(super) fn failure_secs(bytes: &[u8]) -> Option<u64> {
 /// body is the other exception: it means a proxy or CDN answered rather than
 /// the homeserver, so it signals a stale route, not peer content, and records
 /// `Transient` to place the eviction that follows behind the backoff gate.
-/// Transport failures carry no response and are always transient.
+/// Transport failures carry no response and are always transient. The sender's
+/// own transactions are classified by [`classify_transaction_error`] instead.
 #[must_use]
 pub(super) fn classify_error(error: &Error) -> Option<Classification> {
 	let Error::Federation(_, response) = error else {
@@ -462,4 +463,18 @@ pub(super) fn classify_error(error: &Error) -> Option<Classification> {
 			Some(Classification::Transient),
 		| _ => None,
 	}
+}
+
+/// Classifies a failed outbound transaction (`PUT /send/{txnId}`) for the
+/// sender. A peer answers a transaction it processed with 200 and per-PDU
+/// results, even when some of its PDUs fail, so any other answer means the
+/// whole transaction went unprocessed, and the sender re-sends it unchanged.
+/// Every such failure therefore counts against the destination: a failure
+/// [`classify_error`] records keeps its class, and a JSON 4xx it leaves
+/// unrecorded (400 `M_BAD_JSON`, 403 `M_FORBIDDEN`, 413) records `Transient`,
+/// so the refused transaction waits out the backoff and the give-up instead of
+/// going out again with every event queued for the peer.
+#[must_use]
+pub(super) fn classify_transaction_error(error: &Error) -> Classification {
+	classify_error(error).unwrap_or(Classification::Transient)
 }

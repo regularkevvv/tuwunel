@@ -13,7 +13,7 @@ use tuwunel_core::{Error, err, utils::exponential_backoff_streak_cap};
 
 use super::peer::{
 	Backoff, Classification, GIVE_UP_AFTER, MAX_BACKOFF, ShouldAttempt, Streak, attempt_verdict,
-	classify, classify_error, failure_secs, fold_streak, gave_up,
+	classify, classify_error, classify_transaction_error, failure_secs, fold_streak, gave_up,
 };
 
 fn federation_error(status: StatusCode) -> Error {
@@ -90,6 +90,42 @@ fn non_federation_error_is_transient() {
 	let error = err!(BadServerResponse("transport failure"));
 
 	assert!(matches!(classify_error(&error), Some(Classification::Transient)));
+}
+
+#[test]
+fn a_refused_transaction_is_transient() {
+	// A peer answers a transaction it processed with 200 and per-PDU results,
+	// so a JSON 4xx refused the whole transaction. It counts against the
+	// destination for the sender, and still not for any other request.
+	for status in [
+		StatusCode::BAD_REQUEST,
+		StatusCode::UNAUTHORIZED,
+		StatusCode::FORBIDDEN,
+		StatusCode::NOT_FOUND,
+		StatusCode::PAYLOAD_TOO_LARGE,
+	] {
+		let error = federation_error(status);
+
+		assert!(classify_error(&error).is_none(), "{status} recorded for other requests");
+		assert_eq!(classify_transaction_error(&error), Classification::Transient, "{status}");
+	}
+}
+
+#[test]
+fn a_transaction_keeps_every_recorded_class() {
+	assert_eq!(
+		classify_transaction_error(&federation_error(StatusCode::GONE)),
+		Classification::Permanent
+	);
+
+	for error in [
+		federation_error(StatusCode::TOO_MANY_REQUESTS),
+		federation_error(StatusCode::INTERNAL_SERVER_ERROR),
+		federation_error_notjson(StatusCode::FORBIDDEN),
+		err!(BadServerResponse("transport failure")),
+	] {
+		assert_eq!(classify_transaction_error(&error), Classification::Transient, "{error}");
+	}
 }
 
 #[test]
@@ -247,13 +283,52 @@ fn fold_streak_tracks_anchor_and_oldest() {
 	assert!(matches!(second.class, Classification::Permanent));
 }
 
-/// A nine-byte transient failure row recorded at `secs`.
-fn failure_row(secs: u64) -> [u8; 9] {
+/// A nine-byte failure row of `class` recorded at `secs`.
+fn failure_row(class: Classification, secs: u64) -> [u8; 9] {
 	let mut row = [0_u8; 9];
-	row[0] = u8::from(Classification::Transient);
+	row[0] = u8::from(class);
 	row[1..].copy_from_slice(&secs.to_be_bytes());
 
 	row
+}
+
+/// Attempts the sender makes on a peer before giving it up, when every attempt
+/// fails with `class` and the next waits for the verdict's earliest retry, as
+/// the sender's wake does.
+fn attempts_before_giving_up(class: Classification) -> u32 {
+	let window_secs = 180;
+	let n_max = exponential_backoff_streak_cap(Duration::from_secs(window_secs), MAX_BACKOFF);
+	let mut attempts = 1;
+	let mut run = fold_streak(window_secs, None, 0, &failure_row(class, 0));
+	while !gave_up(&run, window_secs) {
+		let span = run
+			.latest_bucket
+			.saturating_sub(run.oldest_bucket)
+			.saturating_add(1);
+
+		let verdict = attempt_verdict(&Backoff {
+			class: run.class,
+			anchor_secs: run.anchor_secs,
+			streak: u32::try_from(span).unwrap_or(u32::MAX).min(n_max),
+			now: run.anchor_secs,
+			window_secs,
+			grace_secs: 15,
+		});
+
+		let ShouldAttempt::No { earliest_retry } = verdict else {
+			panic!("a peer that just failed is attemptable at once");
+		};
+
+		let now = earliest_retry
+			.duration_since(UNIX_EPOCH)
+			.expect("retry after the epoch")
+			.as_secs();
+
+		attempts += 1;
+		run = fold_streak(window_secs, Some(run), now / window_secs, &failure_row(class, now));
+	}
+
+	attempts
 }
 
 #[test]
@@ -275,42 +350,32 @@ fn giving_up_needs_failures_spanning_the_horizon() {
 
 #[test]
 fn a_dead_peer_is_retried_a_bounded_number_of_times() {
-	// Every attempt fails and the next waits for the verdict's earliest retry,
-	// as the sender's wake does, until the failures span the give-up horizon.
-	let window_secs = 180;
-	let n_max = exponential_backoff_streak_cap(Duration::from_secs(window_secs), MAX_BACKOFF);
-	let mut attempts = 1;
-	let mut run = fold_streak(window_secs, None, 0, &failure_row(0));
-	while !gave_up(&run, window_secs) {
-		let span = run
-			.latest_bucket
-			.saturating_sub(run.oldest_bucket)
-			.saturating_add(1);
-
-		let verdict = attempt_verdict(&Backoff {
-			class: Classification::Transient,
-			anchor_secs: run.anchor_secs,
-			streak: u32::try_from(span).unwrap_or(u32::MAX).min(n_max),
-			now: run.anchor_secs,
-			window_secs,
-			grace_secs: 15,
-		});
-
-		let ShouldAttempt::No { earliest_retry } = verdict else {
-			panic!("a peer that just failed is attemptable at once");
-		};
-
-		let now = earliest_retry
-			.duration_since(UNIX_EPOCH)
-			.expect("retry after the epoch")
-			.as_secs();
-
-		attempts += 1;
-		run = fold_streak(window_secs, Some(run), now / window_secs, &failure_row(now));
-	}
-
 	// The grace tier retries every 15 seconds within the first window (12
 	// attempts), the quadratic curve reaches its daily cap in three more, and
 	// then one a day: 22 attempts over seven days, then none.
-	assert_eq!(attempts, 22, "attempts before giving up");
+	assert_eq!(
+		attempts_before_giving_up(Classification::Transient),
+		22,
+		"attempts before giving up"
+	);
+
+	// A 410 waits the daily cap from the first failure: 8 attempts.
+	assert_eq!(
+		attempts_before_giving_up(Classification::Permanent),
+		8,
+		"attempts on a gone peer"
+	);
+}
+
+#[test]
+fn a_peer_refusing_every_transaction_is_given_up() {
+	// A refused transaction used to record nothing, so the gate never closed
+	// and the sender re-sent it with every event queued for the peer, without
+	// end. It now follows a dead peer's curve to the give-up.
+	for status in [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN, StatusCode::PAYLOAD_TOO_LARGE]
+	{
+		let class = classify_transaction_error(&federation_error(status));
+
+		assert_eq!(attempts_before_giving_up(class), 22, "attempts on a peer answering {status}");
+	}
 }
