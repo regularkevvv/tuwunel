@@ -11,11 +11,15 @@ use ruma::{
 use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{event::Event, pdu::PduBuilder, room_version},
+	matrix::{
+		event::Event,
+		pdu::{PduBuilder, PduEvent, RawPduId},
+		room_version,
+	},
 	utils::{IterStream, ReadyExt},
 };
 
-use super::RoomMutexGuard;
+use super::{Effect, RoomMutexGuard};
 
 /// Creates a new persisted data unit and adds it to a room. This function
 /// takes a roomid_mutex_state, meaning that only this function is able to
@@ -139,6 +143,21 @@ pub async fn build_and_append_pdu_with_txnid(
 		.boxed()
 		.await?;
 
+	// The append returns once the pdu is durable, whatever its effects did, so
+	// the pdu goes to the room's servers even when one of them failed.
+	self.federate_local_pdu(&pdu, &pdu_id).await;
+
+	Ok(pdu.event_id().to_owned())
+}
+
+/// Queues a durable local pdu for the room's other servers.
+///
+/// It follows the append, so the pdu's count has retired and the room's
+/// servers reflect any recount the append repaired. A failure is logged like
+/// any effect of a durable pdu, not returned: the pdu is sent, and its sender
+/// has to hear so (`Effect`).
+#[implement(super::Service)]
+async fn federate_local_pdu(&self, pdu: &PduEvent, pdu_id: &RawPduId) {
 	let mut servers: HashSet<OwnedServerName> = self
 		.services
 		.state_cache
@@ -164,10 +183,9 @@ pub async fn build_and_append_pdu_with_txnid(
 
 	self.services
 		.sending
-		.send_pdu_servers(servers.iter().map(AsRef::as_ref).stream(), &pdu_id)
-		.await?;
-
-	Ok(pdu.event_id().to_owned())
+		.send_pdu_servers(servers.iter().map(AsRef::as_ref).stream(), pdu_id)
+		.await
+		.effect("federation", pdu.event_id());
 }
 
 #[implement(super::Service)]

@@ -10,9 +10,9 @@
 //! the durable indexes had replaced.
 //!
 //! Here the recount is refused while a bridge's user joins a room the cache
-//! last saw without it. The join reports the failure without panicking, and
-//! the cache answers the new membership. The room's next event then recounts
-//! the room.
+//! last saw without it, and so is the join's own retry of it. The join
+//! committed, so it succeeds, without panicking, and the cache answers the
+//! new membership. The room's next event then recounts the room.
 
 use std::{env::var, net::TcpListener, path::PathBuf, process::id as process_id, time::Duration};
 
@@ -106,16 +106,16 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.room_joined_count(&room)
 		.await?;
 
-	// The join's membership commits, and its recount is refused.
+	// The join's membership commits, and its recount is refused, as is the
+	// retry of it that the join's later steps make.
+	refusal::refuse_next("roomid_joinedcount");
 	refusal::refuse_next("roomid_joinedcount");
 	let join = RoomMemberEventContent::new(MembershipState::Join);
-	let joined =
-		append(services, &puppet, &room, PduBuilder::state(puppet.to_string(), &join)).await;
-	if joined.is_ok() {
-		return Err!("a join whose recount was refused reported success");
-	}
+	append(services, &puppet, &room, PduBuilder::state(puppet.to_string(), &join))
+		.await
+		.map_err(|e| err!("a join that committed reported its refused recount: {e}"))?;
 	if refusal::pending() != 0 {
-		return Err!("the join never reached its recount");
+		return Err!("the join never reached its recount and the retry of it");
 	}
 	if !services
 		.state_cache

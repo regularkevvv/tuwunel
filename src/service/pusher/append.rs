@@ -30,7 +30,7 @@ use tuwunel_core::{
 use tuwunel_database::{Deserialized, Json, Map};
 
 use super::{Evaluate, RelatedEvents};
-use crate::rooms::short::ShortRoomId;
+use crate::rooms::{short::ShortRoomId, timeline::Effect};
 
 /// Compact metadata stored for each notified event.
 ///
@@ -67,6 +67,9 @@ struct Appended<'a> {
 }
 
 /// Called by timeline append_pdu.
+///
+/// A write that fails for one recipient is logged, and the rest still run
+/// (`Effect`).
 #[implement(super::Service)]
 #[tracing::instrument(name = "append", level = "debug", skip_all)]
 pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
@@ -193,7 +196,13 @@ async fn append_pdu_for_user(
 		.filter(|_| highlight)
 		.map_async(|root| self.increment_thread_highlightcount(pdu.room_id(), user, root));
 
-	join4(main_notify, thread_notify, main_highlight, thread_highlight).await;
+	let counted = join4(main_notify, thread_notify, main_highlight, thread_highlight).await;
+	for counted in [counted.0, counted.1, counted.2, counted.3]
+		.into_iter()
+		.flatten()
+	{
+		counted.effect("push count", pdu.event_id());
+	}
 
 	if notify || highlight {
 		let id: PduId = (*pdu_id).into();
@@ -209,7 +218,7 @@ async fn append_pdu_for_user(
 				.useridcount_notification
 				.put((user, id.count.into_unsigned()), Json(notified))
 				.await
-				.expect("database write error");
+				.effect("notification row", pdu.event_id());
 		}
 	}
 
@@ -221,29 +230,28 @@ async fn append_pdu_for_user(
 					.sending
 					.send_pdu_push(pdu_id, user, push_key)
 					.await
-					.log_err(Level::TRACE)
-					.ok();
+					.effect("push notification", pdu.event_id());
 			})
 			.await;
 	}
 }
 
 #[implement(super::Service)]
-async fn increment_notificationcount(&self, room_id: &RoomId, user_id: &UserId) {
+async fn increment_notificationcount(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 	let db = &self.db.userroomid_notificationcount;
 	let key = (room_id.to_owned(), user_id.to_owned());
 	let _lock = self.notification_increment_mutex.lock(&key).await;
 
-	increment(db, (user_id, room_id)).await;
+	increment(db, (user_id, room_id)).await
 }
 
 #[implement(super::Service)]
-async fn increment_highlightcount(&self, room_id: &RoomId, user_id: &UserId) {
+async fn increment_highlightcount(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 	let db = &self.db.userroomid_highlightcount;
 	let key = (room_id.to_owned(), user_id.to_owned());
 	let _lock = self.highlight_increment_mutex.lock(&key).await;
 
-	increment(db, (user_id, room_id)).await;
+	increment(db, (user_id, room_id)).await
 }
 
 #[implement(super::Service)]
@@ -252,12 +260,12 @@ async fn increment_thread_notificationcount(
 	room_id: &RoomId,
 	user_id: &UserId,
 	thread_root: &EventId,
-) {
+) -> Result {
 	let db = &self.db.userroomid_notificationcount;
 	let key = (room_id.to_owned(), user_id.to_owned());
 	let _lock = self.notification_increment_mutex.lock(&key).await;
 
-	increment_thread(db, (user_id, room_id, thread_root)).await;
+	increment_thread(db, (user_id, room_id, thread_root)).await
 }
 
 #[implement(super::Service)]
@@ -266,26 +274,24 @@ async fn increment_thread_highlightcount(
 	room_id: &RoomId,
 	user_id: &UserId,
 	thread_root: &EventId,
-) {
+) -> Result {
 	let db = &self.db.userroomid_highlightcount;
 	let key = (room_id.to_owned(), user_id.to_owned());
 	let _lock = self.highlight_increment_mutex.lock(&key).await;
 
-	increment_thread(db, (user_id, room_id, thread_root)).await;
+	increment_thread(db, (user_id, room_id, thread_root)).await
 }
 
-async fn increment(db: &Arc<Map>, key: (&UserId, &RoomId)) {
+async fn increment(db: &Arc<Map>, key: (&UserId, &RoomId)) -> Result {
 	let old: u64 = db.qry(&key).await.deserialized().unwrap_or(0);
 	let new = old.saturating_add(1);
-	db.put(key, new)
-		.await
-		.expect("database write error");
+
+	db.put(key, new).await
 }
 
-async fn increment_thread(db: &Arc<Map>, key: (&UserId, &RoomId, &EventId)) {
+async fn increment_thread(db: &Arc<Map>, key: (&UserId, &RoomId, &EventId)) -> Result {
 	let old: u64 = db.qry(&key).await.deserialized().unwrap_or(0);
 	let new = old.saturating_add(1);
-	db.put(key, new)
-		.await
-		.expect("database write error");
+
+	db.put(key, new).await
 }
