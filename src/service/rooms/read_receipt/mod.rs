@@ -20,7 +20,7 @@ use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Result, debug,
 	debug::INFO_SPAN_LEVEL,
-	err,
+	err, error,
 	matrix::{
 		Event,
 		pdu::{PduCount, PduId, RawPduId},
@@ -106,6 +106,10 @@ impl Service {
 			return false;
 		}
 
+		// The receipt is stored. Each delivery that follows runs whether or not the
+		// other failed; one that fails is logged, and the receipt stays stored.
+		let event_id = event.content.keys().next();
+
 		self.services
 			.sending
 			.send_edu_room_appservices(room_id, |buf| {
@@ -117,14 +121,22 @@ impl Service {
 				Ok(serde_json::to_writer(buf, &edu)?)
 			})
 			.await
-			.expect("edu serialization or flush failed");
+			.unwrap_or_else(|e| {
+				error!(
+					?event_id,
+					effect = "receipt to appservices",
+					"A receipt effect failed: {e}"
+				);
+			});
 
 		if self.services.globals.user_is_local(user_id) {
 			self.services
 				.sending
 				.flush_room(room_id)
 				.await
-				.expect("room flush failed");
+				.unwrap_or_else(|e| {
+					error!(?event_id, effect = "receipt flush", "A receipt effect failed: {e}");
+				});
 		}
 
 		true

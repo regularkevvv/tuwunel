@@ -20,7 +20,7 @@ use tuwunel_core::{
 		room_version,
 	},
 	smallvec::SmallVec,
-	utils::{self, result::LogErr},
+	utils,
 };
 use tuwunel_database::{Json, Txn};
 
@@ -34,6 +34,31 @@ use crate::rooms::{
 };
 
 type Band<'a> = SmallVec<[&'a EventId; 1]>;
+
+/// The outcome of one effect of a durable pdu, logged when it failed.
+///
+/// A pdu's effects follow the commit that stores it, each on its own: push
+/// counts, notification rows and pushes, membership, the search index,
+/// relations and threads, appservice delivery, and, for a local pdu, the queue
+/// to the room's other servers. One that fails is logged at error level under
+/// its name, with the pdu's event id and never its content, and the rest still
+/// run. The pdu stays sent: its sender is told so, and a retry of the sender's
+/// transaction finds the record and runs nothing again.
+///
+/// So each effect runs at most once per live process. Nothing records an
+/// effect as owed, so one that failed, or one a crash cut short, is not
+/// replayed.
+pub(crate) trait Effect {
+	fn effect(self, name: &'static str, event_id: &EventId);
+}
+
+impl Effect for Result {
+	fn effect(self, name: &'static str, event_id: &EventId) {
+		if let Err(e) = self {
+			error!(%event_id, effect = name, "An effect of a stored event failed: {e}");
+		}
+	}
+}
 
 /// Append the incoming event setting the state snapshot to the state from
 /// the server that sent the event.
@@ -114,7 +139,9 @@ where
 /// that followed the event's, and failed, did the same: the count still
 /// retired, and the stale pointer stayed across restarts.
 ///
-/// Returns pdu id
+/// Returns the pdu id, or an error only when the pdu did not commit. The pdu's
+/// effects follow its commit, and one that fails is logged, not returned
+/// (`Effect`).
 #[implement(super::Service)]
 #[inline]
 pub async fn append_pdu<'a, Leafs>(
@@ -264,34 +291,35 @@ where
 
 	drop(insert_lock);
 
+	// The pdu is durable. Nothing below returns an error: an effect that fails
+	// is logged and the rest still run (`Effect`).
+	let event_id = pdu.event_id();
+
 	// Only local senders can own pushers.
 	if self.services.globals.user_is_local(pdu.sender()) {
 		self.services
 			.sending
 			.refresh_push_badge(pdu.sender())
 			.await
-			.log_err()
-			.ok();
+			.effect("push badge", event_id);
 	}
 
 	self.services
 		.pusher
 		.append_pdu(pdu_id, pdu)
 		.await
-		.log_err()
-		.ok();
+		.effect("push", event_id);
 
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
-		.await?;
+		.await;
 
-	// A recount an earlier event in this room failed to commit is retried
-	// here, before this event goes to the room's servers.
+	// A recount that failed to commit, an earlier event's or this event's own,
+	// is retried here, before this event goes to the room's servers.
 	self.services
 		.state_cache
 		.repair_joined_count(pdu.room_id())
 		.await
-		.log_err()
-		.ok();
+		.effect("joined count repair", event_id);
 
 	drop(next_count);
 
@@ -299,12 +327,14 @@ where
 		.appservice
 		.append_pdu(pdu_id, pdu)
 		.await
-		.log_err()
-		.ok();
+		.effect("appservice delivery", event_id);
 
 	Ok(pdu_id)
 }
 
+/// The effects a durable pdu's type and relations call for.
+///
+/// Each runs whether or not the ones before it failed (`Effect`).
 #[implement(super::Service)]
 async fn append_pdu_effects(
 	&self,
@@ -313,38 +343,31 @@ async fn append_pdu_effects(
 	shortroomid: ShortRoomId,
 	count: PduCount,
 	state_lock: &RoomMutexGuard,
-) -> Result {
+) {
+	let event_id = pdu.event_id();
+
 	match *pdu.kind() {
-		| TimelineEventType::RoomRedaction => {
-			let room_version = self
-				.services
-				.state
-				.get_room_version(pdu.room_id())
-				.await?;
-
-			let room_rules = room_version::rules(&room_version)?;
-
-			let redacts_id = pdu.redacts_id(&room_rules);
-
-			if let Some(redacts_id) = &redacts_id
-				&& self
-					.services
-					.state_accessor
-					.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
-					.await?
-			{
-				self.redact_pdu(redacts_id, pdu, shortroomid, state_lock)
-					.await?;
-			}
-		},
-		| TimelineEventType::RoomMember => self.append_member_effects(pdu, count).await?,
+		| TimelineEventType::RoomRedaction => self
+			.append_redaction_effects(pdu, shortroomid, state_lock)
+			.await
+			.effect("redaction", event_id),
+		| TimelineEventType::RoomMember => self
+			.append_member_effects(pdu, count)
+			.await
+			.effect("membership", event_id),
 		| TimelineEventType::RoomMessage => {
-			let content: ExtractBody = pdu.get_content()?;
-			if let Some(body) = content.body {
+			// A body that is not a string leaves nothing to index.
+			let body = pdu
+				.get_content::<ExtractBody>()
+				.ok()
+				.and_then(|content| content.body);
+
+			if let Some(body) = body {
 				self.services
 					.search
 					.index_pdu(shortroomid, &pdu_id, &body)
-					.await?;
+					.await
+					.effect("search index", event_id);
 
 				if self
 					.services
@@ -354,8 +377,9 @@ async fn append_pdu_effects(
 				{
 					self.services
 						.admin
-						.command(body, Some((pdu.event_id()).into()))
-						.await?;
+						.command(body, Some(event_id.into()))
+						.await
+						.effect("admin command", event_id);
 				}
 			}
 		},
@@ -364,7 +388,8 @@ async fn append_pdu_effects(
 				self.services
 					.search
 					.index_pdu(shortroomid, &pdu_id, &topic)
-					.await?;
+					.await
+					.effect("search index", event_id);
 			},
 		| _ => {},
 	}
@@ -374,7 +399,8 @@ async fn append_pdu_effects(
 		self.services
 			.spaces
 			.cache_evict(pdu.room_id())
-			.await?;
+			.await
+			.effect("space hierarchy cache", event_id);
 	}
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>()
@@ -385,7 +411,8 @@ async fn append_pdu_effects(
 		self.services
 			.pdu_metadata
 			.add_relation(count, related_pducount)
-			.await?;
+			.await
+			.effect("relation", event_id);
 	}
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesTo>() {
@@ -397,14 +424,16 @@ async fn append_pdu_effects(
 					self.services
 						.pdu_metadata
 						.add_relation(count, related_pducount)
-						.await?;
+						.await
+						.effect("relation", event_id);
 				}
 			},
 			| Relation::Thread(thread) => {
 				self.services
 					.threads
 					.add_to_thread(&thread.event_id, pdu_id, pdu)
-					.await?;
+					.await
+					.effect("thread", event_id);
 			},
 			| Relation::Replacement(replacement) => {
 				self.services
@@ -433,6 +462,36 @@ async fn append_pdu_effects(
 			| _ => {}, // TODO: Aggregate other types
 		}
 	}
+}
+
+/// Redacts the event a redaction names, when its sender may redact it.
+#[implement(super::Service)]
+async fn append_redaction_effects(
+	&self,
+	pdu: &PduEvent,
+	shortroomid: ShortRoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let room_version = self
+		.services
+		.state
+		.get_room_version(pdu.room_id())
+		.await?;
+
+	let room_rules = room_version::rules(&room_version)?;
+
+	let redacts_id = pdu.redacts_id(&room_rules);
+
+	if let Some(redacts_id) = &redacts_id
+		&& self
+			.services
+			.state_accessor
+			.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
+			.await?
+	{
+		self.redact_pdu(redacts_id, pdu, shortroomid, state_lock)
+			.await?;
+	}
 
 	Ok(())
 }
@@ -449,7 +508,10 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 	};
 
 	let user_id = UserId::parse(state_key).expect("This state_key was previously validated");
-	let content: RoomMemberEventContent = pdu.get_content()?;
+	// The parse error would quote the content, which the log must not carry.
+	let content: RoomMemberEventContent = pdu
+		.get_content()
+		.map_err(|_| err!("the member event's content does not parse"))?;
 	let is_invite = content.membership == MembershipState::Invite;
 	let is_direct = content.is_direct;
 
