@@ -17,6 +17,9 @@
 //!   even when its X-Matrix signature verifies for the request without a body,
 //!   and the event is never stored. The event handler refuses the same PDUs on
 //!   its own.
+//! - A correctly signed chain rooted in an unavailable auth event is refused
+//!   without storing its descendants as timeline events or outliers. An honest
+//!   join before and after the chain proves the refusal is specific to auth.
 
 use std::{
 	env::temp_dir,
@@ -78,6 +81,9 @@ fn inbound_pdus_are_redacted_on_bad_hashes_and_refused_when_not_canonical() -> R
 		format!("port={port}"),
 		"listening=true".to_owned(),
 		"log=\"warn\"".to_owned(),
+		"dns_attempts=1".to_owned(),
+		"dns_timeout=1".to_owned(),
+		"federation_timeout=2".to_owned(),
 	]);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -171,6 +177,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"redaction keeps the membership"
 	);
 
+	missing_auth_chain_is_refused(services, base, &room_id, &remote).await?;
+
 	// A PDU that is not canonical JSON is refused with its transaction.
 	let oscar = remote_user("oscar")?;
 	let join = signed_join(services, &room_id, &oscar, &remote, "oscar").await?;
@@ -214,6 +222,108 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"a PDU that is not canonical JSON took effect"
 	);
 
+	Ok(())
+}
+
+/// Unlike Complement's fetch-order expectations, this checks the actual
+/// acceptance boundary: missing auth must never become stored room state.
+async fn missing_auth_chain_is_refused(
+	services: &Services,
+	base: &str,
+	room_id: &RoomId,
+	remote: &Remote,
+) -> Result {
+	let missing_user = remote_user("missing-auth-root")?;
+	let missing = signed_join(services, room_id, &missing_user, remote, "not sent").await?;
+	let mut unavailable = event_id(&missing, remote)?;
+	let create = services
+		.state_accessor
+		.room_state_get_id(room_id, &StateEventType::RoomCreate, "")
+		.await?;
+	let before = services
+		.timeline
+		.latest_pdu_in_room(room_id)
+		.await?
+		.event_id;
+
+	for localpart in ["corrupt-chain-c", "corrupt-chain-d", "corrupt-chain-e"] {
+		let user = remote_user(localpart)?;
+		let mut pdu = signed_join(services, room_id, &user, remote, localpart).await?;
+		let Some(CanonicalJsonValue::Array(auth)) = pdu.get_mut("auth_events") else {
+			return Err!("the chain fixture has no auth events");
+		};
+		let required = CanonicalJsonValue::String(create.to_string());
+		let Some(index) = auth.iter().position(|event| *event == required) else {
+			return Err!("the chain fixture omitted its required create event");
+		};
+		auth[index] = CanonicalJsonValue::String(unavailable.to_string());
+		pdu.remove("hashes");
+		pdu.remove("signatures");
+		hash_and_sign_event(
+			remote.name.as_str(),
+			&remote.keypair,
+			&mut pdu,
+			&remote.rules.redaction,
+		)
+		.map_err(|error| err!("the chain fixture could not be signed: {error}"))?;
+		let id = event_id(&pdu, remote)?;
+		let (status, reply) = send_pdus(services, base, remote, &pdu).await?;
+		assert_eq!(status, 200, "the signed transaction was refused: {reply}");
+		assert!(
+			reply["pdus"][id.as_str()]["error"].is_string(),
+			"missing auth was accepted: {reply}"
+		);
+		assert!(
+			services.timeline.get_pdu_json(&id).await.is_err(),
+			"missing-auth descendant was stored"
+		);
+		assert!(
+			services
+				.timeline
+				.get_outlier_pdu_json(&id)
+				.await
+				.is_err(),
+			"missing-auth descendant became an outlier"
+		);
+		assert!(
+			!services
+				.state_cache
+				.is_joined(&user, room_id)
+				.await,
+			"missing-auth descendant changed membership"
+		);
+		assert_eq!(
+			services
+				.timeline
+				.latest_pdu_in_room(room_id)
+				.await?
+				.event_id,
+			before,
+			"missing-auth descendant changed the timeline"
+		);
+		unavailable = id;
+	}
+
+	let user = remote_user("after-corrupt-chain")?;
+	let honest = signed_join(services, room_id, &user, remote, "honest after refusal").await?;
+	let id = event_id(&honest, remote)?;
+	let (status, reply) = send_pdus(services, base, remote, &honest).await?;
+	assert_eq!(status, 200, "the honest control transaction was refused: {reply}");
+	assert!(
+		reply["pdus"][id.as_str()].get("error").is_none(),
+		"honest control join failed: {reply}"
+	);
+	assert!(
+		services
+			.state_cache
+			.is_joined(&user, room_id)
+			.await,
+		"honest control join did not take effect"
+	);
+	assert_eq!(
+		stored_content(services, &id).await?,
+		json!({"membership": "join", "displayname": "honest after refusal"})
+	);
 	Ok(())
 }
 
