@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use futures::{Stream, StreamExt, TryFutureExt, pin_mut};
 use ruma::{OwnedUserId, UserId, api::Direction, events::room::encrypted::Relation};
 use tuwunel_core::{
-	PduId,
+	Error, PduId, Result,
 	arrayvec::ArrayVec,
 	implement,
 	matrix::{Event, Pdu, PduCount, RawPduId},
@@ -271,28 +271,41 @@ pub async fn ignored_thread_view(
 	sender_user: &UserId,
 	ignored: &BTreeSet<OwnedUserId>,
 	root: &Pdu,
-) -> IgnoredThreadView {
-	let Ok(root_id) = self
+) -> Result<IgnoredThreadView> {
+	let root_id = self
 		.services
 		.timeline
 		.get_pdu_id(root.event_id())
 		.await
-	else {
-		return Unchanged;
-	};
+		.map_err(|error| {
+			if error.kind() == ruma::api::error::ErrorKind::NotFound {
+				Error::bad_database("Missing ignored thread root mapping")
+			} else {
+				error
+			}
+		})?;
+	if matches!(root_id.pdu_count(), PduCount::Backfilled(_)) {
+		return Ok(Unchanged);
+	}
 
 	let participants = self
 		.services
 		.threads
 		.get_participants(&root_id)
 		.await
-		.unwrap_or_default();
+		.map_err(|error| {
+			if error.kind() == ruma::api::error::ErrorKind::NotFound {
+				Error::bad_database("Missing ignored thread participants")
+			} else {
+				error
+			}
+		})?;
 
 	if !participants
 		.iter()
 		.any(|user| ignored.contains(user))
 	{
-		return Unchanged;
+		return Ok(Unchanged);
 	}
 
 	let root_pid: PduId = root_id.into();
@@ -304,7 +317,9 @@ pub async fn ignored_thread_view(
 			Direction::Backward,
 			Some(sender_user),
 		)
-		.ready_filter_map(|(_, pdu)| {
+		.await?
+		.into_iter()
+		.filter_map(|(_, pdu)| {
 			pdu.get_content()
 				.is_ok_and(|content: ExtractRelatesTo| {
 					matches!(content.relates_to, Relation::Thread(_))
@@ -319,17 +334,17 @@ pub async fn ignored_thread_view(
 		| false => (total.saturating_add(1), unignored.saturating_add(1), latest.or(Some(pdu))),
 	};
 
-	let (total, unignored, latest) = replies.ready_fold((0, 0, None), fold).await;
+	let (total, unignored, latest) = replies.fold((0, 0, None), fold);
 
 	if total == 0 {
-		return match self.redacted_root(ignored, root).await {
+		return Ok(match self.redacted_root(ignored, root).await {
 			| None => Unchanged,
 			| root => Adjusted { root, count: None, latest: None },
-		};
+		});
 	}
 
 	if unignored == 0 {
-		return Omitted;
+		return Ok(Omitted);
 	}
 
 	let swap = root
@@ -357,10 +372,10 @@ pub async fn ignored_thread_view(
 	let root = self.redacted_root(ignored, root).await;
 
 	if root.is_none() && count.is_none() && latest.is_none() {
-		return Unchanged;
+		return Ok(Unchanged);
 	}
 
-	Adjusted { root, count, latest }
+	Ok(Adjusted { root, count, latest })
 }
 
 /// The spec'd redacted form of an ignored sender's thread root, content side

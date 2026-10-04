@@ -1,5 +1,5 @@
 use axum::extract::State;
-use futures::{FutureExt, StreamExt, TryFutureExt, future::Either, pin_mut};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::Either, pin_mut};
 use ruma::{
 	DeviceId, RoomId, UInt, UserId,
 	api::{
@@ -13,7 +13,7 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Err, PduId, Result, at,
+	Err, Error, PduId, Result, at,
 	matrix::{
 		event::{Event, Matches},
 		pdu::{PduCount, PduEvent},
@@ -23,7 +23,7 @@ use tuwunel_core::{
 	utils::{
 		BoolExt, IterStream, ReadyExt,
 		result::{FlatOk, LogErr},
-		stream::{BroadbandExt, TryIgnore, WidebandExt},
+		stream::{BroadbandExt, TryIgnore, TryWidebandExt},
 	},
 };
 use tuwunel_service::{
@@ -189,20 +189,25 @@ pub(crate) async fn get_messages(
 		.inspect(|(count, _)| scanned = Some(*count))
 		.ready_take_while(|(count, _)| Some(*count) != to)
 		.ready_filter_map(|item| event_filter(item, filter))
-		.wide_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
-		.wide_filter_map(|item| event_filters(services, sender_user, item, bypass_visibility))
+		.map(Ok::<_, Error>)
+		.try_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
+		.try_filter_map(async |item| {
+			Ok(event_filters(services, sender_user, item, bypass_visibility).await)
+		})
 		.take(limit)
-		.wide_then(|item| add_membership_unsigned(services, item, sender_user, encrypted))
-		.wide_then(async |(count, pdu)| {
+		.wide_and_then(async |item| {
+			Ok(add_membership_unsigned(services, item, sender_user, encrypted).await)
+		})
+		.wide_and_then(async |(count, pdu)| {
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
 				.await;
 
-			(count, pdu)
+			Ok((count, pdu))
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	let lazy_loading_context = lazy_loading::Context {
 		user_id: sender_user,
@@ -330,9 +335,9 @@ pub(crate) async fn related_by_filter(
 	shortroomid: ShortRoomId,
 	filter: &RoomEventFilter,
 	item: PdusIterItem,
-) -> Option<PdusIterItem> {
+) -> Result<Option<PdusIterItem>> {
 	if filter.related_by_senders.is_empty() && filter.related_by_rel_types.is_empty() {
-		return Some(item);
+		return Ok(Some(item));
 	}
 
 	let rel_types: RelTypes = filter
@@ -345,11 +350,11 @@ pub(crate) async fn related_by_filter(
 	let (count, _) = &item;
 	let target = PduId { shortroomid, count: *count };
 
-	services
+	Ok(services
 		.pdu_metadata
 		.has_incoming_relation(target, &filter.related_by_senders, &rel_types)
-		.await
-		.then_some(item)
+		.await?
+		.then_some(item))
 }
 
 #[inline]

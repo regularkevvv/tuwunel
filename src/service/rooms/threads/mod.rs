@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, pin::pin, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join3};
 use ruma::{
@@ -20,9 +20,8 @@ use tuwunel_core::{
 	Error, Event, Result, err,
 	matrix::pdu::{PduCount, PduEvent, PduId, RawPduId},
 	utils::{
-		ReadyExt,
 		bytes::u64_from_bytes,
-		stream::{TryIgnore, TryReadyExt, automatic_width},
+		stream::{TryReadyExt, automatic_width},
 	},
 };
 use tuwunel_database::{Map, Txn};
@@ -498,24 +497,23 @@ impl Service {
 		self.db
 			.threadid_userids
 			.raw_keys()
-			.ignore_err()
-			.map(RawPduId::from)
-			.for_each_concurrent(automatic_width(), async |root_id| {
-				self.index_thread_activity(root_id).await;
+			.map(|key| key.and_then(RawPduId::from_bytes))
+			.try_for_each_concurrent(automatic_width(), async |root_id| {
+				self.index_thread_activity(root_id).await
 			})
-			.await;
-
-		Ok(())
+			.await
 	}
 
-	async fn index_thread_activity(&self, root_id: RawPduId) {
+	async fn index_thread_activity(&self, root_id: RawPduId) -> Result {
 		let root: PduId = root_id.into();
 
-		let replies = self
+		let mut replies = self
 			.services
 			.pdu_metadata
 			.get_relations(root.shortroomid, root.count, None, Direction::Backward, None)
-			.ready_filter_map(|(count, pdu)| {
+			.await?
+			.into_iter()
+			.filter_map(|(count, pdu)| {
 				pdu.get_content()
 					.is_ok_and(|content: ExtractThreadRelation| {
 						content.relates_to.rel_type == RelationType::Thread
@@ -523,9 +521,7 @@ impl Service {
 					.then_some(count)
 			});
 
-		let mut replies = pin!(replies);
-
-		let latest = replies.next().await.unwrap_or(root.count);
+		let latest = replies.next().unwrap_or(root.count);
 
 		let activity_id: RawPduId = PduId {
 			shortroomid: root.shortroomid,
@@ -537,7 +533,7 @@ impl Service {
 
 		txn.insert_raw(&self.db.threadactivityid_rootid, activity_id, root_id);
 		txn.insert_raw(&self.db.threadrootid_latestcount, root_id, latest.to_be_bytes());
-		txn.execute().await.expect("database write error");
+		txn.execute().await
 	}
 }
 
