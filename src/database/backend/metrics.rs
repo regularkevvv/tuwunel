@@ -208,27 +208,53 @@ pub(crate) fn dump_on_close() {
 
 #[cfg(test)]
 mod tests {
-	use std::{sync::Arc, thread};
+	use std::{
+		sync::{Arc, Barrier},
+		thread,
+	};
 
 	use super::{OpStat, SNAPSHOT_GATE};
 
 	#[test]
 	fn concurrent_snapshot_cannot_split_a_record() {
 		let stat = Arc::new(OpStat::new());
+		let start = Arc::new(Barrier::new(5));
+		let finish = Arc::new(Barrier::new(5));
 		let workers: Vec<_> = std::iter::repeat_with(|| {
 			let stat = Arc::clone(&stat);
+			let start = Arc::clone(&start);
+			let finish = Arc::clone(&finish);
 			thread::spawn(move || {
-				for _ in 0..10_000 {
-					stat.record(8);
+				for _ in 0..100 {
+					start.wait();
+					for _ in 0..100 {
+						stat.record(8);
+					}
+					finish.wait();
 				}
 			})
 		})
 		.take(4)
 		.collect();
-		let mut snapshots = 0_usize;
-		while workers.iter().any(|worker| !worker.is_finished()) {
-			let _guard = SNAPSHOT_GATE.write().expect("snapshot gate");
-			let value = stat.json();
+		// Each phase races a snapshot with one recording batch. Workers cannot
+		// start the next batch or exit before that snapshot has been collected,
+		// even if the scheduler lets every recorder finish its batch first.
+		let mut snapshots = Vec::with_capacity(100);
+		for _ in 0..100 {
+			start.wait();
+			let value = {
+				let _guard = SNAPSHOT_GATE.write().expect("snapshot gate");
+				stat.json()
+			};
+			snapshots.push(value);
+			finish.wait();
+		}
+		for worker in workers {
+			worker.join().expect("metric recorder");
+		}
+		// Assert after releasing the barriers and joining every recorder, so a
+		// failed consistency check cannot strand workers or poison the gate.
+		for value in &snapshots {
 			let count = value["count"].as_u64().expect("count");
 			assert_eq!(value["bytes"].as_u64(), Some(count * 8));
 			let sum: u64 = value["log2_hist"]
@@ -238,12 +264,15 @@ mod tests {
 				.map(|bucket| bucket.as_u64().expect("bucket"))
 				.sum();
 			assert_eq!(sum, count);
-			snapshots = snapshots.saturating_add(1);
-		}
-		for worker in workers {
-			worker.join().expect("metric recorder");
 		}
 		assert_eq!(stat.json()["count"], 40_000);
-		assert!(snapshots > 0, "concurrent recording was never sampled");
+		assert_eq!(snapshots.len(), 100);
+		assert!(
+			snapshots.iter().any(|value| {
+				let count = value["count"].as_u64().expect("count");
+				count > 0 && count < 40_000
+			}),
+			"in-progress recording was never sampled"
+		);
 	}
 }
