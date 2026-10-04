@@ -73,7 +73,8 @@ fn typed_bundles_refuse_invalid_tails_and_shared_budget_overflow() -> Result {
 				.await
 				.map_err(|_| err!("typed bundle fixture exceeded its deadline"))
 				.and_then(|result| result);
-			outcome.and(server.server.shutdown())
+			let shutdown = server.server.shutdown();
+			outcome.and(shutdown)
 		};
 		let (run, outcome) = tokio::join!(async_run(&server), exercise);
 		drop(services);
