@@ -218,7 +218,7 @@ async fn private_read_premirror(services: &Services, room: &RoomId, user: &UserI
 	services
 		.short
 		.get_or_create_shortroomid(room)
-		.await;
+		.await?;
 
 	let gate = services
 		.read_receipt

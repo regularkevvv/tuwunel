@@ -327,7 +327,7 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 				.services
 				.short
 				.get_or_create_shortstatekey(&new_pdu.kind.to_string().into(), state_key)
-				.await;
+				.await?;
 
 			let new = self
 				.services

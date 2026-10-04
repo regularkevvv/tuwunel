@@ -442,7 +442,7 @@ async fn optional_lookup_budget(context: &Context<'_>) -> Result {
 		let short_key = services
 			.short
 			.get_or_create_shortstatekey(&StateEventType::RoomTopic, &key)
-			.await;
+			.await?;
 		diff.extend_from_slice(&short_key.to_be_bytes());
 		diff.extend_from_slice(&short_event.to_be_bytes());
 	}
@@ -482,7 +482,7 @@ async fn optional_lookup_budget(context: &Context<'_>) -> Result {
 	let duplicate_key = services
 		.short
 		.get_or_create_shortstatekey(&StateEventType::RoomTopic, "permission-duplicate")
-		.await;
+		.await?;
 	services.db["shortstatekey_statekey"]
 		.put(duplicate_key, (&StateEventType::RoomPowerLevels, ""))
 		.await?;

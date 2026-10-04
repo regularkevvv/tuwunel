@@ -476,7 +476,7 @@ async fn dictionary_and_snapshot_budgets(endpoint: &Endpoint<'_>) -> Result {
 		let short_key = services
 			.short
 			.get_or_create_shortstatekey(&StateEventType::RoomTopic, &key)
-			.await;
+			.await?;
 		encoded.extend_from_slice(&short_key.to_be_bytes());
 		encoded.extend_from_slice(&short_event.to_be_bytes());
 	}

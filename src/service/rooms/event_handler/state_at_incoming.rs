@@ -106,7 +106,7 @@ where
 			.services
 			.short
 			.get_or_create_shortstatekey(&prev_event_type, state_key)
-			.await;
+			.await?;
 
 		state.insert(shortstatekey, prev_event.event_id().into());
 		// Now it's the state after the pdu
@@ -214,13 +214,12 @@ where
 			self.services
 				.short
 				.get_or_create_shortstatekey(&event_type, &state_key)
-				.map(move |shortstatekey| (shortstatekey, event_id))
+				.map_ok(move |shortstatekey| (shortstatekey, event_id))
 				.await
 		})
-		.collect::<HashMap<_, _>>()
-		.inspect(|state| trace!(state = state.len(), "Created shortstatekeys."))
-		.map(Some)
-		.map(Ok)
+		.try_collect::<HashMap<_, _>>()
+		.inspect_ok(|state| trace!(state = state.len(), "Created shortstatekeys."))
+		.map_ok(Some)
 		.await
 }
 
@@ -257,16 +256,16 @@ where
 				.services
 				.short
 				.get_or_create_shortstatekey(&event_type, state_key)
-				.await;
+				.await?;
 
-			(shortstatekey, event_id.to_owned())
+			Ok((shortstatekey, event_id.to_owned()))
 		});
 
 	let leaf_state_after_event: Vec<_> = self
 		.services
 		.state_accessor
 		.state_full_ids_strict(sstatehash)
-		.chain(leaf.map(Ok))
+		.chain(leaf)
 		.try_collect()
 		.await
 		.map_err(ForkError::State)?;

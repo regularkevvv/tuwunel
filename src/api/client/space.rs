@@ -6,7 +6,7 @@ use std::{
 
 use axum::extract::State;
 use futures::{
-	StreamExt,
+	StreamExt, TryStreamExt,
 	future::ready,
 	stream::{once, unfold},
 };
@@ -259,6 +259,7 @@ pub(crate) async fn get_client_hierarchy(
 				.iter()
 				.copied()
 				.stream()
+				.map(Ok)
 				.chain(rooms.iter().stream().then(async |chunk| {
 					// `get_or_create_shortroomid` is used (not `get_shortroomid`) because rooms
 					// in a remote hierarchy our server has never touched have no shortroomid
@@ -270,20 +271,23 @@ pub(crate) async fn get_client_hierarchy(
 						.get_or_create_shortroomid(&chunk.summary.room_id)
 						.await
 				}))
-				.collect::<Vec<_>>()
-				.await;
+				.try_collect::<Vec<_>>()
+				.await?;
 
 			// Backstop against pagination loops: only return a token if the skip
 			// set strictly grew. With `get_or_create_shortroomid` above this should
 			// always hold when `rooms.len() >= limit`, but checking is cheap.
-			(next_skip.len() > skip_room_ids.len()).then_some(PaginationToken {
-				suggested_only,
-				short_room_ids: next_skip,
-				limit: limit.try_into().unwrap_or_default(),
-				max_depth: max_depth.try_into().unwrap_or_default(),
-			})
+			Ok::<_, tuwunel_core::Error>((next_skip.len() > skip_room_ids.len()).then_some(
+				PaginationToken {
+					suggested_only,
+					short_room_ids: next_skip,
+					limit: limit.try_into().unwrap_or_default(),
+					max_depth: max_depth.try_into().unwrap_or_default(),
+				},
+			))
 		})
 		.await
+		.transpose()?
 		.flatten()
 		.as_ref()
 		.map(ToString::to_string);
