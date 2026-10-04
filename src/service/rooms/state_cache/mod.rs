@@ -45,6 +45,9 @@ pub struct Service {
 	// share this exclusion. Outer room-state locks may precede it; no code
 	// holding it acquires a room-state lock. Repair obligations live in D1.
 	membership_mutex: MutexMap<OwnedRoomId, ()>,
+	// Fresh for every service graph, including replacement after an older
+	// writer ran. Durable per-room stamps never authorize another process.
+	recount_generation: String,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -129,6 +132,7 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
 			membership_mutex: MutexMap::new(),
+			recount_generation: utils::rand::string(recount::GENERATION_BYTES),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),
@@ -362,16 +366,17 @@ pub fn room_members<'a>(
 		.map(|(_, user_id): (Ignore, &UserId)| user_id)
 }
 
-/// Returns the joined count after completing any durable pending recount.
-/// Membership cannot change between marker inspection, repair and this read.
+/// Returns the joined count after pending repair and first-read reconciliation.
+/// Membership cannot change between inspection, repair and this read.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_joined_count(&self, room_id: &RoomId) -> Result<u64> {
-	let guard = self.membership_mutex.lock(room_id).await;
-	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await?;
-	let count = self.db.roomid_joinedcount.get(room_id).await?;
-	utils::bytes::u64_from_bytes(count.as_ref())
-		.map_err(|_| tuwunel_core::err!(Database("Invalid joined-member count")))
+	Box::pin(self.read_reconciled_count(
+		room_id,
+		&self.db.roomid_joinedcount,
+		"Invalid joined-member count",
+	))
+	.await
 }
 
 /// Returns the invited count after completing any durable pending recount.
@@ -380,11 +385,12 @@ pub async fn room_joined_count(&self, room_id: &RoomId) -> Result<u64> {
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_invited_count(&self, room_id: &RoomId) -> Result<u64> {
-	let guard = self.membership_mutex.lock(room_id).await;
-	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await?;
-	let count = self.db.roomid_invitedcount.get(room_id).await?;
-	utils::bytes::u64_from_bytes(count.as_ref())
-		.map_err(|_| Error::bad_database("Invalid invited-member count"))
+	Box::pin(self.read_reconciled_count(
+		room_id,
+		&self.db.roomid_invitedcount,
+		"Invalid invited-member count",
+	))
+	.await
 }
 
 /// Returns the knocked count after completing any durable pending recount.
@@ -393,11 +399,12 @@ pub async fn room_invited_count(&self, room_id: &RoomId) -> Result<u64> {
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_knocked_count(&self, room_id: &RoomId) -> Result<u64> {
-	let guard = self.membership_mutex.lock(room_id).await;
-	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await?;
-	let count = self.db.roomid_knockedcount.get(room_id).await?;
-	utils::bytes::u64_from_bytes(count.as_ref())
-		.map_err(|_| Error::bad_database("Invalid knocked-member count"))
+	Box::pin(self.read_reconciled_count(
+		room_id,
+		&self.db.roomid_knockedcount,
+		"Invalid knocked-member count",
+	))
+	.await
 }
 
 /// Returns an iterator of all our local joined users in a room who are

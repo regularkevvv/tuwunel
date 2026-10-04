@@ -168,12 +168,15 @@ pub async fn update_joined_count(&self, room_id: &RoomId) -> Result {
 
 /// Holds the membership exclusion through all scans and the aggregate commit.
 #[implement(super::Service)]
-async fn update_joined_count_locked(
+pub(super) async fn update_joined_count_locked(
 	&self,
 	room_id: &RoomId,
 	_guard: &super::MembershipGuard,
 ) -> Result {
 	self.ensure_recount_pending(room_id).await?;
+	// Refuse malformed reconciliation metadata before any aggregate mutation.
+	// A missing or prior-process stamp is normal and will be replaced below.
+	self.recount_is_current(room_id).await?;
 	let inventory = self.prepare_recount_inventory(room_id).await?;
 	let mut joined_servers = inventory.joined_servers;
 	let joinedcount = inventory.joined.to_be_bytes();
@@ -209,6 +212,11 @@ async fn update_joined_count_locked(
 		txn.insert_raw(&self.db.serverroomids, serverroom_id, []);
 	}
 
+	txn.put_raw(
+		&self.services.db["global"],
+		(super::recount::RECOUNT_GENERATION, room_id),
+		self.recount_generation.as_bytes(),
+	);
 	txn.del(&self.services.db["global"], (RECOUNT_PENDING, room_id));
 	txn.execute().await
 }

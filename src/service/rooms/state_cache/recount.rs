@@ -12,6 +12,8 @@ use super::Service;
 
 const MAX_RECOUNT_ROWS: usize = 4096;
 const MAX_RECOUNT_BYTES: usize = 512 * 1024;
+pub(super) const GENERATION_BYTES: usize = 32;
+pub(super) const RECOUNT_GENERATION: &str = "membership_recount_generation_v1";
 
 /// Complete key-presence membership inventories, prepared before any aggregate
 /// or server-index mutation. Values are not projected, matching membership's
@@ -52,6 +54,46 @@ impl RecountBudget {
 }
 
 impl Service {
+	/// A stamp is only a bounded cache hint for this service graph. Missing or
+	/// prior-process stamps require reconciliation; corrupt encodings refuse.
+	pub(super) async fn recount_is_current(&self, room: &RoomId) -> Result<bool> {
+		match self.services.db["global"]
+			.qry(&(RECOUNT_GENERATION, room))
+			.await
+		{
+			| Ok(value)
+				if value.len() == GENERATION_BYTES
+					&& value.iter().all(u8::is_ascii_alphanumeric) =>
+				Ok(value.as_ref() == self.recount_generation.as_bytes()),
+			| Ok(_) => Err(Error::bad_database("Invalid membership recount generation")),
+			| Err(error) if error.is_not_found() => Ok(false),
+			| Err(error) => Err(error),
+		}
+	}
+
+	/// All readers use the same room exclusion as membership and recounts.
+	/// Validate the existing counter before replacing unmarked legacy counts:
+	/// a corrupt/missing counter cannot silently become a healthy zero.
+	pub(super) async fn read_reconciled_count(
+		&self,
+		room: &RoomId,
+		map: &Map,
+		invalid: &'static str,
+	) -> Result<u64> {
+		let guard = self.membership_mutex.lock(room).await;
+		Box::pin(self.repair_joined_count_locked(room, &guard)).await?;
+		let value = map.get(room).await?;
+		let count = tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+			.map_err(|_| Error::bad_database(invalid))?;
+		if self.recount_is_current(room).await? {
+			return Ok(count);
+		}
+		Box::pin(self.update_joined_count_locked(room, &guard)).await?;
+		let value = map.get(room).await?;
+		tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+			.map_err(|_| Error::bad_database(invalid))
+	}
+
 	pub(super) async fn prepare_recount_inventory(
 		&self,
 		room: &RoomId,
