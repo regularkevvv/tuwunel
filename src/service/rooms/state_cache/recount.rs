@@ -77,7 +77,7 @@ impl Service {
 	pub(super) async fn read_reconciled_count(
 		&self,
 		room: &RoomId,
-		map: &Map,
+		map: &std::sync::Arc<Map>,
 		invalid: &'static str,
 	) -> Result<u64> {
 		let guard = self.membership_mutex.lock(room).await;
