@@ -4,7 +4,7 @@ use ruma::{
 	api::error::{ErrorKind, LimitExceededErrorData},
 };
 use tuwunel_core::{Error, Result};
-use tuwunel_database::{Ignore, Interfix};
+use tuwunel_database::{Ignore, Interfix, Map};
 
 use super::Service;
 
@@ -13,7 +13,7 @@ use super::Service;
 pub struct RoomMemberInventoryCount {
 	/// Local members counted, including disabled and guest accounts.
 	pub local_members: usize,
-	/// All joined-member keys examined, including remote members.
+	/// All membership keys examined, including remote members.
 	pub examined: usize,
 	/// User-ID bytes examined; the constant encoded room prefix is excluded.
 	pub user_id_bytes: usize,
@@ -29,13 +29,59 @@ impl Service {
 		row_limit: usize,
 		byte_limit: usize,
 	) -> Result<RoomMemberInventoryCount> {
+		self.bounded_local_membership_count(
+			&self.db.roomuserid_joinedcount,
+			room,
+			row_limit,
+			byte_limit,
+		)
+		.await
+	}
+
+	/// Counts local invitations only after a complete fallible key scan, with
+	/// the same row/byte budgets as joined membership.
+	pub async fn bounded_local_invited_member_count(
+		&self,
+		room: &RoomId,
+		row_limit: usize,
+		byte_limit: usize,
+	) -> Result<RoomMemberInventoryCount> {
+		self.bounded_local_membership_count(
+			&self.db.roomuserid_invitecount,
+			room,
+			row_limit,
+			byte_limit,
+		)
+		.await
+	}
+
+	/// Proves local membership exists, or proves both complete inventories
+	/// empty. Failed or oversized reads never become an empty room.
+	pub async fn has_local_membership_checked(&self, room: &RoomId) -> Result<bool> {
+		let joined = self
+			.bounded_local_member_count(room, 1024, 128 * 1024)
+			.await?;
+		if joined.local_members > 0 {
+			return Ok(true);
+		}
+		let invited = self
+			.bounded_local_invited_member_count(room, 1024, 128 * 1024)
+			.await?;
+		Ok(invited.local_members > 0)
+	}
+
+	async fn bounded_local_membership_count(
+		&self,
+		map: &std::sync::Arc<Map>,
+		room: &RoomId,
+		row_limit: usize,
+		byte_limit: usize,
+	) -> Result<RoomMemberInventoryCount> {
 		let row_limit = row_limit.min(1024);
 		let byte_limit = byte_limit.min(128 * 1024);
 		let prefix = (room, Interfix);
-		let keys = self
-			.db
-			.roomuserid_joinedcount
-			.keys_prefix_capped::<(Ignore, &UserId), _>(&prefix, row_limit.saturating_add(1));
+		let keys =
+			map.keys_prefix_capped::<(Ignore, &UserId), _>(&prefix, row_limit.saturating_add(1));
 		pin_mut!(keys);
 		let mut count = RoomMemberInventoryCount {
 			local_members: 0,

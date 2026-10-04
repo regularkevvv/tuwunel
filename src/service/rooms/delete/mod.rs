@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::{FutureExt, StreamExt};
 use ruma::{OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId};
 use serde::{Deserialize, Serialize};
-use tuwunel_core::{Result, debug, result::LogErr, trace, utils::future::BoolExt, warn};
+use tuwunel_core::{Result, debug, result::LogErr, trace, warn};
 
 use crate::rooms::timeline::RoomMutexGuard;
 
@@ -37,25 +37,21 @@ impl Service {
 			"Caller must checking if delete_rooms_after_leave configured."
 		);
 
-		let has_local_users = self
+		match self
 			.services
 			.state_cache
-			.local_users_in_room(room_id)
-			.boxed()
-			.into_future()
-			.map(|(next, ..)| next.as_ref().is_some());
-
-		let has_local_invites = self
-			.services
-			.state_cache
-			.local_users_invited_to_room(room_id)
-			.boxed()
-			.into_future()
-			.map(|(next, ..)| next.as_ref().is_some());
-
-		if has_local_users.or(has_local_invites).await {
-			trace!(?room_id, "Not deleting with local joined or invited");
-			return;
+			.has_local_membership_checked(room_id)
+			.await
+		{
+			| Ok(true) => {
+				trace!(?room_id, "Not deleting with local joined or invited");
+				return;
+			},
+			| Err(error) => {
+				warn!(%error, "Not deleting room with incomplete membership inventory");
+				return;
+			},
+			| Ok(false) => {},
 		}
 
 		debug!(?room_id, "Preparing to delete room...");

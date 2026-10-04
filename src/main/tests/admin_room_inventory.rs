@@ -41,6 +41,7 @@ fn admin_room_pages_preserve_totals_or_refuse_incomplete_inventories() -> Result
 		"log=\"warn\"".into(),
 		"allow_local_presence=false".into(),
 		"allow_outgoing_presence=false".into(),
+		"delete_rooms_after_leave=true".into(),
 	]);
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -188,9 +189,150 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 			.is_empty()
 	);
 	endpoint.page("empty_rooms=true", 0).await?;
+	empty_deletion_inventory(endpoint, &alpha).await?;
+	complete_empty_deletion(endpoint).await?;
 	corrupt_inputs(endpoint, &alpha).await?;
 	member_budgets(endpoint, &alpha).await?;
 	aggregate_members(endpoint, &[alpha, zeta]).await
+}
+
+async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
+	let services = endpoint.services;
+	let joined = &services.db["roomuserid_joinedcount"];
+	let admin = &services.globals.server_user;
+	let original = joined.qry(&(room, admin)).await?.to_vec();
+	joined.del((room, admin)).await?;
+	assert!(
+		!services
+			.state_cache
+			.has_local_membership_checked(room)
+			.await?
+	);
+	for name in ["roomuserid_joinedcount", "roomuserid_invitecount"] {
+		let members = &services.db[name];
+		members.put((room, "not-a-user"), b"").await?;
+		assert_eq!(
+			services
+				.state_cache
+				.has_local_membership_checked(room)
+				.await
+				.expect_err("corrupt membership cannot prove an empty room")
+				.status_code(),
+			http::StatusCode::INTERNAL_SERVER_ERROR
+		);
+		empty_deletion_preserves_room(services, room).await?;
+		members.del((room, "not-a-user")).await?;
+		for index in 0..1025 {
+			members
+				.put((room, &format!("@guard-{index:04}:remote.test")), b"")
+				.await?;
+		}
+		assert_eq!(
+			services
+				.state_cache
+				.has_local_membership_checked(room)
+				.await
+				.expect_err("incomplete membership cannot prove an empty room")
+				.status_code(),
+			http::StatusCode::TOO_MANY_REQUESTS
+		);
+		empty_deletion_preserves_room(services, room).await?;
+		for index in 0..1025 {
+			members
+				.del((room, &format!("@guard-{index:04}:remote.test")))
+				.await?;
+		}
+		for index in 0..600 {
+			members
+				.put((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))), b"")
+				.await?;
+		}
+		assert_eq!(
+			services
+				.state_cache
+				.has_local_membership_checked(room)
+				.await
+				.expect_err("membership byte overflow cannot prove an empty room")
+				.status_code(),
+			http::StatusCode::TOO_MANY_REQUESTS
+		);
+		empty_deletion_preserves_room(services, room).await?;
+		for index in 0..600 {
+			members
+				.del((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))))
+				.await?;
+		}
+	}
+	let invited = &services.db["roomuserid_invitecount"];
+	invited
+		.put((room, "@disabled:localhost"), b"")
+		.await?;
+	assert!(
+		services
+			.state_cache
+			.has_local_membership_checked(room)
+			.await?
+	);
+	empty_deletion_preserves_room(services, room).await?;
+	invited.del((room, "@disabled:localhost")).await?;
+	joined.put_raw((room, admin), original).await?;
+	assert!(
+		services
+			.state_cache
+			.has_local_membership_checked(room)
+			.await?
+	);
+	Ok(())
+}
+
+async fn complete_empty_deletion(endpoint: &Endpoint<'_>) -> Result {
+	let services = endpoint.services;
+	let room = endpoint.create("Empty deletion").await?;
+	services.db["roomuserid_joinedcount"]
+		.del((&room, &services.globals.server_user))
+		.await?;
+	assert!(
+		!services
+			.state_cache
+			.has_local_membership_checked(&room)
+			.await?
+	);
+	let state_lock = services.state.mutex.lock(&room).await;
+	services
+		.delete
+		.delete_if_empty_local(&room, state_lock)
+		.await;
+	assert!(
+		services.db["roomid_shortroomid"]
+			.get(&room)
+			.await
+			.expect_err("a proved empty room must be deleted")
+			.is_not_found()
+	);
+	assert!(
+		services.db["roomid_shortstatehash"]
+			.get(&room)
+			.await
+			.expect_err("a proved empty room must lose its current state")
+			.is_not_found()
+	);
+	endpoint.page("", 2).await?;
+	Ok(())
+}
+
+async fn empty_deletion_preserves_room(services: &Services, room: &RoomId) -> Result {
+	let rooms = &services.db["roomid_shortroomid"];
+	let states = &services.db["roomid_shortstatehash"];
+	let original_room = rooms.get(room).await?.to_vec();
+	let original_state = states.get(room).await?.to_vec();
+	let state_lock = services.state.mutex.lock(room).await;
+	services
+		.delete
+		.delete_if_empty_local(room, state_lock)
+		.await;
+	assert_eq!(rooms.get(room).await?.to_vec(), original_room);
+	assert_eq!(states.get(room).await?.to_vec(), original_state);
+	Ok(())
 }
 
 async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
