@@ -202,7 +202,7 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 
 async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	let services = endpoint.services;
-	let joined = &services.db["roomuserid_joinedcount"];
+	let joined = &services.db["roomuserid_joined"];
 	let admin = &services.globals.server_user;
 	let original = joined.qry(&(room, admin)).await?.to_vec();
 	joined.del((room, admin)).await?;
@@ -219,7 +219,7 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 			.has_local_membership_checked(room)
 			.await?
 	);
-	for name in ["roomuserid_joinedcount", "roomuserid_invitecount"] {
+	for name in ["roomuserid_joined", "roomuserid_invitecount"] {
 		let members = &services.db[name];
 		members.put((room, "not-a-user"), b"").await?;
 		assert_eq!(
@@ -343,7 +343,7 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 async fn complete_empty_deletion(endpoint: &Endpoint<'_>) -> Result {
 	let services = endpoint.services;
 	let room = endpoint.create("Empty deletion").await?;
-	services.db["roomuserid_joinedcount"]
+	services.db["roomuserid_joined"]
 		.del((&room, &services.globals.server_user))
 		.await?;
 	assert_eq!(
@@ -420,7 +420,7 @@ async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> R
 async fn complete_room_pruning(endpoint: &Endpoint<'_>) -> Result {
 	let services = endpoint.services;
 	let room = endpoint.create("Complete prune").await?;
-	services.db["roomuserid_joinedcount"]
+	services.db["roomuserid_joined"]
 		.del((&room, &services.globals.server_user))
 		.await?;
 	match services
