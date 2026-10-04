@@ -1113,7 +1113,7 @@ async fn fork_resolve(
 	if let Some(event_id) = memo_event_id.filter(|_| walk.mode == WalkMode::Active) {
 		// Strict frontier loads and the polled-chain sentinel make this state
 		// transitively complete for later memo consumers.
-		let compressed: Arc<CompressedState> = self
+		let compressed: Result<Arc<CompressedState>> = self
 			.services
 			.state_compressor
 			.compress_state_events(
@@ -1123,7 +1123,11 @@ async fn fork_resolve(
 			)
 			.try_collect()
 			.map_ok(Arc::new)
-			.await?;
+			.await;
+		let Ok(compressed) = compressed else {
+			walk.fallback = Some(Fallback::Unevaluable);
+			return None;
+		};
 
 		self.cache_resolved_state(walk.room_id, event_id, compressed)
 			.await;

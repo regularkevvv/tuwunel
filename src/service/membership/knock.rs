@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, collections::HashMap, iter::once, sync::Arc};
 
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedEventId, OwnedServerName, RoomId,
 	RoomOrAliasId, RoomVersionId, UserId,
