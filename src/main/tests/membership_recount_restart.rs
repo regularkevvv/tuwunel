@@ -117,7 +117,9 @@ async fn seed(services: &Services) -> Result {
 				.await
 				.expect_err("aggregate commit is refused");
 		} else if name == "rejected" {
-			refusal::refuse_next("global");
+			// The global map also carries unrelated counters and startup writes.
+			// Target the joined index in the same atomic membership/marker batch.
+			refusal::refuse_next("roomuserid_joined");
 			membership(services, &room, false)
 				.await
 				.expect_err("membership and marker commit is refused");
