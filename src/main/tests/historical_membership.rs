@@ -326,11 +326,15 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let key = short_event.to_be_bytes();
 	let map = &services.db["shorteventid_shortstatehash"];
 	let saved = map.get(&key).await?.to_vec();
-	for missing in [true, false] {
-		if missing {
-			map.remove(&key).await?;
+	let mut trailing = saved.clone();
+	trailing.push(0);
+	let mut separator = saved.clone();
+	separator.push(0xFF);
+	for invalid in [None, Some(vec![b'{']), Some(trailing), Some(separator)] {
+		if let Some(invalid) = invalid {
+			map.raw_put(&key, &invalid).await?;
 		} else {
-			map.raw_put(&key, b"{").await?;
+			map.remove(&key).await?;
 		}
 		services.clear_cache().await;
 		fixture
@@ -344,11 +348,15 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let count_map = &services.db["roomuserid_leftcount"];
 	let count_key = (&fixture.room, &peer);
 	let saved = count_map.qry(&count_key).await?.to_vec();
-	for missing in [true, false] {
-		if missing {
-			count_map.del(&count_key).await?;
+	let mut trailing = saved.clone();
+	trailing.push(0);
+	let mut separator = saved.clone();
+	separator.push(0xFF);
+	for invalid in [None, Some(vec![b'{']), Some(trailing), Some(separator)] {
+		if let Some(invalid) = invalid {
+			count_map.put_raw(&count_key, &invalid).await?;
 		} else {
-			count_map.put_raw(&count_key, b"{").await?;
+			count_map.del(&count_key).await?;
 		}
 		services.clear_cache().await;
 		fixture
@@ -357,6 +365,28 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		count_map.put_raw(&count_key, &saved).await?;
 		services.clear_cache().await;
 		fixture.departed().await?;
+	}
+
+	// The room/event compact IDs also require an exact numeric value. A valid
+	// prefix followed by extra bytes or a separator cannot panic or select data.
+	for (map_name, key) in [
+		("roomid_shortroomid", fixture.room.as_bytes()),
+		("eventid_shorteventid", marker.as_bytes()),
+	] {
+		let map = &services.db[map_name];
+		let saved = map.get(key).await?.to_vec();
+		for suffix in [0_u8, 0xFF] {
+			let mut invalid = saved.clone();
+			invalid.push(suffix);
+			map.raw_put(key, &invalid).await?;
+			services.clear_cache().await;
+			fixture
+				.members(OWNER, Some(&at), http::StatusCode::INTERNAL_SERVER_ERROR)
+				.await?;
+			map.raw_put(key, &saved).await?;
+			services.clear_cache().await;
+			fixture.historical(&at).await?;
+		}
 	}
 
 	// A valid state value stored under a foreign room cannot be served as a

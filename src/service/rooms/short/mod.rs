@@ -126,11 +126,9 @@ async fn create_shorteventid(&self, event_id: &EventId) -> ShortEventId {
 
 #[implement(Service)]
 pub async fn get_shorteventid(&self, event_id: &EventId) -> Result<ShortEventId> {
-	self.db
-		.eventid_shorteventid
-		.get(event_id)
-		.await
-		.deserialized()
+	let value = self.db.eventid_shorteventid.get(event_id).await?;
+	utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| err!(Database("Invalid compact event ID")))
 }
 
 #[implement(Service)]
@@ -323,11 +321,9 @@ pub async fn get_shortstatehash(&self, state_hash: &Digest) -> Result<ShortState
 
 #[implement(Service)]
 pub async fn get_shortroomid(&self, room_id: &RoomId) -> Result<ShortRoomId> {
-	self.db
-		.roomid_shortroomid
-		.get(room_id)
-		.await
-		.deserialized()
+	let value = self.db.roomid_shortroomid.get(room_id).await?;
+	utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| err!(Database("Invalid compact room ID")))
 }
 
 #[implement(Service)]

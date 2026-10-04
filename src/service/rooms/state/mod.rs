@@ -670,12 +670,13 @@ pub async fn pdu_shortstatehash(&self, event_id: &EventId) -> Result<ShortStateH
 )]
 pub async fn get_shortstatehash(&self, shorteventid: ShortEventId) -> Result<ShortStateHash> {
 	const BUFSIZE: usize = size_of::<ShortEventId>();
-
-	self.db
+	let value = self
+		.db
 		.shorteventid_shortstatehash
 		.aqry::<BUFSIZE, _>(&shorteventid)
-		.await
-		.deserialized()
+		.await?;
+	tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid historical state hash"))
 }
 
 #[implement(Service)]

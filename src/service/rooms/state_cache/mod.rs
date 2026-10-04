@@ -21,7 +21,7 @@ use ruma::{
 };
 use serde::de::DeserializeOwned;
 use tuwunel_core::{
-	Result, debug_warn, implement,
+	Error, Result, debug_warn, implement,
 	matrix::{Event, Pdu, event::Owned},
 	trace,
 	utils::{
@@ -494,11 +494,9 @@ pub async fn get_knock_count(&self, room_id: &RoomId, user_id: &UserId) -> Resul
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn get_left_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
 	let key = (room_id, user_id);
-	self.db
-		.roomuserid_leftcount
-		.qry(&key)
-		.await
-		.deserialized()
+	let value = self.db.roomuserid_leftcount.qry(&key).await?;
+	utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid departure count"))
 }
 
 #[implement(Service)]
