@@ -13,7 +13,7 @@ use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result, err, http,
 	matrix::Event,
-	ruma::{OwnedEventId, OwnedRoomId, UserId, events::StateEventType},
+	ruma::{EventId, OwnedEventId, OwnedRoomId, UserId, events::StateEventType},
 };
 use tuwunel_service::Services;
 
@@ -166,15 +166,6 @@ impl Fixture<'_> {
 		Ok(body)
 	}
 
-	fn member<'a>(&self, body: &'a Value, user: &UserId) -> &'a Value {
-		body["chunk"]
-			.as_array()
-			.expect("complete member chunk")
-			.iter()
-			.find(|event| event["state_key"] == user.as_str())
-			.expect("expected member")
-	}
-
 	async fn historical(&self, at: &str) -> Result {
 		for token in [OWNER, PEER] {
 			let body = self
@@ -187,8 +178,8 @@ impl Fixture<'_> {
 					.len(),
 				2
 			);
-			assert_eq!(self.member(&body, self.peer)["content"]["displayname"], "before");
-			assert_eq!(self.member(&body, self.peer)["content"]["membership"], "join");
+			assert_eq!(member(&body, self.peer)["content"]["displayname"], "before");
+			assert_eq!(member(&body, self.peer)["content"]["membership"], "join");
 		}
 		Ok(())
 	}
@@ -204,10 +195,19 @@ impl Fixture<'_> {
 				.len(),
 			2
 		);
-		assert_eq!(self.member(&body, self.peer)["content"]["membership"], "leave");
-		assert_eq!(self.member(&body, self.peer)["content"]["displayname"], "after");
+		assert_eq!(member(&body, self.peer)["content"]["membership"], "leave");
+		assert_eq!(member(&body, self.peer)["content"]["displayname"], "after");
 		Ok(())
 	}
+}
+
+fn member<'a>(body: &'a Value, user: &UserId) -> &'a Value {
+	body["chunk"]
+		.as_array()
+		.expect("complete member chunk")
+		.iter()
+		.find(|event| event["state_key"] == user.as_str())
+		.expect("expected member")
 }
 
 async fn exercise(services: &Services, base: &str) -> Result {
@@ -242,27 +242,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.to_string();
 	fixture.historical(&at).await?;
 
-	// Use a real prev_batch token produced by sync, rather than only a count
-	// obtained directly from storage. With limit one, the boundary is our
-	// final message and does not alter membership state.
-	let filter = json!({"room":{"rooms":[fixture.room],"timeline":{"limit":1}}});
-	let sync: Value = services
-		.client
-		.clients
-		.default
-		.get(fixture.client.url("sync"))
-		.bearer_auth(OWNER)
-		.query(&[("timeout", "0"), ("filter", &filter.to_string())])
-		.send()
-		.await?
-		.error_for_status()?
-		.json()
-		.await?;
-	let prev = sync["rooms"]["join"][fixture.room.as_str()]["timeline"]["prev_batch"]
-		.as_str()
-		.expect("actual sync prev_batch")
-		.to_owned();
-	fixture.historical(&prev).await?;
+	sync_boundary(&fixture).await?;
 
 	fixture.profile("after").await?;
 	fixture
@@ -284,8 +264,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 			.len(),
 		2
 	);
-	assert_eq!(fixture.member(&departed_at, &peer)["content"]["membership"], "leave");
-	assert_eq!(fixture.member(&departed_at, &peer)["content"]["displayname"], "after");
+	assert_eq!(member(&departed_at, &peer)["content"]["membership"], "leave");
+	assert_eq!(member(&departed_at, &peer)["content"]["displayname"], "after");
 	fixture
 		.post(&format!("join/{}", fixture.room), LATE, &json!({}))
 		.await?;
@@ -310,7 +290,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 			.len(),
 		3
 	);
-	assert_eq!(fixture.member(&current, &late)["content"]["membership"], "join");
+	assert_eq!(member(&current, &late)["content"]["membership"], "join");
 
 	for token in ["not-a-token", "9223372036854775808", "-9223372036854775809"] {
 		fixture
@@ -321,92 +301,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.members(OWNER, Some("0"), http::StatusCode::NOT_FOUND)
 		.await?;
 
-	// Damaged per-event snapshots must never select current state instead.
-	let short_event = services.short.get_shorteventid(&marker).await?;
-	let key = short_event.to_be_bytes();
-	let map = &services.db["shorteventid_shortstatehash"];
-	let saved = map.get(&key).await?.to_vec();
-	let mut trailing = saved.clone();
-	trailing.push(0);
-	let mut separator = saved.clone();
-	separator.push(0xFF);
-	for invalid in [None, Some(vec![b'{']), Some(trailing), Some(separator)] {
-		if let Some(invalid) = invalid {
-			map.raw_put(&key, &invalid).await?;
-		} else {
-			map.remove(&key).await?;
-		}
-		services.clear_cache().await;
-		fixture
-			.members(OWNER, Some(&at), http::StatusCode::INTERNAL_SERVER_ERROR)
-			.await?;
-		map.raw_put(&key, &saved).await?;
-		services.clear_cache().await;
-		fixture.historical(&at).await?;
-	}
-
-	let count_map = &services.db["roomuserid_leftcount"];
-	let count_key = (&fixture.room, &peer);
-	let saved = count_map.qry(&count_key).await?.to_vec();
-	let mut trailing = saved.clone();
-	trailing.push(0);
-	let mut separator = saved.clone();
-	separator.push(0xFF);
-	for invalid in [None, Some(vec![b'{']), Some(trailing), Some(separator)] {
-		if let Some(invalid) = invalid {
-			count_map.put_raw(&count_key, &invalid).await?;
-		} else {
-			count_map.del(&count_key).await?;
-		}
-		services.clear_cache().await;
-		fixture
-			.members(PEER, None, http::StatusCode::INTERNAL_SERVER_ERROR)
-			.await?;
-		count_map.put_raw(&count_key, &saved).await?;
-		services.clear_cache().await;
-		fixture.departed().await?;
-	}
-
-	// The room/event compact IDs also require an exact numeric value. A valid
-	// prefix followed by extra bytes or a separator cannot panic or select data.
-	for (map_name, key) in [
-		("roomid_shortroomid", fixture.room.as_bytes()),
-		("eventid_shorteventid", marker.as_bytes()),
-	] {
-		let map = &services.db[map_name];
-		let saved = map.get(key).await?.to_vec();
-		for suffix in [0_u8, 0xFF] {
-			let mut invalid = saved.clone();
-			invalid.push(suffix);
-			map.raw_put(key, &invalid).await?;
-			services.clear_cache().await;
-			fixture
-				.members(OWNER, Some(&at), http::StatusCode::INTERNAL_SERVER_ERROR)
-				.await?;
-			map.raw_put(key, &saved).await?;
-			services.clear_cache().await;
-			fixture.historical(&at).await?;
-		}
-	}
-
-	// A valid state value stored under a foreign room cannot be served as a
-	// historical boundary merely because its count fits the request.
-	let marker_id = services.timeline.get_pdu_id(&marker).await?;
-	let event_map = &services.db["pduid_pdu"];
-	let saved = event_map.get(&marker_id).await?.to_vec();
-	let mut corrupted: Value = serde_json::from_slice(&saved)?;
-	corrupted["room_id"] = json!("!foreign-historical-boundary:localhost");
-	event_map
-		.raw_put(&marker_id, serde_json::to_vec(&corrupted)?)
-		.await?;
-	services.clear_cache().await;
-	fixture
-		.members(OWNER, Some(&at), http::StatusCode::INTERNAL_SERVER_ERROR)
-		.await?;
-	event_map.raw_put(&marker_id, &saved).await?;
-	services.clear_cache().await;
-	fixture.historical(&at).await?;
-	fixture.departed().await?;
+	record_failures(&fixture, &marker, &at).await?;
 
 	// A later history-policy change does not move the former user's default
 	// snapshot into the present.
@@ -458,6 +353,126 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	Ok(())
 }
 
+async fn sync_boundary(fixture: &Fixture<'_>) -> Result {
+	let services = fixture.client.services;
+	// Use a real prev_batch token produced by sync, rather than only a count
+	// obtained directly from storage. With limit one, the boundary is our
+	// final message and does not alter membership state.
+	let filter = json!({"room":{"rooms":[fixture.room],"timeline":{"limit":1}}});
+	let sync: Value = services
+		.client
+		.clients
+		.default
+		.get(fixture.client.url("sync"))
+		.bearer_auth(OWNER)
+		.query(&[("timeout", "0"), ("filter", &filter.to_string())])
+		.send()
+		.await?
+		.error_for_status()?
+		.json()
+		.await?;
+	let prev = sync["rooms"]["join"][fixture.room.as_str()]["timeline"]["prev_batch"]
+		.as_str()
+		.expect("actual sync prev_batch")
+		.to_owned();
+	fixture.historical(&prev).await?;
+
+	Ok(())
+}
+
+async fn record_failures(fixture: &Fixture<'_>, marker: &EventId, at: &str) -> Result {
+	let services = fixture.client.services;
+	let peer = fixture.peer;
+	// Damaged per-event snapshots must never select current state instead.
+	let short_event = services.short.get_shorteventid(marker).await?;
+	let key = short_event.to_be_bytes();
+	let map = &services.db["shorteventid_shortstatehash"];
+	let saved = map.get(&key).await?.to_vec();
+	let mut trailing = saved.clone();
+	trailing.push(0);
+	let mut separator = saved.clone();
+	separator.push(0xFF);
+	for invalid in [None, Some(vec![b'{']), Some(trailing), Some(separator)] {
+		if let Some(invalid) = invalid {
+			map.raw_put(&key, &invalid).await?;
+		} else {
+			map.remove(&key).await?;
+		}
+		services.clear_cache().await;
+		fixture
+			.members(OWNER, Some(at), http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
+		map.raw_put(&key, &saved).await?;
+		services.clear_cache().await;
+		fixture.historical(at).await?;
+	}
+
+	let count_map = &services.db["roomuserid_leftcount"];
+	let count_key = (&fixture.room, peer);
+	let saved = count_map.qry(&count_key).await?.to_vec();
+	let mut trailing = saved.clone();
+	trailing.push(0);
+	let mut separator = saved.clone();
+	separator.push(0xFF);
+	for invalid in [None, Some(vec![b'{']), Some(trailing), Some(separator)] {
+		if let Some(invalid) = invalid {
+			count_map.put_raw(&count_key, &invalid).await?;
+		} else {
+			count_map.del(&count_key).await?;
+		}
+		services.clear_cache().await;
+		fixture
+			.members(PEER, None, http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
+		count_map.put_raw(&count_key, &saved).await?;
+		services.clear_cache().await;
+		fixture.departed().await?;
+	}
+
+	// The room/event compact IDs also require an exact numeric value. A valid
+	// prefix followed by extra bytes or a separator cannot panic or select data.
+	for (map_name, key) in [
+		("roomid_shortroomid", fixture.room.as_bytes()),
+		("eventid_shorteventid", marker.as_bytes()),
+	] {
+		let map = &services.db[map_name];
+		let saved = map.get(key).await?.to_vec();
+		for suffix in [0_u8, 0xFF] {
+			let mut invalid = saved.clone();
+			invalid.push(suffix);
+			map.raw_put(key, &invalid).await?;
+			services.clear_cache().await;
+			fixture
+				.members(OWNER, Some(at), http::StatusCode::INTERNAL_SERVER_ERROR)
+				.await?;
+			map.raw_put(key, &saved).await?;
+			services.clear_cache().await;
+			fixture.historical(at).await?;
+		}
+	}
+
+	// A valid state value stored under a foreign room cannot be served as a
+	// historical boundary merely because its count fits the request.
+	let marker_id = services.timeline.get_pdu_id(marker).await?;
+	let event_map = &services.db["pduid_pdu"];
+	let saved = event_map.get(&marker_id).await?.to_vec();
+	let mut corrupted: Value = serde_json::from_slice(&saved)?;
+	corrupted["room_id"] = json!("!foreign-historical-boundary:localhost");
+	event_map
+		.raw_put(&marker_id, serde_json::to_vec(&corrupted)?)
+		.await?;
+	services.clear_cache().await;
+	fixture
+		.members(OWNER, Some(at), http::StatusCode::INTERNAL_SERVER_ERROR)
+		.await?;
+	event_map.raw_put(&marker_id, &saved).await?;
+	services.clear_cache().await;
+	fixture.historical(at).await?;
+	fixture.departed().await?;
+
+	Ok(())
+}
+
 async fn invitation_history(context: &Fixture<'_>) -> Result {
 	let services = context.client.services;
 	let client = Client {
@@ -506,7 +521,7 @@ async fn invitation_history(context: &Fixture<'_>) -> Result {
 			.len(),
 		2
 	);
-	assert_eq!(fixture.member(&members, fixture.peer)["content"]["membership"], "invite");
+	assert_eq!(member(&members, fixture.peer)["content"]["membership"], "invite");
 	fixture
 		.post(&format!("join/{}", fixture.room), PEER, &json!({}))
 		.await?;
