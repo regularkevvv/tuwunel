@@ -23,7 +23,6 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Error, Result, err, info,
-	matrix::Event,
 	utils::{
 		TryFutureExtExt,
 		math::Expected,
