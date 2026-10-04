@@ -85,7 +85,7 @@ pub(crate) async fn get_threads_route(
 					services
 						.pdu_metadata
 						.ignored_thread_view(sender_user, &ignored, &pdu)
-						.await,
+						.await?,
 			};
 
 			Ok(match view {

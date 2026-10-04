@@ -1,11 +1,7 @@
-use std::iter::once;
+use std::collections::{HashSet, VecDeque};
 
 use axum::extract::State;
-use futures::{
-	FutureExt, StreamExt, TryFutureExt,
-	future::try_join3,
-	stream::{select_all, unfold},
-};
+use futures::{FutureExt, future::try_join3};
 use ruma::{
 	EventId, RoomId, UInt, UserId,
 	api::{
@@ -14,6 +10,7 @@ use ruma::{
 			get_relating_events, get_relating_events_with_rel_type,
 			get_relating_events_with_rel_type_and_event_type,
 		},
+		error::{ErrorKind, LimitExceededErrorData},
 	},
 	events::{TimelineEventType, relation::RelationType},
 };
@@ -21,15 +18,11 @@ use tuwunel_core::{
 	Err, Error, Result, at, err,
 	matrix::{
 		event::{Event, RelationTypeEqual},
-		pdu::{PduCount, PduId},
+		pdu::{PduCount, PduEvent, PduId},
 	},
-	utils::{
-		BoolExt,
-		result::FlatOk,
-		stream::{ReadyExt, WidebandExt},
-	},
+	utils::{BoolExt, json::serialized_len, result::FlatOk},
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, rooms::pdu_metadata::RelationReadBudget};
 
 use crate::{Ruma, client::is_ignored_pdu};
 
@@ -130,7 +123,7 @@ async fn paginate_relations_with_filter(
 ) -> Result<get_relating_events::v1::Response> {
 	let from: Option<PduCount> = from.map(str::parse).transpose()?;
 
-	let to: Option<PduCount> = to.map(str::parse).flat_ok();
+	let to: Option<PduCount> = to.map(str::parse).transpose()?;
 
 	// Spec (v1.10) recommends depth of at least 3
 	let max_depth: usize = if recurse { 3 } else { 0 };
@@ -146,8 +139,11 @@ async fn paginate_relations_with_filter(
 	let target = services
 		.timeline
 		.get_pdu_id(target)
-		.map_ok(PduId::from)
-		.map_ok(Ok::<_, Error>);
+		.map(|result| match result {
+			| Ok(id) => Ok(Some(PduId::from(id))),
+			| Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+			| Err(error) => Err(error),
+		});
 
 	let visible = services
 		.state_accessor
@@ -162,7 +158,7 @@ async fn paginate_relations_with_filter(
 
 	let (shortroomid, target, ()) = try_join3(shortroomid, target, visible).await?;
 
-	let Ok(target) = target else {
+	let Some(target) = target else {
 		return Ok(get_relating_events::v1::Response::new(Vec::new()));
 	};
 
@@ -174,9 +170,11 @@ async fn paginate_relations_with_filter(
 		return Ok(get_relating_events::v1::Response::new(Vec::new()));
 	}
 
-	if let Ok(target_pdu) = services.timeline.get_pdu(target_event_id).await
-		&& is_ignored_pdu(services, &target_pdu, sender_user).await
-	{
+	let target_pdu = services.timeline.get_pdu(target_event_id).await?;
+	if target_pdu.room_id() != room_id || target_pdu.event_id() != target_event_id {
+		return Err(Error::bad_database("Mismatched relation parent event"));
+	}
+	if is_ignored_pdu(services, &target_pdu, sender_user).await {
 		return Err!(HttpJson(NOT_FOUND, {
 			"errcode": "M_SENDER_IGNORED",
 			"error": "You have ignored the user that sent this event",
@@ -184,53 +182,22 @@ async fn paginate_relations_with_filter(
 		}));
 	}
 
-	let fetch = |depth: usize, count: PduCount| {
-		services
-			.pdu_metadata
-			.get_relations(shortroomid, count, from, dir, Some(sender_user))
-			.map(move |(count, pdu)| (depth, count, pdu))
-			.ready_filter(|(_, count, _)| matches!(count, PduCount::Normal(_)))
-			.boxed()
-	};
-
-	let events = unfold(select_all(once(fetch(0, target.count))), async |mut relations| {
-		let (depth, count, pdu) = relations.next().await?;
-
-		if depth < max_depth {
-			relations.push(fetch(depth.saturating_add(1), count));
-		}
-
-		Some(((depth, count, pdu), relations))
-	})
-	.ready_take_while(|&(_, count, _)| Some(count) != to)
-	.ready_filter(|(_, _, pdu)| {
-		filter_event_type
-			.as_ref()
-			.is_none_or(|kind| kind == pdu.kind())
-	})
-	.ready_filter(|(_, _, pdu)| {
-		filter_rel_type
-			.as_ref()
-			.is_none_or(|rel_type| rel_type.relation_type_equal(pdu))
-	})
-	.wide_filter_map(async |(depth, count, pdu)| {
-		services
-			.state_accessor
-			.user_can_see_event(sender_user, pdu.room_id(), pdu.event_id())
-			.await
-			.then_some((depth, count, pdu))
-	})
-	.take(limit)
-	.wide_then(async |(depth, count, pdu)| {
-		let pdu = services
-			.pdu_metadata
-			.bundle_aggregations(sender_user, pdu)
-			.await;
-
-		(depth, count, pdu)
-	})
-	.collect::<Vec<_>>()
-	.await;
+	let events = collect_relations(
+		RelationQuery {
+			services,
+			sender_user,
+			shortroomid,
+			from,
+			to,
+			dir,
+			limit,
+			max_depth,
+			filter_event_type: filter_event_type.as_ref(),
+			filter_rel_type: filter_rel_type.as_ref(),
+		},
+		target.count,
+	)
+	.await?;
 
 	Ok(get_relating_events::v1::Response {
 		recursion_depth: max_depth
@@ -261,4 +228,94 @@ async fn paginate_relations_with_filter(
 			.map(Event::into_format)
 			.collect(),
 	})
+}
+
+struct RelationQuery<'a> {
+	services: &'a Services,
+	sender_user: &'a UserId,
+	shortroomid: u64,
+	from: Option<PduCount>,
+	to: Option<PduCount>,
+	dir: Direction,
+	limit: usize,
+	max_depth: usize,
+	filter_event_type: Option<&'a TimelineEventType>,
+	filter_rel_type: Option<&'a RelationType>,
+}
+
+async fn collect_relations(
+	query: RelationQuery<'_>,
+	target: PduCount,
+) -> Result<Vec<(usize, PduCount, PduEvent)>> {
+	let mut budget = RelationReadBudget::default();
+	let mut queue = VecDeque::from([(0_usize, target)]);
+	let mut visited = HashSet::from([target]);
+	let mut examined = Vec::new();
+	while let Some((depth, parent)) = queue.pop_front() {
+		let children = query
+			.services
+			.pdu_metadata
+			.get_relations_bounded(
+				query.shortroomid,
+				parent,
+				query.from,
+				query.dir,
+				Some(query.sender_user),
+				&mut budget,
+			)
+			.await?;
+		for (count, pdu) in children {
+			if !visited.insert(count) {
+				continue;
+			}
+			if depth < query.max_depth {
+				queue.push_back((depth.saturating_add(1), count));
+			}
+			examined.push((depth, count, pdu));
+		}
+	}
+	// Order every recursion level together before taking the requested page.
+	examined.sort_by_key(|(_, count, _)| *count);
+	if query.dir == Direction::Backward {
+		examined.reverse();
+	}
+	let mut events = Vec::new();
+	let mut bytes = 64_usize;
+	for (depth, count, pdu) in examined {
+		if Some(count) == query.to || events.len() == query.limit {
+			break;
+		}
+		if !query
+			.filter_event_type
+			.is_none_or(|kind| kind == pdu.kind())
+			|| !query
+				.filter_rel_type
+				.is_none_or(|kind| kind.relation_type_equal(&pdu))
+			|| !query
+				.services
+				.state_accessor
+				.user_can_see_event(query.sender_user, pdu.room_id(), pdu.event_id())
+				.await
+		{
+			continue;
+		}
+		let pdu = query
+			.services
+			.pdu_metadata
+			.bundle_aggregations(query.sender_user, pdu)
+			.await;
+		bytes = bytes.saturating_add(1).saturating_add(
+			serialized_len(pdu.as_pdu())
+				.map_err(|_| Error::bad_database("Invalid relation response event"))?,
+		);
+		if bytes > 256 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Relation response byte limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		events.push((depth, count, pdu));
+	}
+	Ok(events)
 }
