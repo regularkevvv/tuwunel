@@ -48,17 +48,16 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> R
 				.await?;
 		}
 	}
-	if self.services.server.config.bundle_edit_relations {
-		if let Some(mut replacement) = self.newest_replacement(&pdu, &mut budget).await?
-			&& !self
-				.services
-				.state_accessor
-				.erased_for(sender_user, &replacement)
-				.await
-		{
-			replacement.remove_transaction_id_unless_sender(Some(sender_user));
-			pdu.set_replacement_bundle(&replacement.into_format())?;
-		}
+	if self.services.server.config.bundle_edit_relations
+		&& let Some(mut replacement) = self.newest_replacement(&pdu, &mut budget).await?
+		&& !self
+			.services
+			.state_accessor
+			.erased_for(sender_user, &replacement)
+			.await
+	{
+		replacement.remove_transaction_id_unless_sender(Some(sender_user));
+		pdu.set_replacement_bundle(&replacement.into_format())?;
 	}
 	if self
 		.services
