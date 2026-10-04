@@ -8,7 +8,7 @@ mod via;
 use std::{
 	collections::{HashMap, HashSet},
 	convert::identity,
-	sync::{Arc, Mutex, RwLock},
+	sync::{Arc, RwLock},
 };
 
 use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
@@ -38,9 +38,6 @@ use crate::appservice::RegistrationInfo;
 
 pub struct Service {
 	appservice_in_room_cache: AppServiceInRoomCache,
-	/// Rooms whose last recount failed to commit; the room's next event
-	/// recounts it ([`Service::repair_joined_count`]).
-	stale_counts: Mutex<HashSet<OwnedRoomId>>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -123,7 +120,6 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
-			stale_counts: Mutex::new(HashSet::new()),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),

@@ -15,11 +15,13 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Result, implement, is_not_empty,
+	Error, Result, implement, is_not_empty,
 	matrix::PduCount,
 	utils::{ReadyExt, result::LogErr},
 };
 use tuwunel_database::{Json, Txn, serialize_key, serialize_val};
+
+const RECOUNT_PENDING: &str = "membership_recount_pending";
 
 /// Optional stripped room state attached to invite and knock transitions.
 pub type StrippedRoomState = Option<Vec<Raw<AnyStrippedStateEvent>>>;
@@ -153,17 +155,18 @@ pub async fn update_membership(
 /// the servers in it.
 ///
 /// They derive from the membership indexes and are recomputed whole, so any
-/// later recount of the room repairs a failed one. A failed recount also marks
-/// the room, and the room's next event recounts it
-/// ([`Self::repair_joined_count`]). The servers an event goes to then need not
-/// wait for the room's next membership change. The mark is process-local, so
-/// after a restart the room's next membership change is what recounts it.
+/// later recount of the room repairs a failed one. Every membership commit
+/// leaves a durable pending marker; this aggregate commit removes it
+/// atomically. A refusal or restart leaves the marker for the room's next event
+/// to repair ([`Self::repair_joined_count`]), even when a bulk update deferred
+/// recounting.
 ///
 /// This commit changes no membership index, so it invalidates nothing in the
 /// appservice-in-room cache; the membership commit before it did.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn update_joined_count(&self, room_id: &RoomId) -> Result {
+	self.ensure_recount_pending(room_id).await?;
 	let mut joinedcount = 0_u64;
 	let mut invitedcount = 0_u64;
 	let mut knockedcount = 0_u64;
@@ -230,38 +233,38 @@ pub async fn update_joined_count(&self, room_id: &RoomId) -> Result {
 		txn.insert_raw(&self.db.serverroomids, serverroom_id, []);
 	}
 
-	let committed = txn.execute().await;
-
-	if committed.is_ok() {
-		self.stale_counts
-			.lock()
-			.expect("locked")
-			.remove(room_id);
-	} else {
-		self.stale_counts
-			.lock()
-			.expect("locked")
-			.insert(room_id.to_owned());
-	}
-
-	committed
+	txn.del(&self.services.db["global"], (RECOUNT_PENDING, room_id));
+	txn.execute().await
 }
 
-/// Recounts `room_id` if its last recount failed to commit.
+/// Also retain the obligation when an explicit recount of older data fails.
+#[implement(super::Service)]
+async fn ensure_recount_pending(&self, room_id: &RoomId) -> Result {
+	let key = (RECOUNT_PENDING, room_id);
+	let global = &self.services.db["global"];
+	match global.qry(&key).await {
+		| Ok(value) if value.is_empty() => Ok(()),
+		| Ok(_) => Err(Error::bad_database("Invalid membership recount marker")),
+		| Err(error) if error.is_not_found() => global.put(key, &[0_u8; 0][..]).await,
+		| Err(error) => Err(error),
+	}
+}
+
+/// Recounts a durably marked room after a refused or deferred aggregate commit.
+/// A missing marker is normal; other read failures and malformed markers
+/// refuse.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn repair_joined_count(&self, room_id: &RoomId) -> Result {
-	let stale = self
-		.stale_counts
-		.lock()
-		.expect("locked")
-		.contains(room_id);
-
-	if !stale {
-		return Ok(());
+	match self.services.db["global"]
+		.qry(&(RECOUNT_PENDING, room_id))
+		.await
+	{
+		| Ok(value) if value.is_empty() => self.update_joined_count(room_id).await,
+		| Ok(_) => Err(Error::bad_database("Invalid membership recount marker")),
+		| Err(error) if error.is_not_found() => Ok(()),
+		| Err(error) => Err(error),
 	}
-
-	self.update_joined_count(room_id).await
 }
 
 /// Commits one change to a room's membership indexes, then drops the room's
@@ -273,7 +276,10 @@ pub async fn repair_joined_count(&self, room_id: &RoomId) -> Result {
 /// recount that follows means a failed recount cannot leave the cache
 /// contradicting durable membership.
 #[implement(super::Service)]
-pub(super) async fn commit_membership(&self, room_id: &RoomId, txn: Txn) -> Result {
+pub(super) async fn commit_membership(&self, room_id: &RoomId, mut txn: Txn) -> Result {
+	// Never publish membership without its repair obligation, including bulk
+	// updates that defer recounting and a kill before the first recount starts.
+	txn.put(&self.services.db["global"], (RECOUNT_PENDING, room_id), &[0_u8; 0][..]);
 	let committed = txn.execute().await;
 
 	self.appservice_in_room_cache
