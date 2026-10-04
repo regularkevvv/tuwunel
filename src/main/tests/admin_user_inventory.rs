@@ -132,7 +132,10 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 	}
 	users.insert(&bob, "").await?;
 	services.db["userid_locked"]
-		.insert(&locked, "*")
+		.insert(&locked, "")
+		.await?;
+	services.db["userid_erased"]
+		.insert(&alice, "")
 		.await?;
 	services
 		.profile
@@ -146,6 +149,7 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 		.await?;
 	assert_eq!(page["users"][0]["name"], alice.as_str());
 	assert_eq!(page["users"][0]["last_seen_ts"], 123);
+	assert_eq!(page["users"][0]["erased"], true);
 	assert_eq!(page["users"][1]["name"], bob.as_str());
 	assert_eq!(page["users"][1]["deactivated"], true);
 	assert_eq!(page["next_token"], "2");
@@ -186,8 +190,42 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 	endpoint
 		.page(3, "user_id=test&from=9999", 3)
 		.await?;
+	ancillary_errors(endpoint, &alice).await?;
 	inventory_errors(endpoint, &alice).await?;
 	aggregate_budgets(endpoint).await
+}
+
+async fn ancillary_errors(endpoint: &Endpoint<'_>, alice: &UserId) -> Result {
+	let services = endpoint.services;
+	let alias = services.admin.admin_alias.alias();
+	let aliases = &services.db["alias_roomid"];
+	let saved = match aliases.get(alias).await {
+		| Ok(value) => Some(value.to_vec()),
+		| Err(error) if error.is_not_found() => None,
+		| Err(error) => return Err(error),
+	};
+	aliases.insert(alias, "not-a-room-id").await?;
+	for version in [2, 3] {
+		endpoint
+			.refused(
+				version,
+				"user_id=test&admins=false",
+				http::StatusCode::INTERNAL_SERVER_ERROR,
+			)
+			.await?;
+	}
+	if let Some(value) = saved {
+		aliases.raw_put(alias, &value).await?;
+	} else {
+		aliases.remove(alias).await?;
+	}
+	assert!(
+		!services
+			.admin
+			.user_is_admin_checked(alice)
+			.await?
+	);
+	Ok(())
 }
 
 async fn inventory_errors(endpoint: &Endpoint<'_>, alice: &UserId) -> Result {

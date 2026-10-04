@@ -1512,6 +1512,11 @@ async fn a_saturated_bound_refuses_unsent_and_the_lease_still_renews() -> Result
 		panic!("no slot for the read");
 	};
 	assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS, "{error}");
+	let error = map
+		.contains_checked(&("key",))
+		.await
+		.expect_err("a refused presence read cannot become a missing key");
+	assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS, "{error}");
 	backend
 		.lease
 		.renew()
@@ -1522,6 +1527,10 @@ async fn a_saturated_bound_refuses_unsent_and_the_lease_still_renews() -> Result
 	drop(held);
 	map.insert(&b"key".to_vec(), b"accepted").await?;
 	assert_eq!(fake.applied(), 1);
+	assert!(map.contains_checked(&("key",)).await?);
+	assert!(!map.contains_checked(&("absent",)).await?);
+	map.insert(&b"empty".to_vec(), b"").await?;
+	assert!(map.contains_checked(&("empty",)).await?, "an empty value still exists");
 	backend.close().await;
 
 	Ok(())

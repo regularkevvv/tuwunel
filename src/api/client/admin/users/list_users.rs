@@ -192,14 +192,17 @@ async fn user_minor_details(
 		}
 	}
 
-	let admin = services.admin.user_is_admin(user_id).await;
+	let admin = services
+		.admin
+		.user_is_admin_checked(user_id)
+		.await?;
 	if let Some(want_admin) = params.admins
 		&& want_admin != admin
 	{
 		return Ok(None);
 	}
 
-	let locked = services.users.is_locked(user_id).await;
+	let locked = services.users.is_locked_checked(user_id).await?;
 	if locked && !params.locked {
 		return Ok(None);
 	}
@@ -219,7 +222,7 @@ async fn user_minor_details(
 	let avatar_url =
 		optional_field(services.profile.avatar_url(user_id).await)?.map(|url| url.to_string());
 
-	let erased = services.users.is_erased(user_id).await;
+	let erased = services.users.is_erased_checked(user_id).await?;
 
 	let devices = services
 		.users

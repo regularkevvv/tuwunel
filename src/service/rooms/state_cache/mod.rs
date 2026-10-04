@@ -784,6 +784,16 @@ pub async fn is_joined<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) -
 		.await
 }
 
+/// Checks joined-membership presence without folding storage failures into
+/// an absent membership. The stored count value is not deserialized.
+#[implement(Service)]
+pub async fn is_joined_checked(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.userroomid_joinedcount
+		.contains_checked(&(user_id, room_id))
+		.await
+}
+
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn is_knocked<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) -> bool {
