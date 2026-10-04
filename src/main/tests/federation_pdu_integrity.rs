@@ -245,7 +245,8 @@ async fn signature_power_and_version_refusals(
 	let Some(CanonicalJsonValue::Object(keys)) = signatures.get_mut(remote.name.as_str()) else {
 		return Err!("signed fixture has no origin signature");
 	};
-	keys.insert(KEY_ID.into(), CanonicalJsonValue::String(Base64::new(vec![0_u8; 64]).encode()));
+	let signature: Base64 = Base64::new(vec![0_u8; 64]);
+	keys.insert(KEY_ID.into(), CanonicalJsonValue::String(signature.encode()));
 	assert_refused_without_storage(services, base, room_id, remote, &pdu).await?;
 	assert!(
 		!services
