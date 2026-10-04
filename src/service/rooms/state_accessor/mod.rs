@@ -7,7 +7,7 @@ mod user_can;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::{TryFutureExt, future::try_join};
+use futures::future::try_join;
 use ruma::{
 	EventEncryptionAlgorithm, OwnedRoomAliasId, RoomId, UserId,
 	api::error::ErrorKind,
