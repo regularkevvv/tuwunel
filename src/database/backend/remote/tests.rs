@@ -1820,7 +1820,7 @@ async fn capped_typed_stream_bounds_fetch_and_commit_drain_without_shortening_it
 	);
 	let before = fake.served();
 	let devices: Vec<Vec<u8>> = map
-		.stream_prefix_capped::<&[u8], &[u8], _>(&prefix, 32)
+		.stream_prefix_capped::<&[u8], &[u8], _>(&(prefix,), 32)
 		.map_ok(|(key, _)| key.to_vec())
 		.try_collect()
 		.await?;
@@ -1834,7 +1834,7 @@ async fn capped_typed_stream_bounds_fetch_and_commit_drain_without_shortening_it
 	assert_eq!(backend.scans().len(), 0, "prefix page left its scan registered");
 	let before = fake.served();
 	let keys: Vec<Vec<u8>> = map
-		.keys_prefix_capped::<&[u8], _>(&prefix, 32)
+		.keys_prefix_capped::<&[u8], _>(&(prefix,), 32)
 		.map_ok(<[u8]>::to_vec)
 		.try_collect()
 		.await?;
