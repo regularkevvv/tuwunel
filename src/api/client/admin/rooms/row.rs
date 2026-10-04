@@ -2,7 +2,7 @@ use ruma::{
 	RoomId, UInt,
 	api::error::{ErrorKind, LimitExceededErrorData},
 	events::{
-		StateEventType,
+		StateEventType, TimelineEventType,
 		room::{
 			canonical_alias::RoomCanonicalAliasEventContent,
 			create::RoomCreateEventContent,
@@ -219,7 +219,7 @@ async fn state_event(
 		.await?;
 	if let Some(event) = &event {
 		if event.room_id() != room
-			|| event.kind().as_str() != kind.as_str()
+			|| event.kind() != &TimelineEventType::from(kind.clone())
 			|| event.state_key() != Some("")
 		{
 			return Err(err!(Database("Mismatched room summary event")));
