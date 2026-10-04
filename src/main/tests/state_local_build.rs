@@ -1346,13 +1346,18 @@ async fn assert_refused_before_walk(
 	if !error.to_string().contains(expected_error) {
 		return Err!("{context} was refused for another reason: {error}");
 	}
-	assert_eq!(error.status_code(), tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(
+		error.status_code(),
+		tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+		"{context} must classify corrupt stored mappings as a server failure"
+	);
 	assert_eq!(
 		services
 			.state
 			.get_room_shortstatehash(room_id)
 			.await?,
-		state_before
+		state_before,
+		"{context} changed the accepted room state"
 	);
 	let frontier_after: Vec<OwnedEventId> = services
 		.state
