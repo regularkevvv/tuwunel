@@ -155,7 +155,7 @@ pub fn pdus<'a>(
 				.pduid_pdu
 				.raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
-				.and_then(move |item| self.each_slice(item, user_id, room_id))
+				.and_then(move |item| Box::pin(self.each_slice(item, user_id, room_id)))
 		})
 		.try_flatten_stream()
 }
@@ -178,7 +178,7 @@ pub fn pdus_rev<'a>(
 				.pduid_pdu
 				.rev_raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
-				.and_then(move |item| self.each_slice(item, user_id, room_id))
+				.and_then(move |item| Box::pin(self.each_slice(item, user_id, room_id)))
 		})
 		.try_flatten_stream()
 }
