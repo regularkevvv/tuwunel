@@ -33,7 +33,6 @@ use tuwunel_core::{
 			Digest as Sha256Digest, delimited as sha256_delimited, hash as sha256_hash,
 		},
 		math::usize_from_ruma,
-		result::FlatOk,
 		stream::{TryBroadbandExt, TryWidebandExt, WidebandExt},
 	},
 };
@@ -171,18 +170,19 @@ pub(super) async fn handle_room(
 
 	let meta = room_meta_future(services, room_id);
 	let events = join3(timeline, required_state, invite_state);
-	let member_counts = member_counts_future(services, room_id);
+	let member_counts = member_counts_future(services, room_id, is_invite);
 	let notification_counts = notification_counts_future(services, sender_user, room_id);
 	let (
 		(room_name, room_avatar),
 		(timeline, required_state, invite_state),
-		(joined_count, invited_count),
+		member_counts,
 		(highlight_count, notification_count, _last_notification_read, thread_counts),
 	) = join4(meta, events, member_counts, notification_counts)
 		.boxed()
 		.await;
 	let timeline = timeline.map_err(Failure::Payload)?;
 	let required_state = required_state.map_err(Failure::Payload)?;
+	let (joined_count, invited_count) = member_counts.map_err(Failure::Payload)?;
 
 	let (heroes, heroes_name, heroes_avatar) = resolve_heroes(
 		services,
@@ -356,25 +356,37 @@ fn room_meta_future<'a>(
 	join(room_name, room_avatar)
 }
 
-fn member_counts_future<'a>(
-	services: &'a Services,
-	room_id: &'a RoomId,
-) -> impl Future<Output = (Option<UInt>, Option<UInt>)> + Send + 'a {
-	let joined_count = services
-		.state_cache
-		.room_joined_count(room_id)
-		.map_ok(TryInto::try_into)
-		.map_ok(Result::ok)
-		.map(FlatOk::flat_ok);
+async fn member_counts_future(
+	services: &Services,
+	room_id: &RoomId,
+	is_invite: bool,
+) -> Result<(Option<UInt>, Option<UInt>)> {
+	let joined_count = services.state_cache.room_joined_count(room_id);
 
-	let invited_count = services
-		.state_cache
-		.room_invited_count(room_id)
-		.map_ok(TryInto::try_into)
-		.map_ok(Result::ok)
-		.map(FlatOk::flat_ok);
+	let invited_count = services.state_cache.room_invited_count(room_id);
 
-	join(joined_count, invited_count)
+	let (joined_count, invited_count) = join(joined_count, invited_count).await;
+	Ok((
+		response_count(joined_count, is_invite, "Invalid joined-member count")?,
+		response_count(invited_count, is_invite, "Invalid invited-member count")?,
+	))
+}
+
+/// A remote invitation may have no resolved aggregate counts. Only genuine
+/// absence in that invitation path is optional; repair/storage/corruption
+/// failures and missing joined-room counts refuse the complete range.
+fn response_count(
+	count: Result<u64>,
+	is_invite: bool,
+	invalid: &'static str,
+) -> Result<Option<UInt>> {
+	match count {
+		| Ok(count) => UInt::try_from(count)
+			.map(Some)
+			.map_err(|_| Error::bad_database(invalid)),
+		| Err(error) if is_invite && error.is_not_found() => Ok(None),
+		| Err(error) => Err(error),
+	}
 }
 
 fn notification_counts_future<'a>(

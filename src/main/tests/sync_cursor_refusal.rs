@@ -237,6 +237,48 @@ async fn frontier_controls(
 	Ok(())
 }
 
+async fn count_controls(client: &Client<'_>, room: &RoomId, since: &str) -> Result {
+	for name in ["roomid_joinedcount", "roomid_invitedcount"] {
+		let map = &client.services.db[name];
+		let saved = map.get(room).await?.as_ref().to_vec();
+		for corrupt in [vec![], vec![0_u8; 7], vec![0_u8; 9], u64::MAX.to_be_bytes().to_vec()] {
+			map.insert(room.as_bytes(), corrupt.as_slice())
+				.await?;
+			sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+			assert_eq!(map.get(room).await?.as_ref(), corrupt, "failed sync preserves counter");
+		}
+		map.insert(room.as_bytes(), saved.as_slice())
+			.await?;
+	}
+	let global = &client.services.db["global"];
+	let key = serialize_key(("membership_recount_generation_v1", room))?;
+	let saved = global
+		.get(key.as_slice())
+		.await?
+		.as_ref()
+		.to_vec();
+	global
+		.insert(key.as_slice(), b"invalid-generation")
+		.await?;
+	sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+	assert_eq!(global.get(key.as_slice()).await?.as_ref(), b"invalid-generation");
+	global
+		.insert(key.as_slice(), saved.as_slice())
+		.await?;
+	let key = serialize_key(("membership_recount_pending", room))?;
+	global
+		.insert(key.as_slice(), b"invalid-marker")
+		.await?;
+	sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+	assert_eq!(global.get(key.as_slice()).await?.as_ref(), b"invalid-marker");
+	global.remove(key.as_slice()).await?;
+	let healthy = sync(client, Some(since), http::StatusCode::OK).await?;
+	let summary = &healthy["rooms"]["join"][room.as_str()]["summary"];
+	assert_eq!(summary["m.joined_member_count"], 1, "restored sync serves actual count");
+	assert_eq!(summary["m.invited_member_count"], 0, "restored sync serves actual count");
+	Ok(())
+}
+
 async fn exercise(services: &Services, base: &str) -> Result {
 	wait_until_ready(services, base).await?;
 	let user = register(services, "cursor-owner", TOKEN).await?;
@@ -268,6 +310,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		delivery > since.parse::<u64>()?,
 		"inbox control is newer than the last acknowledged token"
 	);
+	count_controls(&client, &healthy, &since).await?;
 	let pdus = &services.db["pduid_pdu"];
 	let state_id = services.timeline.get_pdu_id(&state).await?;
 	let saved = pdus.get(&state_id).await?.to_vec();

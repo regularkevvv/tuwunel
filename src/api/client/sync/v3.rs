@@ -2238,8 +2238,10 @@ async fn calculate_state_changes<'a>(
 	let member_counts = send_member_counts
 		.then_async(|| calculate_counts(services, room_id, sender_user, include_heroes));
 
-	let (joined_member_count, invited_member_count, heroes) =
-		member_counts.await.unwrap_or((None, None, None));
+	let (joined_member_count, invited_member_count, heroes) = member_counts
+		.await
+		.transpose()?
+		.unwrap_or((None, None, None));
 
 	Ok(StateChanges {
 		heroes,
@@ -2281,19 +2283,21 @@ async fn calculate_counts(
 	room_id: &RoomId,
 	sender_user: &UserId,
 	include_heroes: bool,
-) -> (Option<u64>, Option<u64>, Option<Vec<OwnedUserId>>) {
-	let joined_member_count = services
-		.state_cache
-		.room_joined_count(room_id)
-		.unwrap_or(0);
+) -> Result<(Option<u64>, Option<u64>, Option<Vec<OwnedUserId>>)> {
+	let joined_member_count = services.state_cache.room_joined_count(room_id);
 
-	let invited_member_count = services
-		.state_cache
-		.room_invited_count(room_id)
-		.unwrap_or(0);
+	let invited_member_count = services.state_cache.room_invited_count(room_id);
 
 	let (joined_member_count, invited_member_count) =
 		join(joined_member_count, invited_member_count).await;
+	let joined_member_count = u64::from(
+		UInt::try_from(joined_member_count?)
+			.map_err(|_| Error::bad_database("Invalid joined-member count"))?,
+	);
+	let invited_member_count = u64::from(
+		UInt::try_from(invited_member_count?)
+			.map_err(|_| Error::bad_database("Invalid invited-member count"))?,
+	);
 
 	let small_room = joined_member_count.saturating_add(invited_member_count) <= 5;
 
@@ -2304,7 +2308,7 @@ async fn calculate_counts(
 		.and_is(small_room)
 		.then_async(|| calculate_heroes(services, room_id, sender_user));
 
-	(Some(joined_member_count), Some(invited_member_count), heroes.await)
+	Ok((Some(joined_member_count), Some(invited_member_count), heroes.await))
 }
 
 pub(crate) async fn calculate_heroes(
