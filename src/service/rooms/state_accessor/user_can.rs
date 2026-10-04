@@ -94,12 +94,15 @@ pub async fn user_can_see_event(
 		.await
 	{
 		| Ok(shortstatehash) => Some(shortstatehash),
-		| Err(_)
-			if self
-				.is_initial_room_create(room_id, event_id)
-				.await =>
+		| Err(error)
+			if error.kind() == ErrorKind::NotFound
+				&& self
+					.is_initial_room_create(room_id, event_id)
+					.await =>
 			return true,
-		| Err(_) => self.snapshotless_state(room_id, event_id).await,
+		| Err(error) if error.kind() == ErrorKind::NotFound =>
+			self.snapshotless_state(room_id, event_id).await,
+		| Err(_) => return false,
 	};
 
 	let Some(shortstatehash) = shortstatehash else {

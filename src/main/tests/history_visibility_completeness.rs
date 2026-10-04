@@ -119,6 +119,15 @@ async fn exercise(services: &Services, base: &str) -> Result {
 			.await,
 		"the initial create event must retain default federation visibility"
 	);
+	verify_visibility_fallback_refusals(
+		services,
+		&former_member,
+		&former_member_id,
+		&unjoined_server,
+		&room,
+		&create,
+	)
+	.await?;
 
 	let history_event = services
 		.state_accessor
@@ -289,7 +298,85 @@ async fn verify_outlier_uses_current_state(
 	);
 
 	assert_event_visible(owner, room, &pdu.event_id, "outlier by current state").await?;
-	assert_event_hidden(former_member, room, &pdu.event_id, "outlier by current state").await
+	assert_event_hidden(former_member, room, &pdu.event_id, "outlier by current state").await?;
+	verify_visibility_fallback_refusals(
+		services,
+		owner,
+		owner_id,
+		owner_id.server_name(),
+		room,
+		&pdu.event_id,
+	)
+	.await?;
+	assert_event_visible(owner, room, &pdu.event_id, "restored snapshotless outlier").await
+}
+
+/// Genuine snapshot absence permits the documented create/outlier fallback;
+/// malformed records and complete but unavailable hashes never do.
+async fn verify_visibility_fallback_refusals(
+	services: &Services,
+	client: &Client<'_>,
+	user_id: &UserId,
+	origin: &ServerName,
+	room: &RoomId,
+	event: &OwnedEventId,
+) -> Result {
+	// Outliers need not have a compact ID yet. Allocate only in this disposable
+	// fixture so the malformed snapshot cell is reachable by the normal reader.
+	let shorteventid = services
+		.short
+		.get_or_create_shorteventid(event)
+		.await;
+	let key = shorteventid.to_be_bytes();
+	let states = &services.db["shorteventid_shortstatehash"];
+	assert_eq!(
+		states
+			.get(&key)
+			.await
+			.expect_err("fixture needs an absent snapshot")
+			.kind(),
+		tuwunel_core::ruma::api::error::ErrorKind::NotFound
+	);
+	let mut trailing = 1_u64.to_be_bytes().to_vec();
+	trailing.push(0);
+	let mut separator = 1_u64.to_be_bytes().to_vec();
+	separator.push(0xFF);
+	for invalid in [Vec::new(), vec![0_u8], trailing, separator, u64::MAX.to_be_bytes().to_vec()]
+	{
+		states.raw_put(&key, &invalid).await?;
+		services.clear_cache().await;
+		assert!(
+			!services
+				.state_accessor
+				.user_can_see_event(user_id, room, event)
+				.await,
+			"corrupt snapshot cannot grant user fallback"
+		);
+		assert!(
+			!services
+				.state_accessor
+				.server_can_see_event(origin, room, event)
+				.await,
+			"corrupt snapshot cannot grant federation fallback"
+		);
+		assert_event_hidden(client, room, event, "corrupt snapshot fallback refusal").await?;
+		assert_eq!(states.get(&key).await?.as_ref(), invalid.as_slice());
+		states.remove(&key).await?;
+		services.clear_cache().await;
+		assert!(
+			services
+				.state_accessor
+				.user_can_see_event(user_id, room, event)
+				.await
+		);
+		assert!(
+			services
+				.state_accessor
+				.server_can_see_event(origin, room, event)
+				.await
+		);
+	}
+	Ok(())
 }
 
 async fn set_history_visibility(client: &Client<'_>, room: &RoomId) -> Result {
