@@ -406,7 +406,7 @@ async fn optional_lookup_budget(context: &Context<'_>) -> Result {
 		.raw_put(&hash.to_be_bytes(), &diff)
 		.await?;
 	services.db["roomid_shortstatehash"]
-		.raw_put(context.room, hash.to_be_bytes())
+		.raw_put(context.room, hash)
 		.await?;
 	mapping.del(&forward_key).await?;
 	services.clear_cache().await;
@@ -450,7 +450,7 @@ async fn optional_lookup_budget(context: &Context<'_>) -> Result {
 		.raw_put(&duplicate_hash.to_be_bytes(), &duplicate_diff)
 		.await?;
 	services.db["roomid_shortstatehash"]
-		.raw_put(context.room, duplicate_hash.to_be_bytes())
+		.raw_put(context.room, duplicate_hash)
 		.await?;
 	services.clear_cache().await;
 	context.refused_permissions().await?;
@@ -643,7 +643,7 @@ async fn genuine_absence(context: &Context<'_>) -> Result {
 		.raw_put(&hash.to_be_bytes(), &diff)
 		.await?;
 	services.db["roomid_shortstatehash"]
-		.raw_put(context.room, hash.to_be_bytes())
+		.raw_put(context.room, hash)
 		.await?;
 	services.clear_cache().await;
 	assert!(
