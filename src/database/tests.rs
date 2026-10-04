@@ -664,6 +664,29 @@ fn de_record_json_trailing() {
 }
 
 #[test]
+fn de_record_cbor_trailing() {
+	let expected = vec![42_u64, 93_u64];
+	let good = serialize_to_vec(Cbor(&expected)).expect("serialize valid CBOR record");
+	let actual = from_slice::<Cbor<Vec<u64>>>(&good).expect("valid CBOR record");
+	assert_eq!(actual.0, expected);
+	let secret = "disposable-cbor-record-marker";
+	let extra = serialize_to_vec(Cbor(secret)).expect("serialize trailing CBOR value");
+	for tail in [vec![0_u8], vec![0xFF_u8], extra] {
+		let mut invalid = good.clone();
+		invalid.extend_from_slice(&tail);
+		let error =
+			from_slice::<Cbor<Vec<u64>>>(&invalid).expect_err("CBOR trailing bytes must refuse");
+		assert!(!error.to_string().contains(secret), "CBOR record bytes cannot enter errors");
+	}
+	for len in 0..good.len() {
+		assert!(
+			from_slice::<Cbor<Vec<u64>>>(&good[..len]).is_err(),
+			"truncated CBOR record must refuse"
+		);
+	}
+}
+
+#[test]
 fn de_record_raw_pdu_ids() {
 	for count in [PduCount::Normal(42), PduCount::Backfilled(-42)] {
 		let expected: RawPduId = PduId { shortroomid: 7, count }.into();

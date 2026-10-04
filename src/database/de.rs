@@ -304,9 +304,17 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 				Ok(value)
 			},
 
-			| "Cbor" => visitor
-				.visit_newtype_struct(&mut minicbor_serde::Deserializer::new(self.record_trail()))
-				.map_err(|e| Self::Error::SerdeDe(format!("{name}: {e}").into())),
+			| "Cbor" => {
+				let bytes = self.record_trail();
+				let mut decoder = minicbor_serde::Deserializer::new(bytes);
+				let value = visitor
+					.visit_newtype_struct(&mut decoder)
+					.map_err(|_| Self::Error::SerdeDe("Invalid CBOR database record".into()))?;
+				if decoder.decoder().position() != bytes.len() {
+					return Err(Self::Error::SerdeDe("Trailing CBOR database bytes".into()));
+				}
+				Ok(value)
+			},
 
 			| _ => visitor.visit_newtype_struct(self),
 		}
