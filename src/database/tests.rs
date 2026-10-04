@@ -614,7 +614,7 @@ fn de_record_invalid_numeric_boundaries() {
 	let mut missing = 42_u64.to_be_bytes().to_vec();
 	missing.extend_from_slice(&93_u64.to_be_bytes());
 	assert!(from_slice::<(u64, u64)>(&missing).is_err(), "missing separator must refuse");
-	let mut wrong = good.to_vec();
+	let mut wrong = good.clone();
 	wrong[8] = 0;
 	assert!(from_slice::<(u64, u64)>(&wrong).is_err(), "wrong separator must refuse");
 	for len in 0..8 {
@@ -643,7 +643,8 @@ fn de_record_compatible_tails_and_ignore() {
 
 #[test]
 fn de_record_nested_sequence_refusal() {
-	assert!(from_slice::<((u64, u64), u64)>(&[0_u8; 24]).is_err());
+	from_slice::<((u64, u64), u64)>(&[0_u8; 24])
+		.expect_err("nested record sequences must refuse");
 }
 
 #[test]
