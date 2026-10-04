@@ -5,7 +5,7 @@ use ruma::{
 	EventId, RoomId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 };
-use tuwunel_core::{Error, Event, PduCount, Result, implement, utils::json::serialized_len};
+use tuwunel_core::{Error, Event, PduCount, PduEvent, Result, implement};
 use tuwunel_database::{Interfix, serialize_key};
 
 use super::Service;
@@ -45,7 +45,10 @@ pub async fn validate_timeline_frontier(
 		.get_shortroomid(room_id)
 		.await?;
 	let mut rows = 0_usize;
-	let mut bytes = 0_usize;
+	let mut bytes = room_id
+		.as_str()
+		.len()
+		.saturating_add(size_of::<u64>());
 	while let Some((key, value)) = frontier.try_next().await? {
 		rows = rows.saturating_add(1);
 		bytes = bytes
@@ -74,6 +77,11 @@ pub async fn validate_timeline_frontier(
 					error
 				}
 			})?;
+		let encoded: &[u8] = pdu_id.as_ref();
+		bytes = bytes.saturating_add(encoded.len());
+		if bytes > MAX_FRONTIER_BYTES {
+			return Err(frontier_limit());
+		}
 		if pdu_id.shortroomid() != shortroomid.to_be_bytes()
 			|| !matches!(pdu_id.pdu_count(), PduCount::Normal(_))
 		{
@@ -83,10 +91,8 @@ pub async fn validate_timeline_frontier(
 		if count <= since || until.is_some_and(|until| count > until) {
 			continue;
 		}
-		let pdu = self
-			.services
-			.timeline
-			.get_pdu_from_id(&pdu_id)
+		let value = self.services.db["pduid_pdu"]
+			.get(&pdu_id)
 			.await
 			.map_err(|error| {
 				if error.is_not_found() {
@@ -95,13 +101,12 @@ pub async fn validate_timeline_frontier(
 					error
 				}
 			})?;
-		bytes = bytes.saturating_add(
-			serialized_len(pdu.as_pdu())
-				.map_err(|_| Error::bad_database("Invalid room frontier event serialization"))?,
-		);
+		bytes = bytes.saturating_add(value.len());
 		if bytes > MAX_FRONTIER_BYTES {
 			return Err(frontier_limit());
 		}
+		let pdu: PduEvent = serde_json::from_slice(value.as_ref())
+			.map_err(|_| Error::bad_database("Invalid accepted room frontier event"))?;
 		if pdu.event_id() != event_id || pdu.room_id() != room_id {
 			return Err(Error::bad_database("Mismatched accepted room frontier event"));
 		}
