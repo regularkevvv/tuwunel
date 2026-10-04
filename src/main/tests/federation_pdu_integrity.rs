@@ -20,6 +20,10 @@
 //! - A correctly signed chain rooted in an unavailable auth event is refused
 //!   without storing its descendants as timeline events or outliers. An honest
 //!   join before and after the chain proves the refusal is specific to auth.
+//! - A bad event signature and a joined member's signed power-level escalation
+//!   are refused without storage or state changes. A normal message from that
+//!   member is accepted. A create event with an unsupported room version is
+//!   refused by the actual incoming-PDU parser and cannot become stored state.
 
 use std::{
 	env::temp_dir,
@@ -178,6 +182,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	);
 
 	missing_auth_chain_is_refused(services, base, &room_id, &remote).await?;
+	signature_power_and_version_refusals(services, base, &room_id, &remote, &trent).await?;
 
 	// A PDU that is not canonical JSON is refused with its transaction.
 	let oscar = remote_user("oscar")?;
@@ -222,6 +227,179 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"a PDU that is not canonical JSON took effect"
 	);
 
+	Ok(())
+}
+
+async fn signature_power_and_version_refusals(
+	services: &Services,
+	base: &str,
+	room_id: &RoomId,
+	remote: &Remote,
+	joined_user: &UserId,
+) -> Result {
+	let user = remote_user("invalid-signature")?;
+	let mut pdu = signed_join(services, room_id, &user, remote, "bad signature").await?;
+	let Some(CanonicalJsonValue::Object(signatures)) = pdu.get_mut("signatures") else {
+		return Err!("signed fixture has no signatures");
+	};
+	let Some(CanonicalJsonValue::Object(keys)) = signatures.get_mut(remote.name.as_str()) else {
+		return Err!("signed fixture has no origin signature");
+	};
+	keys.insert(KEY_ID.into(), CanonicalJsonValue::String(Base64::new(vec![0_u8; 64]).encode()));
+	assert_refused_without_storage(services, base, room_id, remote, &pdu).await?;
+	assert!(
+		!services
+			.state_cache
+			.is_joined(&user, room_id)
+			.await
+	);
+
+	// All auth events exist and the sender has joined; the refusal must not
+	// be explained by the missing-auth fixture or an unjoined sender.
+	let mut power = signed_join(services, room_id, joined_user, remote, "power fixture").await?;
+	let mut auth = Vec::new();
+	for (kind, state_key) in [
+		(StateEventType::RoomCreate, ""),
+		(StateEventType::RoomPowerLevels, ""),
+		(StateEventType::RoomMember, joined_user.as_str()),
+	] {
+		let id = services
+			.state_accessor
+			.room_state_get_id(room_id, &kind, state_key)
+			.await?;
+		auth.push(CanonicalJsonValue::String(id.to_string()));
+	}
+	power.insert("auth_events".into(), CanonicalJsonValue::Array(auth));
+	power.insert("type".into(), CanonicalJsonValue::String("m.room.power_levels".into()));
+	power.insert("state_key".into(), CanonicalJsonValue::String(String::new()));
+	power.insert(
+		"content".into(),
+		serde_json::from_value(json!({"users": {joined_user.as_str(): 100}}))?,
+	);
+	resign(&mut power, remote)?;
+	let before_power = services
+		.state_accessor
+		.room_state_get_id(room_id, &StateEventType::RoomPowerLevels, "")
+		.await?;
+	assert_refused_without_storage(services, base, room_id, remote, &power).await?;
+	assert_eq!(
+		services
+			.state_accessor
+			.room_state_get_id(room_id, &StateEventType::RoomPowerLevels, "")
+			.await?,
+		before_power
+	);
+
+	let mut message = power;
+	message.insert("type".into(), CanonicalJsonValue::String("m.room.message".into()));
+	message.remove("state_key");
+	message.insert(
+		"content".into(),
+		serde_json::from_value(json!({"msgtype": "m.text", "body": "allowed at power zero"}))?,
+	);
+	resign(&mut message, remote)?;
+	let id = event_id(&message, remote)?;
+	let (status, reply) = send_pdus(services, base, remote, &message).await?;
+	assert_eq!(status, 200);
+	assert!(
+		reply["pdus"][id.as_str()].get("error").is_none(),
+		"honest power-zero control failed: {reply}"
+	);
+	assert_eq!(
+		stored_content(services, &id).await?,
+		json!({"msgtype": "m.text", "body": "allowed at power zero"})
+	);
+
+	let mut create = signed_join(services, room_id, &user, remote, "version fixture").await?;
+	create.insert("type".into(), CanonicalJsonValue::String("m.room.create".into()));
+	create.insert("state_key".into(), CanonicalJsonValue::String(String::new()));
+	create.remove("room_id");
+	create.insert(
+		"content".into(),
+		serde_json::from_value(json!({"room_version": "org.example.unsupported"}))?,
+	);
+	resign(&mut create, remote)?;
+	let raw = to_raw_value(&create)?;
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(&raw)
+			.await
+			.is_err(),
+		"unsupported version was parsed"
+	);
+	let id = event_id(&create, remote)?;
+	let before = services
+		.timeline
+		.latest_pdu_in_room(room_id)
+		.await?
+		.event_id;
+	let (status, _) = send_pdus(services, base, remote, &create).await?;
+	assert_eq!(status, 200, "a canonical transaction should get its per-PDU verdict");
+	assert!(services.timeline.get_pdu_json(&id).await.is_err());
+	assert!(
+		services
+			.timeline
+			.get_outlier_pdu_json(&id)
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		services
+			.timeline
+			.latest_pdu_in_room(room_id)
+			.await?
+			.event_id,
+		before
+	);
+	Ok(())
+}
+
+fn resign(pdu: &mut CanonicalJsonObject, remote: &Remote) -> Result {
+	pdu.remove("hashes");
+	pdu.remove("signatures");
+	hash_and_sign_event(remote.name.as_str(), &remote.keypair, pdu, &remote.rules.redaction)
+		.map_err(|error| err!("fixture signing failed: {error}"))?;
+	Ok(())
+}
+
+async fn assert_refused_without_storage(
+	services: &Services,
+	base: &str,
+	room_id: &RoomId,
+	remote: &Remote,
+	pdu: &CanonicalJsonObject,
+) -> Result {
+	let id = event_id(pdu, remote)?;
+	let before = services
+		.timeline
+		.latest_pdu_in_room(room_id)
+		.await?
+		.event_id;
+	let (status, reply) = send_pdus(services, base, remote, pdu).await?;
+	assert_eq!(status, 200, "signed transaction was refused: {reply}");
+	assert!(
+		reply["pdus"][id.as_str()]["error"].is_string(),
+		"invalid event was accepted: {reply}"
+	);
+	assert!(services.timeline.get_pdu_json(&id).await.is_err(), "invalid event was stored");
+	assert!(
+		services
+			.timeline
+			.get_outlier_pdu_json(&id)
+			.await
+			.is_err(),
+		"invalid event became an outlier"
+	);
+	assert_eq!(
+		services
+			.timeline
+			.latest_pdu_in_room(room_id)
+			.await?
+			.event_id,
+		before,
+		"invalid event changed timeline"
+	);
 	Ok(())
 }
 
