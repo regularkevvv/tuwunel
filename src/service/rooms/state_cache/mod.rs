@@ -6,7 +6,7 @@ mod update;
 mod via;
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::HashMap,
 	convert::identity,
 	sync::{Arc, RwLock},
 };
