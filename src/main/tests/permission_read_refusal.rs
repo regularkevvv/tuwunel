@@ -250,12 +250,42 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let target_id = services.timeline.get_pdu_id(&target).await?;
 	let saved_target = SavedRecord::load(services, "pduid_pdu", target_id.as_ref()).await?;
 	power_read_failures(&context, &saved_target).await?;
+	incoming_power_controls(&context).await?;
 	publication_alias_controls(&context).await?;
 	optional_lookup_budget(&context).await?;
 	misdirected_lookup(&context, &saved_target).await?;
 	canonical_read_failures(&context, &saved_target).await?;
 	cross_room_refusal(&context).await?;
 	genuine_absence(&context).await
+}
+
+async fn incoming_power_controls(context: &Context<'_>) -> Result {
+	let services = context.client.services;
+	let before = context.frontier().await;
+	let hash = services.db["roomid_shortstatehash"]
+		.get(context.room)
+		.await?
+		.to_vec();
+	let (status, body) = context
+		.put(
+			&format!("rooms/{}/state/m.room.power_levels", context.room),
+			&json!({"users_default": "invalid incoming integer"}),
+		)
+		.await?;
+	assert_eq!(status, http::StatusCode::BAD_REQUEST, "invalid incoming power levels: {body}");
+	assert!(
+		body.get("event_id").is_none(),
+		"invalid input cannot announce a committed event"
+	);
+	assert_eq!(context.frontier().await, before);
+	assert_eq!(
+		services.db["roomid_shortstatehash"]
+			.get(context.room)
+			.await?
+			.as_ref(),
+		hash.as_slice()
+	);
+	context.healthy().await
 }
 
 async fn power_read_failures(context: &Context<'_>, target: &SavedRecord) -> Result {
