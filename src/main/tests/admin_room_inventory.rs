@@ -351,7 +351,7 @@ async fn complete_empty_deletion(endpoint: &Endpoint<'_>) -> Result {
 			.delete
 			.bounded_empty_local_rooms()
 			.await?,
-		[room.clone()]
+		std::slice::from_ref(&room)
 	);
 	assert!(
 		!services
