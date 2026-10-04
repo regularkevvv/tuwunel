@@ -1769,3 +1769,35 @@ async fn del_prefix_and_clear_past_the_drain_budget_remove_every_row() -> Result
 
 	Ok(())
 }
+
+#[tokio::test]
+async fn capped_typed_stream_bounds_fetch_and_commit_drain_without_shortening_its_snapshot()
+-> Result {
+	let (fake, _server, backend) = rig(256, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let cap = 1025_usize;
+	fake.fill(map_id(), (0..5000).map(|index| (numbered(index), b"before".to_vec())));
+	let before = fake.served();
+	let mut stream = Box::pin(map.stream_capped::<&[u8], &[u8]>(cap));
+	let (key, value) = stream.next().await.expect("nonempty map")?;
+	assert_eq!(value, b"before");
+	let mut seen = vec![key.to_vec()];
+	// Updating this map drains the declared cap, not the rest of its inventory.
+	map.insert(&numbered(500), b"after").await?;
+	assert_eq!(fake.served().saturating_sub(before), cap, "a drain read beyond the typed cap");
+	while let Some(row) = stream.next().await {
+		let (key, value) = row?;
+		assert_eq!(value, b"before", "the capped reader lost its pre-commit snapshot");
+		seen.push(key.to_vec());
+	}
+	assert_eq!(seen, (0..cap).map(numbered).collect::<Vec<_>>());
+	drop(stream);
+	assert_eq!(backend.scans().len(), 0, "the capped reader left a scan registered");
+	let before = fake.served();
+	let mut empty = Box::pin(map.stream_capped::<&[u8], &[u8]>(0));
+	assert!(empty.next().await.is_none());
+	drop(empty);
+	assert_eq!(fake.served(), before, "a zero cap fetched rows");
+	backend.close().await;
+	Ok(())
+}

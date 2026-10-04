@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use axum::{Json, extract::State, response::IntoResponse};
-use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use ruma::api::{client::tuwunel::get_remote_version, federation::discovery::get_server_version};
 use subtle::ConstantTimeEq;
@@ -28,7 +27,7 @@ pub(crate) async fn tuwunel_server_version() -> Result<impl IntoResponse> {
 pub(crate) async fn tuwunel_local_user_count(
 	State(services): State<crate::State>,
 ) -> Result<impl IntoResponse> {
-	let user_count = services.users.list_local_users().count().await;
+	let user_count = services.users.bounded_local_user_count().await?;
 
 	Ok(Json(serde_json::json!({
 		"count": user_count

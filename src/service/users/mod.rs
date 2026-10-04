@@ -2,6 +2,7 @@ mod dehydrated_device;
 pub mod device;
 mod keys;
 mod ldap;
+mod local_count;
 mod register;
 
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use tuwunel_database::{Deserialized, Json, Map};
 
 pub use self::{
 	dehydrated_device::DehydratedDevice, device::ToDeviceTarget, keys::parse_master_key,
-	register::Register,
+	local_count::MAX_LOCAL_USER_COUNT_ROWS, register::Register,
 };
 
 pub const PASSWORD_SENTINEL: &str = "*";
