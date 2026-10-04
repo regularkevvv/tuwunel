@@ -28,7 +28,7 @@ pub use tuwunel_core::matrix::pdu::{PduId, RawPduId};
 use tuwunel_core::{
 	Err, Error, Result, at, err, implement,
 	matrix::{
-		ShortEventId,
+		Event, ShortEventId,
 		pdu::{PduCount, PduEvent},
 	},
 	utils::{
@@ -691,4 +691,49 @@ pub async fn get_pdu_id(&self, event_id: &EventId) -> Result<RawPduId> {
 		return Err(Error::bad_database("Invalid accepted event index"));
 	}
 	Ok(RawPduId::from(encoded))
+}
+
+/// Reads the last canonical room event at or before a membership pagination
+/// boundary. This seeks one row; malformed keys, payloads or reverse indexes
+/// refuse the lookup instead of selecting another event or current state.
+#[implement(Service)]
+pub async fn member_snapshot_boundary(
+	&self,
+	room_id: &RoomId,
+	count: PduCount,
+) -> Result<(PduCount, PduEvent)> {
+	let shortroomid = self
+		.services
+		.short
+		.get_shortroomid(room_id)
+		.await?;
+	let start: RawPduId = PduId { shortroomid, count }.into();
+	let stream = self.db.pduid_pdu.rev_raw_stream_from(&start);
+	pin_mut!(stream);
+	let Some((key, value)) = stream.try_next().await? else {
+		return Err(err!(Request(NotFound("No event at membership boundary"))));
+	};
+	if !key.starts_with(&shortroomid.to_be_bytes()) {
+		return Err(err!(Request(NotFound("No room event at membership boundary"))));
+	}
+	if !matches!(key.len(), 16 | 24) || key.len() == 24 && key[8..16] != [0_u8; 8] {
+		return Err(Error::bad_database("Invalid membership boundary index"));
+	}
+	let position = RawPduId::from(key).pdu_count();
+	let event = serde_json::from_slice::<PduEvent>(value)
+		.map_err(|_| Error::bad_database("Invalid membership boundary event"))?;
+	let canonical = self
+		.get_pdu_id(event.event_id())
+		.await
+		.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Missing membership boundary reverse index")
+			} else {
+				error
+			}
+		})?;
+	if event.room_id() != room_id || canonical.as_ref() != key || position > count {
+		return Err(Error::bad_database("Mismatched membership boundary event"));
+	}
+	Ok((position, event))
 }

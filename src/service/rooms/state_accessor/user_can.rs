@@ -3,7 +3,7 @@ use ruma::{
 	EventId, RoomId, UserId,
 	api::error::ErrorKind,
 	events::{
-		StateEventType, TimelineEventType,
+		TimelineEventType,
 		room::{
 			history_visibility::HistoryVisibility,
 			member::{MembershipState, RoomMemberEventContent},
@@ -244,8 +244,7 @@ pub async fn user_can_see_state_events_checked(
 		.await
 	{
 		| Ok(hash) => hash,
-		| Err(error) if error.kind() == ruma::api::error::ErrorKind::NotFound =>
-			return Ok(false),
+		| Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
 		| Err(error) => return Err(error),
 	};
 	match self

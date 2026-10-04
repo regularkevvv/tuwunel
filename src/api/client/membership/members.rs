@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use axum::extract::State;
-use futures::{StreamExt, pin_mut};
+use futures::{StreamExt, pin_mut, stream};
 use ruma::{
 	UserId,
 	api::{
@@ -17,68 +17,79 @@ use ruma::{
 	},
 	serde::Raw,
 };
-use tuwunel_core::{Err, Error, Result, matrix::Event, utils::json::serialized_len};
+use tuwunel_core::{
+	Err, Error, Result,
+	matrix::{Event, Pdu},
+	utils::json::serialized_len,
+};
 
 use crate::Ruma;
 
+const MAX_STATE_ENTRIES: usize = 4096;
 const MAX_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const RESPONSE_ENVELOPE_BYTES: usize = 64;
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/members`
 ///
-/// Lists complete, bounded current membership state with optional filtering.
-/// TODO: select historical state for `at` and former members.
+/// Lists complete, bounded membership state at the requested pagination
+/// boundary, the caller's departure, or current state.
 ///
 /// - Requires state visibility under the room history policy
 pub(crate) async fn get_member_events_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_member_events::v3::Request>,
 ) -> Result<get_member_events::v3::Response> {
-	if !services
+	let snapshot = services
 		.state_accessor
-		.user_can_see_state_events_checked(body.sender_user(), &body.room_id)
-		.await?
-	{
-		return Err!(Request(Forbidden(
-			"You aren't a member of the room and weren't previously a member of the room."
-		)));
-	}
+		.member_snapshot(&body.room_id, body.sender_user(), body.at.as_deref())
+		.await?;
 
 	let membership = body.membership.as_ref();
 	let not_membership = body.not_membership.as_ref();
-	let membership_filter = |content: &RoomMemberEventContent| match (membership, not_membership)
-	{
-		| (Some(included), Some(excluded)) =>
-			content.membership == *included || content.membership != *excluded,
-		| (Some(included), None) => content.membership == *included,
-		| (None, Some(excluded)) => content.membership != *excluded,
-		| (None, None) => true,
-	};
-	let state = services
-		.state_accessor
-		.room_state_full(&body.room_id);
+	let state = stream::iter(snapshot.hash).flat_map(|hash| {
+		services
+			.state_accessor
+			.state_full_pdus_strict(hash)
+	});
 	pin_mut!(state);
 	let mut source_bytes = 0_usize;
 	let mut response_bytes = RESPONSE_ENVELOPE_BYTES;
 	let mut chunk = Vec::new();
+	let mut state_entries = 0_usize;
+	let mut replaced_boundary = false;
 	while let Some(entry) = state.next().await {
 		let ((event_type, state_key), pdu) = entry?;
+		state_entries = state_entries.saturating_add(1);
+		if pdu.room_id().as_str() != body.room_id.as_str() {
+			return Err(Error::bad_database("Mismatched membership snapshot room"));
+		}
 		charge_json(&mut source_bytes, pdu.as_pdu(), MAX_SOURCE_BYTES)?;
+		let replaces = snapshot.boundary.as_ref().is_some_and(|event| {
+			event.event_type().to_cow_str() == event_type.to_cow_str()
+				&& event.state_key() == Some(state_key.as_str())
+		});
+		replaced_boundary |= replaces;
 		if event_type != StateEventType::RoomMember {
 			continue;
 		}
-		UserId::parse(state_key.as_str())
-			.map_err(|_| Error::bad_database("Invalid member state key"))?;
-
-		let content = pdu
-			.get_content::<RoomMemberEventContent>()
-			.map_err(|_| Error::bad_database("Invalid membership state event"))?;
-		if membership_filter(&content) {
-			let event: Raw<RoomMemberEvent> = pdu.into_format();
-			response_bytes = response_bytes.saturating_add(1); // array separator
-			charge_json(&mut response_bytes, &event, MAX_RESPONSE_BYTES)?;
-			chunk.push(event);
+		validate_member(&pdu)?;
+		if replaces {
+			continue;
+		}
+		append_member(&mut chunk, &mut response_bytes, pdu, membership, not_membership)?;
+	}
+	if let Some(pdu) = snapshot.boundary {
+		if pdu.state_key().is_some() && !replaced_boundary && state_entries >= MAX_STATE_ENTRIES {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Historical membership state row limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		charge_json(&mut source_bytes, pdu.as_pdu(), MAX_SOURCE_BYTES)?;
+		if pdu.event_type().to_cow_str() == "m.room.member" {
+			append_member(&mut chunk, &mut response_bytes, pdu, membership, not_membership)?;
 		}
 	}
 
@@ -143,6 +154,40 @@ pub(crate) async fn joined_members_route(
 	}
 
 	Ok(joined_members::v3::Response { joined })
+}
+
+fn validate_member(pdu: &Pdu) -> Result<RoomMemberEventContent> {
+	UserId::parse(
+		pdu.state_key()
+			.ok_or_else(|| Error::bad_database("Missing member state key"))?,
+	)
+	.map_err(|_| Error::bad_database("Invalid member state key"))?;
+	pdu.get_content::<RoomMemberEventContent>()
+		.map_err(|_| Error::bad_database("Invalid membership state event"))
+}
+
+fn append_member(
+	chunk: &mut Vec<Raw<RoomMemberEvent>>,
+	response_bytes: &mut usize,
+	pdu: Pdu,
+	membership: Option<&MembershipState>,
+	not_membership: Option<&MembershipState>,
+) -> Result {
+	let content = validate_member(&pdu)?;
+	let selected = match (membership, not_membership) {
+		| (Some(included), Some(excluded)) =>
+			content.membership == *included || content.membership != *excluded,
+		| (Some(included), None) => content.membership == *included,
+		| (None, Some(excluded)) => content.membership != *excluded,
+		| (None, None) => true,
+	};
+	if selected {
+		let event: Raw<RoomMemberEvent> = pdu.into_format();
+		*response_bytes = response_bytes.saturating_add(1);
+		charge_json(response_bytes, &event, MAX_RESPONSE_BYTES)?;
+		chunk.push(event);
+	}
+	Ok(())
 }
 
 fn charge_json<T: serde::Serialize>(bytes: &mut usize, value: &T, limit: usize) -> Result {

@@ -841,6 +841,15 @@ pub async fn is_left(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 	self.db.userroomid_leftstate.contains(&key).await
 }
 
+/// Checks departure presence without discarding storage failures.
+#[implement(Service)]
+pub async fn is_left_checked(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.userroomid_leftstate
+		.contains_checked(&(user_id, room_id))
+		.await
+}
+
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Result {

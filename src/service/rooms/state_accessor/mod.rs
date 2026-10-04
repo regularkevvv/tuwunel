@@ -1,4 +1,5 @@
 mod erased;
+mod member_snapshot;
 mod room_state;
 mod server_can;
 mod state;
@@ -7,7 +8,8 @@ mod user_can;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::{TryFutureExt, future::try_join};
+use futures::future::try_join;
+pub use member_snapshot::MemberSnapshot;
 use ruma::{
 	EventEncryptionAlgorithm, OwnedRoomAliasId, RoomId, UserId,
 	api::error::ErrorKind,
@@ -67,35 +69,32 @@ impl Service {
 					error
 				}
 			})?;
-		let create = self
-			.state_get(snapshot, &StateEventType::RoomCreate, "")
+		let create = self.state_get(snapshot, &StateEventType::RoomCreate, "");
+		let power_levels =
+			self.state_get_optional(snapshot, &StateEventType::RoomPowerLevels, "");
+		let (create, power_levels) = try_join(create, power_levels)
+			.await
 			.map_err(|error| {
 				if error.kind() == ErrorKind::NotFound {
 					Error::bad_database("Missing room creation event")
 				} else {
 					error
 				}
-			})
-			.and_then(async |pdu| {
+			})?;
+		if create.room_id() != room_id {
+			return Err(Error::bad_database("Mismatched room creation event"));
+		}
+		let create = RoomCreateEvent::new(create);
+		let power_levels = power_levels
+			.map(|pdu| {
 				if pdu.room_id() != room_id {
-					return Err(Error::bad_database("Mismatched room creation event"));
+					return Err(Error::bad_database("Mismatched power level event"));
 				}
-				Ok(RoomCreateEvent::new(pdu))
-			});
-		let power_levels = self
-			.state_get_optional(snapshot, &StateEventType::RoomPowerLevels, "")
-			.and_then(async |pdu| {
-				pdu.map(|pdu| {
-					if pdu.room_id() != room_id {
-						return Err(Error::bad_database("Mismatched power level event"));
-					}
-					pdu.get_content::<RoomPowerLevelsEventContent>()
-						.map_err(|_| Error::bad_database("Invalid power level event"))
-				})
-				.transpose()
-			});
+				pdu.get_content::<RoomPowerLevelsEventContent>()
+					.map_err(|_| Error::bad_database("Invalid power level event"))
+			})
+			.transpose()?;
 
-		let (create, power_levels) = try_join(create, power_levels).await?;
 		let room_version = create.room_version()?;
 		let rules = room_version::rules(&room_version)?;
 		let creators = create.creators(&rules.authorization)?;
