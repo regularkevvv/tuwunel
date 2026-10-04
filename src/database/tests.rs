@@ -671,6 +671,9 @@ fn de_record_cbor_trailing() {
 	assert_eq!(actual.0, expected);
 	let secret = "disposable-cbor-record-marker";
 	let extra = serialize_to_vec(Cbor(secret)).expect("serialize trailing CBOR value");
+	let error =
+		from_slice::<Cbor<Vec<u64>>>(&extra).expect_err("wrong CBOR value type must refuse");
+	assert!(!error.to_string().contains(secret), "CBOR type errors cannot expose values");
 	for tail in [vec![0_u8], vec![0xFF_u8], extra] {
 		let mut invalid = good.clone();
 		invalid.extend_from_slice(&tail);
