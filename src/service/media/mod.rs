@@ -696,15 +696,16 @@ impl Service {
 		Ok(urls.next().await)
 	}
 
-	/// Gets all the MXC URIs in our media database
+	/// Gets the complete MXC inventory through 4,096 stored media rows and
+	/// 1 MiB of retained keys. Refuses overflow, malformed URIs or read errors
+	/// before a caller can start deleting media. Thumbnail rows retain their
+	/// existing separate inventory entries.
 	pub async fn get_all_mxcs(&self) -> Result<Vec<OwnedMxcUri>> {
-		let all_keys = self.db.get_all_media_keys().await;
+		let all_keys = self.db.get_all_media_keys().await?;
 
 		let mut mxcs = Vec::with_capacity(all_keys.len());
 
 		for key in all_keys {
-			trace!("Full MXC key from database: {key:?}");
-
 			let mut parts = key.split(|&b| b == 0xFF);
 			let mxc = parts
 				.next()
@@ -718,20 +719,15 @@ impl Service {
 				.transpose()?;
 
 			let Some(mxc_s) = mxc else {
-				debug_warn!(
-					?mxc,
-					"Parsed MXC URL unicode bytes from database but is still invalid"
-				);
-				continue;
+				return Err!(Database("Missing media URI in inventory"));
 			};
 
-			trace!("Parsed MXC key to URL: {mxc_s}");
 			let mxc = OwnedMxcUri::from(mxc_s);
 
 			if mxc.is_valid() {
 				mxcs.push(mxc);
 			} else {
-				debug_warn!("{mxc:?} from database was found to not be valid");
+				return Err!(Database("Invalid media URI in inventory"));
 			}
 		}
 
