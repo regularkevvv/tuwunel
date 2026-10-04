@@ -605,6 +605,25 @@ async fn eligibility(fixture: &Fixture<'_>) -> Result {
 		);
 		fixture.healthy().await?;
 	}
+	let newer = send(&fixture.client, fixture.room, "newer-eligible", "m.room.message",
+		json!({"msgtype": "m.text", "body": "newest", "m.new_content": {"msgtype": "m.text", "body": "newest"}, "m.relates_to": {"rel_type": "m.replace", "event_id": fixture.root}})).await?;
+	let newest = child(services, fixture.root_id, newer, 1).await?;
+	assert!(
+		poll_until(Duration::from_secs(10), async || services.db["relatesto_typed"]
+			.get(newest.key.as_slice())
+			.await
+			.is_ok())
+		.await,
+		"newest eligible edit settles"
+	);
+	let body = fixture
+		.get(&format!("rooms/{}/event/{}", fixture.room, fixture.root), http::StatusCode::OK)
+		.await?;
+	assert_eq!(
+		body["unsigned"]["m.relations"]["m.replace"]["event_id"].as_str(),
+		Some(newest.event.as_str()),
+		"newest eligible edit wins the timestamp/count ordering"
+	);
 	assert_ne!(
 		peer,
 		services
