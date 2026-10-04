@@ -202,7 +202,10 @@ async fn member_snapshot_visible(
 		let content = event
 			.get_content::<RoomMemberEventContent>()
 			.map_err(|_| Error::bad_database("Invalid boundary membership event"))?;
-		if content.membership == MembershipState::Join {
+		if content.membership == MembershipState::Join
+			|| content.membership == MembershipState::Invite
+				&& visibility == HistoryVisibility::Invited
+		{
 			return Ok(true);
 		}
 	}

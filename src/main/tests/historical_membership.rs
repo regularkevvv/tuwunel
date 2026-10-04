@@ -424,5 +424,122 @@ async fn exercise(services: &Services, base: &str) -> Result {
 			.get_content::<Value>()?["history_visibility"],
 		"joined"
 	);
+	invitation_history(&fixture).await?;
+	Ok(())
+}
+
+async fn invitation_history(context: &Fixture<'_>) -> Result {
+	let services = context.client.services;
+	let client = Client {
+		services,
+		base: context.client.base,
+		token: OWNER,
+	};
+	let room = client
+		.create_room(&json!({"preset":"private_chat", "initial_state":[{
+			"type":"m.room.history_visibility", "state_key":"", "content":{"history_visibility":"invited"}
+		}]}))
+		.await?;
+	let fixture = Fixture { client, room, peer: context.peer };
+	let before = fixture.marker("before-invitation").await?;
+	let before_at = services
+		.timeline
+		.get_pdu_count(&before)
+		.await?
+		.to_string();
+	fixture
+		.members(PEER, Some(&before_at), http::StatusCode::FORBIDDEN)
+		.await?;
+	fixture
+		.post(
+			&format!("rooms/{}/invite", fixture.room),
+			OWNER,
+			&json!({"user_id":fixture.peer}),
+		)
+		.await?;
+	let invite = services
+		.state_accessor
+		.room_state_get_id(&fixture.room, &StateEventType::RoomMember, fixture.peer.as_str())
+		.await?;
+	let invite_at = services
+		.timeline
+		.get_pdu_count(&invite)
+		.await?
+		.to_string();
+	let members = fixture
+		.members(PEER, Some(&invite_at), http::StatusCode::OK)
+		.await?;
+	assert_eq!(
+		members["chunk"]
+			.as_array()
+			.expect("invited snapshot")
+			.len(),
+		2
+	);
+	assert_eq!(fixture.member(&members, fixture.peer)["content"]["membership"], "invite");
+	fixture
+		.post(&format!("join/{}", fixture.room), PEER, &json!({}))
+		.await?;
+	// Joining now does not grant state from before an invited-history cutoff.
+	fixture
+		.members(PEER, Some(&before_at), http::StatusCode::FORBIDDEN)
+		.await?;
+	services
+		.client
+		.clients
+		.default
+		.put(
+			fixture
+				.client
+				.url(&format!("rooms/{}/state/m.room.history_visibility", fixture.room)),
+		)
+		.bearer_auth(OWNER)
+		.json(&json!({"history_visibility":"joined"}))
+		.send()
+		.await?
+		.error_for_status()?;
+	let private = fixture.marker("joined-private").await?;
+	let private_at = services
+		.timeline
+		.get_pdu_count(&private)
+		.await?
+		.to_string();
+	fixture
+		.members(LATE, Some(&private_at), http::StatusCode::FORBIDDEN)
+		.await?;
+	services
+		.client
+		.clients
+		.default
+		.put(
+			fixture
+				.client
+				.url(&format!("rooms/{}/state/m.room.history_visibility", fixture.room)),
+		)
+		.bearer_auth(OWNER)
+		.json(&json!({"history_visibility":"world_readable"}))
+		.send()
+		.await?
+		.error_for_status()?;
+	let public = fixture.marker("world-readable").await?;
+	let public_at = services
+		.timeline
+		.get_pdu_count(&public)
+		.await?
+		.to_string();
+	let members = fixture
+		.members(LATE, Some(&public_at), http::StatusCode::OK)
+		.await?;
+	assert_eq!(
+		members["chunk"]
+			.as_array()
+			.expect("public snapshot")
+			.len(),
+		2
+	);
+	// The current public policy does not overwrite a private historical policy.
+	fixture
+		.members(LATE, Some(&private_at), http::StatusCode::FORBIDDEN)
+		.await?;
 	Ok(())
 }
