@@ -15,7 +15,7 @@ use tuwunel_core::{
 };
 use tuwunel_service::Services;
 
-use super::{room_row, usize_to_uint};
+use super::{RoomRowBudget, room_row, usize_to_uint};
 use crate::{Ruma, client::admin::require_admin};
 
 /// # `GET /_synapse/admin/v1/rooms/{room_id}`
@@ -34,7 +34,8 @@ pub(crate) async fn admin_room_details_route(
 		return Err!(Request(NotFound("Room not found")));
 	}
 
-	let row = room_row(&services, room_id);
+	let mut budget = RoomRowBudget::default();
+	let row = room_row(&services, room_id, &mut budget);
 
 	let topic = services
 		.state_accessor
@@ -53,6 +54,7 @@ pub(crate) async fn admin_room_details_route(
 		.map(|content: Result<RoomTombstoneEventContent>| content.ok());
 
 	let (row, topic, avatar, tombstone) = join4(row, topic, avatar, tombstone).boxed().await;
+	let row = row?;
 
 	let joined_local_devices = local_device_count(&services, room_id).await;
 

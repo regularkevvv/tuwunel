@@ -1,17 +1,13 @@
 use std::cmp::Ordering;
 
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::uint;
 use synapse_admin_api::rooms::list_rooms::v1::{
 	Request, Response, RoomDetails, RoomSortOrder, SortDirection,
 };
-use tuwunel_core::{
-	Result,
-	utils::stream::{BroadbandExt, ReadyExt},
-};
+use tuwunel_core::Result;
 
-use super::{room_row, usize_to_uint};
+use super::{RoomRowBudget, room_row, usize_to_uint};
 use crate::{Ruma, client::admin::require_admin};
 
 /// # `GET /_synapse/admin/v1/rooms`
@@ -24,7 +20,7 @@ pub(crate) async fn admin_list_rooms_route(
 ) -> Result<Response> {
 	require_admin(&services, body.sender_user()).await?;
 
-	let search_term = body.search_term.as_deref().map(str::to_lowercase);
+	let search_term = body.search_term.as_deref();
 	let order_by = body
 		.order_by
 		.clone()
@@ -32,18 +28,18 @@ pub(crate) async fn admin_list_rooms_route(
 
 	let backward = matches!(body.dir, Some(SortDirection::Backward));
 
-	let mut rooms: Vec<RoomDetails> = services
-		.metadata
-		.iter_ids()
-		.map(ToOwned::to_owned)
-		.broad_then(async |room_id| room_row(&services, &room_id).await)
-		.ready_filter(|room| {
-			matches_search(room, search_term.as_deref())
-				&& matches_public(room, body.public_rooms)
-				&& matches_empty(room, body.empty_rooms)
-		})
-		.collect()
-		.await;
+	let room_ids = services.metadata.bounded_room_ids().await?;
+	let mut budget = RoomRowBudget::default();
+	let mut rooms = Vec::new();
+	for room_id in room_ids {
+		let room = room_row(&services, &room_id, &mut budget).await?;
+		if matches_search(&room, search_term)
+			&& matches_public(&room, body.public_rooms)
+			&& matches_empty(&room, body.empty_rooms)
+		{
+			rooms.push(room);
+		}
+	}
 
 	sort_rooms(&mut rooms, &order_by);
 
@@ -83,16 +79,17 @@ fn matches_search(room: &RoomDetails, search_term: Option<&str>) -> bool {
 	let Some(term) = search_term else {
 		return true;
 	};
+	let folded = term.to_lowercase();
 
 	let name_hit = room
 		.name
 		.as_deref()
-		.is_some_and(|name| name.to_lowercase().contains(term));
+		.is_some_and(|name| name.to_lowercase().contains(&folded));
 
 	let alias_hit = room
 		.canonical_alias
 		.as_ref()
-		.is_some_and(|alias| alias.as_str().to_lowercase().contains(term));
+		.is_some_and(|alias| alias.as_str().to_lowercase().contains(&folded));
 
 	name_hit || alias_hit || room.room_id.as_str() == term
 }
@@ -199,5 +196,14 @@ mod tests {
 		assert!(matches_search(&room, Some("!abcdef:example.org")));
 		// A substring of the room id must not match: the id is compared exactly.
 		assert!(!matches_search(&room, Some("abcdef")));
+	}
+
+	#[test]
+	fn search_keeps_room_id_case_while_folding_names() {
+		let mut room = RoomDetails::new(room_id!("!AbCd:example.org").to_owned());
+		room.name = Some("The Lounge".into());
+		assert!(matches_search(&room, Some("!AbCd:example.org")));
+		assert!(!matches_search(&room, Some("!abcd:example.org")));
+		assert!(matches_search(&room, Some("LOUNGE")));
 	}
 }

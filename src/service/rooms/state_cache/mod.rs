@@ -1,3 +1,4 @@
+mod inventory;
 #[cfg(test)]
 mod tests;
 mod update;
@@ -10,6 +11,7 @@ use std::{
 };
 
 use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
+pub use inventory::RoomMemberInventoryCount;
 use ruma::{
 	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
 	events::{AnyStrippedStateEvent, AnySyncStateEvent, room::member::MembershipState},

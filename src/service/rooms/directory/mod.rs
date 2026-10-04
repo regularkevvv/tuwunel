@@ -61,6 +61,15 @@ pub async fn is_public_room(&self, room_id: &RoomId) -> bool {
 	self.visibility(room_id).await == Visibility::Public
 }
 
+/// Reports public-directory membership without hiding failed storage reads.
+#[implement(Service)]
+pub async fn is_public_room_checked(&self, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.publicroomids
+		.contains_checked(&(room_id,))
+		.await
+}
+
 #[implement(Service)]
 pub async fn visibility(&self, room_id: &RoomId) -> Visibility {
 	if self.db.publicroomids.get(room_id).await.is_ok() {
