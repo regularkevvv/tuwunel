@@ -362,7 +362,7 @@ async fn publication_alias_controls(context: &Context<'_>) -> Result {
 		publications.remove(context.room).await?;
 		context.healthy().await?;
 	}
-	let alias = b"#preserved-permission-alias:localhost";
+	let alias: &[u8] = b"#preserved-permission-alias:localhost";
 	publications.raw_put(context.room, alias).await?;
 	context
 		.publication("public", http::StatusCode::OK)
