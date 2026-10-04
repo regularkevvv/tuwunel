@@ -5,6 +5,7 @@ use futures::{
 };
 use ruma::{
 	EventId, OwnedEventId, RoomId, UserId,
+	api::error::{ErrorKind, LimitExceededErrorData},
 	events::{
 		StateEventType, TimelineEventType,
 		room::{
@@ -28,6 +29,16 @@ use crate::rooms::{
 	short::{ShortEventId, ShortStateHash, ShortStateKey},
 	state_compressor::{CompressedState, compress_state_event, parse_compressed_state_event},
 };
+
+const MAX_STATE_MAPPING_BYTES: usize = 512 * 1024;
+
+fn state_mapping_limit() -> Error {
+	Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+		"Room state mapping byte limit reached".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	)
+}
 
 /// The user was a joined member at this state (potentially in the past)
 #[implement(super::Service)]
@@ -677,17 +688,36 @@ pub fn state_full_entries_strict(
 		.try_collect::<Vec<_>>()
 		.and_then(async move |entries| {
 			let (shortstatekeys, event_ids): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-			self.services
-				.short
-				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
+			// Resolve and charge each value before fetching the next one.
+			shortstatekeys
+				.into_iter()
+				.stream()
+				.then(async move |shortstatekey| {
+					self.services
+						.short
+						.get_statekey_from_short(shortstatekey)
+						.await
+				})
 				.zip(event_ids.into_iter().stream())
 				.map(|(state_key, event_id)| {
 					state_key
 						.map(|state_key| (state_key, event_id))
 						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
 				})
-				.try_collect::<Vec<_>>()
+				.try_fold((Vec::new(), 0_usize), async |(mut entries, bytes), entry| {
+					let (state_key, event_id) = entry;
+					let bytes = bytes
+						.saturating_add(state_key.0.to_cow_str().len())
+						.saturating_add(state_key.1.as_str().len())
+						.saturating_add(event_id.as_str().len());
+					if bytes > MAX_STATE_MAPPING_BYTES {
+						return Err(state_mapping_limit());
+					}
+					entries.push((state_key, event_id));
+					Ok((entries, bytes))
+				})
 				.await
+				.map(|(entries, _)| entries)
 		})
 		.map_ok(Vec::into_iter)
 		.map_ok(IterStream::try_stream)
@@ -702,13 +732,19 @@ pub fn state_full_pdus_strict(
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<((StateEventType, StateKey), Pdu)>> + Send + '_ {
 	self.state_full_entries_strict(shortstatehash)
-		.broad_and_then(async |(state_key, event_id)| {
+		.and_then(async |(state_key, event_id)| {
 			let pdu = self
 				.services
 				.timeline
 				.get_pdu(&event_id)
 				.await
-				.map_err(|_| Error::bad_database("Incomplete state event"))?;
+				.map_err(|error| {
+					if error.kind() == ErrorKind::NotFound {
+						Error::bad_database("Incomplete state event")
+					} else {
+						error
+					}
+				})?;
 			if pdu.event_id() != event_id
 				|| pdu.event_type().to_cow_str() != state_key.0.to_cow_str()
 				|| pdu.state_key() != Some(state_key.1.as_str())
@@ -759,17 +795,32 @@ pub fn state_full_ids_strict(
 			},
 		)
 		.and_then(async move |(shortstatekeys, shorteventids)| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
+			shorteventids
+				.into_iter()
+				.stream()
+				.then(async move |shorteventid| {
+					self.services
+						.short
+						.get_eventid_from_short::<OwnedEventId>(shorteventid)
+						.await
+				})
 				.zip(shortstatekeys.into_iter().stream())
 				.map(|(event_id, shortstatekey)| {
 					event_id
 						.map(|event_id| (shortstatekey, event_id))
 						.map_err(|_| Error::bad_database("Incomplete state event mapping"))
 				})
-				.try_collect::<Vec<_>>()
+				.try_fold((Vec::new(), 0_usize), async |(mut entries, bytes), entry| {
+					let (shortstatekey, event_id) = entry;
+					let bytes = bytes.saturating_add(event_id.as_str().len());
+					if bytes > MAX_STATE_MAPPING_BYTES {
+						return Err(state_mapping_limit());
+					}
+					entries.push((shortstatekey, event_id));
+					Ok((entries, bytes))
+				})
 				.await
+				.map(|(entries, _)| entries)
 		})
 		.map_ok(Vec::into_iter)
 		.map_ok(IterStream::try_stream)

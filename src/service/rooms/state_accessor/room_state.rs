@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt, TryFutureExt};
-use ruma::{OwnedEventId, RoomId, events::StateEventType};
+use ruma::{OwnedEventId, RoomId, api::error::ErrorKind, events::StateEventType};
 use serde::Deserialize;
 use tuwunel_core::{
 	Result, err, implement,
@@ -68,7 +68,13 @@ pub fn room_state_full<'a>(
 					})
 				})
 		})
-		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
+		.map_err(move |error| {
+			if error.kind() == ErrorKind::NotFound {
+				err!(Database("Missing state for {room_id:?}"))
+			} else {
+				error
+			}
+		})
 		.try_flatten_stream()
 		.boxed()
 }

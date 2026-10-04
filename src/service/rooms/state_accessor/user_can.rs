@@ -228,6 +228,40 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 	}
 }
 
+/// The existing state-visibility policy with checked membership and snapshot
+/// reads. Only a genuinely absent room becomes a negative authorization result.
+#[implement(super::Service)]
+pub async fn user_can_see_state_events_checked(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+) -> Result<bool> {
+	let cache = &self.services.state_cache;
+	if cache.is_joined_checked(user_id, room_id).await? {
+		return Ok(true);
+	}
+	let shortstatehash = match self
+		.services
+		.state
+		.get_room_shortstatehash(room_id)
+		.await
+	{
+		| Ok(hash) => hash,
+		| Err(error) if error.kind() == ruma::api::error::ErrorKind::NotFound =>
+			return Ok(false),
+		| Err(error) => return Err(error),
+	};
+	match self
+		.history_visibility_at(room_id, shortstatehash)
+		.await?
+	{
+		| HistoryVisibility::WorldReadable => Ok(true),
+		| HistoryVisibility::Invited => cache.is_invited_checked(user_id, room_id).await,
+		| HistoryVisibility::Shared => cache.once_joined_checked(user_id, room_id).await,
+		| _ => Ok(false),
+	}
+}
+
 /// Whether a user may see a room: a current or prior membership (joined,
 /// invited, left), or a world-readable room. Forgetting a room clears the
 /// user's left-state, so a forgotten room is not visible.
