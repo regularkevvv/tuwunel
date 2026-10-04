@@ -20,7 +20,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Error, Event, PduEvent, Result,
 	error::inspect_debug_log,
-	http, implement,
+	implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
 	result::{AndThenRef, FlatOk},
 	smallvec::SmallVec,
