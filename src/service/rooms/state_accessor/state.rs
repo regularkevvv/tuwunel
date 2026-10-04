@@ -336,7 +336,7 @@ async fn state_cell_from_snapshot(
 			|| pdu.state_key() != Some(candidate_key.as_str())
 			|| snapshot_room
 				.as_ref()
-				.is_some_and(|room| room.as_ref() != pdu.room_id())
+				.is_some_and(|room| room.as_str() != pdu.room_id().as_str())
 		{
 			return Err(Error::bad_database("Mismatched state event mapping"));
 		}
