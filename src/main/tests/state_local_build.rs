@@ -522,15 +522,22 @@ async fn missing_event_reverse(
 	remove_short_row(services, "shorteventid_eventid", shorteventid).await?;
 	suppress_upgrade(services, held.event_id.as_ref()).await?;
 	assert_unevaluable(services, top.event_id.as_ref(), "missing event reverse map").await?;
-	assert_fetches(
+	// Current-state absence now validates the entire snapshot. This corrupt
+	// non-ACL cell must refuse before the incoming walk or federation fetch.
+	assert_refused_before_walk(
 		services,
 		&room_id,
 		&top,
 		top_json,
-		ExpectedWalkOutcome::Unevaluable,
 		"missing event reverse map",
+		"Incomplete state event mapping",
 	)
-	.await
+	.await?;
+	services.db["shorteventid_eventid"]
+		.get(&shorteventid.to_be_bytes())
+		.await
+		.expect_err("early refusal cannot recreate the missing reverse mapping");
+	assert_no_memo(services, held.event_id.as_ref()).await
 }
 
 async fn missing_state_key_reverse(
@@ -561,6 +568,7 @@ async fn missing_state_key_reverse(
 		&top,
 		top_json,
 		"missing state key reverse map",
+		"Incomplete state key mapping",
 	)
 	.await
 }
@@ -1292,6 +1300,7 @@ async fn assert_refused_before_walk(
 	incoming: &PduEvent,
 	incoming_json: CanonicalJsonObject,
 	context: &str,
+	expected_error: &str,
 ) -> Result {
 	let room_version = match services.state.get_room_version(room_id).await {
 		| Ok(room_version) => room_version,
@@ -1300,6 +1309,16 @@ async fn assert_refused_before_walk(
 
 	let incoming_json = into_outgoing_federation(incoming_json, &room_version);
 	let before = services.event_handler.state_local_metrics();
+	let state_before = services
+		.state
+		.get_room_shortstatehash(room_id)
+		.await?;
+	let frontier_before: Vec<OwnedEventId> = services
+		.state
+		.get_forward_extremities(room_id)
+		.map(ToOwned::to_owned)
+		.collect()
+		.await;
 
 	let result = services
 		.event_handler
@@ -1324,12 +1343,24 @@ async fn assert_refused_before_walk(
 		return Err!("{context} was not refused");
 	};
 
-	if !error
-		.to_string()
-		.contains("Incomplete state key mapping")
-	{
+	if !error.to_string().contains(expected_error) {
 		return Err!("{context} was refused for another reason: {error}");
 	}
+	assert_eq!(error.status_code(), tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(
+		services
+			.state
+			.get_room_shortstatehash(room_id)
+			.await?,
+		state_before
+	);
+	let frontier_after: Vec<OwnedEventId> = services
+		.state
+		.get_forward_extremities(room_id)
+		.map(ToOwned::to_owned)
+		.collect()
+		.await;
+	assert_eq!(frontier_after, frontier_before, "{context} changed the accepted frontier");
 
 	assert!(
 		services
