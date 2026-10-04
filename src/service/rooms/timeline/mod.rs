@@ -687,10 +687,7 @@ pub async fn get_pdu_id_from_shorteventid(&self, shorteventid: ShortEventId) -> 
 pub async fn get_pdu_id(&self, event_id: &EventId) -> Result<RawPduId> {
 	let handle = self.db.eventid_pduid.get(event_id).await?;
 	let encoded: &[u8] = handle.as_ref();
-	if !matches!(encoded.len(), 16 | 24) || encoded.len() == 24 && encoded[8..16] != [0_u8; 8] {
-		return Err(Error::bad_database("Invalid accepted event index"));
-	}
-	Ok(RawPduId::from(encoded))
+	RawPduId::from_bytes(encoded)
 }
 
 /// Reads the last canonical room event at or before a membership pagination
@@ -716,10 +713,7 @@ pub async fn member_snapshot_boundary(
 	if !key.starts_with(&shortroomid.to_be_bytes()) {
 		return Err(err!(Request(NotFound("No room event at membership boundary"))));
 	}
-	if !matches!(key.len(), 16 | 24) || key.len() == 24 && key[8..16] != [0_u8; 8] {
-		return Err(Error::bad_database("Invalid membership boundary index"));
-	}
-	let position = RawPduId::from(key).pdu_count();
+	let position = RawPduId::from_bytes(key)?.pdu_count();
 	let event = serde_json::from_slice::<PduEvent>(value)
 		.map_err(|_| Error::bad_database("Invalid membership boundary event"))?;
 	let canonical = self

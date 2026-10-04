@@ -676,6 +676,18 @@ fn de_record_raw_pdu_ids() {
 	let mut invalid = [0_u8; 24];
 	invalid[8] = 1;
 	assert!(from_slice::<RawPduId>(&invalid).is_err(), "nonzero backfill marker must refuse");
+	let mut negative_normal = [0_u8; 16];
+	negative_normal[8] = 0x80;
+	assert!(
+		from_slice::<RawPduId>(&negative_normal).is_err(),
+		"negative normal count must refuse"
+	);
+	let mut positive_backfill = [0_u8; 24];
+	positive_backfill[23] = 1;
+	assert!(
+		from_slice::<RawPduId>(&positive_backfill).is_err(),
+		"positive backfill count must refuse"
+	);
 }
 
 #[test]
