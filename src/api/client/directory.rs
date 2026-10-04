@@ -111,7 +111,11 @@ pub(crate) async fn set_room_visibility_route(
 ) -> Result<set_room_visibility::v3::Response> {
 	let sender_user = body.sender_user();
 
-	if !services.metadata.exists(&body.room_id).await {
+	if !services
+		.metadata
+		.exists_checked(&body.room_id)
+		.await?
+	{
 		// Return 404 if the room doesn't exist
 		return Err!(Request(NotFound("Room not found")));
 	}
@@ -120,7 +124,7 @@ pub(crate) async fn set_room_visibility_route(
 		.users
 		.is_deactivated(sender_user)
 		.await
-		.unwrap_or(false)
+		.map_err(|_| Error::bad_database("Cannot read room publisher account state"))?
 		&& body.appservice_info.is_none()
 	{
 		return Err!(Request(Forbidden("Guests cannot publish to room directories")));
@@ -162,9 +166,8 @@ pub(crate) async fn set_room_visibility_route(
 			// Preserve the alias the room was published under.
 			let published_alias = services
 				.directory
-				.published_alias(&body.room_id)
-				.await
-				.ok();
+				.published_alias_checked(&body.room_id)
+				.await?;
 
 			services
 				.directory
@@ -373,30 +376,17 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 }
 
 /// Check whether the user can publish to the room directory via power levels of
-/// room history visibility event or room creator
+/// room history visibility event. Failed reads never grant creator fallback.
 async fn user_can_publish_room(
 	services: &Services,
 	user_id: &UserId,
 	room_id: &RoomId,
 ) -> Result<bool> {
-	match services
+	let power_levels = services
 		.state_accessor
 		.get_power_levels(room_id)
-		.await
-	{
-		| Ok(power_levels) =>
-			Ok(power_levels.user_can_send_state(user_id, StateEventType::RoomHistoryVisibility)),
-		| _ => {
-			match services
-				.state_accessor
-				.room_state_get(room_id, &StateEventType::RoomCreate, "")
-				.await
-			{
-				| Ok(event) => Ok(event.sender() == user_id),
-				| _ => Err!(Request(Forbidden("User is not allowed to publish this room"))),
-			}
-		},
-	}
+		.await?;
+	Ok(power_levels.user_can_send_state(user_id, StateEventType::RoomHistoryVisibility))
 }
 
 async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> PublicRoomsChunk {

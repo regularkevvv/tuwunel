@@ -7,9 +7,10 @@ mod user_can;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::{FutureExt, TryFutureExt, future::try_join};
+use futures::{TryFutureExt, future::try_join};
 use ruma::{
 	EventEncryptionAlgorithm, OwnedRoomAliasId, RoomId, UserId,
+	api::error::ErrorKind,
 	events::{
 		StateEventType,
 		room::{
@@ -29,8 +30,8 @@ use ruma::{
 	room::RoomType,
 };
 use tuwunel_core::{
-	Result, err,
-	matrix::{Pdu, room_version},
+	Error, Result, err,
+	matrix::{Event, Pdu, room_version},
 	utils::BoolExt,
 };
 
@@ -51,17 +52,50 @@ impl crate::Service for Service {
 
 impl Service {
 	/// Gets the effective power levels of a room, regardless of if there is an
-	/// `m.room.power_levels` state.
+	/// `m.room.power_levels` state. Defaults require proven absence in a
+	/// complete snapshot; corruption and failed reads remain errors.
 	pub async fn get_power_levels(&self, room_id: &RoomId) -> Result<RoomPowerLevels> {
-		let create = self.get_create(room_id);
+		let snapshot = self
+			.services
+			.state
+			.get_room_shortstatehash(room_id)
+			.await
+			.map_err(|error| {
+				if error.kind() == ErrorKind::NotFound {
+					Error::bad_database("Missing room permission state")
+				} else {
+					error
+				}
+			})?;
+		let create = self
+			.state_get(snapshot, &StateEventType::RoomCreate, "")
+			.map_err(|error| {
+				if error.kind() == ErrorKind::NotFound {
+					Error::bad_database("Missing room creation event")
+				} else {
+					error
+				}
+			})
+			.and_then(async |pdu| {
+				if pdu.room_id() != room_id {
+					return Err(Error::bad_database("Mismatched room creation event"));
+				}
+				Ok(RoomCreateEvent::new(pdu))
+			});
 		let power_levels = self
-			.room_state_get_content(room_id, &StateEventType::RoomPowerLevels, "")
-			.map_ok(|c: RoomPowerLevelsEventContent| c)
-			.map(Result::ok)
-			.map(Ok);
+			.state_get_optional(snapshot, &StateEventType::RoomPowerLevels, "")
+			.and_then(async |pdu| {
+				pdu.map(|pdu| {
+					if pdu.room_id() != room_id {
+						return Err(Error::bad_database("Mismatched power level event"));
+					}
+					pdu.get_content::<RoomPowerLevelsEventContent>()
+						.map_err(|_| Error::bad_database("Invalid power level event"))
+				})
+				.transpose()
+			});
 
 		let (create, power_levels) = try_join(create, power_levels).await?;
-
 		let room_version = create.room_version()?;
 		let rules = room_version::rules(&room_version)?;
 		let creators = create.creators(&rules.authorization)?;

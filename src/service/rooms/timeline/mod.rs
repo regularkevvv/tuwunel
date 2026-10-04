@@ -19,12 +19,14 @@ use futures::{
 };
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId,
-	UserId, api::Direction, events::room::encrypted::Relation,
+	UserId,
+	api::{Direction, error::ErrorKind},
+	events::room::encrypted::Relation,
 };
 use serde::Deserialize;
 pub use tuwunel_core::matrix::pdu::{PduId, RawPduId};
 use tuwunel_core::{
-	Err, Result, at, err, implement,
+	Err, Error, Result, at, err, implement,
 	matrix::{
 		ShortEventId,
 		pdu::{PduCount, PduEvent},
@@ -541,13 +543,21 @@ pub async fn get<T>(&self, event_id: &EventId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	let accepted = self.get_non_outlier(event_id);
-	let outlier = self.get_outlier(event_id);
-
-	pin_mut!(accepted, outlier);
-	select_ok([Left(accepted), Right(outlier)])
-		.await
-		.map(at!(0))
+	// Accepted records are canonical. An outlier is a fallback only when no
+	// accepted index exists; it cannot mask a failed/corrupt accepted read.
+	match self.get_pdu_id(event_id).await {
+		| Ok(pdu_id) => self.get_from_id(&pdu_id).await.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Missing accepted event record")
+			} else if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+				Error::bad_database("Invalid accepted event record")
+			} else {
+				error
+			}
+		}),
+		| Err(error) if error.kind() == ErrorKind::NotFound => self.get_outlier(event_id).await,
+		| Err(error) => Err(error),
+	}
 }
 
 /// Returns the pdu into T.
@@ -675,9 +685,10 @@ pub async fn get_pdu_id_from_shorteventid(&self, shorteventid: ShortEventId) -> 
 /// Returns the pdu's id.
 #[implement(Service)]
 pub async fn get_pdu_id(&self, event_id: &EventId) -> Result<RawPduId> {
-	self.db
-		.eventid_pduid
-		.get(event_id)
-		.await
-		.map(|handle| RawPduId::from(&*handle))
+	let handle = self.db.eventid_pduid.get(event_id).await?;
+	let encoded: &[u8] = handle.as_ref();
+	if !matches!(encoded.len(), 16 | 24) || encoded.len() == 24 && encoded[8..16] != [0_u8; 8] {
+		return Err(Error::bad_database("Invalid accepted event index"));
+	}
+	Ok(RawPduId::from(encoded))
 }

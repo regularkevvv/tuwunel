@@ -234,30 +234,32 @@ pub async fn state_get_optional(
 		// unmapped one could be this cell, but only the matching entry's event
 		// id: another entry's missing event mapping cannot hide it.
 		| None => {
-			let (shortstatekeys, shorteventids): (Vec<_>, Vec<_>) = self
+			let entries = self
 				.state_full_shortids(shortstatehash)
 				.try_collect::<Vec<_>>()
-				.await?
-				.into_iter()
-				.unzip();
-
-			let shorteventid = self
-				.services
-				.short
-				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
-				.zip(shorteventids.into_iter().stream())
-				.map(|(state_key, shorteventid)| {
-					state_key
-						.map(|state_key| (state_key, shorteventid))
-						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
-				})
-				.try_collect::<Vec<_>>()
-				.await?
-				.into_iter()
-				.find(|((candidate_type, candidate_key), _)| {
-					candidate_type == event_type && candidate_key.as_str() == state_key
-				})
-				.map(at!(1));
+				.await?;
+			let mut shorteventid = None;
+			let mut bytes = 0_usize;
+			for (shortstatekey, candidate_event) in entries {
+				let (candidate_type, candidate_key) = self
+					.services
+					.short
+					.get_statekey_from_short(shortstatekey)
+					.await
+					.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+				bytes = bytes
+					.saturating_add(candidate_type.to_cow_str().len())
+					.saturating_add(candidate_key.as_str().len());
+				if bytes > MAX_STATE_MAPPING_BYTES {
+					return Err(state_mapping_limit());
+				}
+				if candidate_type == *event_type
+					&& candidate_key.as_str() == state_key
+					&& shorteventid.replace(candidate_event).is_some()
+				{
+					return Err(Error::bad_database("Duplicate state key mapping"));
+				}
+			}
 			let Some(shorteventid) = shorteventid else {
 				return Ok(None);
 			};
