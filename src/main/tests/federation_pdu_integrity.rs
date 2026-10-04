@@ -253,13 +253,11 @@ async fn room_version_errors_refuse_invitation_fallback(
 		)
 		.await?;
 	assert_eq!(services.state.get_room_version(room).await?, RoomVersionId::V11);
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(&raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(&raw)
+		.await
+		.expect("healthy current state must parse the signed control PDU");
 	let hashes = &services.db["roomid_shortstatehash"];
 	let original = hashes.get(room).await?.to_vec();
 	hashes.remove(room).await?;
@@ -271,14 +269,11 @@ async fn room_version_errors_refuse_invitation_fallback(
 			.expect_err("a missing room snapshot permits invitation recovery")
 			.is_not_found()
 	);
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(&raw)
-			.await
-			.is_ok(),
-		"the stored invitation must actually provide a usable version"
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(&raw)
+		.await
+		.expect("the stored invitation must actually provide a usable version");
 	invitation_source_limits(services, room, &raw).await?;
 	invitation_state_limits(services, room, &raw).await?;
 	invitation_aggregate_limits(services, room, &raw).await?;
@@ -308,13 +303,11 @@ async fn room_version_errors_refuse_invitation_fallback(
 	}
 	hashes.insert(room, original).await?;
 	assert_eq!(services.state.get_room_version(room).await?, RoomVersionId::V11);
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(&raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(&raw)
+		.await
+		.expect("restored current state must parse the signed control PDU");
 	invited.del((room, user)).await?;
 	states.del((user, room)).await?;
 	Ok(())
@@ -354,13 +347,11 @@ async fn invitation_source_limits(
 			.put((room, &format!("@invite-{index:04}:remote.test")), b"")
 			.await?;
 	}
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("the exact invited-ID row limit must permit recovery");
 	members
 		.put((room, "@overflow:remote.test"), b"")
 		.await?;
@@ -384,13 +375,11 @@ async fn invitation_source_limits(
 			.del((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))))
 			.await?;
 	}
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("restored invited-ID input must permit recovery");
 	Ok(())
 }
 
@@ -425,13 +414,11 @@ async fn invitation_state_limits(
 	states
 		.put_raw((user, room), encoded_invitation(user, 128, 0)?)
 		.await?;
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("the exact stripped-event row limit must permit recovery");
 	states
 		.put_raw((user, room), encoded_invitation(user, 129, 0)?)
 		.await?;
@@ -440,13 +427,11 @@ async fn invitation_state_limits(
 	let exact = encoded_invitation(user, 1, padding)?;
 	assert_eq!(exact.len(), 64 * 1024);
 	states.put_raw((user, room), &exact).await?;
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("the exact stored invitation byte limit must permit recovery");
 	states
 		.put_raw((user, room), encoded_invitation(user, 1, padding.saturating_add(1))?)
 		.await?;
@@ -462,13 +447,11 @@ async fn invitation_state_limits(
 		.await?;
 	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
 	states.put_raw((user, room), original).await?;
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("restored invitation state must permit recovery");
 	Ok(())
 }
 
@@ -502,13 +485,11 @@ async fn invitation_aggregate_limits(
 			states.put_raw((&extra, room), &encoded).await?;
 			extra_users.push(extra);
 		}
-		assert!(
-			services
-				.event_handler
-				.parse_incoming_pdu(raw)
-				.await
-				.is_ok()
-		);
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.expect("the exact aggregate invitation budget must permit recovery");
 		let overflow =
 			UserId::parse(format!("@invite-overflow:{}", services.globals.server_name()))?;
 		members.put((room, &overflow), b"").await?;
@@ -534,13 +515,11 @@ async fn invitation_aggregate_limits(
 	members.del((room, &conflicting)).await?;
 	states.del((&conflicting, room)).await?;
 	states.put_raw((user, room), original).await?;
-	assert!(
-		services
-			.event_handler
-			.parse_incoming_pdu(raw)
-			.await
-			.is_ok()
-	);
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("restored aggregate invitation input must permit recovery");
 	Ok(())
 }
 
