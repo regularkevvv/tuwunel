@@ -14,7 +14,7 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Error, Event, PduEvent, Result, err,
+	Error, Event, PduEvent, Result,
 	error::inspect_debug_log,
 	implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
