@@ -15,32 +15,6 @@ pub(crate) use self::{
 	v5::sync_events_v5_route,
 };
 
-#[derive(Clone, Copy)]
-enum TimelineErrors {
-	Ignore,
-	Propagate,
-}
-
-async fn load_timeline(
-	services: &Services,
-	sender_user: &UserId,
-	room_id: &RoomId,
-	roomsincecount: PduCount,
-	next_batch: Option<PduCount>,
-	limit: usize,
-) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
-	load_timeline_with_errors(
-		services,
-		sender_user,
-		room_id,
-		roomsincecount,
-		next_batch,
-		limit,
-		TimelineErrors::Ignore,
-	)
-	.await
-}
-
 async fn load_timeline_fallible(
 	services: &Services,
 	sender_user: &UserId,
@@ -48,27 +22,6 @@ async fn load_timeline_fallible(
 	roomsincecount: PduCount,
 	next_batch: Option<PduCount>,
 	limit: usize,
-) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
-	load_timeline_with_errors(
-		services,
-		sender_user,
-		room_id,
-		roomsincecount,
-		next_batch,
-		limit,
-		TimelineErrors::Propagate,
-	)
-	.await
-}
-
-async fn load_timeline_with_errors(
-	services: &Services,
-	sender_user: &UserId,
-	room_id: &RoomId,
-	roomsincecount: PduCount,
-	next_batch: Option<PduCount>,
-	limit: usize,
-	errors: TimelineErrors,
 ) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
 	let until = next_batch.map(|count| count.saturating_add(1));
 	let pdus = services
@@ -83,13 +36,7 @@ async fn load_timeline_with_errors(
 	let mut limited = false;
 
 	while let Some(pdu) = pdus.next().await {
-		let (pducount, pdu) = match pdu {
-			| Ok(pdu) => pdu,
-			| Err(error) if first || matches!(errors, TimelineErrors::Propagate) => {
-				return Err(error);
-			},
-			| Err(_) => continue,
-		};
+		let (pducount, pdu) = pdu?;
 
 		if first {
 			first = false;

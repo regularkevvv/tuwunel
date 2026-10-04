@@ -72,7 +72,7 @@ use tuwunel_service::{
 	},
 };
 
-use super::{load_timeline, share_encrypted_room, strip_prev_state};
+use super::{load_timeline_fallible, share_encrypted_room, strip_prev_state};
 use crate::{
 	ClientIp, Ruma,
 	client::{ignored_filter, is_empty_account_data_event, with_membership},
@@ -149,6 +149,8 @@ enum StateAfter {
 
 type PresenceUpdates = HashMap<OwnedUserId, PresenceEventContent>;
 type TimelineEventIds = SmallVec<[OwnedEventId; 1]>;
+type JoinedRooms =
+	(BTreeMap<OwnedRoomId, JoinedRoom>, HashSet<OwnedUserId>, HashSet<OwnedUserId>);
 
 impl StateAfter {
 	fn requested(self) -> bool { !matches!(self, Self::Off) }
@@ -477,12 +479,7 @@ async fn build_sync_events(
 		keys_changed,
 		presence_updates,
 		(_, to_device_events, device_one_time_keys_count, device_unused_fallback_key_types),
-		(
-			(joined_rooms, mut device_list_updates, left_encrypted_users),
-			left_rooms,
-			invited_rooms,
-			knocked_rooms,
-		),
+		(joined_rooms, left_rooms, invited_rooms, knocked_rooms),
 	) = join5(
 		account_data,
 		keys_changed,
@@ -498,6 +495,8 @@ async fn build_sync_events(
 	.boxed()
 	.await;
 
+	let (joined_rooms, mut device_list_updates, left_encrypted_users) = joined_rooms?;
+	let left_rooms = left_rooms?;
 	device_list_updates.extend(keys_changed);
 
 	let device_list_left =
@@ -537,16 +536,14 @@ fn collect_joined_rooms<'a>(
 	full_state: bool,
 	state_after: StateAfter,
 	filter: &'a FilterDefinition,
-) -> impl Future<
-	Output = (BTreeMap<OwnedRoomId, JoinedRoom>, HashSet<OwnedUserId>, HashSet<OwnedUserId>),
-> + Send
-+ 'a {
+) -> impl Future<Output = Result<JoinedRooms>> + Send + 'a {
 	services
 		.state_cache
 		.rooms_joined(sender_user)
 		.ready_filter(|&room_id| filter.room.matches(room_id))
 		.map(ToOwned::to_owned)
-		.broad_filter_map(move |room_id| {
+		.map(Ok::<_, Error>)
+		.broad_and_then(move |room_id| {
 			load_joined_room(
 				services,
 				sender_user,
@@ -559,9 +556,9 @@ fn collect_joined_rooms<'a>(
 				filter,
 			)
 			.map_ok(move |(joined_room, dlu, jeu)| (room_id, joined_room, dlu, jeu))
-			.ok()
+			.map_err(sync_room_failure)
 		})
-		.ready_fold(
+		.ready_try_fold(
 			(BTreeMap::new(), HashSet::new(), HashSet::new()),
 			|(mut joined_rooms, mut device_list_updates, mut left_encrypted_users),
 			 (room_id, joined_room, dlu, leu)| {
@@ -571,7 +568,7 @@ fn collect_joined_rooms<'a>(
 					joined_rooms.insert(room_id, joined_room);
 				}
 
-				(joined_rooms, device_list_updates, left_encrypted_users)
+				Ok((joined_rooms, device_list_updates, left_encrypted_users))
 			},
 		)
 }
@@ -584,12 +581,13 @@ fn collect_left_rooms<'a>(
 	full_state: bool,
 	state_after: StateAfter,
 	filter: &'a FilterDefinition,
-) -> impl Future<Output = BTreeMap<OwnedRoomId, LeftRoom>> + Send + 'a {
+) -> impl Future<Output = Result<BTreeMap<OwnedRoomId, LeftRoom>>> + Send + 'a {
 	services
 		.state_cache
 		.rooms_left_state(sender_user)
 		.ready_filter(|(room_id, _)| filter.room.matches(room_id))
-		.broad_filter_map(move |(room_id, _)| {
+		.map(Ok::<_, Error>)
+		.broad_and_then(move |(room_id, _)| {
 			handle_left_room(
 				services,
 				since,
@@ -601,10 +599,22 @@ fn collect_left_rooms<'a>(
 				filter,
 			)
 			.map_ok(move |left_room| (room_id, left_room))
-			.ok()
+			.map_err(sync_room_failure)
 		})
-		.ready_filter_map(|(room_id, left_room)| left_room.map(|left_room| (room_id, left_room)))
-		.collect()
+		.ready_try_filter_map(|(room_id, left_room)| {
+			Ok(left_room.map(|left_room| (room_id, left_room)))
+		})
+		.try_collect()
+}
+
+/// A selected room's missing stored material is an integrity failure, not
+/// normal absence. Preserve every other classification, including limits.
+fn sync_room_failure(error: Error) -> Error {
+	if error.is_not_found() {
+		Error::bad_database("Missing stored sync room material")
+	} else {
+		error
+	}
 }
 
 async fn collect_invited_rooms<'a>(
@@ -866,7 +876,7 @@ async fn load_left_room(
 		.unwrap_or(10)
 		.min(100);
 
-	let (timeline_pdus, limited, _) = load_timeline(
+	let (timeline_pdus, limited, _) = load_timeline_fallible(
 		services,
 		sender_user,
 		room_id,
@@ -874,8 +884,7 @@ async fn load_left_room(
 		Some(PduCount::Normal(left_count)),
 		timeline_limit.max(1),
 	)
-	.await
-	.unwrap_or_default();
+	.await?;
 
 	let since_shortstatehash = services
 		.timeline
@@ -1354,7 +1363,7 @@ async fn load_join_timeline(
 		.unwrap_or(10)
 		.min(100);
 
-	load_timeline(
+	load_timeline_fallible(
 		services,
 		sender_user,
 		room_id,

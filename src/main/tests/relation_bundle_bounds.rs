@@ -547,17 +547,11 @@ async fn request_error_controls(fixture: &Fixture<'_>) -> Result {
 	fixture
 		.search(http::StatusCode::INTERNAL_SERVER_ERROR)
 		.await?;
-	// Legacy v3 sync withholds a failed room; its global cursor policy is a
-	// separate acceptance gap, rather than a claim of whole-response refusal.
 	let body = fixture
-		.get("sync?timeout=0&full_state=true", http::StatusCode::OK)
+		.get("sync?timeout=0&full_state=true", http::StatusCode::INTERNAL_SERVER_ERROR)
 		.await?;
-	assert!(
-		body["rooms"]["join"]
-			.get(fixture.room.as_str())
-			.is_none(),
-		"sync withholds failed room payload"
-	);
+	assert!(body.get("next_batch").is_none(), "bundle failure cannot advance sync cursor");
+	assert!(body.get("rooms").is_none(), "bundle failure cannot return partial rooms");
 	map.raw_put(child.key.as_slice(), child.short.to_be_bytes().as_slice())
 		.await?;
 	fixture.healthy().await?;
