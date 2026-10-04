@@ -5,6 +5,7 @@ use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId, events::room::join_rules::J
 use tuwunel_core::{
 	Error, Result, implement,
 	utils::{
+		bytes::u64_from_bytes,
 		future::BoolExt,
 		stream::{TryIgnore, WidebandExt},
 	},
@@ -90,12 +91,14 @@ pub async fn bounded_room_ids(&self) -> Result<Vec<OwnedRoomId>> {
 	let rows = self
 		.db
 		.roomid_shortroomid
-		.stream_capped::<&RoomId, u64>(MAX_ROWS + 1);
+		.stream_capped::<&RoomId, &[u8]>(MAX_ROWS + 1);
 	pin_mut!(rows);
 	let mut rooms = Vec::new();
 	let mut bytes = 0_usize;
 	while let Some(row) = rows.next().await {
-		let (room, _) = row?;
+		let (room, short) = row?;
+		u64_from_bytes(short)
+			.map_err(|_| Error::bad_database("Invalid room inventory record"))?;
 		bytes = bytes.saturating_add(room.as_bytes().len());
 		if rooms.len() >= MAX_ROWS || bytes > MAX_BYTES {
 			return Err(Error::Request(

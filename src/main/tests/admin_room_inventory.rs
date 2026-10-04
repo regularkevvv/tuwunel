@@ -209,12 +209,21 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	endpoint
 		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
 		.await?;
-	counts.insert(room, "invalid-count").await?;
+	let malformed: [&[u8]; 4] = [b"", b"short", b"123456789", b"invalid-count"];
+	for value in malformed {
+		counts.insert(room, value).await?;
+		endpoint
+			.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
+	}
+	counts
+		.insert(room, u64::MAX.to_be_bytes())
+		.await?;
 	endpoint
 		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
 		.await?;
 	counts.insert(room, count).await?;
-	let members = &services.db["roomuserid_joinedcount"];
+	let members = &services.db["roomuserid_joined"];
 	members.put((room, "not-a-user"), b"").await?;
 	endpoint
 		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -228,10 +237,12 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 		.await?;
 	states.insert(room, state).await?;
 	let room_key = rooms.get(room).await?.to_vec();
-	rooms.insert(room, "invalid-short-id").await?;
-	endpoint
-		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
-		.await?;
+	for value in malformed {
+		rooms.insert(room, value).await?;
+		endpoint
+			.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
+	}
 	rooms.insert(room, room_key).await?;
 	endpoint.page("", 2).await?;
 	Ok(())
@@ -239,7 +250,7 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 
 async fn member_budgets(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	let services = endpoint.services;
-	let members = &services.db["roomuserid_joinedcount"];
+	let members = &services.db["roomuserid_joined"];
 	// The key-only count includes disabled local accounts and remote rows;
 	// corrupt values do not change membership-presence semantics.
 	let disabled = UserId::parse("@disabled:localhost")?;
@@ -295,7 +306,7 @@ async fn aggregate_members(endpoint: &Endpoint<'_>, first_rooms: &[OwnedRoomId])
 	for index in 0..3 {
 		rooms.push(endpoint.create(&format!("Extra {index}")).await?);
 	}
-	let members = &endpoint.services.db["roomuserid_joinedcount"];
+	let members = &endpoint.services.db["roomuserid_joined"];
 	for room in &rooms {
 		for index in 0..1023 {
 			members

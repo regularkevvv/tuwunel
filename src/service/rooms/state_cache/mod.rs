@@ -359,11 +359,9 @@ pub fn room_members<'a>(
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_joined_count(&self, room_id: &RoomId) -> Result<u64> {
-	self.db
-		.roomid_joinedcount
-		.get(room_id)
-		.await
-		.deserialized()
+	let count = self.db.roomid_joinedcount.get(room_id).await?;
+	utils::bytes::u64_from_bytes(count.as_ref())
+		.map_err(|_| tuwunel_core::err!(Database("Invalid joined-member count")))
 }
 
 /// Returns the number of users which are currently invited to a room
