@@ -1,3 +1,4 @@
+mod frontier;
 mod prune;
 
 use std::{fmt::Write, iter::once, pin::pin, sync::Arc};

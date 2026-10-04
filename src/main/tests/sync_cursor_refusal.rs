@@ -12,9 +12,10 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
-	Result, err, http,
-	ruma::{OwnedEventId, RoomId, events::StateEventType},
+	PduCount, Result, err, http,
+	ruma::{EventId, OwnedEventId, RoomId, events::StateEventType},
 };
+use tuwunel_database::serialize_key;
 use tuwunel_service::Services;
 
 use self::client::{Client, poll_until, register, wait_until_ready};
@@ -161,6 +162,48 @@ fn contains(body: &Value, section: &str, room: &RoomId, event: &OwnedEventId) ->
 		})
 }
 
+async fn frontier_controls(
+	client: &Client<'_>,
+	room: &RoomId,
+	event: &EventId,
+	since: &str,
+) -> Result {
+	let services = client.services;
+	let frontier = &services.db["roomid_pduleaves"];
+	let key = serialize_key((room, event))?;
+	let saved = frontier.get(key.as_ref()).await?.to_vec();
+	for corrupt in [b"\xff".as_slice(), b"$different:test.local".as_slice()] {
+		frontier.raw_put(key.as_ref(), corrupt).await?;
+		services.clear_cache().await;
+		sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+		assert_eq!(
+			frontier.get(key.as_ref()).await?.as_ref(),
+			corrupt,
+			"frontier refusal preserves the corrupt inventory record"
+		);
+	}
+	frontier
+		.raw_put(key.as_ref(), saved.as_slice())
+		.await?;
+	let pdu_id = services.timeline.get_pdu_id(event).await?;
+	let pdus = &services.db["pduid_pdu"];
+	let saved = pdus.get(&pdu_id).await?.to_vec();
+	let mut corrupt: Value = serde_json::from_slice(&saved)?;
+	corrupt["event_id"] = json!("$different:test.local");
+	let corrupt = serde_json::to_vec(&corrupt)?;
+	pdus.raw_put(&pdu_id, corrupt.as_slice()).await?;
+	services.clear_cache().await;
+	sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+	assert_eq!(
+		pdus.get(&pdu_id).await?.as_ref(),
+		corrupt.as_slice(),
+		"frontier refusal preserves the mismatched accepted event"
+	);
+	pdus.raw_put(&pdu_id, saved.as_slice()).await?;
+	services.clear_cache().await;
+	Ok(())
+}
+
 async fn exercise(services: &Services, base: &str) -> Result {
 	wait_until_ready(services, base).await?;
 	let user = register(services, "cursor-owner", TOKEN).await?;
@@ -197,6 +240,14 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let saved = pdus.get(&state_id).await?.to_vec();
 	pdus.remove(&state_id).await?;
 	services.clear_cache().await;
+	services
+		.state
+		.validate_timeline_frontier(
+			&damaged,
+			PduCount::Normal(0),
+			Some(state_id.pdu_count().saturating_sub(1)),
+		)
+		.await?;
 	for _ in 0..2 {
 		sync(&client, Some(&since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
 		let error = pdus
@@ -216,6 +267,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	}
 	pdus.raw_put(&state_id, saved.as_slice()).await?;
 	services.clear_cache().await;
+	frontier_controls(&client, &damaged, &state, &since).await?;
 	let repaired = sync(&client, Some(&since), http::StatusCode::OK).await?;
 	assert!(
 		contains(&repaired, "join", &healthy, &old),

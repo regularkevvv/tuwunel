@@ -1,7 +1,7 @@
 mod v3;
 mod v5;
 
-use futures::{StreamExt, pin_mut};
+use futures::{FutureExt, StreamExt, pin_mut};
 use ruma::{RoomId, UserId, events::TimelineEventType::RoomMember};
 use tuwunel_core::{
 	Error, PduCount, Result,
@@ -23,6 +23,11 @@ async fn load_timeline_fallible(
 	next_batch: Option<PduCount>,
 	limit: usize,
 ) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
+	services
+		.state
+		.validate_timeline_frontier(room_id, roomsincecount, next_batch)
+		.boxed()
+		.await?;
 	let until = next_batch.map(|count| count.saturating_add(1));
 	let pdus = services
 		.timeline
