@@ -49,7 +49,8 @@ fn admin_user_pages_preserve_totals_or_refuse_incomplete_inventories() -> Result
 		drop(listener);
 		let exercise = async {
 			let outcome = exercise(&Endpoint { services: &services, base: &base }).await;
-			outcome.and(server.server.shutdown())
+			let shutdown = server.server.shutdown();
+			outcome.and(shutdown)
 		};
 		let (run, outcome) = tokio::join!(async_run(&server), exercise);
 		drop(services);
