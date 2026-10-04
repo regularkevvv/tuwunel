@@ -127,11 +127,7 @@ impl Service {
 			if let Some((last_seen_ts, last_seen_ip)) = latest
 				&& last_seen_ts.get() > uint!(0)
 			{
-				activity.push(LocalUserActivity {
-					user_id,
-					last_seen_ts,
-					last_seen_ip,
-				});
+				activity.push(LocalUserActivity { user_id, last_seen_ts, last_seen_ip });
 			}
 		}
 		activity.sort_by_key(|item| Reverse(item.last_seen_ts));
@@ -140,7 +136,11 @@ impl Service {
 			bytes
 				.saturating_add(format!("{:?}", item.last_seen_ts).len())
 				.saturating_add(item.user_id.localpart().len())
-				.saturating_add(item.last_seen_ip.as_ref().map_or(0, LastSeenIp::len))
+				.saturating_add(
+					item.last_seen_ip
+						.as_ref()
+						.map_or(0, LastSeenIp::len),
+				)
 				.saturating_add(43)
 		});
 		if reply_bytes > MAX_ACTIVITY_REPLY_BYTES {
