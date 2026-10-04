@@ -135,10 +135,17 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	}
 
 	// The refused recount left the count behind the membership...
-	let stale = services
-		.state_cache
-		.room_joined_count(&room)
+	// Inspect storage directly: the public count reader now repairs pending
+	// recounts, while this fixture must leave the obligation for the next event.
+	let stored = services.db["roomid_joinedcount"]
+		.get(room.as_bytes())
 		.await?;
+	let stale = u64::from_be_bytes(
+		stored
+			.as_ref()
+			.try_into()
+			.expect("stored count width"),
+	);
 	if stale != joined_before {
 		return Err!("the refused recount moved the count from {joined_before} to {stale}");
 	}

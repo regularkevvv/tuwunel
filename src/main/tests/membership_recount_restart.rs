@@ -134,11 +134,11 @@ async fn seed(services: &Services) -> Result {
 
 async fn assert_state(services: &Services, room: &RoomId, pending: bool, count: u64) -> Result {
 	assert_eq!(
-		services
-			.state_cache
-			.room_joined_count(room)
-			.await?,
-		count,
+		services.db["roomid_joinedcount"]
+			.get(room.as_bytes())
+			.await?
+			.as_ref(),
+		count.to_be_bytes(),
 		"aggregate count for {room}"
 	);
 	let marker = services.db["global"].qry(&(PENDING, room)).await;
@@ -191,24 +191,47 @@ async fn resume(services: &Services) -> Result {
 		b"corrupt-marker",
 		"refusal preserves corrupt marker"
 	);
+	let reads = futures::future::join3(
+		services.state_cache.room_joined_count(&refused),
+		services.state_cache.room_invited_count(&refused),
+		services.state_cache.room_knocked_count(&refused),
+	)
+	.await;
+	for read in [reads.0, reads.1, reads.2] {
+		assert!(
+			matches!(read.expect_err("count read refuses corrupt marker"), Error::Database(_)),
+			"public counts cannot serve stale data behind a corrupt repair marker"
+		);
+	}
 	assert_eq!(
-		services
-			.state_cache
-			.room_joined_count(&refused)
-			.await?,
-		0,
+		services.db["roomid_joinedcount"]
+			.get(refused.as_bytes())
+			.await?
+			.as_ref(),
+		0_u64.to_be_bytes(),
 		"corrupt marker cannot publish aggregate counts"
 	);
 	global
 		.put((PENDING, &*refused), &[0_u8; 0][..])
 		.await?;
-	for room in [&refused, &deferred] {
+	assert_eq!(
 		services
 			.state_cache
-			.repair_joined_count(room)
-			.await?;
-		assert_state(services, room, false, 1).await?;
-	}
+			.room_invited_count(&refused)
+			.await?,
+		0,
+		"invited count repairs the refused room after restart"
+	);
+	assert_eq!(
+		services
+			.state_cache
+			.room_knocked_count(&deferred)
+			.await?,
+		0,
+		"knocked count repairs the deferred room after restart"
+	);
+	assert_state(services, &refused, false, 1).await?;
+	assert_state(services, &deferred, false, 1).await?;
 	Ok(())
 }
 

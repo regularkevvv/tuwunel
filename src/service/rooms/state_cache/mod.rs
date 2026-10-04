@@ -2,6 +2,8 @@ mod inventory;
 mod invite_inventory;
 mod recount;
 #[cfg(test)]
+mod recount_tests;
+#[cfg(test)]
 mod tests;
 mod update;
 mod via;
@@ -26,7 +28,7 @@ use tuwunel_core::{
 	matrix::{Event, Pdu, event::Owned},
 	trace,
 	utils::{
-		self, BoolExt,
+		self, BoolExt, MutexMap, MutexMapGuard,
 		future::OptionStream,
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
 	},
@@ -39,6 +41,10 @@ use crate::appservice::RegistrationInfo;
 
 pub struct Service {
 	appservice_in_room_cache: AppServiceInRoomCache,
+	// Within the fenced writer, membership batches and aggregate rebuilds
+	// share this exclusion. Outer room-state locks may precede it; no code
+	// holding it acquires a room-state lock. Repair obligations live in D1.
+	membership_mutex: MutexMap<OwnedRoomId, ()>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -62,6 +68,7 @@ struct Data {
 }
 
 type AppServiceInRoomCache = RwLock<InRoomCache>;
+type MembershipGuard = MutexMapGuard<OwnedRoomId, ()>;
 
 /// Which appservices are in which rooms, as last computed.
 ///
@@ -121,6 +128,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
+			membership_mutex: MutexMap::new(),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),
@@ -354,35 +362,42 @@ pub fn room_members<'a>(
 		.map(|(_, user_id): (Ignore, &UserId)| user_id)
 }
 
-/// Returns the number of users which are currently in a room
+/// Returns the joined count after completing any durable pending recount.
+/// Membership cannot change between marker inspection, repair and this read.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_joined_count(&self, room_id: &RoomId) -> Result<u64> {
+	let guard = self.membership_mutex.lock(room_id).await;
+	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await?;
 	let count = self.db.roomid_joinedcount.get(room_id).await?;
 	utils::bytes::u64_from_bytes(count.as_ref())
 		.map_err(|_| tuwunel_core::err!(Database("Invalid joined-member count")))
 }
 
-/// Returns the number of users which are currently invited to a room
+/// Returns the invited count after completing any durable pending recount.
+/// Malformed counters and refused repairs propagate instead of serving stale
+/// data.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_invited_count(&self, room_id: &RoomId) -> Result<u64> {
-	self.db
-		.roomid_invitedcount
-		.get(room_id)
-		.await
-		.deserialized()
+	let guard = self.membership_mutex.lock(room_id).await;
+	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await?;
+	let count = self.db.roomid_invitedcount.get(room_id).await?;
+	utils::bytes::u64_from_bytes(count.as_ref())
+		.map_err(|_| Error::bad_database("Invalid invited-member count"))
 }
 
-/// Returns the number of users which are currently knocking upon a room
+/// Returns the knocked count after completing any durable pending recount.
+/// Malformed counters and refused repairs propagate instead of serving stale
+/// data.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_knocked_count(&self, room_id: &RoomId) -> Result<u64> {
-	self.db
-		.roomid_knockedcount
-		.get(room_id)
-		.await
-		.deserialized()
+	let guard = self.membership_mutex.lock(room_id).await;
+	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await?;
+	let count = self.db.roomid_knockedcount.get(room_id).await?;
+	utils::bytes::u64_from_bytes(count.as_ref())
+		.map_err(|_| Error::bad_database("Invalid knocked-member count"))
 }
 
 /// Returns an iterator of all our local joined users in a room who are
@@ -848,6 +863,7 @@ pub async fn is_left_checked(&self, user_id: &UserId, room_id: &RoomId) -> Resul
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Result {
+	let guard = self.membership_mutex.lock(room_id).await;
 	let prefix = (room_id, Interfix);
 	let mut txn = self.services.db.txn();
 
@@ -937,7 +953,8 @@ pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Re
 		})
 		.await;
 
-	self.commit_membership(room_id, txn).await
+	self.commit_membership_locked(room_id, txn, &guard)
+		.await
 }
 
 /// A sibling conduwuit-lineage server writes the leave event itself into this

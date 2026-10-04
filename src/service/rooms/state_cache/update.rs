@@ -154,13 +154,25 @@ pub async fn update_membership(
 /// leaves a durable pending marker; this aggregate commit removes it
 /// atomically. A refusal or restart leaves the marker for the room's next event
 /// to repair ([`Self::repair_joined_count`]), even when a bulk update deferred
-/// recounting.
+/// recounting. Public aggregate reads also repair it before returning counts.
+/// Membership commits cannot overlap the complete scans or aggregate commit.
 ///
 /// This commit changes no membership index, so it invalidates nothing in the
 /// appservice-in-room cache; the membership commit before it did.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn update_joined_count(&self, room_id: &RoomId) -> Result {
+	let guard = self.membership_mutex.lock(room_id).await;
+	Box::pin(self.update_joined_count_locked(room_id, &guard)).await
+}
+
+/// Holds the membership exclusion through all scans and the aggregate commit.
+#[implement(super::Service)]
+async fn update_joined_count_locked(
+	&self,
+	room_id: &RoomId,
+	_guard: &super::MembershipGuard,
+) -> Result {
 	self.ensure_recount_pending(room_id).await?;
 	let inventory = self.prepare_recount_inventory(room_id).await?;
 	let mut joined_servers = inventory.joined_servers;
@@ -220,11 +232,23 @@ async fn ensure_recount_pending(&self, room_id: &RoomId) -> Result {
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn repair_joined_count(&self, room_id: &RoomId) -> Result {
+	let guard = self.membership_mutex.lock(room_id).await;
+	Box::pin(self.repair_joined_count_locked(room_id, &guard)).await
+}
+
+/// Marker inspection and any rebuild share the caller's membership exclusion.
+#[implement(super::Service)]
+pub(super) async fn repair_joined_count_locked(
+	&self,
+	room_id: &RoomId,
+	guard: &super::MembershipGuard,
+) -> Result {
 	match self.services.db["global"]
 		.qry(&(RECOUNT_PENDING, room_id))
 		.await
 	{
-		| Ok(value) if value.is_empty() => self.update_joined_count(room_id).await,
+		| Ok(value) if value.is_empty() =>
+			Box::pin(self.update_joined_count_locked(room_id, guard)).await,
 		| Ok(_) => Err(Error::bad_database("Invalid membership recount marker")),
 		| Err(error) if error.is_not_found() => Ok(()),
 		| Err(error) => Err(error),
@@ -240,7 +264,20 @@ pub async fn repair_joined_count(&self, room_id: &RoomId) -> Result {
 /// recount that follows means a failed recount cannot leave the cache
 /// contradicting durable membership.
 #[implement(super::Service)]
-pub(super) async fn commit_membership(&self, room_id: &RoomId, mut txn: Txn) -> Result {
+pub(super) async fn commit_membership(&self, room_id: &RoomId, txn: Txn) -> Result {
+	let guard = self.membership_mutex.lock(room_id).await;
+	self.commit_membership_locked(room_id, txn, &guard)
+		.await
+}
+
+/// The caller retains the same room's exclusion until the commit completes.
+#[implement(super::Service)]
+pub(super) async fn commit_membership_locked(
+	&self,
+	room_id: &RoomId,
+	mut txn: Txn,
+	_guard: &super::MembershipGuard,
+) -> Result {
 	// Never publish membership without its repair obligation, including bulk
 	// updates that defer recounting and a kill before the first recount starts.
 	txn.put(&self.services.db["global"], (RECOUNT_PENDING, room_id), &[0_u8; 0][..]);
