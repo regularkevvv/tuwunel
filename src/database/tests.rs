@@ -11,6 +11,7 @@ use tuwunel_core::{
 	arrayvec::ArrayVec,
 	config::{Config, Figment, Sources},
 	log::{LogLevelReloadHandles, Logging, capture::State},
+	matrix::{PduCount, PduId, RawPduId},
 	metrics::Metrics,
 	ruma::{EventId, RoomId, UserId, serde::Raw},
 };
@@ -600,19 +601,80 @@ fn de_tuple_incomplete_with_sep() {
 }
 
 #[test]
-#[cfg_attr(
-	debug_assertions,
-	should_panic(expected = "deserialization failed to consume trailing bytes")
-)]
-fn de_tuple_unfinished() {
-	let user_id: &UserId = "@user:example.com".try_into().unwrap();
-	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
-
+fn de_record_trailing_tuple() {
 	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFF@user:example.com";
-	let (a, b): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
+	let error = from_slice::<(&UserId, &RoomId)>(raw).expect_err("trailing records must refuse");
+	assert!(!error.to_string().contains("example.com"), "record bytes must not enter errors");
+}
 
-	assert_eq!(a, user_id, "deserialized user_id does not match");
-	assert_eq!(b, room_id, "deserialized room_id does not match");
+#[test]
+fn de_record_invalid_numeric_boundaries() {
+	let good = serialize_to_vec(&(42_u64, 93_u64)).expect("serialize numeric tuple");
+	assert_eq!(from_slice::<(u64, u64)>(&good).expect("valid numeric tuple"), (42, 93));
+	let mut missing = 42_u64.to_be_bytes().to_vec();
+	missing.extend_from_slice(&93_u64.to_be_bytes());
+	assert!(from_slice::<(u64, u64)>(&missing).is_err(), "missing separator must refuse");
+	let mut wrong = good.to_vec();
+	wrong[8] = 0;
+	assert!(from_slice::<(u64, u64)>(&wrong).is_err(), "wrong separator must refuse");
+	for len in 0..8 {
+		assert!(from_slice::<u64>(&good[..len]).is_err(), "short integer must refuse");
+	}
+	let mut trailing = 42_u64.to_be_bytes().to_vec();
+	trailing.push(0);
+	assert!(from_slice::<u64>(&trailing).is_err(), "unexpected numeric tail must refuse");
+}
+
+#[test]
+fn de_record_compatible_tails_and_ignore() {
+	let raw: &[u8] = b"@user:example.com";
+	let (user, empty): (&UserId, &str) = from_slice(raw).expect("legacy empty tail");
+	assert_eq!(user.as_str(), "@user:example.com");
+	assert_eq!(empty, "");
+	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFFextra";
+	let (user, _): (&UserId, crate::de::IgnoreAll) =
+		from_slice(raw).expect("explicit tail ignore");
+	assert_eq!(user.as_str(), "@user:example.com");
+	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFF";
+	let (user, room): (&UserId, &RoomId) = from_slice(raw).expect("legacy trailing separator");
+	assert_eq!(user.as_str(), "@user:example.com");
+	assert_eq!(room.as_str(), "!room:example.com");
+}
+
+#[test]
+fn de_record_nested_sequence_refusal() {
+	assert!(from_slice::<((u64, u64), u64)>(&[0_u8; 24]).is_err());
+}
+
+#[test]
+fn de_record_json_trailing() {
+	for (good, bad) in [
+		(b"{\"key\":42}".as_slice(), b"{\"key\":42}trailing".as_slice()),
+		(b"[1,2,3]".as_slice(), b"[1,2,3]trailing".as_slice()),
+	] {
+		assert!(from_slice::<serde_json::Value>(good).is_ok(), "valid JSON record");
+		assert!(from_slice::<serde_json::Value>(bad).is_err(), "JSON record trailing bytes");
+		assert!(from_slice::<Json<serde_json::Value>>(good).is_ok(), "valid JSON directive");
+		assert!(
+			from_slice::<Json<serde_json::Value>>(bad).is_err(),
+			"JSON directive trailing bytes"
+		);
+	}
+}
+
+#[test]
+fn de_record_raw_pdu_ids() {
+	for count in [PduCount::Normal(42), PduCount::Backfilled(-42)] {
+		let expected: RawPduId = PduId { shortroomid: 7, count }.into();
+		let actual: RawPduId = from_slice(expected.as_ref()).expect("valid raw PDU key");
+		assert_eq!(actual, expected);
+	}
+	for len in [0, 1, 8, 15, 17, 23, 25, 32] {
+		assert!(from_slice::<RawPduId>(&vec![0_u8; len]).is_err(), "invalid key width {len}");
+	}
+	let mut invalid = [0_u8; 24];
+	invalid[8] = 1;
+	assert!(from_slice::<RawPduId>(&invalid).is_err(), "nonzero backfill marker must refuse");
 }
 
 #[test]

@@ -128,7 +128,15 @@ impl serde::de::Visitor<'_> for RawIdVisitor {
 	}
 
 	#[inline]
-	fn visit_bytes<E>(self, buf: &[u8]) -> Result<RawId, E> { Ok(RawId::from(buf)) }
+	fn visit_bytes<E: serde::de::Error>(self, buf: &[u8]) -> Result<RawId, E> {
+		if !matches!(buf.len(), RawId::NORMAL_LEN | RawId::BACKFILLED_LEN) {
+			return Err(E::invalid_length(buf.len(), &self));
+		}
+		if buf.len() == RawId::BACKFILLED_LEN && buf[INT_LEN..INT_LEN * 2] != [0_u8; INT_LEN] {
+			return Err(E::custom("Invalid backfilled PDU key marker"));
+		}
+		Ok(RawId::from(buf))
+	}
 }
 
 impl From<Id> for RawId {
