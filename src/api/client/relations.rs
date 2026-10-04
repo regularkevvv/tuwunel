@@ -230,6 +230,7 @@ async fn paginate_relations_with_filter(
 	})
 }
 
+#[derive(Clone, Copy)]
 struct RelationQuery<'a> {
 	services: &'a Services,
 	sender_user: &'a UserId,
@@ -285,12 +286,12 @@ async fn collect_relations(
 		if Some(count) == query.to || events.len() == query.limit {
 			break;
 		}
-		if !query
+		if query
 			.filter_event_type
-			.is_none_or(|kind| kind == pdu.kind())
-			|| !query
+			.is_some_and(|kind| kind != pdu.kind())
+			|| query
 				.filter_rel_type
-				.is_none_or(|kind| kind.relation_type_equal(&pdu))
+				.is_some_and(|kind| !kind.relation_type_equal(&pdu))
 			|| !query
 				.services
 				.state_accessor

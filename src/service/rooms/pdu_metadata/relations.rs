@@ -18,7 +18,7 @@ use crate::rooms::short::ShortRoomId;
 
 /// Shared examined-row and encoded-byte budget for one relation query,
 /// including recursively fetched parents and rows whose children were purged.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct RelationReadBudget {
 	rows: usize,
 	bytes: usize,
@@ -95,7 +95,7 @@ pub async fn has_relation(
 		.get_relations(target.shortroomid, target.count, None, Direction::Forward, None)
 		.await?;
 	Ok(relations.into_iter().any(|(_, pdu)| {
-		if !user_id.is_none_or(is_equal_to!(pdu.sender())) {
+		if user_id.is_some_and(|user| user != pdu.sender()) {
 			return false;
 		}
 		debug_assert!(
