@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::subscriber::NoSubscriber;
 use tuwunel_core::{
-	Result, Server,
+	Error, Result, Server,
 	arrayvec::ArrayVec,
 	config::{Config, Figment, Sources},
+	http,
 	log::{LogLevelReloadHandles, Logging, capture::State},
 	matrix::{PduCount, PduId, RawPduId},
 	metrics::Metrics,
@@ -324,8 +325,7 @@ fn ser_cbor_ruma_raw() {
 /// `ser_json_raw_field_roundtrip` below) when a value contains a `Raw<T>`
 /// field.
 #[test]
-#[should_panic(expected = "expected any valid JSON value")]
-fn ser_cbor_raw_field_roundtrip() {
+fn ser_cbor_raw_field_refuses() {
 	#[derive(Debug, Serialize, Deserialize)]
 	struct Entry {
 		key: Raw<serde_json::Value>,
@@ -333,16 +333,30 @@ fn ser_cbor_raw_field_roundtrip() {
 	}
 
 	let entry = Entry {
-		key: Raw::from_json_string(r#"{"hello":"world","n":42}"#.to_owned())
+		key: Raw::from_json_string(r#"{"hello":"disposable-cbor-raw-marker","n":42}"#.to_owned())
 			.expect("construct Raw"),
 		used: false,
 	};
 
 	let serialized = serialize_to_vec(Cbor(&entry)).expect("serialize cbor");
 
-	let _: Entry = from_slice::<Cbor<_>>(&serialized)
-		.expect("deserialize cbor")
-		.0;
+	let error = from_slice::<Cbor<Entry>>(&serialized)
+		.expect_err("raw JSON field is unsupported in CBOR records");
+	assert!(
+		matches!(&error, Error::SerdeDe(message) if message.as_ref() == "Invalid CBOR database record"),
+		"unsupported CBOR raw field must return the exact stored-record refusal"
+	);
+	assert_eq!(
+		error.status_code(),
+		http::StatusCode::INTERNAL_SERVER_ERROR,
+		"invalid stored CBOR record is a server failure"
+	);
+	assert!(
+		!error
+			.to_string()
+			.contains("disposable-cbor-raw-marker"),
+		"stored CBOR raw field cannot leak through the error"
+	);
 }
 
 /// Round-trip the same `Raw<T>`-bearing struct through `Json`. This is the
