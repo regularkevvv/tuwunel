@@ -19,8 +19,8 @@ use tuwunel_service::Services;
 
 use self::client::{Client, poll_until, register, wait_until_ready};
 
-const TOKEN: &str = "disposable-thread-owner-token";
-const OTHER: &str = "disposable-thread-observer-token";
+const TOKEN: &str = "disposable-thread-owner-access-token";
+const OTHER: &str = "disposable-thread-observer-access-token";
 
 struct DatabasePath(PathBuf);
 impl Drop for DatabasePath {
