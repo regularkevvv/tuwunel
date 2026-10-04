@@ -156,8 +156,9 @@ async fn category_room_events(
 		.map(Event::into_pdu)
 		.map(Ok::<_, Error>)
 		.wide_and_then(async |pdu| {
-			let context =
-				event_context(services, sender_user, &pdu, &criteria.event_context).await?;
+			let context = event_context(services, sender_user, &pdu, &criteria.event_context)
+				.boxed()
+				.await?;
 
 			let pdu = services
 				.pdu_metadata
@@ -237,7 +238,7 @@ where
 		after_limit,
 	);
 
-	let (events_before, events_after) = join(events_before, events_after).await;
+	let (events_before, events_after) = join(events_before, events_after).boxed().await;
 	let events_before = events_before?;
 	let events_after = events_after?;
 
