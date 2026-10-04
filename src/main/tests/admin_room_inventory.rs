@@ -8,6 +8,7 @@ use std::{
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
+use tuwunel_admin::{fini, init};
 use tuwunel_core::{
 	Result, err, http,
 	ruma::{OwnedRoomId, RoomId, UserId},
@@ -47,10 +48,12 @@ fn admin_room_pages_preserve_totals_or_refuse_incomplete_inventories() -> Result
 	let server = Server::new(Some(&args), Some(&runtime))?;
 	let result = runtime.block_on(async {
 		let services = async_start(&server).await?;
+		init(&services.admin);
 		let base = format!("http://127.0.0.1:{port}");
 		drop(listener);
 		let exercise = async {
 			let outcome = exercise(&Endpoint { services: &services, base: &base }).await;
+			fini(&services.admin);
 			let shutdown = server.server.shutdown();
 			outcome.and(shutdown)
 		};
@@ -191,6 +194,7 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 	endpoint.page("empty_rooms=true", 0).await?;
 	empty_deletion_inventory(endpoint, &alpha).await?;
 	complete_empty_deletion(endpoint).await?;
+	complete_room_pruning(endpoint).await?;
 	corrupt_inputs(endpoint, &alpha).await?;
 	member_budgets(endpoint, &alpha).await?;
 	aggregate_members(endpoint, &[alpha, zeta]).await
@@ -237,6 +241,7 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 			http::StatusCode::INTERNAL_SERVER_ERROR
 		);
 		empty_deletion_preserves_room(services, room).await?;
+		prune_refuses_without_deletion(services, room).await?;
 		members.del((room, "not-a-user")).await?;
 		for index in 0..1025 {
 			members
@@ -262,6 +267,7 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 			http::StatusCode::TOO_MANY_REQUESTS
 		);
 		empty_deletion_preserves_room(services, room).await?;
+		prune_refuses_without_deletion(services, room).await?;
 		for index in 0..1025 {
 			members
 				.del((room, &format!("@guard-{index:04}:remote.test")))
@@ -291,6 +297,7 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 			http::StatusCode::TOO_MANY_REQUESTS
 		);
 		empty_deletion_preserves_room(services, room).await?;
+		prune_refuses_without_deletion(services, room).await?;
 		for index in 0..600 {
 			members
 				.del((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))))
@@ -387,6 +394,63 @@ async fn empty_deletion_preserves_room(services: &Services, room: &RoomId) -> Re
 		.await;
 	assert_eq!(rooms.get(room).await?.to_vec(), original_room);
 	assert_eq!(states.get(room).await?.to_vec(), original_state);
+	Ok(())
+}
+
+async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> Result {
+	let rooms = &services.db["roomid_shortroomid"];
+	let states = &services.db["roomid_shortstatehash"];
+	let original_room = rooms.get(room).await?.to_vec();
+	let original_state = states.get(room).await?.to_vec();
+	match services
+		.admin
+		.command_in_place("room prune-empty".into(), None)
+		.await
+	{
+		| Err(output) => assert!(output.as_str().contains("Command failed")),
+		| Ok(Some(output)) =>
+			panic!("prune succeeded over an incomplete inventory: {}", output.as_str()),
+		| Ok(None) => panic!("prune succeeded over an incomplete inventory without output"),
+	}
+	assert_eq!(rooms.get(room).await?.to_vec(), original_room);
+	assert_eq!(states.get(room).await?.to_vec(), original_state);
+	Ok(())
+}
+
+async fn complete_room_pruning(endpoint: &Endpoint<'_>) -> Result {
+	let services = endpoint.services;
+	let room = endpoint.create("Complete prune").await?;
+	services.db["roomuserid_joinedcount"]
+		.del((&room, &services.globals.server_user))
+		.await?;
+	match services
+		.admin
+		.command_in_place("room prune-empty".into(), None)
+		.await
+	{
+		| Ok(Some(output)) => assert!(
+			output
+				.as_str()
+				.contains("Successfully deleted 1 rooms")
+		),
+		| Err(output) => panic!("prune refused complete empty inventory: {}", output.as_str()),
+		| Ok(None) => panic!("prune omitted successful deletion count"),
+	}
+	assert!(
+		services.db["roomid_shortroomid"]
+			.get(&room)
+			.await
+			.expect_err("prune must delete a proved empty room")
+			.is_not_found()
+	);
+	assert!(
+		services.db["roomid_shortstatehash"]
+			.get(&room)
+			.await
+			.expect_err("prune must delete its current state")
+			.is_not_found()
+	);
+	endpoint.page("", 2).await?;
 	Ok(())
 }
 
