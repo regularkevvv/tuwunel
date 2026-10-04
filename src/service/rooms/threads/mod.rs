@@ -17,7 +17,7 @@ use ruma::{
 use serde::Deserialize;
 use serde_json::json;
 use tuwunel_core::{
-	Error, Event, Result, err, http,
+	Error, Event, Result, err,
 	matrix::pdu::{PduCount, PduEvent, PduId, RawPduId},
 	utils::{
 		ReadyExt,

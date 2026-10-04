@@ -11,7 +11,7 @@ use ruma::{
 	events::{GlobalAccountDataEventType, ignored_user_list::IgnoredUserListEvent},
 };
 use tuwunel_core::{
-	Err, Error, Result, at, http,
+	Err, Error, Result, at,
 	matrix::{
 		Event,
 		pdu::{PduCount, PduEvent},
