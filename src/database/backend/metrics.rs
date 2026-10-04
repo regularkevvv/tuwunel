@@ -189,6 +189,23 @@ pub(crate) fn snapshot() -> serde_json::Value {
 	})
 }
 
+/// Writes the snapshot to `TUWUNEL_DB_METRICS_FILE` if set.
+///
+/// Called from the facade's drop and from the router's shutdown sequence,
+/// because a shutdown with dangling references never runs the drop.
+/// Failures are logged and swallowed: metrics must never take down a
+/// shutdown path.
+pub(crate) fn dump_on_close() {
+	let Ok(path) = std::env::var("TUWUNEL_DB_METRICS_FILE") else {
+		return;
+	};
+
+	let json = snapshot();
+	if let Err(error) = std::fs::write(&path, json.to_string()) {
+		tuwunel_core::error!(%error, path, "failed writing database metrics snapshot");
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{sync::Arc, thread};
@@ -198,16 +215,16 @@ mod tests {
 	#[test]
 	fn concurrent_snapshot_cannot_split_a_record() {
 		let stat = Arc::new(OpStat::new());
-		let workers: Vec<_> = (0..4)
-			.map(|_| {
-				let stat = Arc::clone(&stat);
-				thread::spawn(move || {
-					for _ in 0..10_000 {
-						stat.record(8);
-					}
-				})
+		let workers: Vec<_> = std::iter::repeat_with(|| {
+			let stat = Arc::clone(&stat);
+			thread::spawn(move || {
+				for _ in 0..10_000 {
+					stat.record(8);
+				}
 			})
-			.collect();
+		})
+		.take(4)
+		.collect();
 		let mut snapshots = 0_usize;
 		while workers.iter().any(|worker| !worker.is_finished()) {
 			let _guard = SNAPSHOT_GATE.write().expect("snapshot gate");
@@ -228,22 +245,5 @@ mod tests {
 		}
 		assert_eq!(stat.json()["count"], 40_000);
 		assert!(snapshots > 0, "concurrent recording was never sampled");
-	}
-}
-
-/// Writes the snapshot to `TUWUNEL_DB_METRICS_FILE` if set.
-///
-/// Called from the facade's drop and from the router's shutdown sequence,
-/// because a shutdown with dangling references never runs the drop.
-/// Failures are logged and swallowed: metrics must never take down a
-/// shutdown path.
-pub(crate) fn dump_on_close() {
-	let Ok(path) = std::env::var("TUWUNEL_DB_METRICS_FILE") else {
-		return;
-	};
-
-	let json = snapshot();
-	if let Err(error) = std::fs::write(&path, json.to_string()) {
-		tuwunel_core::error!(%error, path, "failed writing database metrics snapshot");
 	}
 }
