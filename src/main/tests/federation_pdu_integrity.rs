@@ -337,14 +337,16 @@ async fn signature_power_and_version_refusals(
 		.event_id;
 	let (status, _) = send_pdus(services, base, remote, &create).await?;
 	assert_eq!(status, 200, "a canonical transaction should get its per-PDU verdict");
-	assert!(services.timeline.get_pdu_json(&id).await.is_err());
-	assert!(
-		services
-			.timeline
-			.get_outlier_pdu_json(&id)
-			.await
-			.is_err()
-	);
+	services
+		.timeline
+		.get_pdu_json(&id)
+		.await
+		.unwrap_err();
+	services
+		.timeline
+		.get_outlier_pdu_json(&id)
+		.await
+		.unwrap_err();
 	assert_eq!(
 		services
 			.timeline
