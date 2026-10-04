@@ -34,7 +34,7 @@ use tuwunel_core::{
 		},
 		math::usize_from_ruma,
 		result::FlatOk,
-		stream::{TryBroadbandExt, WidebandExt},
+		stream::{TryBroadbandExt, TryWidebandExt, WidebandExt},
 	},
 };
 use tuwunel_service::Services;
@@ -159,14 +159,15 @@ pub(super) async fn handle_room(
 		.wide_then(|(position, pdu)| {
 			with_membership(services, pdu, sender_user, encrypted).map(move |pdu| (position, pdu))
 		})
-		.wide_then(|(position, pdu)| {
+		.map(Ok::<_, Error>)
+		.wide_and_then(|(position, pdu)| {
 			services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.map(move |pdu| (position, pdu))
+				.map_ok(move |pdu| (position, pdu))
 		})
-		.map(|(position, pdu)| (position, Event::into_format(pdu)))
-		.collect::<Vec<_>>();
+		.map_ok(|(position, pdu)| (position, Event::into_format(pdu)))
+		.try_collect::<Vec<_>>();
 
 	let meta = room_meta_future(services, room_id);
 	let events = join3(timeline, required_state, invite_state);
@@ -180,6 +181,7 @@ pub(super) async fn handle_room(
 	) = join4(meta, events, member_counts, notification_counts)
 		.boxed()
 		.await;
+	let timeline = timeline.map_err(Failure::Payload)?;
 	let required_state = required_state.map_err(Failure::Payload)?;
 
 	let (heroes, heroes_name, heroes_avatar) = resolve_heroes(

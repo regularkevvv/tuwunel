@@ -16,13 +16,13 @@ use ruma::{
 };
 use search_events::v3::{Request, Response};
 use tuwunel_core::{
-	Err, Result, at, is_true,
+	Err, Error, Result, at, is_true,
 	matrix::Event,
 	result::FlatOk,
 	utils::{
 		IterStream,
 		option::OptionExt,
-		stream::{ReadyExt, TryIgnore, WidebandExt},
+		stream::{ReadyExt, TryWidebandExt},
 	},
 };
 use tuwunel_service::{
@@ -154,23 +154,24 @@ async fn category_room_events(
 		.flatten()
 		.stream()
 		.map(Event::into_pdu)
-		.wide_then(async |pdu| {
+		.map(Ok::<_, Error>)
+		.wide_and_then(async |pdu| {
 			let context =
-				event_context(services, sender_user, &pdu, &criteria.event_context).await;
+				event_context(services, sender_user, &pdu, &criteria.event_context).await?;
 
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
-			SearchResult {
+			Ok(SearchResult {
 				rank: None,
 				result: Some(pdu.into_format()),
 				context,
-			}
+			})
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	let highlights = criteria
 		.search_term
@@ -198,23 +199,20 @@ async fn event_context<E>(
 	sender_user: &UserId,
 	pdu: &E,
 	event_context: &EventContext,
-) -> EventContextResult
+) -> Result<EventContextResult>
 where
 	E: Event,
 {
 	// An absent event_context deserializes to the default 5/5; treat that as no
 	// request.
 	if event_context.is_default() {
-		return EventContextResult::default();
+		return Ok(EventContextResult::default());
 	}
 
-	let Ok(base_count) = services
+	let base_count = services
 		.timeline
 		.get_pdu_count(pdu.event_id())
-		.await
-	else {
-		return EventContextResult::default();
-	};
+		.await?;
 
 	let room_id = pdu.room_id();
 	let bounded = |limit: UInt| limit.try_into().unwrap_or(0).min(CONTEXT_MAX);
@@ -240,6 +238,8 @@ where
 	);
 
 	let (events_before, events_after) = join(events_before, events_after).await;
+	let events_before = events_before?;
+	let events_after = events_after?;
 
 	let start = events_before
 		.last()
@@ -267,13 +267,13 @@ where
 		.map(Event::into_format)
 		.collect();
 
-	EventContextResult {
+	Ok(EventContextResult {
 		start,
 		end,
 		events_before,
 		events_after,
 		profile_info: BTreeMap::new(),
-	}
+	})
 }
 
 async fn collect_context_half<'a, S>(
@@ -281,22 +281,21 @@ async fn collect_context_half<'a, S>(
 	pdus: S,
 	sender_user: &'a UserId,
 	take: usize,
-) -> Vec<PdusIterItem>
+) -> Result<Vec<PdusIterItem>>
 where
 	S: Stream<Item = Result<PdusIterItem>> + Send + 'a,
 {
-	pdus.ignore_err()
-		.wide_filter_map(|item| visibility_filter(services, item, sender_user))
+	pdus.try_filter_map(async |item| Ok(visibility_filter(services, item, sender_user).await))
 		.take(take)
-		.wide_then(async |(count, pdu)| {
+		.wide_and_then(async |(count, pdu)| {
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
-			(count, pdu)
+			Ok((count, pdu))
 		})
-		.collect()
+		.try_collect()
 		.await
 }
 

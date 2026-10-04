@@ -1,28 +1,22 @@
-use futures::{Stream, StreamExt, TryFutureExt};
+use futures::{Stream, StreamExt};
 use ruma::{EventId, OwnedEventId, RoomId};
 use tuwunel_core::{
-	PduId, Result, implement,
+	Result, implement,
 	matrix::{Event, Pdu},
 	trace,
-	utils::{
-		stream::{ReadyExt, TryIgnore, WidebandExt},
-		u64_from_u8,
-	},
+	utils::stream::TryIgnore,
 };
 use tuwunel_database::{Interfix, Txn};
 
-use super::{
-	Service,
-	typed_relations::{Tag, prefix},
-};
+use super::{RelationReadBudget, Service, typed_relations::Tag};
 
 /// Cap on the `m.reference` bundle chunk; /relations is the paginated fallback.
 const BUNDLE_MAX: usize = 100;
 
 /// MSC2675/MSC3267: the event ids of `parent`'s `m.reference` children, oldest
 /// first, from the typed index, capped at `BUNDLE_MAX`. Empty when
-/// `parent` is redacted or unreferenced. The ids come from the index value (the
-/// child shorteventid) without loading the children, so the chunk is filtered
+/// `parent` is redacted or unreferenced. Every index identity and existing
+/// child record is checked before capping the chunk. The chunk is filtered
 /// for neither ignored users nor history visibility. The ignored-user posture
 /// matches the /relations endpoint, which also does not filter relation
 /// children by ignored sender; the history-visibility posture matches the
@@ -30,45 +24,21 @@ const BUNDLE_MAX: usize = 100;
 /// filter children by visibility.
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "trace")]
-pub(super) async fn references(&self, parent: &Pdu) -> Vec<OwnedEventId> {
+pub(super) async fn references(
+	&self,
+	parent: &Pdu,
+	budget: &mut RelationReadBudget,
+) -> Result<Vec<OwnedEventId>> {
 	if parent.is_redacted() {
-		return Vec::new();
+		return Ok(Vec::new());
 	}
-
-	let Ok(parent_id) = self
-		.services
-		.timeline
-		.get_pdu_id(parent.event_id())
-		.map_ok(PduId::from)
-		.await
-	else {
-		return Vec::new();
-	};
-
-	self.referenced_children(parent_id)
+	Ok(self
+		.typed_children(parent, Tag::Reference, budget)
+		.await?
+		.into_iter()
 		.take(BUNDLE_MAX)
-		.collect()
-		.await
-}
-
-#[implement(Service)]
-fn referenced_children(&self, parent_id: PduId) -> impl Stream<Item = OwnedEventId> + Send + '_ {
-	let prefix = prefix(parent_id.shortroomid, parent_id.count, Tag::Reference);
-	let seek = prefix.clone();
-
-	self.db
-		.relatesto_typed
-		.raw_stream_from(seek.as_slice())
-		.ignore_err()
-		.ready_take_while(move |(key, _)| key.starts_with(&prefix))
-		.map(|(_, val)| u64_from_u8(val))
-		.wide_filter_map(async |short| {
-			self.services
-				.short
-				.get_eventid_from_short(short)
-				.await
-				.ok()
-		})
+		.map(|pdu| pdu.event_id)
+		.collect())
 }
 
 #[implement(Service)]

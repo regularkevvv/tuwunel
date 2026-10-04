@@ -207,6 +207,7 @@ pub(crate) async fn event_context(
 			.bundle_aggregations(sender_user, pdu)
 	}))
 	.await
+	.transpose()?
 	.map(Event::into_format);
 
 	Ok(get_context::v3::Response {
@@ -355,7 +356,7 @@ where
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
 			Ok((count, pdu))
 		})

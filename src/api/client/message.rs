@@ -202,7 +202,7 @@ pub(crate) async fn get_messages(
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
 			Ok((count, pdu))
 		})

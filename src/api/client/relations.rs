@@ -304,7 +304,7 @@ async fn collect_relations(
 			.services
 			.pdu_metadata
 			.bundle_aggregations(query.sender_user, pdu)
-			.await;
+			.await?;
 		bytes = bytes.saturating_add(1).saturating_add(
 			serialized_len(pdu.as_pdu())
 				.map_err(|_| Error::bad_database("Invalid relation response event"))?,

@@ -55,7 +55,9 @@ use tuwunel_core::{
 		math::ruma_from_u64,
 		option::OptionExt,
 		result::MapExpect,
-		stream::{BroadbandExt, Tools, TryBroadbandExt, TryReadyExt, WidebandExt},
+		stream::{
+			BroadbandExt, Tools, TryBroadbandExt, TryReadyExt, TryWidebandExt, WidebandExt,
+		},
 	},
 	warn,
 };
@@ -986,12 +988,13 @@ async fn load_left_room(
 		.ready_filter(|pdu| filter.room.timeline.matches(pdu))
 		.take(timeline_limit)
 		.wide_then(|pdu| with_membership(services, pdu, sender_user, encrypted))
-		.wide_then(|pdu| {
+		.map(Ok::<_, Error>)
+		.wide_and_then(|pdu| {
 			services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
 		})
-		.collect::<Vec<_>>();
+		.try_collect::<Vec<_>>();
 
 	let account_data_events = services
 		.account_data
@@ -1005,6 +1008,7 @@ async fn load_left_room(
 			.boxed()
 			.await;
 
+	let timeline_events = timeline_events?;
 	let state = state_after.wrap(StateEvents { events: state_events });
 
 	Ok(Some(LeftRoom {
@@ -1174,7 +1178,7 @@ async fn load_joined_room(
 		send_notification_counts,
 		filter,
 	)
-	.await;
+	.await?;
 
 	let (joined_room, device_list_updates, left_encrypted_users) = finalize_joined_room(
 		services,
@@ -1388,7 +1392,7 @@ async fn await_join_aggregates(
 	last_privateread_update: u64,
 	send_notification_counts: bool,
 	filter: &FilterDefinition,
-) -> JoinAggregates {
+) -> Result<JoinAggregates> {
 	let (notification_count, highlight_count, thread_counts) =
 		notification_count_futures(services, sender_user, room_id, send_notification_counts);
 
@@ -1437,8 +1441,8 @@ async fn await_join_aggregates(
 	.boxed()
 	.await;
 
-	JoinAggregates {
-		room_events,
+	Ok(JoinAggregates {
+		room_events: room_events?,
 		account_data_events,
 		typing_events,
 		private_read_events,
@@ -1447,7 +1451,7 @@ async fn await_join_aggregates(
 		thread_counts,
 		device_list_updates,
 		left_encrypted_users,
-	}
+	})
 }
 
 struct FinalizeJoinFlags {
@@ -1705,7 +1709,7 @@ fn collect_room_events<'a>(
 	joined_sender_member: Option<PduEvent>,
 	encrypted: bool,
 	filter: &'a FilterDefinition,
-) -> impl Future<Output = Vec<PduEvent>> + Send + 'a {
+) -> impl Future<Output = Result<Vec<PduEvent>>> + Send + 'a {
 	let include_in_timeline = |event: &PduEvent| filter.room.timeline.matches(event);
 	timeline_pdus
 		.into_iter()
@@ -1715,12 +1719,13 @@ fn collect_room_events<'a>(
 		.chain(joined_sender_member.into_iter().stream())
 		.ready_filter(include_in_timeline)
 		.wide_then(move |pdu| with_membership(services, pdu, sender_user, encrypted))
-		.wide_then(move |pdu| {
+		.map(Ok::<_, Error>)
+		.wide_and_then(move |pdu| {
 			services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
 		})
-		.collect::<Vec<_>>()
+		.try_collect::<Vec<_>>()
 }
 
 fn collect_room_account_data<'a>(

@@ -25,7 +25,7 @@ pub struct RelationReadBudget {
 }
 
 impl RelationReadBudget {
-	fn charge(&mut self, rows: usize, bytes: usize) -> Result {
+	pub(super) fn charge(&mut self, rows: usize, bytes: usize) -> Result {
 		self.rows = self.rows.saturating_add(rows);
 		self.bytes = self.bytes.saturating_add(bytes);
 		if self.rows > 4096 || self.bytes > 512 * 1024 {
@@ -236,7 +236,7 @@ pub async fn get_relations_bounded(
 }
 
 #[implement(Service)]
-async fn relation_pdu(
+pub(super) async fn relation_pdu(
 	&self,
 	id: &RawPduId,
 	budget: &mut RelationReadBudget,

@@ -452,19 +452,25 @@ impl Service {
 
 	/// MSC3816: whether `user_id` has participated in the thread rooted at
 	/// `root_event_id`, having sent the root event or a threaded reply to it.
-	pub async fn user_participated(&self, root_event_id: &EventId, user_id: &UserId) -> bool {
-		let Ok(root_id) = self
+	pub async fn user_participated(
+		&self,
+		root_event_id: &EventId,
+		user_id: &UserId,
+	) -> Result<bool> {
+		let root_id = self
 			.services
 			.timeline
 			.get_pdu_id(root_event_id)
 			.await
-		else {
-			return false;
-		};
+			.map_err(|error| {
+				if error.kind() == ErrorKind::NotFound {
+					Error::bad_database("Missing thread participation root mapping")
+				} else {
+					error
+				}
+			})?;
 
-		self.is_participant(&root_id, user_id)
-			.await
-			.unwrap_or(false)
+		self.is_participant(&root_id, user_id).await
 	}
 
 	#[tracing::instrument(skip(self), level = "debug")]

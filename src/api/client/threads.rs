@@ -98,7 +98,7 @@ pub(crate) async fn get_threads_route(
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
 			Ok((count, apply_ignored_view(pdu, view)))
 		})
