@@ -248,7 +248,11 @@ async fn state_key_allocation(services: &Services) -> Result {
 
 async fn state_key_limits(services: &Services) -> Result {
 	let kind = StateEventType::RoomTopic;
-	let exact = "x".repeat(512 * 1024 - kind.to_cow_str().len() - 1);
+	let exact = "x".repeat(
+		(512_usize * 1024)
+			.checked_sub(kind.to_cow_str().len().saturating_add(1))
+			.expect("state-key type and separator must fit the input budget"),
+	);
 	let short = services
 		.short
 		.get_or_create_shortstatekey(&kind, &exact)
@@ -399,7 +403,14 @@ async fn write_room_inventory(services: &Services, rows: usize, key_len: usize) 
 	for start in (0..rows).step_by(64) {
 		let mut txn = services.db.txn();
 		for index in start..rows.min(start.saturating_add(64)) {
-			let room = RoomId::parse(format!("!{index:04x}{}", "x".repeat(key_len - 5)))?;
+			let room = RoomId::parse(format!(
+				"!{index:04x}{}",
+				"x".repeat(
+					key_len
+						.checked_sub(5)
+						.expect("room prefix must fit the requested key width")
+				)
+			))?;
 			let short = 100_000_u64.saturating_add(index.try_into()?);
 			txn.insert_raw(mappings, room.as_bytes(), short.to_be_bytes());
 		}
@@ -520,7 +531,7 @@ async fn room_reverse_limits(services: &Services) -> Result {
 async fn refused_batch(
 	services: &Services,
 	events: &[&tuwunel_core::ruma::EventId],
-	expected: tuwunel_core::http::StatusCode,
+	expected: http::StatusCode,
 ) -> Result {
 	let before = services.globals.current_count();
 	let stream = services
@@ -557,12 +568,8 @@ async fn corrupt_batch_mappings(
 	separator.push(0xFF);
 	for invalid in [Vec::new(), vec![0_u8], trailing, separator] {
 		forward.raw_put(event, &invalid).await?;
-		refused_batch(
-			services,
-			&[missing, event],
-			tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR,
-		)
-		.await?;
+		refused_batch(services, &[missing, event], http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
 		refused_single(services, event).await?;
 		assert_eq!(forward.get(event).await?.as_ref(), invalid.as_slice());
 		assert_eq!(reverse.get(&key).await?.as_ref(), saved_reverse.as_slice());
@@ -579,12 +586,8 @@ async fn corrupt_batch_mappings(
 		} else {
 			reverse.remove(&key).await?;
 		}
-		refused_batch(
-			services,
-			&[missing, event],
-			tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR,
-		)
-		.await?;
+		refused_batch(services, &[missing, event], http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
 		refused_single(services, event).await?;
 		assert_eq!(forward.get(event).await?.as_ref(), saved.as_slice());
 		services
@@ -619,7 +622,7 @@ async fn refused_single(services: &Services, event: &tuwunel_core::ruma::EventId
 		.get_or_create_shorteventid(event)
 		.await
 		.expect_err("single allocation must refuse a corrupt existing pair");
-	assert_eq!(error.status_code(), tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(error.status_code(), http::StatusCode::INTERNAL_SERVER_ERROR);
 	assert_eq!(services.globals.current_count(), before, "single refusal cannot allocate");
 	assert!(
 		services.globals.pending_count().is_empty(),
@@ -641,12 +644,7 @@ async fn batch_limits(services: &Services, event: &tuwunel_core::ruma::EventId) 
 		vec![expected; 4096],
 		"complete boundary input preserves every duplicate"
 	);
-	refused_batch(
-		services,
-		&vec![event; 4097],
-		tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS,
-	)
-	.await?;
+	refused_batch(services, &vec![event; 4097], http::StatusCode::TOO_MANY_REQUESTS).await?;
 	let long = tuwunel_core::ruma::EventId::parse(format!("${}", "x".repeat(127)))?;
 	let extra = tuwunel_core::ruma::EventId::parse(format!("${}", "y".repeat(128)))?;
 	let short = services
@@ -661,7 +659,7 @@ async fn batch_limits(services: &Services, event: &tuwunel_core::ruma::EventId) 
 		.await?;
 	assert_eq!(actual, vec![short; 4096], "exact 512 KiB observed IDs remain complete");
 	inputs[0] = extra.as_ref();
-	refused_batch(services, &inputs, tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS).await?;
+	refused_batch(services, &inputs, http::StatusCode::TOO_MANY_REQUESTS).await?;
 	services
 		.short
 		.get_shorteventid(&extra)
