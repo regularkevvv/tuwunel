@@ -67,6 +67,39 @@ fn admin_room_pages_preserve_totals_or_refuse_incomplete_inventories() -> Result
 }
 
 impl Endpoint<'_> {
+	async fn members(&self, room: &RoomId) -> Result<(http::StatusCode, Value)> {
+		let response = self
+			.services
+			.client
+			.clients
+			.default
+			.get(format!("{}/_synapse/admin/v1/rooms/{room}/members", self.base))
+			.bearer_auth(TOKEN)
+			.send()
+			.await?;
+		let status = response.status();
+		Ok((status, response.json().await?))
+	}
+
+	async fn member_page(&self, room: &RoomId, total: usize) -> Result<Value> {
+		let (status, body) = self.members(room).await?;
+		assert_eq!(status, http::StatusCode::OK, "{body}");
+		assert_eq!(body["total"], total);
+		assert_eq!(body["members"].as_array().expect("members").len(), total);
+		Ok(body)
+	}
+
+	async fn members_refused(&self, room: &RoomId, expected: http::StatusCode) -> Result {
+		let (status, body) = self.members(room).await?;
+		assert_eq!(status, expected, "{body}");
+		assert!(body.get("members").is_none());
+		assert!(body.get("total").is_none());
+		if expected == http::StatusCode::TOO_MANY_REQUESTS {
+			assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+		}
+		Ok(())
+	}
+
 	async fn request(&self, query: &str) -> Result<(http::StatusCode, Value)> {
 		let response = self
 			.services
@@ -192,12 +225,56 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 			.is_empty()
 	);
 	endpoint.page("empty_rooms=true", 0).await?;
+	checked_room_members(endpoint, &alpha).await?;
 	empty_deletion_inventory(endpoint, &alpha).await?;
 	complete_empty_deletion(endpoint).await?;
 	complete_room_pruning(endpoint).await?;
 	corrupt_inputs(endpoint, &alpha).await?;
 	member_budgets(endpoint, &alpha).await?;
 	aggregate_members(endpoint, &[alpha, zeta]).await
+}
+
+async fn checked_room_members(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
+	let services = endpoint.services;
+	let admin = &services.globals.server_user;
+	assert_eq!(
+		services
+			.client
+			.clients
+			.default
+			.get(format!("{}/_synapse/admin/v1/rooms/{room}/members", endpoint.base))
+			.send()
+			.await?
+			.status(),
+		http::StatusCode::UNAUTHORIZED
+	);
+	assert_eq!(endpoint.member_page(room, 1).await?["members"], json!([admin]));
+	endpoint
+		.members_refused(&RoomId::parse("!missing:localhost")?, http::StatusCode::NOT_FOUND)
+		.await?;
+	let rooms = &services.db["roomid_shortroomid"];
+	let prefix = rooms.get(room).await?.to_vec();
+	rooms.remove(room).await?;
+	endpoint
+		.members_refused(room, http::StatusCode::NOT_FOUND)
+		.await?;
+	rooms.insert(room, &prefix).await?;
+	// A corrupt first timeline key must refuse instead of proving existence
+	// or panicking in the historical infallible RawPduId decoder.
+	services.db["pduid_pdu"]
+		.insert(&prefix, b"")
+		.await?;
+	endpoint
+		.members_refused(room, http::StatusCode::INTERNAL_SERVER_ERROR)
+		.await?;
+	services.db["pduid_pdu"].remove(&prefix).await?;
+	let joined = &services.db["roomuserid_joined"];
+	let original = joined.qry(&(room, admin)).await?.to_vec();
+	joined.del((room, admin)).await?;
+	endpoint.member_page(room, 0).await?;
+	joined.put_raw((room, admin), original).await?;
+	endpoint.member_page(room, 1).await?;
+	Ok(())
 }
 
 async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
@@ -487,6 +564,9 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	let members = &services.db["roomuserid_joined"];
 	members.put((room, "not-a-user"), b"").await?;
 	endpoint
+		.members_refused(room, http::StatusCode::INTERNAL_SERVER_ERROR)
+		.await?;
+	endpoint
 		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
 		.await?;
 	members.del((room, "not-a-user")).await?;
@@ -500,6 +580,9 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	let room_key = rooms.get(room).await?.to_vec();
 	for value in malformed {
 		rooms.insert(room, value).await?;
+		endpoint
+			.members_refused(room, http::StatusCode::INTERNAL_SERVER_ERROR)
+			.await?;
 		endpoint
 			.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
 			.await?;
@@ -525,6 +608,12 @@ async fn member_budgets(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 		.page(&format!("search_term={room}"), 1)
 		.await?;
 	assert_eq!(page["rooms"][0]["joined_local_members"], 2);
+	assert!(
+		endpoint.member_page(room, 2).await?["members"]
+			.as_array()
+			.expect("members")
+			.contains(&json!(disabled))
+	);
 	members.del((room, &disabled)).await?;
 	for index in 0..1023 {
 		members
@@ -532,8 +621,16 @@ async fn member_budgets(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 			.await?;
 	}
 	endpoint.page("limit=1", 2).await?;
+	let page = endpoint.member_page(room, 1024).await?;
+	let mut expected = vec![services.globals.server_user.to_string()];
+	expected.extend((0..1023).map(|index| format!("@row-{index:04}:remote.test")));
+	expected.sort();
+	assert_eq!(page["members"], json!(expected));
 	members
 		.put((room, "@overflow:remote.test"), b"")
+		.await?;
+	endpoint
+		.members_refused(room, http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;
 	endpoint
 		.refused("limit=1", http::StatusCode::TOO_MANY_REQUESTS)
@@ -551,6 +648,9 @@ async fn member_budgets(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 			.put((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))), b"")
 			.await?;
 	}
+	endpoint
+		.members_refused(room, http::StatusCode::TOO_MANY_REQUESTS)
+		.await?;
 	endpoint
 		.refused("limit=1", http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;

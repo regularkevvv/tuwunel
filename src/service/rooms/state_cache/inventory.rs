@@ -1,6 +1,6 @@
 use futures::{StreamExt, pin_mut};
 use ruma::{
-	RoomId, UserId,
+	OwnedUserId, RoomId, UserId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 };
 use tuwunel_core::{Error, Result};
@@ -20,6 +20,35 @@ pub struct RoomMemberInventoryCount {
 }
 
 impl Service {
+	/// Complete joined-member IDs, including remote and disabled accounts.
+	/// Reads at most 1,025 keys and retains at most 1,024 IDs / 128 KiB.
+	/// Values do not affect the existing key-presence membership semantics.
+	pub async fn bounded_room_members(&self, room: &RoomId) -> Result<Vec<OwnedUserId>> {
+		const MAX_ROWS: usize = 1024;
+		const MAX_BYTES: usize = 128 * 1024;
+		let prefix = (room, Interfix);
+		let keys = self
+			.db
+			.roomuserid_joinedcount
+			.keys_prefix_capped::<(Ignore, &UserId), _>(&prefix, MAX_ROWS + 1);
+		pin_mut!(keys);
+		let mut members = Vec::new();
+		let mut bytes = 0_usize;
+		while let Some(key) = keys.next().await {
+			let (_, user) = key?;
+			bytes = bytes.saturating_add(user.as_bytes().len());
+			if members.len() >= MAX_ROWS || bytes > MAX_BYTES {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"Room member inventory limit reached".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			members.push(user.to_owned());
+		}
+		Ok(members)
+	}
+
 	/// Counts local joined users only after a complete fallible key scan.
 	/// Includes at most 1,024 joined-member keys / 128 KiB user-ID bytes, or
 	/// a caller's smaller remaining budgets, plus one overflow key.

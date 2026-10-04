@@ -57,6 +57,31 @@ pub async fn exists(&self, room_id: &RoomId) -> bool {
 	keys.next().await.is_some()
 }
 
+/// Checks the room index and its first timeline key without hiding failed
+/// reads. Only a missing index or a successful empty key scan means absence.
+/// The scan declares a one-key cap to remote fetch/drain handling.
+#[implement(Service)]
+pub async fn exists_checked(&self, room_id: &RoomId) -> Result<bool> {
+	let room = match self.db.roomid_shortroomid.get(room_id).await {
+		| Ok(room) => room,
+		| Err(error) if error.is_not_found() => return Ok(false),
+		| Err(error) => return Err(error),
+	};
+	let prefix = u64_from_bytes(room.as_ref())
+		.map_err(|_| Error::bad_database("Invalid room inventory record"))?;
+	let keys = self
+		.db
+		.pduid_pdu
+		.keys_prefix_capped::<&[u8], _>(&prefix, 1);
+	pin_mut!(keys);
+	match keys.next().await {
+		| Some(Ok(key)) if matches!(key.len(), 16 | 24) => Ok(true),
+		| Some(Ok(_)) => Err(Error::bad_database("Invalid room timeline key")),
+		| Some(Err(error)) => Err(error),
+		| None => Ok(false),
+	}
+}
+
 #[implement(Service)]
 pub fn public_ids_prefix<'a>(
 	&'a self,
