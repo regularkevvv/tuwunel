@@ -30,7 +30,7 @@ impl Service {
 			if scanned >= MAX_LOCAL_USER_COUNT_ROWS {
 				return Err(Error::Request(
 					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
-					"User count inventory limit reached; use paginated admin user listing".into(),
+					"User count inventory limit reached".into(),
 					http::StatusCode::TOO_MANY_REQUESTS,
 				));
 			}
