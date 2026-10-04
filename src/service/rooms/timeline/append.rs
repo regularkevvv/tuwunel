@@ -445,7 +445,8 @@ async fn append_pdu_effects(
 						pdu,
 						RelationType::Replacement,
 					)
-					.await;
+					.await
+					.effect("typed relation", event_id);
 			},
 			| Relation::Reference(reference) => {
 				self.services
@@ -457,7 +458,8 @@ async fn append_pdu_effects(
 						pdu,
 						RelationType::Reference,
 					)
-					.await;
+					.await
+					.effect("typed relation", event_id);
 			},
 			| _ => {}, // TODO: Aggregate other types
 		}

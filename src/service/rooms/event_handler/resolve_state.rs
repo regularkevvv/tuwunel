@@ -115,8 +115,8 @@ pub async fn resolve_state(
 				.iter()
 				.map(|(ssk, eid)| (ssk, (*eid).borrow())),
 		)
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	Ok(Arc::new(new_room_state))
 }

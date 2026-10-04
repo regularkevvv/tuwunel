@@ -1,10 +1,10 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use ruma::{
 	EventId, RoomId,
 	events::{relation::RelationType, room::encrypted::Relation},
 };
 use tuwunel_core::{
-	PduId, Result,
+	Error, PduId, Result,
 	arrayvec::ArrayVec,
 	implement,
 	matrix::{Event, Pdu, PduCount, RawPduId},
@@ -95,37 +95,36 @@ pub async fn rebuild_typed_relations(&self) -> Result {
 	let pdus = self.services.db["pduid_pdu"].clone();
 
 	pdus.raw_stream()
-		.ignore_err()
-		.ready_filter_map(|(key, value)| {
-			let raw_pdu_id = RawPduId::from(key);
+		.map(|row| {
+			let (key, value) = row?;
+			let raw_pdu_id = RawPduId::from_bytes(key)?;
 			let pdu_id = PduId {
 				shortroomid: u64_from_u8(&raw_pdu_id.shortroomid()),
 				count: raw_pdu_id.pdu_count(),
 			};
-			let pdu = serde_json::from_slice::<Pdu>(value).ok()?;
+			let pdu = serde_json::from_slice::<Pdu>(value)
+				.map_err(|_| Error::bad_database("Invalid stored relation event"))?;
 
-			Some((pdu_id, pdu))
+			Ok((pdu_id, pdu))
 		})
-		.for_each_concurrent(automatic_width(), async |(pdu_id, pdu)| {
-			self.index_pdu_relations(pdu_id, &pdu).await;
+		.try_for_each_concurrent(automatic_width(), async |(pdu_id, pdu)| {
+			self.index_pdu_relations(pdu_id, &pdu).await
 		})
-		.await;
-
-	Ok(())
+		.await
 }
 
 #[implement(Service)]
-async fn index_pdu_relations(&self, pdu_id: PduId, pdu: &Pdu) {
+async fn index_pdu_relations(&self, pdu_id: PduId, pdu: &Pdu) -> Result {
 	let Ok(content) = pdu.get_content::<ExtractRelatesTo>() else {
-		return;
+		return Ok(());
 	};
 
 	let (rel_type, parent) = match content.relates_to {
 		| Relation::Replacement(replacement) => (RelationType::Replacement, replacement.event_id),
 		| Relation::Reference(reference) => (RelationType::Reference, reference.event_id),
-		| _ => return,
+		| _ => return Ok(()),
 	};
 
 	self.add_typed_relation(pdu_id.shortroomid, pdu_id.count, &parent, pdu, rel_type)
-		.await;
+		.await
 }

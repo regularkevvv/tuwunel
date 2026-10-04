@@ -326,7 +326,7 @@ async fn verify_visibility_fallback_refusals(
 	let shorteventid = services
 		.short
 		.get_or_create_shorteventid(event)
-		.await;
+		.await?;
 	let key = shorteventid.to_be_bytes();
 	let states = &services.db["shorteventid_shortstatehash"];
 	assert_eq!(

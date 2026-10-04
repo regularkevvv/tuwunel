@@ -62,24 +62,24 @@ pub async fn add_typed_relation<E: Event>(
 	parent: &EventId,
 	child: &E,
 	rel_type: RelationType,
-) {
+) -> Result {
 	let Some(tag) = tag(&rel_type) else {
-		return;
+		return Ok(());
 	};
 
 	let Ok(parent_count) = self.services.timeline.get_pdu_count(parent).await else {
-		return;
+		return Ok(());
 	};
 
 	let (PduCount::Normal(_), PduCount::Normal(_)) = (parent_count, child_count) else {
-		return; // backfilled relations are not indexed
+		return Ok(()); // backfilled relations are not indexed
 	};
 
 	let child_short = self
 		.services
 		.short
 		.get_or_create_shorteventid(child.event_id())
-		.await;
+		.await?;
 
 	let child_ts = u64::from(child.origin_server_ts().get());
 	let key = key(shortroomid, parent_count, tag, child_ts, child_count);
@@ -88,7 +88,6 @@ pub async fn add_typed_relation<E: Event>(
 		.relatesto_typed
 		.aput_raw::<KEY_LEN, _, _>(key.as_slice(), child_short.to_be_bytes())
 		.await
-		.expect("database write error");
 }
 
 fn tag(rel_type: &RelationType) -> Option<Tag> {

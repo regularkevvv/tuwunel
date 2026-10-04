@@ -714,8 +714,8 @@ async fn apply_send_join_state(
 		.services
 		.state_compressor
 		.compress_state_events(state.iter().map(|(ssk, eid)| (ssk, eid.borrow())))
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	debug!("Saving compressed state...");
 	let HashSetCompressStateEvent {

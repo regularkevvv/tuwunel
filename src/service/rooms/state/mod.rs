@@ -204,7 +204,7 @@ pub async fn set_event_state(
 		.services
 		.short
 		.get_or_create_shorteventid(event_id)
-		.await;
+		.await?;
 
 	let state_hash = calculate_hash(state_ids_compressed.iter().map(|s| &s[..]));
 
@@ -299,7 +299,7 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 		.services
 		.short
 		.get_or_create_shorteventid(&new_pdu.event_id)
-		.await;
+		.await?;
 
 	let previous_shortstatehash = self
 		.get_room_shortstatehash(&new_pdu.room_id)
@@ -333,7 +333,7 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 				.services
 				.state_compressor
 				.compress_state_event(shortstatekey, &new_pdu.event_id)
-				.await;
+				.await?;
 
 			let replaces = states_parents
 				.last()

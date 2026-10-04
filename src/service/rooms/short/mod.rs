@@ -1,18 +1,22 @@
 use std::{borrow::Borrow, sync::Arc};
 
-use futures::{FutureExt, Stream, StreamExt, pin_mut};
-use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, events::StateEventType};
+use futures::{
+	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+	future::{Either, ready},
+	pin_mut,
+};
+use ruma::{
+	EventId, OwnedEventId, OwnedRoomId, RoomId,
+	api::error::{ErrorKind, LimitExceededErrorData},
+	events::StateEventType,
+};
 use serde::Deserialize;
 pub use tuwunel_core::matrix::{ShortEventId, ShortId, ShortRoomId, ShortStateKey};
 use tuwunel_core::{
-	Err, Result, err, implement,
+	Err, Error, Result, err, implement,
 	matrix::StateKey,
 	utils,
-	utils::{
-		IterStream, MutexMap,
-		hash::sha256::Digest,
-		stream::{ReadyExt, WidebandExt},
-	},
+	utils::{IterStream, MutexMap, hash::sha256::Digest, stream::ReadyExt},
 };
 use tuwunel_database::{Deserialized, Get, Map, Qry, Txn};
 
@@ -66,62 +70,149 @@ impl crate::Service for Service {
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
-#[implement(Service)]
-pub async fn get_or_create_shorteventid(&self, event_id: &EventId) -> ShortEventId {
-	if let Ok(shorteventid) = self.get_shorteventid(event_id).await {
-		return shorteventid;
-	}
-
-	self.create_shorteventid(event_id).await
-}
-
-/// Resolves each event id to its short id, allocating any that are absent.
-///
-/// Allocation runs ahead of consumer demand, so a caller that stops early
-/// still allocates for the events already buffered. Today's callers drain the
-/// stream in full.
+/// Complete bounded preflight before lazily allocating missing event IDs.
+/// Existing mappings and reverse bindings must be valid before any creation.
+/// Output stays in input order, including duplicates; allocation follows
+/// demand.
 #[implement(Service)]
 pub fn multi_get_or_create_shorteventid<'a, I>(
 	&'a self,
 	event_ids: I,
-) -> impl Stream<Item = ShortEventId> + Send + '_
+) -> impl Stream<Item = Result<ShortEventId>> + Send + 'a
 where
 	I: Iterator<Item = &'a EventId> + Clone + Send + 'a,
 {
-	event_ids
-		.clone()
-		.stream()
-		.get(&self.db.eventid_shorteventid)
-		.zip(event_ids.into_iter().stream())
-		.wide_then(async |(result, event_id)| match result {
-			| Ok(ref short) => utils::u64_from_u8(short),
-			| Err(_) => self.create_shorteventid(event_id).await,
+	self.prepare_event_ids(event_ids)
+		.map_ok(Vec::into_iter)
+		.map_ok(IterStream::try_stream)
+		.try_flatten_stream()
+		.and_then(move |(event_id, known)| match known {
+			| Some(short) => Either::Left(ready(Ok(short))),
+			| None => Either::Right(self.create_shorteventid(event_id)),
 		})
 }
 
 #[implement(Service)]
-async fn create_shorteventid(&self, event_id: &EventId) -> ShortEventId {
-	let _lock = self.creating.shorteventid.lock(event_id).await;
-
-	if let Ok(shorteventid) = self.get_shorteventid(event_id).await {
-		return shorteventid;
+async fn prepare_event_ids<'a, I>(
+	&self,
+	event_ids: I,
+) -> Result<Vec<(&'a EventId, Option<ShortEventId>)>>
+where
+	I: Iterator<Item = &'a EventId> + Send,
+{
+	let mut events = Vec::new();
+	let mut bytes = 0_usize;
+	for event_id in event_ids {
+		bytes = bytes.saturating_add(event_id.as_str().len());
+		if events.len() >= 4096 || bytes > 512 * 1024 {
+			return Err(short_allocation_limit());
+		}
+		events.push(event_id);
 	}
+	let reads = events
+		.iter()
+		.copied()
+		.stream()
+		.get(&self.db.eventid_shorteventid);
+	pin_mut!(reads);
+	let mut prepared = Vec::new();
+	for event_id in &events {
+		let read = reads
+			.next()
+			.await
+			.ok_or_else(|| Error::bad_database("Incomplete event ID lookup batch"))?;
+		let known = match read {
+			| Ok(value) => Some(
+				utils::bytes::u64_from_bytes(value.as_ref())
+					.map_err(|_| Error::bad_database("Invalid compact event ID"))?,
+			),
+			| Err(error) if error.kind() == ErrorKind::NotFound => None,
+			| Err(error) => return Err(error),
+		};
+		prepared.push((*event_id, known));
+	}
+	let known: Vec<_> = prepared
+		.iter()
+		.filter_map(|(event_id, short)| short.map(|short| (*event_id, short)))
+		.collect();
+	let reverse = known
+		.iter()
+		.map(|(_, short)| short.to_be_bytes())
+		.stream()
+		.get(&self.db.shorteventid_eventid);
+	pin_mut!(reverse);
+	for (event_id, _) in &known {
+		let value = reverse
+			.next()
+			.await
+			.ok_or_else(|| Error::bad_database("Incomplete event ID reverse batch"))?
+			.map_err(|error| {
+				if error.kind() == ErrorKind::NotFound {
+					Error::bad_database("Incomplete event ID reverse mapping")
+				} else {
+					error
+				}
+			})?;
+		if value.as_ref() != event_id.as_bytes() {
+			return Err(Error::bad_database("Mismatched event ID reverse mapping"));
+		}
+	}
+	Ok(prepared)
+}
 
-	let short = self
-		.services
-		.globals
-		.next_count()
+#[implement(Service)]
+pub async fn get_or_create_shorteventid(&self, event_id: &EventId) -> Result<ShortEventId> {
+	match self.existing_event_id(event_id).await? {
+		| Some(short) => Ok(short),
+		| None => self.create_shorteventid(event_id).await,
+	}
+}
+
+#[implement(Service)]
+async fn existing_event_id(&self, event_id: &EventId) -> Result<Option<ShortEventId>> {
+	let short = match self.get_shorteventid(event_id).await {
+		| Ok(short) => short,
+		| Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		| Err(error) => return Err(error),
+	};
+	let reverse = self
+		.db
+		.shorteventid_eventid
+		.get(&short.to_be_bytes())
 		.await
-		.expect("failed to obtain next sequence number");
-	let mut txn = self.services.db.txn();
+		.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Incomplete event ID reverse mapping")
+			} else {
+				error
+			}
+		})?;
+	if reverse.as_ref() != event_id.as_bytes() {
+		return Err(Error::bad_database("Mismatched event ID reverse mapping"));
+	}
+	Ok(Some(short))
+}
 
+#[implement(Service)]
+async fn create_shorteventid(&self, event_id: &EventId) -> Result<ShortEventId> {
+	let _lock = self.creating.shorteventid.lock(event_id).await;
+	if let Some(short) = self.existing_event_id(event_id).await? {
+		return Ok(short);
+	}
+	let short = self.services.globals.next_count().await?;
+	let mut txn = self.services.db.txn();
 	txn.insert_raw(&self.db.shorteventid_eventid, (*short).to_be_bytes(), event_id);
 	txn.insert_raw(&self.db.eventid_shorteventid, event_id, (*short).to_be_bytes());
-	txn.execute()
-		.await
-		.expect("database transaction execute error");
+	txn.execute().await?;
+	Ok(*short)
+}
 
-	*short
+fn short_allocation_limit() -> Error {
+	Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+		"Event ID allocation input limit reached".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	)
 }
 
 #[implement(Service)]
@@ -269,8 +360,10 @@ pub async fn get_or_create_shortstatehash<F>(
 where
 	F: FnOnce(&mut Txn, ShortStateHash) -> Result,
 {
-	if let Ok(shortstatehash) = self.get_shortstatehash(state_hash).await {
-		return Ok((shortstatehash, true));
+	match self.get_shortstatehash(state_hash).await {
+		| Ok(shortstatehash) => return Ok((shortstatehash, true)),
+		| Err(error) if error.kind() == ErrorKind::NotFound => {},
+		| Err(error) => return Err(error),
 	}
 
 	self.create_shortstatehash(state_hash, write_statediff)
@@ -292,8 +385,10 @@ where
 		.lock(state_hash)
 		.await;
 
-	if let Ok(shortstatehash) = self.get_shortstatehash(state_hash).await {
-		return Ok((shortstatehash, true));
+	match self.get_shortstatehash(state_hash).await {
+		| Ok(shortstatehash) => return Ok((shortstatehash, true)),
+		| Err(error) if error.kind() == ErrorKind::NotFound => {},
+		| Err(error) => return Err(error),
 	}
 
 	let shortstatehash = self.services.globals.next_count().await?;
@@ -312,11 +407,31 @@ where
 
 #[implement(Service)]
 pub async fn get_shortstatehash(&self, state_hash: &Digest) -> Result<ShortStateHash> {
-	self.db
+	let value = self
+		.db
 		.statehash_shortstatehash
 		.get(state_hash)
+		.await?;
+	let shortstatehash = utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid compact state hash"))?;
+	self.existing_state_hash(shortstatehash).await?;
+	Ok(shortstatehash)
+}
+
+#[implement(Service)]
+async fn existing_state_hash(&self, shortstatehash: ShortStateHash) -> Result {
+	self.services
+		.state_compressor
+		.load_shortstatehash_info(shortstatehash)
 		.await
-		.deserialized()
+		.map(|_| ())
+		.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Incomplete allocated state hash")
+			} else {
+				error
+			}
+		})
 }
 
 #[implement(Service)]

@@ -223,7 +223,7 @@ async fn new_shortstatehash_info(
 pub fn compress_state_events<'a, I>(
 	&'a self,
 	state: I,
-) -> impl Stream<Item = CompressedStateEvent> + Send + 'a
+) -> impl Stream<Item = Result<CompressedStateEvent>> + Send + 'a
 where
 	I: Iterator<Item = (&'a ShortStateKey, &'a EventId)> + Clone + Debug + Send + 'a,
 {
@@ -238,7 +238,9 @@ where
 		.stream()
 		.map(at!(0))
 		.zip(short_event_ids)
-		.map(|(shortstatekey, shorteventid)| compress_state_event(*shortstatekey, shorteventid))
+		.map(|(shortstatekey, shorteventid)| {
+			Ok(compress_state_event(*shortstatekey, shorteventid?))
+		})
 }
 
 #[implement(Service)]
@@ -246,14 +248,14 @@ pub async fn compress_state_event(
 	&self,
 	shortstatekey: ShortStateKey,
 	event_id: &EventId,
-) -> CompressedStateEvent {
+) -> Result<CompressedStateEvent> {
 	let shorteventid = self
 		.services
 		.short
 		.get_or_create_shorteventid(event_id)
-		.await;
+		.await?;
 
-	compress_state_event(shortstatekey, shorteventid)
+	Ok(compress_state_event(shortstatekey, shorteventid))
 }
 
 /// Creates a new shortstatehash that often is just a diff to an already

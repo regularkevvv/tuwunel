@@ -6,7 +6,7 @@ use std::{
 	time::Instant,
 };
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, RoomId, RoomVersionId, ServerName,
 	events::StateEventType, room_version_rules::RoomVersionRules,
@@ -170,9 +170,9 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 				.iter()
 				.map(|(ssk, eid)| (ssk, eid.borrow())),
 		)
-		.collect()
-		.map(Arc::new)
-		.await;
+		.try_collect()
+		.map_ok(Arc::new)
+		.await?;
 
 	// Memoize only complete local or fetched state after positional auth succeeds;
 	// soft-failed events cannot establish reusable state.

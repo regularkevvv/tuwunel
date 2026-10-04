@@ -1121,9 +1121,9 @@ async fn fork_resolve(
 					.iter()
 					.map(|(shortstatekey, event_id)| (shortstatekey, event_id.borrow())),
 			)
-			.collect()
-			.map(Arc::new)
-			.await;
+			.try_collect()
+			.map_ok(Arc::new)
+			.await?;
 
 		self.cache_resolved_state(walk.room_id, event_id, compressed)
 			.await;

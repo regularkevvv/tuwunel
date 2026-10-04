@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, collections::HashMap, iter::once, sync::Arc};
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedEventId, OwnedServerName, RoomId,
 	RoomOrAliasId, RoomVersionId, UserId,
@@ -600,8 +600,8 @@ async fn apply_send_knock_state(
 				.iter()
 				.map(|(ssk, eid)| (ssk, eid.borrow())),
 		)
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	debug!("Saving compressed state");
 	let HashSetCompressStateEvent {

@@ -1989,8 +1989,8 @@ async fn replace_state_before_without(
 				.iter()
 				.map(|(shortstatekey, event_id)| (shortstatekey, event_id.as_ref())),
 		)
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	let compressed = Arc::new(compressed);
 
