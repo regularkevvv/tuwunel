@@ -1813,6 +1813,25 @@ async fn capped_typed_stream_bounds_fetch_and_commit_drain_without_shortening_it
 	);
 	assert_eq!(fake.served().saturating_sub(before), 32, "cursor page fetched beyond its cap");
 	assert_eq!(backend.scans().len(), 0, "cursor page left its scan registered");
+	let prefix = "devices/";
+	fake.fill(
+		map_id(),
+		(0..130).map(|index| (format!("{prefix}{index:03}").into_bytes(), b"device".to_vec())),
+	);
+	let before = fake.served();
+	let devices: Vec<Vec<u8>> = map
+		.stream_prefix_capped::<&[u8], &[u8], _>(&prefix, 32)
+		.map_ok(|(key, _)| key.to_vec())
+		.try_collect()
+		.await?;
+	assert_eq!(
+		devices,
+		(0..32)
+			.map(|index| format!("{prefix}{index:03}").into_bytes())
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(fake.served().saturating_sub(before), 32, "prefix page fetched beyond its cap");
+	assert_eq!(backend.scans().len(), 0, "prefix page left its scan registered");
 	backend.close().await;
 	Ok(())
 }

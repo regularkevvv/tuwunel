@@ -3,6 +3,7 @@
 use std::{env::var, fs::remove_dir_all, path::PathBuf, process::id as process_id};
 
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
+use tuwunel_admin::{fini, init};
 use tuwunel_core::{
 	Error, Result, http,
 	ruma::{UserId, api::error::ErrorKind},
@@ -29,7 +30,9 @@ fn local_user_count_is_complete_or_refused_including_disabled_rows() -> Result {
 	let server = Server::new(Some(&args), Some(&runtime))?;
 	let result = runtime.block_on(async {
 		let services = async_start(&server).await?;
+		init(&services.admin);
 		let outcome = exercise(&services).await;
+		fini(&services.admin);
 		let shutdown = server.server.shutdown();
 		drop(services);
 		let run = async_run(&server).await;

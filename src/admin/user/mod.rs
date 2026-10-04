@@ -146,8 +146,8 @@ pub(super) enum UserCommand {
 
 	/// - List local users by recent activity.
 	LastActive {
-		#[arg(short, long)]
-		limit: Option<usize>,
+		#[arg(short, long, default_value_t = 48, value_parser = clap::value_parser!(u16).range(1..=64))]
+		limit: u16,
 	},
 
 	/// - List one bounded page of local users in database order

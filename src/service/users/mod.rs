@@ -2,6 +2,7 @@ mod dehydrated_device;
 pub mod device;
 mod keys;
 mod ldap;
+mod local_activity;
 mod local_count;
 mod local_page;
 mod register;
@@ -31,6 +32,9 @@ pub use self::{
 	dehydrated_device::DehydratedDevice,
 	device::ToDeviceTarget,
 	keys::parse_master_key,
+	local_activity::{
+		DeviceMetadataInventory, LocalUserActivity, MAX_ADMIN_DEVICE_BYTES, MAX_ADMIN_DEVICE_ROWS,
+	},
 	local_count::MAX_LOCAL_USER_COUNT_ROWS,
 	local_page::{LocalUserPage, MAX_LOCAL_USER_PAGE_ROWS},
 	register::Register,

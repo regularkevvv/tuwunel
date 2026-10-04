@@ -141,6 +141,24 @@ fn local_user_listing_refuses_unbounded_limits_and_invalid_cursors() {
 	);
 }
 
+#[test]
+fn last_active_defaults_to_48_and_refuses_unbounded_output() {
+	assert!(matches!(
+		parse_ok(&["admin", "users", "last-active"]),
+		AdminCommand::Users(UserCommand::LastActive { limit: 48 })
+	));
+	assert!(matches!(
+		parse_ok(&["admin", "users", "last-active", "--limit", "64"]),
+		AdminCommand::Users(UserCommand::LastActive { limit: 64 })
+	));
+	for limit in ["0", "65", "65536"] {
+		assert!(
+			parse_err(&["admin", "users", "last-active", "--limit", limit])
+				.contains("invalid value")
+		);
+	}
+}
+
 fn get_help_inner(input: &str) {
 	let error = parse_err(&["argv[0] doesn't matter", input]);
 
