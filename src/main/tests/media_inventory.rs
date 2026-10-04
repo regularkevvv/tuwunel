@@ -166,8 +166,8 @@ async fn avatar_protection(services: &Services) -> Result {
 		services
 			.timeline
 			.build_and_append_pdu(PduBuilder::state(String::new(), &content), user, &room, &guard)
-			.await?;
-	}
+			.await?
+	};
 	assert!(
 		services
 			.media
@@ -269,7 +269,7 @@ async fn corruption_and_byte_budget(services: &Services) -> Result {
 		.delete_by_date_size(u64::MAX, 0, false)
 		.await
 		.expect_err("corruption must refuse before deletion");
-	assert!(map.get("not-an-mxc").await.is_ok());
+	assert_eq!(map.get("not-an-mxc").await?.to_vec(), 0_u64.to_be_bytes());
 	map.clear().await?;
 	map.insert(&[0xFE], 0_u64.to_be_bytes()).await?;
 	services
