@@ -62,7 +62,7 @@ fn client_membership_responses_are_complete_filtered_and_bounded() -> Result {
 		let base = format!("http://127.0.0.1:{port}");
 		drop(listener);
 		let exercise = async {
-			let outcome = timeout(Duration::from_secs(120), exercise(&services, &base))
+			let outcome = timeout(Duration::from_mins(2), exercise(&services, &base))
 				.await
 				.map_err(|_| err!("client membership fixture exceeded its deadline"))
 				.and_then(|result| result);
