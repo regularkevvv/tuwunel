@@ -163,8 +163,9 @@ async fn exercise(services: &Services) -> Result {
 
 async fn layer_and_cache_budgets(services: &Services, cells: &[[u8; 16]]) -> Result {
 	for index in 0..17_u64 {
-		let parent = if index == 0 { 0 } else { 20_000 + index - 1 };
-		row(services, 20_000 + index, parent, &[], &[]).await?;
+		let hash = 20_000_u64.saturating_add(index);
+		let parent = if index == 0 { 0 } else { hash.saturating_sub(1) };
+		row(services, hash, parent, &[], &[]).await?;
 	}
 	assert_eq!(
 		refused(
@@ -198,7 +199,8 @@ async fn layer_and_cache_budgets(services: &Services, cells: &[[u8; 16]]) -> Res
 	);
 	row(services, 30_000, 0, cells, &[]).await?;
 	for index in 1..8_u64 {
-		row(services, 30_000 + index, 30_000 + index - 1, &[], &[]).await?;
+		let hash = 30_000_u64.saturating_add(index);
+		row(services, hash, hash.saturating_sub(1), &[], &[]).await?;
 	}
 	assert_eq!(
 		services
