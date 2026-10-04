@@ -596,7 +596,18 @@ pub async fn get_from_id<T>(&self, pdu_id: &RawPduId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	self.db.pduid_pdu.get(pdu_id).await.deserialized()
+	self.db
+		.pduid_pdu
+		.get(pdu_id)
+		.await
+		.deserialized()
+		.map_err(|error| {
+			if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+				Error::bad_database("Invalid stored accepted event record")
+			} else {
+				error
+			}
+		})
 }
 
 /// Checks if pdu exists
