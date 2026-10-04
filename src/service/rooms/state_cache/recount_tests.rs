@@ -52,7 +52,7 @@ async fn services() -> Result<Arc<Services>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_recount_and_count_reads_share_the_actual_room_exclusion() -> Result {
 	let services = services().await?;
-	let outcome = timeout(std::time::Duration::from_secs(120), exclusion(&services)).await;
+	let outcome = timeout(std::time::Duration::from_mins(2), exclusion(&services)).await;
 	services.stop().await;
 	outcome.expect("membership exclusion fixture deadline")
 }
