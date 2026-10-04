@@ -188,6 +188,39 @@ async fn frontier_controls(
 	let pdu_id = services.timeline.get_pdu_id(event).await?;
 	let pdus = &services.db["pduid_pdu"];
 	let saved = pdus.get(&pdu_id).await?.to_vec();
+	let mut padded = saved.clone();
+	let encoded: &[u8] = pdu_id.as_ref();
+	let overhead = key
+		.len()
+		.checked_add(event.as_str().len())
+		.and_then(|bytes| bytes.checked_add(encoded.len()))
+		.and_then(|bytes| bytes.checked_add(room.as_str().len()))
+		.and_then(|bytes| bytes.checked_add(size_of::<u64>()))
+		.expect("owned frontier boundary overhead fits usize");
+	let remaining = (512_usize * 1024)
+		.checked_sub(overhead)
+		.expect("owned frontier overhead is below its byte budget");
+	assert!(saved.len() < remaining, "owned frontier PDU leaves room for boundary padding");
+	padded.resize(remaining, b' ');
+	pdus.raw_put(&pdu_id, padded.as_slice()).await?;
+	services.clear_cache().await;
+	services
+		.state
+		.validate_timeline_frontier(
+			room,
+			PduCount::Normal(since.parse()?),
+			Some(pdu_id.pdu_count()),
+		)
+		.await?;
+	padded.push(b' ');
+	pdus.raw_put(&pdu_id, padded.as_slice()).await?;
+	services.clear_cache().await;
+	sync(client, Some(since), http::StatusCode::TOO_MANY_REQUESTS).await?;
+	assert_eq!(
+		pdus.get(&pdu_id).await?.as_ref(),
+		padded.as_slice(),
+		"frontier byte overflow preserves the complete stored record"
+	);
 	let mut corrupt: Value = serde_json::from_slice(&saved)?;
 	corrupt["event_id"] = json!("$different:test.local");
 	let corrupt = serde_json::to_vec(&corrupt)?;
