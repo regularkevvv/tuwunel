@@ -338,7 +338,8 @@ async fn corrupt_records(fixture: &Fixture<'_>) -> Result {
 	let mut long = valid.clone();
 	long.push(0);
 	for invalid in [valid[..8].to_vec(), valid[..15].to_vec(), long] {
-		map.raw_put(invalid.as_slice(), []).await?;
+		map.raw_put(invalid.as_slice(), &[0_u8; 0][..])
+			.await?;
 		fixture
 			.refused(http::StatusCode::INTERNAL_SERVER_ERROR)
 			.await?;
@@ -359,7 +360,8 @@ async fn corrupt_records(fixture: &Fixture<'_>) -> Result {
 		&[1_u8],
 		"nonempty index value must remain stored"
 	);
-	map.raw_put(valid.as_slice(), []).await?;
+	map.raw_put(valid.as_slice(), &[0_u8; 0][..])
+		.await?;
 	fixture.healthy().await?;
 	Ok(())
 }
@@ -475,7 +477,8 @@ async fn row_limits(fixture: &Fixture<'_>) -> Result {
 	}
 	assert_eq!(fixture.direct().await?, 2, "exactly 4096 examined rows include purged children");
 	let overflow = key(parent, PduCount::Normal(2_000_000));
-	map.raw_put(overflow.as_slice(), []).await?;
+	map.raw_put(overflow.as_slice(), &[0_u8; 0][..])
+		.await?;
 	fixture
 		.refused(http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;
