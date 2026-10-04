@@ -99,6 +99,7 @@ serde_html_form.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 sha1.workspace = true
+subtle.workspace = true
 synapse-admin-api.workspace = true
 tokio.workspace = true
 tracing.workspace = true

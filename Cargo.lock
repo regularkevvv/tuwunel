@@ -5405,6 +5405,7 @@ dependencies = [
  "serde_html_form",
  "serde_json",
  "sha1",
+ "subtle",
  "synapse-admin-api",
  "tokio",
  "tower",

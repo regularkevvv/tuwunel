@@ -36,7 +36,10 @@ use std::{
 	collections::BTreeSet,
 	sync::{
 		Arc, Mutex, PoisonError,
-		atomic::{AtomicU64, Ordering::SeqCst},
+		atomic::{
+			AtomicBool, AtomicU64,
+			Ordering::{Relaxed, SeqCst},
+		},
 	},
 	time::{Duration, Instant},
 };
@@ -467,11 +470,23 @@ impl Backend {
 	/// Called with the exclusive barrier held, so no page fetch is in flight
 	/// and no scan's state lock can be held by a stream.
 	async fn drain(&self, maps: &BTreeSet<u16>) -> Result {
+		let started = Instant::now();
+		let active = AtomicBool::new(false);
+		let completed = AtomicBool::new(false);
+		tuwunel_core::defer!({
+			let micros = usize::try_from(started.elapsed().as_micros()).unwrap_or(usize::MAX);
+			crate::backend::metrics::record_drain(
+				micros,
+				active.load(Relaxed),
+				completed.load(Relaxed),
+			);
+		});
 		let scans = self.scans.touching(maps);
 		let mut open = Vec::with_capacity(scans.len());
 		for scan in &scans {
 			let state = scan.state.lock().await;
 			if !state.exhausted {
+				active.store(true, Relaxed);
 				open.push((scan, state, 0_usize));
 			}
 		}
@@ -508,6 +523,7 @@ impl Backend {
 			STATS.remote_drain_truncated.record(rows);
 		}
 
+		completed.store(true, Relaxed);
 		Ok(())
 	}
 

@@ -269,6 +269,10 @@ impl Database {
 	/// Shutdown paths that cannot guarantee this database's drop (dangling
 	/// shutdown references) call this explicitly; drop also invokes it.
 	pub fn dump_operation_metrics(&self) { backend::metrics::dump_on_close(); }
+
+	/// Aggregate counts, sizes and histograms. No keys, values or map names.
+	#[must_use]
+	pub fn operation_metrics(&self) -> serde_json::Value { backend::metrics::snapshot() }
 }
 
 impl Drop for Database {
