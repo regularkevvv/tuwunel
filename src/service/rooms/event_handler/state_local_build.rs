@@ -886,6 +886,10 @@ async fn committed_state_after(
 			.short
 			.get_or_create_shortstatekey(&event_type, state_key)
 			.await;
+		let Ok(shortstatekey) = shortstatekey else {
+			walk.fallback = Some(Fallback::Unevaluable);
+			return None;
+		};
 
 		state.insert(shortstatekey, event_id.to_owned());
 	}
@@ -1015,7 +1019,7 @@ async fn gated_fold(
 		.services
 		.short
 		.get_or_create_shortstatekey(&event_type, state_key)
-		.await;
+		.await?;
 
 	let mut state = StateIds::clone(before);
 	state.insert(shortstatekey, pdu.event_id().to_owned());
@@ -1097,18 +1101,22 @@ async fn fork_resolve(
 		return None;
 	};
 
-	let state: StateIds = resolved
+	let state: Result<StateIds> = resolved
 		.into_iter()
 		.stream()
 		.broad_then(async |((event_type, state_key), event_id)| {
 			self.services
 				.short
 				.get_or_create_shortstatekey(&event_type, &state_key)
-				.map(move |shortstatekey| (shortstatekey, event_id))
+				.map_ok(move |shortstatekey| (shortstatekey, event_id))
 				.await
 		})
-		.collect()
+		.try_collect()
 		.await;
+	let Ok(state) = state else {
+		walk.fallback = Some(Fallback::Unevaluable);
+		return None;
+	};
 
 	if let Some(event_id) = memo_event_id.filter(|_| walk.mode == WalkMode::Active) {
 		// Strict frontier loads and the polled-chain sentinel make this state

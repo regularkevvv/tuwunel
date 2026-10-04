@@ -681,7 +681,7 @@ async fn resolve_and_force_state_after(
 			.services
 			.short
 			.get_or_create_shortstatekey(&event_type.to_string().into(), state_key)
-			.await;
+			.await?;
 
 		state_after.insert(shortstatekey, event_id.to_owned());
 		// Now it's the state after the event.
