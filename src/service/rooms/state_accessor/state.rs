@@ -4,7 +4,7 @@ use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
 };
 use ruma::{
-	EventId, OwnedEventId, RoomId, UserId,
+	EventId, OwnedEventId, OwnedRoomId, RoomId, UserId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 	events::{
 		StateEventType, TimelineEventType,
@@ -20,6 +20,7 @@ use tuwunel_core::{
 	matrix::{Event, Pdu, PduCount, StateKey},
 	pair_of,
 	utils::{
+		json::serialized_len,
 		result::FlatOk,
 		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore},
 	},
@@ -226,41 +227,16 @@ pub async fn state_get_optional(
 
 	let shorteventid = match direct_shorteventid {
 		| Some(shorteventid) => shorteventid,
-		// Proving the cell absent needs every entry's compact key mapped, since an
-		// unmapped one could be this cell, but only the matching entry's event
-		// id: another entry's missing event mapping cannot hide it. Even a valid
-		// shortcut outside this snapshot cannot establish absence.
+		// Absence requires complete mappings bound to their stored events. A
+		// corrupt reverse key can decode as another type and hide this cell.
+		// Even a valid shortcut outside the snapshot cannot establish absence.
 		| None => {
-			let entries = self
-				.state_full_shortids(shortstatehash)
-				.try_collect::<Vec<_>>()
-				.await?;
-			let mut shorteventid = None;
-			let mut bytes = 0_usize;
-			for (shortstatekey, candidate_event) in entries {
-				let (candidate_type, candidate_key) = self
-					.services
-					.short
-					.get_statekey_from_short(shortstatekey)
-					.await
-					.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
-				bytes = bytes
-					.saturating_add(candidate_type.to_cow_str().len())
-					.saturating_add(candidate_key.as_str().len());
-				if bytes > MAX_STATE_MAPPING_BYTES {
-					return Err(state_mapping_limit());
-				}
-				if candidate_type == *event_type
-					&& candidate_key.as_str() == state_key
-					&& shorteventid.replace(candidate_event).is_some()
-				{
-					return Err(Error::bad_database("Duplicate state key mapping"));
-				}
-			}
-			let Some(shorteventid) = shorteventid else {
+			let Some(shorteventid) = self
+				.state_cell_from_snapshot(shortstatehash, event_type, state_key)
+				.await?
+			else {
 				return Ok(None);
 			};
-
 			shorteventid
 		},
 	};
@@ -285,6 +261,88 @@ pub async fn state_get_optional(
 	}
 
 	Ok(Some(pdu))
+}
+
+/// Proves optional-state presence or absence from every bounded mapped cell.
+#[implement(super::Service)]
+async fn state_cell_from_snapshot(
+	&self,
+	shortstatehash: ShortStateHash,
+	event_type: &StateEventType,
+	state_key: &str,
+) -> Result<Option<ShortEventId>> {
+	let entries = self
+		.state_full_shortids(shortstatehash)
+		.try_collect::<Vec<_>>()
+		.await?;
+	let mut shorteventid = None;
+	let mut bytes = 0_usize;
+	let mut decoded = Vec::new();
+	for (shortstatekey, candidate_event) in entries {
+		let (candidate_type, candidate_key) = self
+			.services
+			.short
+			.get_statekey_from_short(shortstatekey)
+			.await
+			.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+		bytes = bytes
+			.saturating_add(candidate_type.to_cow_str().len())
+			.saturating_add(candidate_key.as_str().len());
+		if bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		let event_id: OwnedEventId = self
+			.services
+			.short
+			.get_eventid_from_short(candidate_event)
+			.await
+			.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
+		bytes = bytes.saturating_add(event_id.as_str().len());
+		if bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		if candidate_type == *event_type
+			&& candidate_key.as_str() == state_key
+			&& shorteventid.replace(candidate_event).is_some()
+		{
+			return Err(Error::bad_database("Duplicate state key mapping"));
+		}
+		decoded.push((candidate_type, candidate_key, event_id));
+	}
+	let mut source_bytes = 0_usize;
+	let mut snapshot_room: Option<OwnedRoomId> = None;
+	for (candidate_type, candidate_key, event_id) in decoded {
+		let pdu = self
+			.services
+			.timeline
+			.get_pdu(&event_id)
+			.await
+			.map_err(|error| {
+				if error.kind() == ErrorKind::NotFound {
+					Error::bad_database("Incomplete state event")
+				} else {
+					error
+				}
+			})?;
+		source_bytes = source_bytes.saturating_add(
+			serialized_len(pdu.as_pdu())
+				.map_err(|_| Error::bad_database("Invalid state event serialization"))?,
+		);
+		if source_bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		if pdu.event_id() != event_id
+			|| pdu.event_type().to_cow_str() != candidate_type.to_cow_str()
+			|| pdu.state_key() != Some(candidate_key.as_str())
+			|| snapshot_room
+				.as_ref()
+				.is_some_and(|room| room.as_ref() != pdu.room_id())
+		{
+			return Err(Error::bad_database("Mismatched state event mapping"));
+		}
+		snapshot_room = Some(pdu.room_id().to_owned());
+	}
+	Ok(shorteventid)
 }
 
 /// Gets history visibility from an event's state without converting corrupt
