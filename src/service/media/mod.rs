@@ -1,3 +1,4 @@
+mod avatars;
 mod data;
 pub(super) mod migrations;
 mod preview;
@@ -816,10 +817,11 @@ impl Service {
 		size_gt: u64,
 		keep_profiles: bool,
 	) -> Result<Vec<OwnedMxcUri>> {
-		let spared = keep_profiles
-			.then_async(|| self.avatar_mxcs())
-			.await
-			.unwrap_or_default();
+		let spared = if keep_profiles {
+			self.avatar_mxcs().await?
+		} else {
+			HashSet::new()
+		};
 
 		let candidates = self.get_all_mxcs().await?;
 
@@ -844,33 +846,6 @@ impl Service {
 			.await;
 
 		Ok(deleted)
-	}
-
-	/// The MXCs of every local user's profile avatar and every room's avatar,
-	/// the spare-set honoured by `keep_profiles`.
-	async fn avatar_mxcs(&self) -> HashSet<OwnedMxcUri> {
-		let user_avatars = self
-			.services
-			.users
-			.list_local_users()
-			.map(ToOwned::to_owned)
-			.broad_filter_map(async |user| self.services.profile.avatar_url(&user).await.ok());
-
-		let room_avatars = self
-			.services
-			.metadata
-			.iter_ids()
-			.map(ToOwned::to_owned)
-			.broad_filter_map(|room_id| async move {
-				self.services
-					.state_accessor
-					.get_avatar(&room_id)
-					.await
-					.ok()
-					.and_then(|avatar| avatar.url)
-			});
-
-		user_avatars.chain(room_avatars).collect().await
 	}
 
 	fn is_local(&self, mxc: &OwnedMxcUri) -> bool {
