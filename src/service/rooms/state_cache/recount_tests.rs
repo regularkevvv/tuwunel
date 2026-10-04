@@ -141,7 +141,7 @@ async fn strict_counts(services: &Services, room: &RoomId) -> Result {
 		for length in [0_usize, 7, 9] {
 			let bytes = vec![0_u8; length];
 			services.db[map]
-				.raw_put(room.as_bytes(), bytes.as_slice())
+				.insert(room.as_bytes(), bytes.as_slice())
 				.await?;
 			assert!(
 				matches!(
@@ -162,7 +162,7 @@ async fn strict_counts(services: &Services, room: &RoomId) -> Result {
 			);
 		}
 		services.db[map]
-			.raw_put(room.as_bytes(), expected.to_be_bytes())
+			.insert(room.as_bytes(), expected.to_be_bytes())
 			.await?;
 		assert_eq!(
 			read_count(&services.state_cache, room, kind).await?,
