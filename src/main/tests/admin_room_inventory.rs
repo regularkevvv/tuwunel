@@ -202,6 +202,13 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 	let admin = &services.globals.server_user;
 	let original = joined.qry(&(room, admin)).await?.to_vec();
 	joined.del((room, admin)).await?;
+	assert_eq!(
+		services
+			.delete
+			.bounded_empty_local_rooms()
+			.await?,
+		[room.to_owned()]
+	);
 	assert!(
 		!services
 			.state_cache
@@ -211,6 +218,15 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 	for name in ["roomuserid_joinedcount", "roomuserid_invitecount"] {
 		let members = &services.db[name];
 		members.put((room, "not-a-user"), b"").await?;
+		assert_eq!(
+			services
+				.delete
+				.bounded_empty_local_rooms()
+				.await
+				.expect_err("prune cannot return a partial candidate list")
+				.status_code(),
+			http::StatusCode::INTERNAL_SERVER_ERROR
+		);
 		assert_eq!(
 			services
 				.state_cache
@@ -227,6 +243,15 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 				.put((room, &format!("@guard-{index:04}:remote.test")), b"")
 				.await?;
 		}
+		assert_eq!(
+			services
+				.delete
+				.bounded_empty_local_rooms()
+				.await
+				.expect_err("prune cannot accept a member row overflow")
+				.status_code(),
+			http::StatusCode::TOO_MANY_REQUESTS
+		);
 		assert_eq!(
 			services
 				.state_cache
@@ -249,6 +274,15 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 		}
 		assert_eq!(
 			services
+				.delete
+				.bounded_empty_local_rooms()
+				.await
+				.expect_err("prune cannot accept a member byte overflow")
+				.status_code(),
+			http::StatusCode::TOO_MANY_REQUESTS
+		);
+		assert_eq!(
+			services
 				.state_cache
 				.has_local_membership_checked(room)
 				.await
@@ -269,6 +303,13 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 		.await?;
 	assert!(
 		services
+			.delete
+			.bounded_empty_local_rooms()
+			.await?
+			.is_empty()
+	);
+	assert!(
+		services
 			.state_cache
 			.has_local_membership_checked(room)
 			.await?
@@ -276,6 +317,13 @@ async fn empty_deletion_inventory(endpoint: &Endpoint<'_>, room: &RoomId) -> Res
 	empty_deletion_preserves_room(services, room).await?;
 	invited.del((room, "@disabled:localhost")).await?;
 	joined.put_raw((room, admin), original).await?;
+	assert!(
+		services
+			.delete
+			.bounded_empty_local_rooms()
+			.await?
+			.is_empty()
+	);
 	assert!(
 		services
 			.state_cache
@@ -291,6 +339,13 @@ async fn complete_empty_deletion(endpoint: &Endpoint<'_>) -> Result {
 	services.db["roomuserid_joinedcount"]
 		.del((&room, &services.globals.server_user))
 		.await?;
+	assert_eq!(
+		services
+			.delete
+			.bounded_empty_local_rooms()
+			.await?,
+		[room.clone()]
+	);
 	assert!(
 		!services
 			.state_cache
@@ -456,6 +511,16 @@ async fn aggregate_members(endpoint: &Endpoint<'_>, first_rooms: &[OwnedRoomId])
 				.await?;
 		}
 	}
+	assert_eq!(
+		endpoint
+			.services
+			.delete
+			.bounded_empty_local_rooms()
+			.await
+			.expect_err("protected rooms still consume the shared prune budget")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
 	endpoint
 		.refused("search_term=unmatched&limit=1", http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;

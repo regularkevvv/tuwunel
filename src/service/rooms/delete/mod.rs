@@ -7,6 +7,8 @@ use tuwunel_core::{Result, debug, result::LogErr, trace, warn};
 
 use crate::rooms::timeline::RoomMutexGuard;
 
+mod inventory;
+
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 }
