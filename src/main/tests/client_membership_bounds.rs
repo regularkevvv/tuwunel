@@ -483,9 +483,12 @@ async fn dictionary_and_snapshot_budgets(endpoint: &Endpoint<'_>) -> Result {
 	services.db["shortstatehash_statediff"]
 		.raw_put(&hash.to_be_bytes(), &encoded)
 		.await?;
-	room_state
-		.raw_put(endpoint.room, hash.to_be_bytes())
-		.await?;
+	room_state.raw_put(endpoint.room, hash).await?;
+	assert_eq!(
+		room_state.get(endpoint.room).await?.as_ref(),
+		hash.to_be_bytes(),
+		"synthetic current state must retain an exact u64 encoding"
+	);
 	services.clear_cache().await;
 	for route in ["members?membership=ban", "joined_members"] {
 		endpoint
@@ -507,9 +510,12 @@ async fn dictionary_and_snapshot_budgets(endpoint: &Endpoint<'_>) -> Result {
 	services.db["shortstatehash_statediff"]
 		.raw_put(&hash.to_be_bytes(), &encoded)
 		.await?;
-	room_state
-		.raw_put(endpoint.room, hash.to_be_bytes())
-		.await?;
+	room_state.raw_put(endpoint.room, hash).await?;
+	assert_eq!(
+		room_state.get(endpoint.room).await?.as_ref(),
+		hash.to_be_bytes(),
+		"synthetic current state must retain an exact u64 encoding"
+	);
 	services.clear_cache().await;
 	for route in ["members", "joined_members"] {
 		endpoint
