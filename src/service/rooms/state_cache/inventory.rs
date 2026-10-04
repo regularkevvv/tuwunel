@@ -9,6 +9,7 @@ use tuwunel_database::{Ignore, Interfix};
 use super::Service;
 
 /// Complete key-only membership count, including the work required to prove it.
+#[derive(Clone, Copy)]
 pub struct RoomMemberInventoryCount {
 	/// Local members counted, including disabled and guest accounts.
 	pub local_members: usize,
