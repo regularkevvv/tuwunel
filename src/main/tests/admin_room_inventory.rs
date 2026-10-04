@@ -205,6 +205,10 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	rooms.remove("not-a-room").await?;
 	let counts = &services.db["roomid_joinedcount"];
 	let count = counts.get(room).await?.to_vec();
+	counts.remove(room).await?;
+	endpoint
+		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
+		.await?;
 	counts.insert(room, "invalid-count").await?;
 	endpoint
 		.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)

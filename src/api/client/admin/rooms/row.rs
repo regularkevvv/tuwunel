@@ -13,7 +13,6 @@ use ruma::{
 			name::RoomNameEventContent,
 		},
 	},
-	uint,
 };
 use serde::de::DeserializeOwned;
 use synapse_admin_api::rooms::list_rooms::v1::RoomDetails;
@@ -149,12 +148,19 @@ pub(super) async fn room_row(
 		.directory
 		.is_public_room_checked(room)
 		.await?;
-	let joined_members = match services.state_cache.room_joined_count(room).await {
-		| Ok(count) =>
-			UInt::try_from(count).map_err(|_| err!(Database("Invalid joined-member count")))?,
-		| Err(error) if error.is_not_found() => uint!(0),
-		| Err(error) => return Err(error),
-	};
+	let joined_count = services
+		.state_cache
+		.room_joined_count(room)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Database("Missing known room member count"))
+			} else {
+				error
+			}
+		})?;
+	let joined_members = UInt::try_from(joined_count)
+		.map_err(|_| err!(Database("Invalid joined-member count")))?;
 	let members = services
 		.state_cache
 		.bounded_local_member_count(room, budget.member_rows, budget.member_bytes)
