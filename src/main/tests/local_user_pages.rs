@@ -149,13 +149,12 @@ async fn exercise(services: &Services) -> Result {
 	assert!(third.users.is_empty());
 	assert_eq!(third.examined, 8);
 	assert!(third.next.is_none());
-	let output = match services
+	let Ok(Some(output)) = services
 		.admin
 		.command_in_place("users list-users --limit 16".into(), None)
 		.await
-	{
-		| Ok(Some(output)) => output,
-		| _ => panic!("admin page must succeed and produce output"),
+	else {
+		panic!("admin page must succeed and produce output");
 	};
 	assert!(
 		output
