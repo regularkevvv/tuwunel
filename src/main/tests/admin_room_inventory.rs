@@ -481,10 +481,14 @@ async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> R
 	let original_state = states.get(room).await?.to_vec();
 	match services
 		.admin
-		.command_in_place("room prune-empty".into(), None)
+		.command_in_place("rooms prune-empty".into(), None)
 		.await
 	{
-		| Err(output) => assert!(output.as_str().contains("Command failed")),
+		| Err(output) => assert!(
+			output.as_str().contains("Command failed"),
+			"prune must reach the handler and refuse the inventory: {}",
+			output.as_str()
+		),
 		| Ok(Some(output)) =>
 			panic!("prune succeeded over an incomplete inventory: {}", output.as_str()),
 		| Ok(None) => panic!("prune succeeded over an incomplete inventory without output"),
@@ -502,7 +506,7 @@ async fn complete_room_pruning(endpoint: &Endpoint<'_>) -> Result {
 		.await?;
 	match services
 		.admin
-		.command_in_place("room prune-empty".into(), None)
+		.command_in_place("rooms prune-empty".into(), None)
 		.await
 	{
 		| Ok(Some(output)) => assert!(
