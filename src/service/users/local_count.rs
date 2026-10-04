@@ -50,6 +50,17 @@ impl Service {
 	/// propagates storage or deserialization errors rather than counting a
 	/// prefix.
 	pub async fn bounded_local_user_count(&self) -> Result<usize> {
+		self.count_user_inventory(true).await
+	}
+
+	/// Counts every registered inventory row, including inactive accounts,
+	/// without collecting owned IDs. Refuses beyond 1,024 rows or on decoding
+	/// errors; this is distinct from the active-local diagnostic's semantics.
+	pub async fn bounded_user_count(&self) -> Result<usize> {
+		self.count_user_inventory(false).await
+	}
+
+	async fn count_user_inventory(&self, local_only: bool) -> Result<usize> {
 		let rows = self
 			.db
 			.userid_password
@@ -67,7 +78,7 @@ impl Service {
 				));
 			}
 			scanned = scanned.saturating_add(1);
-			if !password.is_empty() {
+			if !local_only || !password.is_empty() {
 				count = count.saturating_add(1);
 			}
 		}

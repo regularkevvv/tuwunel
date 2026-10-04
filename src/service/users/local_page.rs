@@ -15,13 +15,20 @@ const MAX_USER_ID_BYTES: usize = 4096;
 /// A fresh bounded snapshot of one part of the user inventory. The cursor
 /// refers to the last included row, even if that account is disabled.
 #[derive(Debug)]
-pub struct LocalUserPage {
-	/// Accounts with nonempty stored passwords from the included rows.
+pub struct UserInventoryPage {
+	/// Accounts selected from the included rows by the requested filter.
 	pub users: Vec<OwnedUserId>,
 	/// Included rows plus a possible lookahead row, at most `limit + 1`.
 	pub examined: usize,
 	/// Last included inventory row when another page exists.
 	pub next: Option<OwnedUserId>,
+}
+
+#[derive(Clone, Copy)]
+enum PageKind {
+	Local,
+	All,
+	Historical,
 }
 
 fn output_limit() -> Error {
@@ -43,7 +50,34 @@ impl Service {
 		&self,
 		after: Option<&UserId>,
 		limit: usize,
-	) -> Result<LocalUserPage> {
+	) -> Result<UserInventoryPage> {
+		self.user_page(after, limit, PageKind::Local)
+			.await
+	}
+
+	/// Pages every user-inventory row, including inactive accounts. Historical
+	/// filtering happens after the row budget is charged, so filtered pages may
+	/// be empty while still advancing their cursor. Storage errors propagate.
+	pub async fn user_inventory_page(
+		&self,
+		after: Option<&UserId>,
+		limit: usize,
+		historical_only: bool,
+	) -> Result<UserInventoryPage> {
+		let kind = if historical_only {
+			PageKind::Historical
+		} else {
+			PageKind::All
+		};
+		self.user_page(after, limit, kind).await
+	}
+
+	async fn user_page(
+		&self,
+		after: Option<&UserId>,
+		limit: usize,
+		kind: PageKind,
+	) -> Result<UserInventoryPage> {
 		if !(1..=MAX_LOCAL_USER_PAGE_ROWS).contains(&limit) {
 			return Err(Error::BadRequest(
 				ErrorKind::InvalidParam,
@@ -69,7 +103,12 @@ impl Service {
 				break;
 			}
 			last = Some(user.to_owned());
-			if !password.is_empty() {
+			let include = match kind {
+				| PageKind::Local => !password.is_empty(),
+				| PageKind::All => true,
+				| PageKind::Historical => user.is_historical(),
+			};
+			if include {
 				bytes = bytes.saturating_add(user.as_bytes().len());
 				if bytes > MAX_USER_ID_BYTES {
 					return Err(output_limit());
@@ -85,6 +124,6 @@ impl Service {
 		{
 			return Err(output_limit());
 		}
-		Ok(LocalUserPage { users, examined, next })
+		Ok(UserInventoryPage { users, examined, next })
 	}
 }

@@ -115,7 +115,12 @@ async fn exercise(services: &Services) -> Result {
 	assert!(exhausted.users.is_empty());
 	assert_eq!(exhausted.examined, 0);
 	assert!(exhausted.next.is_none());
+	disabled_and_reply_budgets(services).await?;
+	query_inventory_pages(services).await
+}
 
+async fn disabled_and_reply_budgets(services: &Services) -> Result {
+	let map = &services.db["userid_password"];
 	map.clear().await?;
 	for index in 0..40 {
 		map.insert(&format!("@disabled-{index:03}:localhost"), "")
@@ -191,5 +196,106 @@ async fn exercise(services: &Services) -> Result {
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
+	assert_eq!(
+		services
+			.users
+			.user_inventory_page(None, 32, false)
+			.await
+			.expect_err("all-user pages share the reply budget")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	Ok(())
+}
+
+async fn query_inventory_pages(services: &Services) -> Result {
+	let map = &services.db["userid_password"];
+	map.clear().await?;
+	for index in 0..70 {
+		map.insert(&format!("@page-{index:03}:localhost"), if index % 2 == 0 { "*" } else { "" })
+			.await?;
+	}
+	let historical = UserId::parse("@zz%legacy:localhost").expect("valid historical user");
+	assert!(historical.is_historical());
+	map.insert(&historical, "").await?;
+	let all = services
+		.users
+		.user_inventory_page(None, 16, false)
+		.await?;
+	assert_eq!(all.users.len(), 16);
+	assert!(
+		all.users
+			.iter()
+			.any(|user| user.as_str() == "@page-001:localhost"),
+		"inactive users belong to the registered-user inventory"
+	);
+	let first = services
+		.users
+		.user_inventory_page(None, 16, true)
+		.await?;
+	assert!(first.users.is_empty());
+	assert_eq!(first.examined, 17);
+	assert_eq!(
+		first
+			.next
+			.as_ref()
+			.expect("filtered page cursor")
+			.as_str(),
+		"@page-015:localhost"
+	);
+	let mut after: Option<OwnedUserId> = None;
+	let mut found = Vec::new();
+	let mut pages = 0_usize;
+	loop {
+		let page = services
+			.users
+			.user_inventory_page(after.as_deref(), 16, true)
+			.await?;
+		assert!(page.examined <= 17);
+		found.extend(page.users);
+		pages = pages.saturating_add(1);
+		let Some(next) = page.next else {
+			break;
+		};
+		if let Some(previous) = after {
+			assert!(next.as_str() > previous.as_str());
+		}
+		after = Some(next);
+	}
+	assert_eq!(pages, 5);
+	assert_eq!(found, vec![historical]);
+	let Ok(Some(output)) = services
+		.admin
+		.command_in_place("query users iter-users --historical --limit 16".into(), None)
+		.await
+	else {
+		panic!("historical inventory command must succeed");
+	};
+	assert!(
+		output
+			.as_str()
+			.contains("Page contains 0 user inventory row(s); examined 17 rows")
+	);
+	assert!(output.as_str().contains(
+		"!admin query users iter-users --after @page-015:localhost --limit 16 --historical"
+	));
+	assert!(
+		!output.as_str().contains("zz%legacy"),
+		"the first filtered page cannot scan ahead to a match"
+	);
+	map.insert(b"\x01invalid", "*").await?;
+	services
+		.users
+		.user_inventory_page(None, 16, true)
+		.await
+		.expect_err("filtered pages cannot discard malformed inventory keys");
+	let Err(output) = services
+		.admin
+		.command_in_place("query users iter-users --historical".into(), None)
+		.await
+	else {
+		panic!("inventory command must fail on malformed storage");
+	};
+	assert!(!output.as_str().contains("Page contains"));
 	Ok(())
 }

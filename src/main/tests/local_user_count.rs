@@ -47,7 +47,7 @@ async fn exercise(services: &Services) -> Result {
 	let map = &services.db["userid_password"];
 	// Only this fresh disposable database is modified; no existing user data.
 	map.clear().await?;
-	assert_eq!(services.users.bounded_local_user_count().await?, 0);
+	assert_counts(services, 0, 0).await?;
 	assert!(
 		services
 			.users
@@ -58,7 +58,7 @@ async fn exercise(services: &Services) -> Result {
 	map.insert("@active:localhost", "hash").await?;
 	map.insert("@sso:localhost", "*").await?;
 	map.insert("@disabled:localhost", "").await?;
-	assert_eq!(services.users.bounded_local_user_count().await?, 2);
+	assert_counts(services, 2, 3).await?;
 	assert_eq!(
 		services
 			.users
@@ -77,6 +77,11 @@ async fn exercise(services: &Services) -> Result {
 		.expect_err("malformed row cannot disappear from a count");
 	services
 		.users
+		.bounded_user_count()
+		.await
+		.expect_err("malformed row cannot disappear from a registered-user count");
+	services
+		.users
 		.bounded_local_users()
 		.await
 		.expect_err("malformed row cannot disappear from an inventory");
@@ -85,7 +90,7 @@ async fn exercise(services: &Services) -> Result {
 		map.insert(&format!("@disabled-{index:04}:localhost"), "")
 			.await?;
 	}
-	assert_eq!(services.users.bounded_local_user_count().await?, 2);
+	assert_counts(services, 2, MAX_LOCAL_USER_COUNT_ROWS).await?;
 	assert_eq!(services.users.bounded_local_users().await?.len(), 2);
 	map.insert("@overflow-disabled:localhost", "")
 		.await?;
@@ -96,6 +101,27 @@ async fn exercise(services: &Services) -> Result {
 		.expect_err("disabled rows still consume the read budget");
 	assert_eq!(error.status_code(), http::StatusCode::TOO_MANY_REQUESTS);
 	assert!(matches!(error, Error::Request(ErrorKind::LimitExceeded(_), _, _)));
+	assert_eq!(
+		services
+			.users
+			.bounded_user_count()
+			.await
+			.expect_err("all-user count cannot become a successful prefix")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	let Err(output) = services
+		.admin
+		.command_in_place("query users count-users".into(), None)
+		.await
+	else {
+		panic!("registered-user count must propagate overflow");
+	};
+	assert!(
+		output
+			.as_str()
+			.contains("User count inventory limit reached")
+	);
 	assert_eq!(
 		services
 			.users
@@ -122,7 +148,7 @@ async fn exercise(services: &Services) -> Result {
 		"inventory refusal must precede room resolution and membership changes"
 	);
 	map.remove("@overflow-disabled:localhost").await?;
-	assert_eq!(services.users.bounded_local_user_count().await?, 2);
+	assert_counts(services, 2, MAX_LOCAL_USER_COUNT_ROWS).await?;
 	assert_eq!(services.users.bounded_local_users().await?.len(), 2);
 	map.clear().await?;
 	for index in 0..600 {
@@ -130,7 +156,7 @@ async fn exercise(services: &Services) -> Result {
 			.expect("valid long user id");
 		map.insert(&user, "*").await?;
 	}
-	assert_eq!(services.users.bounded_local_user_count().await?, 600);
+	assert_counts(services, 600, 600).await?;
 	assert_eq!(
 		services
 			.users
@@ -140,5 +166,11 @@ async fn exercise(services: &Services) -> Result {
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
+	Ok(())
+}
+
+async fn assert_counts(services: &Services, active: usize, total: usize) -> Result {
+	assert_eq!(services.users.bounded_local_user_count().await?, active);
+	assert_eq!(services.users.bounded_user_count().await?, total);
 	Ok(())
 }

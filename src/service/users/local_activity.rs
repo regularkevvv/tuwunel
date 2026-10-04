@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 
 use futures::{StreamExt, pin_mut};
 use ruma::{
-	DeviceId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+	DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::{
 		client::device::{Device, LastSeenIp},
 		error::{ErrorKind, LimitExceededErrorData},
@@ -21,6 +21,7 @@ pub const MAX_ADMIN_DEVICE_BYTES: usize = 64 * 1024;
 const MAX_ACTIVITY_DEVICE_ROWS: usize = 4096;
 const MAX_ACTIVITY_DEVICE_BYTES: usize = 256 * 1024;
 const MAX_ACTIVITY_REPLY_BYTES: usize = 16 * 1024;
+const MAX_ADMIN_DEVICE_ID_BYTES: usize = 32 * 1024;
 
 /// Complete device metadata with the work performed to obtain it.
 #[derive(Debug)]
@@ -53,6 +54,32 @@ fn inventory_limit() -> Error {
 }
 
 impl Service {
+	/// A complete key-only device inventory with at most 128 IDs and 32 KiB of
+	/// retained ID bytes. One overflow key detects larger inventories. Metadata
+	/// values are not decoded, preserving the key-listing semantics.
+	pub async fn bounded_device_ids(&self, user_id: &UserId) -> Result<Vec<OwnedDeviceId>> {
+		let prefix = (user_id, Interfix);
+		let keys = self
+			.db
+			.userdeviceid_metadata
+			.keys_prefix_capped::<(Ignore, &DeviceId), _>(
+				&prefix,
+				MAX_ADMIN_DEVICE_ROWS.saturating_add(1),
+			);
+		pin_mut!(keys);
+		let mut devices = Vec::new();
+		let mut bytes = 0_usize;
+		while let Some(key) = keys.next().await {
+			let (_, device_id) = key?;
+			bytes = bytes.saturating_add(device_id.as_str().len());
+			if devices.len() >= MAX_ADMIN_DEVICE_ROWS || bytes > MAX_ADMIN_DEVICE_ID_BYTES {
+				return Err(inventory_limit());
+			}
+			devices.push(device_id.to_owned());
+		}
+		Ok(devices)
+	}
+
 	/// Returns a complete device inventory, or refuses it. Row and byte budgets
 	/// may be reduced to zero by a caller's remaining aggregate budget. One
 	/// lookahead detects overflow; raw bytes are checked before JSON decoding.

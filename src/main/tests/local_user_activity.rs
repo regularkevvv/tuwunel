@@ -168,10 +168,31 @@ async fn exercise(services: &Services) -> Result {
 	assert_eq!(lines.len(), 2);
 	assert!(lines[0].ends_with("bob"));
 	assert!(lines[1].ends_with("alice"));
+	per_user_failures(services, &alice).await?;
+	aggregate_and_reply_budgets(services).await
+}
 
+async fn per_user_failures(services: &Services, alice: &UserId) -> Result {
+	let metadata = &services.db["userdeviceid_metadata"];
 	metadata
-		.put((&alice, "CORRUPT"), b"not-json")
+		.put((alice, "CORRUPT"), b"not-json")
 		.await?;
+	assert_eq!(
+		services
+			.users
+			.bounded_device_ids(alice)
+			.await?
+			.len(),
+		3
+	);
+	let Ok(Some(output)) = services
+		.admin
+		.command_in_place("query users list-devices @alice:localhost".into(), None)
+		.await
+	else {
+		panic!("key-only device query must not decode metadata values");
+	};
+	assert!(output.as_str().contains("CORRUPT"));
 	services
 		.users
 		.recent_local_activity(1)
@@ -187,15 +208,12 @@ async fn exercise(services: &Services) -> Result {
 	assert!(!output.as_str().contains("Query completed"));
 	metadata.clear().await?;
 	metadata
-		.put(
-			(&alice, "KEY"),
-			tuwunel_database::Json(serde_json::json!({"device_id":"OTHER"})),
-		)
+		.put((alice, "KEY"), tuwunel_database::Json(serde_json::json!({"device_id":"OTHER"})))
 		.await?;
 	assert!(
 		services
 			.users
-			.bounded_devices_metadata(&alice, 128, MAX_ADMIN_DEVICE_BYTES)
+			.bounded_devices_metadata(alice, 128, MAX_ADMIN_DEVICE_BYTES)
 			.await
 			.expect_err("metadata must match the stored key")
 			.to_string()
@@ -204,14 +222,23 @@ async fn exercise(services: &Services) -> Result {
 
 	metadata.clear().await?;
 	for index in 0..=MAX_ADMIN_DEVICE_ROWS {
-		device(services, &alice, serde_json::json!({"device_id":format!("D{index:03}")})).await?;
+		device(services, alice, serde_json::json!({"device_id":format!("D{index:03}")})).await?;
 	}
 	assert_eq!(
 		services
 			.users
-			.bounded_devices_metadata(&alice, usize::MAX, usize::MAX)
+			.bounded_devices_metadata(alice, usize::MAX, usize::MAX)
 			.await
 			.expect_err("caller limits cannot remove the hard per-user cap")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	assert_eq!(
+		services
+			.users
+			.bounded_device_ids(alice)
+			.await
+			.expect_err("key-only device listings share the hard row cap")
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
@@ -224,7 +251,7 @@ async fn exercise(services: &Services) -> Result {
 	metadata.clear().await?;
 	device(
 		services,
-		&alice,
+		alice,
 		serde_json::json!({"device_id":"LARGE",
 		"display_name":"x".repeat(MAX_ADMIN_DEVICE_BYTES)}),
 	)
@@ -232,13 +259,30 @@ async fn exercise(services: &Services) -> Result {
 	assert_eq!(
 		services
 			.users
-			.bounded_devices_metadata(&alice, 128, MAX_ADMIN_DEVICE_BYTES)
+			.bounded_devices_metadata(alice, 128, MAX_ADMIN_DEVICE_BYTES)
 			.await
 			.expect_err("raw byte budget must precede decoding a large row")
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
+	metadata.clear().await?;
+	device(services, alice, serde_json::json!({"device_id":"x".repeat(32 * 1024 + 1)})).await?;
+	assert_eq!(
+		services
+			.users
+			.bounded_device_ids(alice)
+			.await
+			.expect_err("device IDs have a separate retained-byte budget")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
 
+	Ok(())
+}
+
+async fn aggregate_and_reply_budgets(services: &Services) -> Result {
+	let users = &services.db["userid_password"];
+	let metadata = &services.db["userdeviceid_metadata"];
 	users.clear().await?;
 	metadata.clear().await?;
 	for user_index in 0..33 {

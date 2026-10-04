@@ -33,6 +33,33 @@ where
 		.map(result_deserialize_key::<K>)
 }
 
+/// Streams at most `limit` typed keys under a serialized prefix. The same
+/// prefix and cap bound remote fetches and commit drains. Borrowed keys must
+/// not be retained across another poll; values are not projected.
+///
+/// # Panics
+///
+/// Panics if the prefix cannot be serialized.
+#[implement(super::Map)]
+pub fn keys_prefix_capped<'a, K, P>(
+	self: &'a Arc<Self>,
+	prefix: &P,
+	limit: usize,
+) -> impl Stream<Item = Result<Key<'_, K>>> + Send + use<'a, K, P>
+where
+	P: Serialize + ?Sized + Debug,
+	K: Deserialize<'a> + Send,
+{
+	let key = serialize_key(prefix).expect("failed to serialize query key");
+	seek_stream_bounded::<stream::Keys<'_>, _>(self, Direction::Forward, Some(&*key), Bound {
+		within: Some(&key),
+		cap: Some(limit),
+	})
+	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
+	.take(limit)
+	.map(result_deserialize_key::<K>)
+}
+
 /// Streams raw keys matching a serialized prefix in ascending order.
 ///
 /// The scan begins at the encoded prefix and stops at the first nonmatching

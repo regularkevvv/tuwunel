@@ -159,6 +159,25 @@ fn last_active_defaults_to_48_and_refuses_unbounded_output() {
 	}
 }
 
+#[test]
+fn query_user_inventory_requires_bounded_limits_and_valid_cursors() {
+	for flags in [&[][..], &["--historical", "--after", "@user:localhost", "--limit", "32"][..]] {
+		let mut args = vec!["admin", "query", "users", "iter-users"];
+		args.extend_from_slice(flags);
+		assert!(matches!(parse_ok(&args), AdminCommand::Query(QueryCommand::Users(_))));
+	}
+	for limit in ["0", "33", "65536"] {
+		assert!(
+			parse_err(&["admin", "query", "users", "iter-users", "--limit", limit])
+				.contains("invalid value")
+		);
+	}
+	assert!(
+		parse_err(&["admin", "query", "users", "iter-users", "--after", "invalid-user"])
+			.contains("invalid value")
+	);
+}
+
 fn get_help_inner(input: &str) {
 	let error = parse_err(&["argv[0] doesn't matter", input]);
 

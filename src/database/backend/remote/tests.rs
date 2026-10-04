@@ -1832,6 +1832,19 @@ async fn capped_typed_stream_bounds_fetch_and_commit_drain_without_shortening_it
 	);
 	assert_eq!(fake.served().saturating_sub(before), 32, "prefix page fetched beyond its cap");
 	assert_eq!(backend.scans().len(), 0, "prefix page left its scan registered");
+	let before = fake.served();
+	let keys: Vec<Vec<u8>> = map
+		.keys_prefix_capped::<&[u8], _>(&prefix, 32)
+		.map_ok(<[u8]>::to_vec)
+		.try_collect()
+		.await?;
+	assert_eq!(keys, devices, "key-only prefix bounds differ from row bounds");
+	assert_eq!(
+		fake.served().saturating_sub(before),
+		32,
+		"key-only prefix fetched beyond its cap"
+	);
+	assert_eq!(backend.scans().len(), 0, "key-only prefix left its scan registered");
 	backend.close().await;
 	Ok(())
 }

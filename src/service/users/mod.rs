@@ -36,7 +36,7 @@ pub use self::{
 		DeviceMetadataInventory, LocalUserActivity, MAX_ADMIN_DEVICE_BYTES, MAX_ADMIN_DEVICE_ROWS,
 	},
 	local_count::MAX_LOCAL_USER_COUNT_ROWS,
-	local_page::{LocalUserPage, MAX_LOCAL_USER_PAGE_ROWS},
+	local_page::{MAX_LOCAL_USER_PAGE_ROWS, UserInventoryPage},
 	register::Register,
 };
 
