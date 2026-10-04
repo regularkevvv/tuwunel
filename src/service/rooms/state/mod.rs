@@ -28,7 +28,7 @@ use tuwunel_core::{
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
+use tuwunel_database::{Ignore, Interfix, Map, Txn, serialize_key};
 
 use crate::{
 	rooms::{
