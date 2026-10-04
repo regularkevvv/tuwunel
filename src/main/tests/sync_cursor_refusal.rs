@@ -56,7 +56,8 @@ fn failed_room_sync_preserves_the_cursor_and_retry_deliveries() -> Result {
 				.await
 				.map_err(|_| err!("sync cursor fixture exceeded its deadline"))
 				.and_then(|result| result);
-			outcome.and(server.server.shutdown())
+			let shutdown = server.server.shutdown();
+			outcome.and(shutdown)
 		};
 		let (run, outcome) = tokio::join!(async_run(&server), exercise);
 		drop(services);
