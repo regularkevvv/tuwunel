@@ -21,7 +21,7 @@ use tuwunel_core::{
 	pair_of,
 	utils::{
 		result::FlatOk,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, TryIgnore},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore},
 	},
 };
 
@@ -687,37 +687,25 @@ pub fn state_full_entries_strict(
 	self.state_full_ids_strict(shortstatehash)
 		.try_collect::<Vec<_>>()
 		.and_then(async move |entries| {
-			let (shortstatekeys, event_ids): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-			// Resolve and charge each value before fetching the next one.
-			shortstatekeys
-				.into_iter()
-				.stream()
-				.then(async move |shortstatekey| {
-					self.services
-						.short
-						.get_statekey_from_short(shortstatekey)
-						.await
-				})
-				.zip(event_ids.into_iter().stream())
-				.map(|(state_key, event_id)| {
-					state_key
-						.map(|state_key| (state_key, event_id))
-						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
-				})
-				.try_fold((Vec::new(), 0_usize), async |(mut entries, bytes), entry| {
-					let (state_key, event_id) = entry;
-					let bytes = bytes
-						.saturating_add(state_key.0.to_cow_str().len())
-						.saturating_add(state_key.1.as_str().len())
-						.saturating_add(event_id.as_str().len());
-					if bytes > MAX_STATE_MAPPING_BYTES {
-						return Err(state_mapping_limit());
-					}
-					entries.push((state_key, event_id));
-					Ok((entries, bytes))
-				})
-				.await
-				.map(|(entries, _)| entries)
+			let mut decoded = Vec::new();
+			let mut bytes = 0_usize;
+			for (shortstatekey, event_id) in entries {
+				let state_key = self
+					.services
+					.short
+					.get_statekey_from_short(shortstatekey)
+					.await
+					.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+				bytes = bytes
+					.saturating_add(state_key.0.to_cow_str().len())
+					.saturating_add(state_key.1.as_str().len())
+					.saturating_add(event_id.as_str().len());
+				if bytes > MAX_STATE_MAPPING_BYTES {
+					return Err(state_mapping_limit());
+				}
+				decoded.push((state_key, event_id));
+			}
+			Ok(decoded)
 		})
 		.map_ok(Vec::into_iter)
 		.map_ok(IterStream::try_stream)
@@ -785,42 +773,24 @@ pub fn state_full_ids_strict(
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<(ShortStateKey, OwnedEventId)>> + Send + '_ {
 	self.state_full_shortids(shortstatehash)
-		.try_fold(
-			(Vec::new(), Vec::new()),
-			async |(mut shortstatekeys, mut shorteventids), (shortstatekey, shorteventid)| {
-				shortstatekeys.push(shortstatekey);
-				shorteventids.push(shorteventid);
-
-				Ok((shortstatekeys, shorteventids))
-			},
-		)
-		.and_then(async move |(shortstatekeys, shorteventids)| {
-			shorteventids
-				.into_iter()
-				.stream()
-				.then(async move |shorteventid| {
-					self.services
-						.short
-						.get_eventid_from_short::<OwnedEventId>(shorteventid)
-						.await
-				})
-				.zip(shortstatekeys.into_iter().stream())
-				.map(|(event_id, shortstatekey)| {
-					event_id
-						.map(|event_id| (shortstatekey, event_id))
-						.map_err(|_| Error::bad_database("Incomplete state event mapping"))
-				})
-				.try_fold((Vec::new(), 0_usize), async |(mut entries, bytes), entry| {
-					let (shortstatekey, event_id) = entry;
-					let bytes = bytes.saturating_add(event_id.as_str().len());
-					if bytes > MAX_STATE_MAPPING_BYTES {
-						return Err(state_mapping_limit());
-					}
-					entries.push((shortstatekey, event_id));
-					Ok((entries, bytes))
-				})
-				.await
-				.map(|(entries, _)| entries)
+		.try_collect::<Vec<_>>()
+		.and_then(async move |entries| {
+			let mut decoded = Vec::new();
+			let mut bytes = 0_usize;
+			for (shortstatekey, shorteventid) in entries {
+				let event_id = self
+					.services
+					.short
+					.get_eventid_from_short::<OwnedEventId>(shorteventid)
+					.await
+					.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
+				bytes = bytes.saturating_add(event_id.as_str().len());
+				if bytes > MAX_STATE_MAPPING_BYTES {
+					return Err(state_mapping_limit());
+				}
+				decoded.push((shortstatekey, event_id));
+			}
+			Ok(decoded)
 		})
 		.map_ok(Vec::into_iter)
 		.map_ok(IterStream::try_stream)
