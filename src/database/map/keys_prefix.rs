@@ -88,6 +88,31 @@ where
 	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
 }
 
+/// Streams at most `limit` raw keys under a serialized prefix. The prefix and
+/// cap also bound remote fetches and commit drains. Callers can charge encoded
+/// key bytes before decoding potentially malformed records.
+///
+/// # Panics
+///
+/// Panics if the prefix cannot be serialized.
+#[implement(super::Map)]
+pub fn keys_prefix_raw_capped<P>(
+	self: &Arc<Self>,
+	prefix: &P,
+	limit: usize,
+) -> impl Stream<Item = Result<Key<'_>>> + Send + use<'_, P>
+where
+	P: Serialize + ?Sized + Debug,
+{
+	let key = serialize_key(prefix).expect("failed to serialize query key");
+	seek_stream_bounded::<stream::Keys<'_>, _>(self, Direction::Forward, Some(&*key), Bound {
+		within: Some(&key),
+		cap: Some(limit),
+	})
+	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
+	.take(limit)
+}
+
 /// Streams deserialized keys matching a raw prefix in ascending order.
 ///
 /// The supplied bytes are used directly for the seek and prefix test. Any

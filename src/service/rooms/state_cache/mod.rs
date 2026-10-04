@@ -1,5 +1,6 @@
 mod inventory;
 mod invite_inventory;
+mod recount;
 #[cfg(test)]
 mod tests;
 mod update;

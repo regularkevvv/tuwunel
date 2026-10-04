@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-
-use futures::StreamExt;
 use ruma::{
 	OwnedServerName, RoomId, UserId,
 	events::{
@@ -15,9 +12,7 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Error, Result, implement, is_not_empty,
-	matrix::PduCount,
-	utils::{ReadyExt, result::LogErr},
+	Error, Result, implement, is_not_empty, matrix::PduCount, utils::result::LogErr,
 };
 use tuwunel_database::{Json, Txn, serialize_key, serialize_val};
 
@@ -167,67 +162,36 @@ pub async fn update_membership(
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn update_joined_count(&self, room_id: &RoomId) -> Result {
 	self.ensure_recount_pending(room_id).await?;
-	let mut joinedcount = 0_u64;
-	let mut invitedcount = 0_u64;
-	let mut knockedcount = 0_u64;
-	let mut joined_servers = HashSet::new();
-
-	self.room_members(room_id)
-		.ready_for_each(|joined| {
-			joined_servers.insert(joined.server_name().to_owned());
-			joinedcount = joinedcount.saturating_add(1);
-		})
-		.await;
-
-	invitedcount = invitedcount.saturating_add(
-		self.room_members_invited(room_id)
-			.count()
-			.await
-			.try_into()
-			.unwrap_or(0),
-	);
-
-	knockedcount = knockedcount.saturating_add(
-		self.room_members_knocked(room_id)
-			.count()
-			.await
-			.try_into()
-			.unwrap_or(0),
-	);
-
-	let joinedcount = joinedcount.to_be_bytes();
-	let invitedcount = invitedcount.to_be_bytes();
-	let knockedcount = knockedcount.to_be_bytes();
+	let inventory = self.prepare_recount_inventory(room_id).await?;
+	let mut joined_servers = inventory.joined_servers;
+	let joinedcount = inventory.joined.to_be_bytes();
+	let invitedcount = inventory.invited.to_be_bytes();
+	let knockedcount = inventory.knocked.to_be_bytes();
 	let mut txn = self.services.db.txn();
 
 	txn.insert_raw(&self.db.roomid_joinedcount, room_id, joinedcount);
 	txn.insert_raw(&self.db.roomid_invitedcount, room_id, invitedcount);
 	txn.insert_raw(&self.db.roomid_knockedcount, room_id, knockedcount);
 
-	self.room_servers(room_id)
-		.ready_for_each(|old_joined_server| {
-			if joined_servers.remove(old_joined_server) {
-				return;
-			}
+	for old_joined_server in &inventory.old_servers {
+		if joined_servers.remove(old_joined_server) {
+			continue;
+		}
 
-			// Server not in room anymore
-			let roomserver_id = (room_id, old_joined_server);
-			let serverroom_id = (old_joined_server, room_id);
+		// Server not in room anymore
+		let roomserver_id = (room_id, old_joined_server);
+		let serverroom_id = (old_joined_server, room_id);
 
-			txn.del(&self.db.roomserverids, roomserver_id);
-			txn.del(&self.db.serverroomids, serverroom_id);
-		})
-		.await;
+		txn.del(&self.db.roomserverids, roomserver_id);
+		txn.del(&self.db.serverroomids, serverroom_id);
+	}
 
 	// Now only new servers are in joined_servers anymore
 	for server in &joined_servers {
 		let roomserver_id = (room_id, server);
 		let serverroom_id = (server, room_id);
-		let roomserver_id =
-			serialize_key(roomserver_id).expect("failed to serialize roomserver_id");
-
-		let serverroom_id =
-			serialize_key(serverroom_id).expect("failed to serialize serverroom_id");
+		let roomserver_id = serialize_key(roomserver_id)?;
+		let serverroom_id = serialize_key(serverroom_id)?;
 
 		txn.insert_raw(&self.db.roomserverids, roomserver_id, []);
 		txn.insert_raw(&self.db.serverroomids, serverroom_id, []);
