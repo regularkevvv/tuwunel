@@ -117,7 +117,7 @@ async fn exercise(services: &Services) -> Result {
 		.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
-	let rows = services.state_accessor.state_full_ids(10_002);
+	let rows = services.state_accessor.state_full_ids_strict(10_002);
 	pin_mut!(rows);
 	assert_eq!(
 		rows.next()
