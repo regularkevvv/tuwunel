@@ -148,6 +148,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		json!({"membership": "join", "displayname": "kept"}),
 		"an honest join must keep its content"
 	);
+	room_version_errors_refuse_invitation_fallback(services, &room_id, &honest).await?;
 
 	// A join whose content no longer matches its hash is stored redacted.
 	let mallory = remote_user("mallory")?;
@@ -227,6 +228,92 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"a PDU that is not canonical JSON took effect"
 	);
 
+	Ok(())
+}
+
+async fn room_version_errors_refuse_invitation_fallback(
+	services: &Services,
+	room: &RoomId,
+	pdu: &CanonicalJsonObject,
+) -> Result {
+	let raw = to_raw_value(pdu)?;
+	let user = &services.globals.server_user;
+	let invited = &services.db["roomuserid_invitecount"];
+	let states = &services.db["userroomid_invitestate"];
+	// A valid local invitation previously let the parser continue after a
+	// failed current-state lookup was disguised as a missing create event.
+	invited.put((room, user), b"").await?;
+	states
+		.put_raw(
+			(user, room),
+			serde_json::to_vec(&json!([{
+				"type":"m.room.create", "state_key":"", "sender":user,
+				"content":{"room_version":"11", "creator":user}
+			}]))?,
+		)
+		.await?;
+	assert_eq!(services.state.get_room_version(room).await?, RoomVersionId::V11);
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(&raw)
+			.await
+			.is_ok()
+	);
+	let hashes = &services.db["roomid_shortstatehash"];
+	let original = hashes.get(room).await?.to_vec();
+	hashes.remove(room).await?;
+	assert!(
+		services
+			.state
+			.get_room_version(room)
+			.await
+			.expect_err("a missing room snapshot permits invitation recovery")
+			.is_not_found()
+	);
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(&raw)
+			.await
+			.is_ok(),
+		"the stored invitation must actually provide a usable version"
+	);
+	hashes.insert(room, &original).await?;
+	let missing_layer = u64::MAX.to_be_bytes();
+	let malformed: [&[u8]; 5] = [b"", b"short", b"123456789", b"invalid-count", &missing_layer];
+	for value in malformed {
+		hashes.insert(room, value).await?;
+		assert_eq!(
+			services
+				.state
+				.get_room_version(room)
+				.await
+				.expect_err("unreadable room state is not a missing room")
+				.status_code(),
+			tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR
+		);
+		assert_eq!(
+			services
+				.event_handler
+				.parse_incoming_pdu(&raw)
+				.await
+				.expect_err("a valid invitation cannot hide unreadable current state")
+				.status_code(),
+			tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR
+		);
+	}
+	hashes.insert(room, original).await?;
+	assert_eq!(services.state.get_room_version(room).await?, RoomVersionId::V11);
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(&raw)
+			.await
+			.is_ok()
+	);
+	invited.del((room, user)).await?;
+	states.del((user, room)).await?;
 	Ok(())
 }
 

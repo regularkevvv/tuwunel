@@ -39,10 +39,11 @@ pub async fn parse_incoming_pdu(&self, pdu: &RawJsonValue) -> Result<Parsed> {
 		| Ok(room_version_id) => room_version_id,
 		// We may not be resident (e.g. a rescinded out-of-band invite); recover the
 		// version from a locally-invited member's stored stripped state.
-		| Err(_) => self
+		| Err(error) if error.is_not_found() => self
 			.invited_room_version(&room_id)
 			.await
 			.ok_or_else(|| err!("Server is not in room {room_id}"))?,
+		| Err(error) => return Err(error),
 	};
 
 	gen_event_id(&value, &room_version_id)

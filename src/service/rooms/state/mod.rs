@@ -625,14 +625,18 @@ pub async fn get_room_version_rules(&self, room_id: &RoomId) -> Result<RoomVersi
 	ret(level = "trace"),
 )]
 pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> {
-	self.services
+	let hash = self.get_room_shortstatehash(room_id).await?;
+	let create = self
+		.services
 		.state_accessor
-		.room_state_get_content(room_id, &StateEventType::RoomCreate, "")
-		.await
-		.as_ref()
-		.map(room_version::from_create_content)
-		.cloned()
-		.map_err(|e| err!(Request(NotFound("No create event found: {e:?}"))))
+		.state_get_optional(hash, &StateEventType::RoomCreate, "")
+		.await?
+		.ok_or_else(|| Error::bad_database("Missing known room create event"))?;
+	if create.room_id() != room_id {
+		return Err(Error::bad_database("Mismatched room create event"));
+	}
+	room_version::from_create_event(&create)
+		.map_err(|_| Error::bad_database("Invalid room create content"))
 }
 
 #[implement(Service)]
@@ -642,11 +646,9 @@ pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> 
 	ret(level = "trace"),
 )]
 pub async fn get_room_shortstatehash(&self, room_id: &RoomId) -> Result<ShortStateHash> {
-	self.db
-		.roomid_shortstatehash
-		.get(room_id)
-		.await
-		.deserialized()
+	let value = self.db.roomid_shortstatehash.get(room_id).await?;
+	tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid room state hash"))
 }
 
 /// Returns the state hash at this event.
