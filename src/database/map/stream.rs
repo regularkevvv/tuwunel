@@ -48,7 +48,22 @@ where
 	K: Deserialize<'a> + Send,
 	V: Deserialize<'a> + Send,
 {
-	seek_stream_bounded::<stream::Items<'_>, _>(self, Direction::Forward, None, Bound::cap(limit))
+	self.stream_capped_from(None, limit)
+}
+
+/// [`Map::stream_capped`] starting from an inclusive raw key. A caller uses
+/// [`crate::successor`] to resume strictly after its prior cursor.
+#[implement(super::Map)]
+pub fn stream_capped_from<'a, K, V>(
+	self: &'a Arc<Self>,
+	from: Option<&[u8]>,
+	limit: usize,
+) -> impl Stream<Item = Result<KeyVal<'_, K, V>>> + Send + use<'a, K, V>
+where
+	K: Deserialize<'a> + Send,
+	V: Deserialize<'a> + Send,
+{
+	seek_stream_bounded::<stream::Items<'_>, _>(self, Direction::Forward, from, Bound::cap(limit))
 		.take(limit)
 		.map(keyval::result_deserialize::<K, V>)
 }

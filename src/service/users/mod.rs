@@ -3,6 +3,7 @@ pub mod device;
 mod keys;
 mod ldap;
 mod local_count;
+mod local_page;
 mod register;
 
 use std::sync::Arc;
@@ -27,8 +28,12 @@ use tuwunel_core::{
 use tuwunel_database::{Deserialized, Json, Map};
 
 pub use self::{
-	dehydrated_device::DehydratedDevice, device::ToDeviceTarget, keys::parse_master_key,
-	local_count::MAX_LOCAL_USER_COUNT_ROWS, register::Register,
+	dehydrated_device::DehydratedDevice,
+	device::ToDeviceTarget,
+	keys::parse_master_key,
+	local_count::MAX_LOCAL_USER_COUNT_ROWS,
+	local_page::{LocalUserPage, MAX_LOCAL_USER_PAGE_ROWS},
+	register::Register,
 };
 
 pub const PASSWORD_SENTINEL: &str = "*";

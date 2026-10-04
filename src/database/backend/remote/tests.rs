@@ -1798,6 +1798,21 @@ async fn capped_typed_stream_bounds_fetch_and_commit_drain_without_shortening_it
 	assert!(empty.next().await.is_none());
 	drop(empty);
 	assert_eq!(fake.served(), before, "a zero cap fetched rows");
+	let from = crate::successor(&numbered(cap.saturating_sub(1)));
+	let before = fake.served();
+	let next: Vec<Vec<u8>> = map
+		.stream_capped_from::<&[u8], &[u8]>(Some(&from), 32)
+		.map_ok(|(key, _)| key.to_vec())
+		.try_collect()
+		.await?;
+	assert_eq!(
+		next,
+		(cap..cap.saturating_add(32))
+			.map(numbered)
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(fake.served().saturating_sub(before), 32, "cursor page fetched beyond its cap");
+	assert_eq!(backend.scans().len(), 0, "cursor page left its scan registered");
 	backend.close().await;
 	Ok(())
 }
