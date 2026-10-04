@@ -190,13 +190,13 @@ impl Context<'_> {
 			.await
 	}
 
-	async fn refused_permissions(&self) -> Result {
+	async fn refused_permissions(&self, phase: &str) -> Result {
 		let services = self.client.services;
 		let error = services
 			.state_accessor
 			.get_power_levels(self.room)
 			.await
-			.expect_err("failed power read cannot become creator defaults");
+			.expect_err(&format!("{phase}: failed power read cannot become creator defaults"));
 		assert_eq!(error.status_code(), http::StatusCode::INTERNAL_SERVER_ERROR);
 		let error = services
 			.state_accessor
@@ -290,8 +290,17 @@ async fn power_read_failures(context: &Context<'_>, target: &SavedRecord) -> Res
 				services.clear_cache().await;
 			} else {
 				record.write(services, b"{").await?;
+				if record.map == "shortstatekey_statekey" {
+					services
+						.short
+						.get_statekey_from_short(short_key)
+						.await
+						.expect("corrupt reverse key control must still decode as another type");
+				}
 			}
-			context.refused_permissions().await?;
+			context
+				.refused_permissions(&format!("{} missing={missing}", record.map))
+				.await?;
 			assert_eq!(
 				services.db[target.map]
 					.get(&target.key)
@@ -315,7 +324,9 @@ async fn power_read_failures(context: &Context<'_>, target: &SavedRecord) -> Res
 		value[field] = replacement;
 		row.write(services, &serde_json::to_vec(&value)?)
 			.await?;
-		context.refused_permissions().await?;
+		context
+			.refused_permissions(&format!("power field {field}"))
+			.await?;
 		row.restore(services).await?;
 		context.healthy().await?;
 	}
@@ -330,7 +341,9 @@ async fn power_read_failures(context: &Context<'_>, target: &SavedRecord) -> Res
 	create_row
 		.write(services, &serde_json::to_vec(&value)?)
 		.await?;
-	context.refused_permissions().await?;
+	context
+		.refused_permissions("foreign creator")
+		.await?;
 	create_row.restore(services).await?;
 	context.healthy().await
 }
@@ -454,7 +467,9 @@ async fn optional_lookup_budget(context: &Context<'_>) -> Result {
 		.raw_put(context.room, duplicate_hash)
 		.await?;
 	services.clear_cache().await;
-	context.refused_permissions().await?;
+	context
+		.refused_permissions("duplicate reverse alias")
+		.await?;
 	mapping
 		.put_raw(&forward_key, &saved_forward)
 		.await?;
@@ -564,7 +579,9 @@ async fn duplicate_current_cell(context: &Context<'_>, short_key: u64) -> Result
 		.raw_put(context.room, hash)
 		.await?;
 	services.clear_cache().await;
-	context.refused_permissions().await?;
+	context
+		.refused_permissions("duplicate compact-key events")
+		.await?;
 	services.db["roomid_shortstatehash"]
 		.raw_put(context.room, &saved_hash)
 		.await?;
