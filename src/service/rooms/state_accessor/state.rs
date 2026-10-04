@@ -206,33 +206,30 @@ pub async fn state_get_optional(
 		| Err(_) => None,
 	};
 
-	let event_id: OwnedEventId = match direct_shortstatekey {
+	let direct_shorteventid = match direct_shortstatekey {
 		| Some(shortstatekey) => {
 			let start = compress_state_event(shortstatekey, 0);
 			let end = compress_state_event(shortstatekey, u64::MAX);
-
-			let shorteventid = self
-				.load_full_state(shortstatehash)
-				.await?
-				.range(start..=end)
+			let full_state = self.load_full_state(shortstatehash).await?;
+			let mut candidates = full_state.range(start..=end).copied();
+			let shorteventid = candidates
 				.next()
-				.copied()
 				.map(parse_compressed_state_event)
 				.map(at!(1));
-			let Some(shorteventid) = shorteventid else {
-				return Ok(None);
-			};
-
-			self.services
-				.short
-				.get_eventid_from_short(shorteventid)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
+			if candidates.next().is_some() {
+				return Err(Error::bad_database("Duplicate state key mapping"));
+			}
+			shorteventid
 		},
+		| None => None,
+	};
 
+	let shorteventid = match direct_shorteventid {
+		| Some(shorteventid) => shorteventid,
 		// Proving the cell absent needs every entry's compact key mapped, since an
 		// unmapped one could be this cell, but only the matching entry's event
-		// id: another entry's missing event mapping cannot hide it.
+		// id: another entry's missing event mapping cannot hide it. Even a valid
+		// shortcut outside this snapshot cannot establish absence.
 		| None => {
 			let entries = self
 				.state_full_shortids(shortstatehash)
@@ -264,13 +261,15 @@ pub async fn state_get_optional(
 				return Ok(None);
 			};
 
-			self.services
-				.short
-				.get_eventid_from_short(shorteventid)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
+			shorteventid
 		},
 	};
+	let event_id: OwnedEventId = self
+		.services
+		.short
+		.get_eventid_from_short(shorteventid)
+		.await
+		.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
 
 	let pdu = self
 		.services

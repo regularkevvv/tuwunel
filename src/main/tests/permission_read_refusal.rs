@@ -252,6 +252,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	power_read_failures(&context, &saved_target).await?;
 	publication_alias_controls(&context).await?;
 	optional_lookup_budget(&context).await?;
+	misdirected_lookup(&context, &saved_target).await?;
 	canonical_read_failures(&context, &saved_target).await?;
 	cross_room_refusal(&context).await?;
 	genuine_absence(&context).await
@@ -457,6 +458,113 @@ async fn optional_lookup_budget(context: &Context<'_>) -> Result {
 	mapping
 		.put_raw(&forward_key, &saved_forward)
 		.await?;
+	services.db["roomid_shortstatehash"]
+		.raw_put(context.room, &saved_hash)
+		.await?;
+	services.clear_cache().await;
+	context.healthy().await
+}
+
+async fn misdirected_lookup(context: &Context<'_>, target: &SavedRecord) -> Result {
+	let services = context.client.services;
+	let forward_key = (StateEventType::RoomPowerLevels, "");
+	let mapping = &services.db["statekey_shortstatekey"];
+	let saved_forward = mapping.qry(&forward_key).await?.to_vec();
+	let short_key = services
+		.short
+		.get_shortstatekey(&forward_key.0, "")
+		.await?;
+	let power = services
+		.state_accessor
+		.room_state_get_id(context.room, &forward_key.0, "")
+		.await?;
+	let power_id = services.timeline.get_pdu_id(&power).await?;
+	let power_row = SavedRecord::load(services, "pduid_pdu", power_id.as_ref()).await?;
+	let mut restricted: Value = serde_json::from_slice(&power_row.value)?;
+	restricted["content"] = json!({
+		"users": {context.owner.as_str(): 100},
+		"state_default": 101,
+		"events": {"m.room.history_visibility": 101, "m.room.redaction": 101},
+		"redact": 101,
+	});
+	power_row
+		.write(services, &serde_json::to_vec(&restricted)?)
+		.await?;
+	let alias = *services.globals.next_count().await?;
+	services.db["shortstatekey_statekey"]
+		.put(alias, &forward_key)
+		.await?;
+	mapping.put(&forward_key, alias).await?;
+	services.clear_cache().await;
+	let power_levels = services
+		.state_accessor
+		.get_power_levels(context.room)
+		.await?;
+	assert!(
+		!power_levels.user_can_send_state(context.owner, StateEventType::RoomHistoryVisibility),
+		"a valid shortcut outside the snapshot cannot grant creator defaults"
+	);
+	assert!(
+		!services
+			.state_accessor
+			.user_can_redact(context.target, context.owner, context.room, false)
+			.await?,
+		"snapshot power levels must deny redaction despite the false shortcut"
+	);
+	context
+		.publication("public", http::StatusCode::FORBIDDEN)
+		.await?;
+	context
+		.refused_redaction(http::StatusCode::FORBIDDEN)
+		.await?;
+	assert_eq!(
+		services.db[target.map]
+			.get(&target.key)
+			.await?
+			.as_ref(),
+		target.value.as_slice(),
+		"false shortcut refusal must preserve the target bytes"
+	);
+	mapping
+		.put_raw(&forward_key, &saved_forward)
+		.await?;
+	services.db["shortstatekey_statekey"]
+		.del(alias)
+		.await?;
+	power_row.restore(services).await?;
+	context.healthy().await?;
+	duplicate_current_cell(context, short_key).await
+}
+
+async fn duplicate_current_cell(context: &Context<'_>, short_key: u64) -> Result {
+	let services = context.client.services;
+	// Two different events under the same compact state key are ambiguous too.
+	let parent = services
+		.state
+		.get_room_shortstatehash(context.room)
+		.await?;
+	let saved_hash = services.db["roomid_shortstatehash"]
+		.get(context.room)
+		.await?
+		.to_vec();
+	let hash = *services.globals.next_count().await?;
+	let mut diff = parent.to_be_bytes().to_vec();
+	diff.extend_from_slice(&short_key.to_be_bytes());
+	diff.extend_from_slice(
+		&services
+			.short
+			.get_shorteventid(context.target)
+			.await?
+			.to_be_bytes(),
+	);
+	services.db["shortstatehash_statediff"]
+		.raw_put(&hash.to_be_bytes(), &diff)
+		.await?;
+	services.db["roomid_shortstatehash"]
+		.raw_put(context.room, hash)
+		.await?;
+	services.clear_cache().await;
+	context.refused_permissions().await?;
 	services.db["roomid_shortstatehash"]
 		.raw_put(context.room, &saved_hash)
 		.await?;
