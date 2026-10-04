@@ -1207,10 +1207,17 @@ async fn corrupt_timeline_pdu(
 			error.is_not_found(),
 			"missing timeline PDU {event_id} returned an unexpected error: {error}"
 		),
-		| PduFailure::Malformed => assert!(
-			matches!(&error, Error::Json(_)),
-			"malformed timeline PDU {event_id} returned an unexpected error: {error}"
-		),
+		| PduFailure::Malformed => {
+			assert!(
+				matches!(&error, Error::Database(message) if message.as_ref() == "Invalid stored accepted event record"),
+				"malformed timeline PDU {event_id} returned an unexpected error: {error}"
+			);
+			assert_eq!(
+				error.status_code(),
+				tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+				"malformed stored timeline PDU must be a server failure"
+			);
+		},
 	}
 
 	Ok(())
