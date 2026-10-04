@@ -1,3 +1,5 @@
+mod bounds;
+
 use std::{
 	collections::{BTreeSet, HashMap},
 	fmt::{Debug, Write},
@@ -16,6 +18,7 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Map, Txn};
 
+use self::bounds::{MAX_DIFF_BYTES, MAX_LAYERS, candidate_state, check_stack, state_limit};
 use crate::rooms::short::{ShortEventId, ShortId, ShortStateHash, ShortStateKey};
 
 pub struct Service {
@@ -130,6 +133,7 @@ pub async fn load_shortstatehash_info(
 		.lock()?
 		.get_mut(&shortstatehash)
 	{
+		check_stack(r)?;
 		return Ok(r.clone());
 	}
 
@@ -172,35 +176,46 @@ async fn new_shortstatehash_info(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> Result<ShortStateInfoVec> {
-	let StateDiff { parent, added, removed } = self.get_statediff(shortstatehash).await?;
-
-	let Some(parent) = parent else {
-		return Ok(vec![ShortStateInfo {
+	let mut pending = Vec::new();
+	let mut seen = BTreeSet::new();
+	let mut current = shortstatehash;
+	let mut stack = Vec::new();
+	loop {
+		if !seen.insert(current) {
+			return Err(err!(Database("Cyclic room state parent chain")));
+		}
+		if let Some(cached) = self.stateinfo_cache.lock()?.get_mut(&current) {
+			check_stack(cached)?;
+			if cached.len().saturating_add(pending.len()) > MAX_LAYERS {
+				return Err(state_limit());
+			}
+			stack = cached.clone();
+			break;
+		}
+		if pending.len() >= MAX_LAYERS {
+			return Err(state_limit());
+		}
+		let diff = self.get_statediff(current).await?;
+		let parent = diff.parent;
+		pending.push((current, diff));
+		let Some(parent) = parent else {
+			break;
+		};
+		current = parent;
+	}
+	for (shortstatehash, StateDiff { added, removed, .. }) in pending.into_iter().rev() {
+		let parent = stack
+			.last()
+			.map(|info: &ShortStateInfo| info.full_state.as_ref());
+		let full_state = candidate_state(parent, &added, &removed)?;
+		stack.push(ShortStateInfo {
 			shortstatehash,
-			full_state: added.clone(),
 			added,
 			removed,
-		}]);
-	};
-
-	let mut stack = Box::pin(self.load_shortstatehash_info(parent)).await?;
-	let top = stack.last().expect("at least one frame");
-
-	let mut full_state = (*top.full_state).clone();
-	full_state.extend(added.iter().copied());
-
-	let removed = (*removed).clone();
-	for r in &removed {
-		full_state.remove(r);
+			full_state: Arc::new(full_state),
+		});
+		check_stack(&stack)?;
 	}
-
-	stack.push(ShortStateInfo {
-		shortstatehash,
-		added,
-		removed: Arc::new(removed),
-		full_state: Arc::new(full_state),
-	});
-
 	Ok(stack)
 }
 
@@ -271,6 +286,22 @@ pub fn save_state_from_diff(
 	diff_to_sibling: usize,
 	mut parent_states: ParentStatesVec,
 ) -> Result {
+	check_stack(&parent_states)?;
+	let parent = parent_states
+		.last()
+		.map(|info| info.full_state.as_ref());
+	// Reject a state that the bounded reader cannot reconstruct before adding
+	// a mutation to the caller's transaction.
+	let full_state = candidate_state(parent, &statediffnew, &statediffremoved)?;
+	let mut candidate = parent_states.clone();
+	candidate.push(ShortStateInfo {
+		shortstatehash,
+		full_state: Arc::new(full_state),
+		added: statediffnew.clone(),
+		removed: statediffremoved.clone(),
+	});
+	check_stack(&candidate)?;
+	drop(candidate);
 	let statediffnew_len = statediffnew.len();
 	let statediffremoved_len = statediffremoved.len();
 	let diffsum = checked!(statediffnew_len + statediffremoved_len)?;
@@ -390,6 +421,9 @@ pub async fn save_state(
 	room_id: &RoomId,
 	new_state_ids_compressed: Arc<CompressedState>,
 ) -> Result<HashSetCompressStateEvent> {
+	if new_state_ids_compressed.len() > bounds::MAX_STATE_EVENTS {
+		return Err(state_limit());
+	}
 	let previous_shortstatehash = self
 		.services
 		.state
@@ -486,9 +520,16 @@ pub(crate) async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Resu
 		.shortstatehash_statediff
 		.aqry::<BUFSIZE, _>(&shortstatehash)
 		.await
-		.map_err(|e| {
-			err!(Database("Failed to find StateDiff from short {shortstatehash:?}: {e}"))
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Database("Missing stored room state delta"))
+			} else {
+				error
+			}
 		})?;
+	if value.len() > MAX_DIFF_BYTES {
+		return Err(state_limit());
+	}
 
 	let parent = value
 		.get(..STRIDE)

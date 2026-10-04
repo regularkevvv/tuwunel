@@ -801,7 +801,13 @@ async fn load_full_state(&self, shortstatehash: ShortStateHash) -> Result<Arc<Co
 	self.services
 		.state_compressor
 		.load_shortstatehash_info(shortstatehash)
-		.map_err(|e| err!(Database("Missing state IDs: {e}")))
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Database("Missing state IDs"))
+			} else {
+				error
+			}
+		})
 		.map_ok(|vec| {
 			vec.last()
 				.expect("at least one layer")
