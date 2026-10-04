@@ -279,6 +279,9 @@ async fn room_version_errors_refuse_invitation_fallback(
 			.is_ok(),
 		"the stored invitation must actually provide a usable version"
 	);
+	invitation_source_limits(services, room, &raw).await?;
+	invitation_state_limits(services, room, &raw).await?;
+	invitation_aggregate_limits(services, room, &raw).await?;
 	hashes.insert(room, &original).await?;
 	let missing_layer = u64::MAX.to_be_bytes();
 	let malformed: [&[u8]; 5] = [b"", b"short", b"123456789", b"invalid-count", &missing_layer];
@@ -314,6 +317,230 @@ async fn room_version_errors_refuse_invitation_fallback(
 	);
 	invited.del((room, user)).await?;
 	states.del((user, room)).await?;
+	Ok(())
+}
+
+async fn invitation_refused(
+	services: &Services,
+	raw: &RawJsonValue,
+	status: tuwunel_core::http::StatusCode,
+) {
+	let error = services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect_err("incomplete invitation input cannot provide a room version");
+	assert_eq!(error.status_code(), status);
+	if status == tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS {
+		assert!(matches!(
+			error.kind(),
+			tuwunel_core::ruma::api::error::ErrorKind::LimitExceeded(_)
+		));
+	}
+}
+
+async fn invitation_source_limits(
+	services: &Services,
+	room: &RoomId,
+	raw: &RawJsonValue,
+) -> Result {
+	use tuwunel_core::http::StatusCode;
+	let members = &services.db["roomuserid_invitecount"];
+	members.put((room, "not-a-user"), b"").await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	members.del((room, "not-a-user")).await?;
+	for index in 0..1023 {
+		members
+			.put((room, &format!("@invite-{index:04}:remote.test")), b"")
+			.await?;
+	}
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.is_ok()
+	);
+	members
+		.put((room, "@overflow:remote.test"), b"")
+		.await?;
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	members
+		.del((room, "@overflow:remote.test"))
+		.await?;
+	for index in 0..1023 {
+		members
+			.del((room, &format!("@invite-{index:04}:remote.test")))
+			.await?;
+	}
+	for index in 0..600 {
+		members
+			.put((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))), b"")
+			.await?;
+	}
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	for index in 0..600 {
+		members
+			.del((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))))
+			.await?;
+	}
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.is_ok()
+	);
+	Ok(())
+}
+
+fn encoded_invitation(user: &UserId, events: usize, padding: usize) -> Result<Vec<u8>> {
+	let mut state = vec![json!({
+		"type":"m.room.create", "state_key":"", "sender":user,
+		"content":{"room_version":"11", "padding":"x".repeat(padding)}
+	})];
+	state.extend((1..events).map(|index| {
+		json!({
+			"type":format!("x{index}"), "state_key":"", "sender":"@a:x", "content":{}
+		})
+	}));
+	Ok(serde_json::to_vec(&state)?)
+}
+
+async fn invitation_state_limits(
+	services: &Services,
+	room: &RoomId,
+	raw: &RawJsonValue,
+) -> Result {
+	use tuwunel_core::http::StatusCode;
+	let user = &services.globals.server_user;
+	let states = &services.db["userroomid_invitestate"];
+	let original = states.qry(&(user, room)).await?.to_vec();
+	states.del((user, room)).await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	for value in [b"invalid".as_slice(), b"[{\"type\":\"m.room.create\"}]", b"[] trailing"] {
+		states.put_raw((user, room), value).await?;
+		invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	}
+	states
+		.put_raw((user, room), encoded_invitation(user, 128, 0)?)
+		.await?;
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.is_ok()
+	);
+	states
+		.put_raw((user, room), encoded_invitation(user, 129, 0)?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	let padding = (64 * 1024_usize).saturating_sub(encoded_invitation(user, 1, 0)?.len());
+	let exact = encoded_invitation(user, 1, padding)?;
+	assert_eq!(exact.len(), 64 * 1024);
+	states.put_raw((user, room), &exact).await?;
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.is_ok()
+	);
+	states
+		.put_raw((user, room), encoded_invitation(user, 1, padding.saturating_add(1))?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	let mut duplicates: Value = serde_json::from_slice(&original)?;
+	let create = duplicates[0].clone();
+	duplicates
+		.as_array_mut()
+		.expect("state array")
+		.push(create);
+	states
+		.put_raw((user, room), serde_json::to_vec(&duplicates)?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	states.put_raw((user, room), original).await?;
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.is_ok()
+	);
+	Ok(())
+}
+
+async fn invitation_aggregate_limits(
+	services: &Services,
+	room: &RoomId,
+	raw: &RawJsonValue,
+) -> Result {
+	use tuwunel_core::http::StatusCode;
+	let user = &services.globals.server_user;
+	let states = &services.db["userroomid_invitestate"];
+	let members = &services.db["roomuserid_invitecount"];
+	let original = states.qry(&(user, room)).await?.to_vec();
+	let padding = (64 * 1024_usize).saturating_sub(encoded_invitation(user, 1, 0)?.len());
+	for (extra_count, events, padding) in [(3_usize, 1, padding), (31, 128, 0)] {
+		let encoded = encoded_invitation(user, events, padding)?;
+		assert!(
+			encoded
+				.len()
+				.saturating_mul(extra_count.saturating_add(1))
+				<= 256 * 1024
+		);
+		states.put_raw((user, room), &encoded).await?;
+		let mut extra_users = Vec::new();
+		for index in 0..extra_count {
+			let extra = UserId::parse(format!(
+				"@invite-budget-{index}:{}",
+				services.globals.server_name()
+			))?;
+			members.put((room, &extra), b"").await?;
+			states.put_raw((&extra, room), &encoded).await?;
+			extra_users.push(extra);
+		}
+		assert!(
+			services
+				.event_handler
+				.parse_incoming_pdu(raw)
+				.await
+				.is_ok()
+		);
+		let overflow =
+			UserId::parse(format!("@invite-overflow:{}", services.globals.server_name()))?;
+		members.put((room, &overflow), b"").await?;
+		states
+			.put_raw((&overflow, room), &encoded)
+			.await?;
+		invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+		extra_users.push(overflow);
+		for extra in extra_users {
+			members.del((room, &extra)).await?;
+			states.del((&extra, room)).await?;
+		}
+	}
+	let conflicting =
+		UserId::parse(format!("@invite-conflict:{}", services.globals.server_name()))?;
+	members.put((room, &conflicting), b"").await?;
+	let mut state: Value = serde_json::from_slice(&original)?;
+	state[0]["content"]["room_version"] = json!("12");
+	states
+		.put_raw((&conflicting, room), serde_json::to_vec(&state)?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	members.del((room, &conflicting)).await?;
+	states.del((&conflicting, room)).await?;
+	states.put_raw((user, room), original).await?;
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.is_ok()
+	);
 	Ok(())
 }
 

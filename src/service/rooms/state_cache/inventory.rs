@@ -24,13 +24,26 @@ impl Service {
 	/// Reads at most 1,025 keys and retains at most 1,024 IDs / 128 KiB.
 	/// Values do not affect the existing key-presence membership semantics.
 	pub async fn bounded_room_members(&self, room: &RoomId) -> Result<Vec<OwnedUserId>> {
+		self.bounded_membership_ids(&self.db.roomuserid_joinedcount, room)
+			.await
+	}
+
+	/// Complete invited-member IDs with the joined inventory's row/byte
+	/// budgets. Remote keys consume the budgets before local-user filtering.
+	pub async fn bounded_invited_members(&self, room: &RoomId) -> Result<Vec<OwnedUserId>> {
+		self.bounded_membership_ids(&self.db.roomuserid_invitecount, room)
+			.await
+	}
+
+	async fn bounded_membership_ids(
+		&self,
+		map: &std::sync::Arc<Map>,
+		room: &RoomId,
+	) -> Result<Vec<OwnedUserId>> {
 		const MAX_ROWS: usize = 1024;
 		const MAX_BYTES: usize = 128 * 1024;
 		let prefix = (room, Interfix);
-		let keys = self
-			.db
-			.roomuserid_joinedcount
-			.keys_prefix_capped::<(Ignore, &UserId), _>(&prefix, MAX_ROWS + 1);
+		let keys = map.keys_prefix_capped::<(Ignore, &UserId), _>(&prefix, MAX_ROWS + 1);
 		pin_mut!(keys);
 		let mut members = Vec::new();
 		let mut bytes = 0_usize;
