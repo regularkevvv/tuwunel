@@ -113,7 +113,9 @@ impl Service {
 			if inventory.examined > limit || inventory.encoded_bytes > byte_limit {
 				return Err(inventory_limit());
 			}
-			let device: Device = serde_json::from_slice(json)?;
+			let device: Device = serde_json::from_slice(json).map_err(|_| {
+				Error::Database("Cannot deserialize stored device metadata".into())
+			})?;
 			if device.device_id.as_str() != key_device.as_str() {
 				return Err(Error::Database("Device metadata does not match its key".into()));
 			}

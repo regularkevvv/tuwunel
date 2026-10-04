@@ -19,6 +19,18 @@ impl Service {
 	/// user IDs, and closes the read before any caller starts changing users or
 	/// rooms. Refuses an oversized or corrupt inventory without a partial list.
 	pub async fn bounded_local_users(&self) -> Result<Vec<OwnedUserId>> {
+		self.bounded_users(true).await
+	}
+
+	/// A complete registered-user inventory, including inactive accounts, with
+	/// the same 1,024-row / 128 KiB retained-ID limits as the local inventory.
+	/// Refuses overflow, malformed IDs and storage errors without a partial
+	/// list.
+	pub async fn bounded_registered_users(&self) -> Result<Vec<OwnedUserId>> {
+		self.bounded_users(false).await
+	}
+
+	async fn bounded_users(&self, local_only: bool) -> Result<Vec<OwnedUserId>> {
 		let rows = self
 			.db
 			.userid_password
@@ -33,7 +45,7 @@ impl Service {
 				return Err(inventory_limit());
 			}
 			scanned = scanned.saturating_add(1);
-			if password.is_empty() {
+			if local_only && password.is_empty() {
 				continue;
 			}
 			bytes = bytes.saturating_add(user.as_bytes().len());
