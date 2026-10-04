@@ -363,6 +363,40 @@ async fn malformed_timeline(
 	);
 	map.raw_put(&id, saved.as_slice()).await?;
 	services.clear_cache().await;
+	for (field, replacement) in
+		[("event_id", newest.as_str()), ("room_id", "!timeline-foreign:test.local")]
+	{
+		let mut corrupt: Value = serde_json::from_slice(&saved)?;
+		corrupt[field] = json!(replacement);
+		let corrupt = serde_json::to_vec(&corrupt)?;
+		map.raw_put(&id, corrupt.as_slice()).await?;
+		services.clear_cache().await;
+		sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+		assert_eq!(
+			map.get(&id).await?.as_ref(),
+			corrupt.as_slice(),
+			"timeline binding refusal preserves the stored event"
+		);
+		map.raw_put(&id, saved.as_slice()).await?;
+		services.clear_cache().await;
+	}
+	let indices = &services.db["eventid_pduid"];
+	let index = indices.get(older.as_bytes()).await?.to_vec();
+	indices.remove(older.as_bytes()).await?;
+	services.clear_cache().await;
+	sync(client, Some(since), http::StatusCode::INTERNAL_SERVER_ERROR).await?;
+	assert!(
+		indices
+			.get(older.as_bytes())
+			.await
+			.expect_err("missing timeline index preserved")
+			.is_not_found(),
+		"missing accepted timeline binding cannot disappear from sync"
+	);
+	indices
+		.raw_put(older.as_bytes(), index.as_slice())
+		.await?;
+	services.clear_cache().await;
 	let body = sync(client, Some(since), http::StatusCode::OK).await?;
 	assert!(
 		contains(&body, "join", room, older) && contains(&body, "join", room, newest),

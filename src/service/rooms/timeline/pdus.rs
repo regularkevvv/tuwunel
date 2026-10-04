@@ -4,7 +4,7 @@ use futures::{
 };
 use ruma::{MilliSecondsSinceUnixEpoch, RoomId, UInt, UserId, api::Direction};
 use tuwunel_core::{
-	Result, at, err, implement,
+	Error, Result, at, err, implement,
 	matrix::pdu::{PduCount, PduEvent},
 	trace,
 	utils::{
@@ -81,7 +81,7 @@ pub fn pdus_near_ts(
 				.map_ok(|pdu| (pdu_id, pdu))
 				.await
 		})
-		.ready_and_then(move |item| Self::each_pdu(item, user_id))
+		.ready_and_then(move |item| Self::each_pdu(item, user_id, room_id))
 }
 
 #[implement(super::Service)]
@@ -155,7 +155,7 @@ pub fn pdus<'a>(
 				.pduid_pdu
 				.raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
-				.ready_and_then(move |item| Self::each_slice(item, user_id))
+				.and_then(move |item| self.each_slice(item, user_id, room_id))
 		})
 		.try_flatten_stream()
 }
@@ -178,7 +178,7 @@ pub fn pdus_rev<'a>(
 				.pduid_pdu
 				.rev_raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
-				.ready_and_then(move |item| Self::each_slice(item, user_id))
+				.and_then(move |item| self.each_slice(item, user_id, room_id))
 		})
 		.try_flatten_stream()
 }
@@ -197,18 +197,40 @@ pub fn outlier_pdus_raw(&self) -> impl Stream<Item = Result<Val<'_>>> + Send {
 }
 
 #[implement(super::Service)]
-fn each_slice((pdu_id, pdu): KeyVal<'_>, user_id: Option<&UserId>) -> Result<PdusIterItem> {
-	let pdu_id: RawPduId = pdu_id.into();
-	let pdu = serde_json::from_slice::<PduEvent>(pdu)?;
-
-	Self::each_pdu((pdu_id, pdu), user_id)
+async fn each_slice(
+	&self,
+	(pdu_id, pdu): KeyVal<'_>,
+	user_id: Option<&UserId>,
+	room_id: &RoomId,
+) -> Result<PdusIterItem> {
+	let pdu_id = RawPduId::from_bytes(pdu_id)?;
+	let pdu = serde_json::from_slice::<PduEvent>(pdu)
+		.map_err(|_| Error::bad_database("Invalid stored timeline event"))?;
+	let accepted_id = self
+		.get_pdu_id(&pdu.event_id)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("Missing stored timeline event index")
+			} else {
+				error
+			}
+		})?;
+	if accepted_id != pdu_id {
+		return Err(Error::bad_database("Mismatched stored timeline event index"));
+	}
+	Self::each_pdu((pdu_id, pdu), user_id, room_id)
 }
 
 #[implement(super::Service)]
 fn each_pdu(
 	(pdu_id, mut pdu): (RawPduId, PduEvent),
 	user_id: Option<&UserId>,
+	room_id: &RoomId,
 ) -> Result<PdusIterItem> {
+	if pdu.room_id.as_str() != room_id.as_str() {
+		return Err(Error::bad_database("Mismatched stored timeline event room"));
+	}
 	pdu.remove_transaction_id_unless_sender(user_id);
 	pdu.add_age().log_err().ok();
 
