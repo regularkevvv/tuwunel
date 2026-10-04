@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use futures::{
-	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+	Stream, StreamExt, TryFutureExt, TryStreamExt,
 	future::{Either, ready},
 	pin_mut,
 };

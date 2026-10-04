@@ -8,7 +8,7 @@ use std::{
 	},
 };
 
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::join};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, future::join};
 use ruma::{
 	EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
 	events::{StateEventType, TimelineEventType},
