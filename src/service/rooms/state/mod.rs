@@ -1,6 +1,6 @@
 mod prune;
 
-use std::{fmt::Write, iter::once, sync::Arc};
+use std::{fmt::Write, iter::once, pin::pin, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::join_all};
@@ -8,7 +8,11 @@ pub(crate) use prune::prune_goal;
 pub use prune::{PruneSummary, Trigger};
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId, UserId,
-	events::{AnyStrippedStateEvent, StateEventType, TimelineEventType},
+	api::error::{ErrorKind, LimitExceededErrorData},
+	events::{
+		AnyStrippedStateEvent, StateEventType, TimelineEventType,
+		room::power_levels::RoomPowerLevelsEventContent,
+	},
 	room_version_rules::AuthorizationRules,
 	serde::Raw,
 };
@@ -16,15 +20,16 @@ use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Error, Event, PduEvent, Result,
 	error::inspect_debug_log,
-	implement,
+	http, implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
 	result::{AndThenRef, FlatOk},
 	smallvec::SmallVec,
 	trace,
 	utils::{
 		IterStream, MutexMap, MutexMapGuard, calculate_hash,
+		json::serialized_len,
 		mutex_map::Guard,
-		stream::{BroadbandExt, TryBroadbandExt, TryIgnore, WidebandExt},
+		stream::{TryIgnore, WidebandExt},
 	},
 	warn,
 };
@@ -435,88 +440,46 @@ where
 
 	let auth_types =
 		auth_types_for_event(kind, sender, state_key, content, auth_rules, include_create)?;
-	let selected = auth_types
-		.iter()
-		.stream()
-		.broad_then(async |key| {
-			let short = match self
-				.services
-				.short
-				.get_shortstatekey(&key.0, &key.1)
-				.await
-			{
-				| Ok(short) => Some(short),
-				| Err(error) if error.is_not_found() => None,
-				| Err(error) => return Err(error),
-			};
-			Ok((short, key))
-		})
-		.try_collect::<Vec<_>>()
-		.await?;
-	let check_all_keys = selected.iter().any(|(short, _)| short.is_none());
-
-	// Select from the actual snapshot. A missing forward key lookup cannot
-	// establish absence: the snapshot may still reference that state cell.
-	// Normally all auth keys are known, so only those cells need reverse reads.
-	// If any dictionary row is absent, inspect the snapshot's keys to distinguish
-	// a genuinely absent optional event from a torn forward mapping.
-	let (state_keys, event_ids) = self
-		.services
-		.state_accessor
-		.state_full_shortids(shortstatehash)
-		.try_fold((Vec::new(), Vec::new()), async |(mut keys, mut ids), (key, id)| {
-			if check_all_keys
-				|| selected
-					.iter()
-					.any(|(short, _)| *short == Some(key))
-			{
-				keys.push(key);
-				ids.push(id);
-			}
-			Ok((keys, ids))
-		})
-		.await?;
-
-	self.services
-		.short
-		.multi_get_statekey_from_short(state_keys.iter().copied().stream())
-		.zip(state_keys.iter().copied().stream())
-		.zip(event_ids.into_iter().stream())
-		.map(|((key, short), id)| {
-			let key = key
-				.map_err(|_| Error::bad_database("Incomplete current-state auth key mapping"))?;
-			if selected
-				.iter()
-				.any(|(known, expected)| *known == Some(short) && **expected != key)
-			{
-				return Err(Error::bad_database("Mismatched current-state auth key mapping"));
-			}
-			Ok((key, id))
-		})
-		.try_filter_map(async |(key, id)| Ok(auth_types.contains(&key).then_some((key, id))))
-		.broad_and_then(async |(key, id)| {
-			let event_id: OwnedEventId = self
-				.services
-				.short
-				.get_eventid_from_short(id)
-				.await?;
-			let pdu = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete current-state auth event"))?;
-			if pdu.room_id() != room_id
-				|| pdu.event_id() != event_id
-				|| pdu.event_type().to_cow_str() != key.0.to_cow_str()
-				|| pdu.state_key() != Some(key.1.as_str())
-			{
-				return Err(Error::bad_database("Mismatched current-state auth event"));
-			}
-			Ok((key, pdu))
-		})
-		.try_collect()
-		.await
+	// Derive optional auth cells from the complete immutable snapshot. Forward
+	// shortcuts cannot prove absence, and no malformed stored cell may disappear
+	// before auth checking or be blamed on the incoming event.
+	let mut state = pin!(
+		self.services
+			.state_accessor
+			.state_full_pdus_strict(shortstatehash)
+	);
+	let mut auth_events = StateMap::new();
+	let mut source_bytes = 0_usize;
+	while let Some((key, pdu)) = state.try_next().await? {
+		source_bytes = source_bytes.saturating_add(
+			serialized_len(pdu.as_pdu())
+				.map_err(|_| Error::bad_database("Invalid auth state serialization"))?,
+		);
+		if source_bytes > 512 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Auth state byte limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		if pdu.room_id() != room_id {
+			return Err(Error::bad_database("Mismatched current-state auth room"));
+		}
+		if !auth_types.contains(&key) {
+			continue;
+		}
+		if key.0 == StateEventType::RoomPowerLevels {
+			pdu.get_content::<RoomPowerLevelsEventContent>()
+				.map_err(|_| Error::bad_database("Invalid stored auth power levels"))?;
+		}
+		if auth_events
+			.insert(key, pdu.as_pdu().clone())
+			.is_some()
+		{
+			return Err(Error::bad_database("Duplicate current-state auth key"));
+		}
+	}
+	Ok(auth_events)
 }
 
 #[implement(Service)]
