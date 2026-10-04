@@ -98,7 +98,7 @@ async fn corruption(services: &Services, room: &RoomId) -> Result {
 			let mut key = serialize_key((room, Interfix))?.to_vec();
 			key.extend_from_slice(suffix);
 			services.db[map]
-				.raw_put(key.as_slice(), 1_u64.to_be_bytes())
+				.insert(key.as_slice(), 1_u64.to_be_bytes())
 				.await?;
 			let error = services
 				.state_cache
