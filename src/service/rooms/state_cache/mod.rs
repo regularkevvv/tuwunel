@@ -3,6 +3,7 @@ mod invite_inventory;
 mod recount;
 #[cfg(test)]
 mod recount_tests;
+mod recovery;
 #[cfg(test)]
 mod tests;
 mod update;
@@ -978,7 +979,7 @@ pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Re
 		})
 		.await;
 
-	self.commit_membership_locked(room_id, txn, &guard)
+	self.commit_membership_erasure_locked(room_id, txn, &guard)
 		.await
 }
 

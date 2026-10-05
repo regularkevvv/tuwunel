@@ -16,7 +16,7 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Json, Txn, serialize_key, serialize_val};
 
-const RECOUNT_PENDING: &str = "membership_recount_pending";
+pub(super) const RECOUNT_PENDING: &str = "membership_recount_pending";
 
 /// Optional stripped room state attached to invite and knock transitions.
 pub type StrippedRoomState = Option<Vec<Raw<AnyStrippedStateEvent>>>;
@@ -284,11 +284,38 @@ pub(super) async fn commit_membership_locked(
 	&self,
 	room_id: &RoomId,
 	mut txn: Txn,
-	_guard: &super::MembershipGuard,
+	guard: &super::MembershipGuard,
 ) -> Result {
 	// Never publish membership without its repair obligation, including bulk
 	// updates that defer recounting and a kill before the first recount starts.
 	txn.put(&self.services.db["global"], (RECOUNT_PENDING, room_id), &[0_u8; 0][..]);
+	self.commit_membership_txn_locked(room_id, txn, guard)
+		.await
+}
+
+/// Counter erasure must not leave an obligation that recreates deleted counts.
+/// Clear the pending marker and generation in the same counter/index commit.
+#[implement(super::Service)]
+pub(super) async fn commit_membership_erasure_locked(
+	&self,
+	room_id: &RoomId,
+	mut txn: Txn,
+	guard: &super::MembershipGuard,
+) -> Result {
+	txn.del(&self.services.db["global"], (RECOUNT_PENDING, room_id));
+	txn.del(&self.services.db["global"], (super::recount::RECOUNT_GENERATION, room_id));
+	self.commit_membership_txn_locked(room_id, txn, guard)
+		.await
+}
+
+/// Invalidate cached membership even when the commit outcome is uncertain.
+#[implement(super::Service)]
+async fn commit_membership_txn_locked(
+	&self,
+	room_id: &RoomId,
+	txn: Txn,
+	_guard: &super::MembershipGuard,
+) -> Result {
 	let committed = txn.execute().await;
 
 	self.appservice_in_room_cache
