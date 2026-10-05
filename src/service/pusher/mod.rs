@@ -28,15 +28,18 @@ use tuwunel_core::{
 	matrix::Event,
 	utils::{
 		MutexMap,
-		stream::{BroadbandExt, ReadyExt, TryIgnore},
+		stream::{BroadbandExt, TryIgnore},
 	},
 };
 use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Json, Map};
 use url::Url;
 
-pub use self::append::Notified;
 use self::badge::SentBadges;
 pub(crate) use self::notification::NotificationGuard;
+pub use self::{
+	append::Notified,
+	notification::{NotificationState, checked_add, count_uint},
+};
 
 /// The events an event relates to, keyed by relation type, for MSC3664.
 type RelatedEvents = BTreeMap<String, FlattenedJson>;
@@ -321,24 +324,59 @@ pub fn get_pushkeys<'a>(&'a self, sender: &'a UserId) -> impl Stream<Item = &str
 		.map(|(_, pushkey): (Ignore, &str)| pushkey)
 }
 
+/// Checked, prefix-bounded reverse notification page. `from` is exclusive.
 #[implement(Service)]
-#[tracing::instrument(level = "debug", skip_all)]
-pub fn get_notifications<'a>(
-	&'a self,
-	sender: &'a UserId,
+pub async fn get_notifications(
+	&self,
+	sender: &UserId,
 	from: Option<u64>,
-) -> impl Stream<Item = (u64, Notified)> + Send + 'a {
-	let from = from
-		.map(|from| from.saturating_sub(1))
-		.unwrap_or(u64::MAX);
-
-	self.db
+	limit: usize,
+) -> Result<Vec<(u64, Notified, usize)>> {
+	let from = match from {
+		| Some(0) => return Ok(Vec::new()),
+		| Some(from) if from > i64::MAX.unsigned_abs() =>
+			return Err(err!(Request(InvalidParam("Invalid notification cursor")))),
+		| Some(from) => from.saturating_sub(1),
+		| None => u64::MAX,
+	};
+	if limit > 64 {
+		return Err(err!(Request(InvalidParam("Notification page limit exceeds 64"))));
+	}
+	let _guard = self.lock_notification_user(sender).await;
+	let prefix = tuwunel_database::serialize_key((sender, Interfix))?;
+	let from = tuwunel_database::serialize_key((sender, from))?;
+	let keys = self
+		.db
 		.useridcount_notification
-		.rev_stream_from(&(sender, from))
-		.ignore_err()
-		.map(|item: ((&UserId, u64), _)| (item.0, item.1))
-		.ready_take_while(move |((user_id, _count), _)| sender == *user_id)
-		.map(|((_, count), notified)| (count, notified))
+		.raw_keys_prefix_reverse(&prefix, &from, limit)
+		.await?;
+	let mut page = Vec::with_capacity(keys.len());
+	for key in keys {
+		let (user, count): (&UserId, u64) = tuwunel_database::deserialize_from_slice(&key)?;
+		if user != sender
+			|| count == 0
+			|| count > i64::MAX.unsigned_abs()
+			|| tuwunel_database::serialize_key((user, count))?.as_slice() != key.as_slice()
+		{
+			return Err(tuwunel_core::Error::bad_database("Invalid notification key"));
+		}
+		let value = self.db.useridcount_notification.get(&key).await?;
+		if value.len() > 64 * 1024 {
+			return Err(tuwunel_core::Error::bad_database("Notification metadata exceeds limit"));
+		}
+		let notified: Notified = serde_json::from_slice(&value)
+			.map_err(|_| tuwunel_core::Error::bad_database("Invalid notification metadata"))?;
+		if notified.actions.len() > 64
+			|| UInt::new(notified.ts).is_none()
+			|| notified.sroomid == 0
+		{
+			return Err(tuwunel_core::Error::bad_database(
+				"Invalid notification metadata fields",
+			));
+		}
+		page.push((count, notified, key.len().saturating_add(value.len())));
+	}
+	Ok(page)
 }
 
 #[implement(Service)]

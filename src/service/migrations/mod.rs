@@ -52,6 +52,7 @@ mod injectivity;
 mod migrate_media;
 mod migrate_profile_keys;
 mod moderation;
+mod notification_cutoffs;
 mod rebuild_roomid_tscount_pducount;
 mod remove_remote_media_userid;
 mod retroactively_fix_bad_data_from_roomuserid_joined;
@@ -267,6 +268,9 @@ async fn fresh(services: &Services) -> Result {
 		.await?;
 	db["global"]
 		.insert(b"media_usage_counters", [])
+		.await?;
+	db["global"]
+		.insert(b"notification_read_cutoffs_v1", [])
 		.await?;
 	mark_clean_injectivity(services).await?;
 
@@ -485,6 +489,10 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 			.insert(b"media_usage_counters", [])
 			.await?;
 	}
+
+	notification_cutoffs::migrate(services, discovered < 19 || foreign_lineage)
+		.boxed()
+		.await?;
 
 	// Claim our schema and lineage together after the import finishes. Retaining
 	// the foreign marker would let older builds bypass their newer-schema gate

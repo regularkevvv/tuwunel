@@ -618,6 +618,7 @@ async fn run_cases(services: &Services) -> Result {
 	};
 
 	reject_bad_url(&fixture).await?;
+	count_read_failure_refuses_gateway_and_preserves_badge(&fixture, &room_id).await?;
 	full_format_delivery(&fixture).await?;
 	event_id_only_delivery(&fixture).await?;
 	gateway_url_paths(&fixture).await?;
@@ -629,6 +630,61 @@ async fn run_cases(services: &Services) -> Result {
 	badge_count_opt_out(&fixture).await?;
 	badge_delivery_memo(&fixture, &room_id).await?;
 	badge_bypasses_suppression(&fixture).await
+}
+
+/// A failed badge source must send nothing, leave its sent-value memo alone,
+/// and permit the identical send after storage repair.
+async fn count_read_failure_refuses_gateway_and_preserves_badge(
+	fixture: &Fixture<'_>,
+	room: &RoomId,
+) -> Result {
+	let config = StubPusherConfig::new(r#"{"rejected":[]}"#);
+	let (pusher, _action, mut rx, _stub) =
+		stub_pusher(fixture, "pk-corrupt-count", config).await?;
+	let service = &fixture.services.pusher;
+	let map = &fixture.services.db["userroomid_notificationcount"];
+	let key = tuwunel_database::serialize_key((fixture.user, room))?;
+	let saved = map.get(&key).await?.to_vec();
+	service
+		.send_badge_notice(fixture.user, &pusher)
+		.await?;
+	let (_, body) = recv(&mut rx).await?;
+	let baseline: Value = serde_json::from_slice(&body)?;
+	let baseline = baseline["notification"]["counts"]["unread"].clone();
+	for corrupt in [vec![], vec![0; 7], vec![0; 9], u64::MAX.to_be_bytes().to_vec()] {
+		map.insert(&key, &corrupt).await?;
+		service
+			.send_badge_notice(fixture.user, &pusher)
+			.await
+			.expect_err("corrupt badge cannot return cache success");
+		service
+			.send_push_notice(fixture.user, &pusher, fixture.ruleset, fixture.pdu)
+			.await
+			.expect_err("corrupt total cannot send a fabricated badge");
+		assert!(
+			matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+			"failed reader must not contact gateway"
+		);
+		assert_eq!(map.get(&key).await?.as_ref(), corrupt);
+	}
+	map.insert(&key, &saved).await?;
+	service
+		.send_badge_notice(fixture.user, &pusher)
+		.await?;
+	assert!(
+		matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+		"refused reads do not replace the accepted badge memo"
+	);
+	service
+		.send_push_notice(fixture.user, &pusher, fixture.ruleset, fixture.pdu)
+		.await?;
+	let (_, body) = recv(&mut rx).await?;
+	let retry: Value = serde_json::from_slice(&body)?;
+	assert_eq!(
+		retry["notification"]["counts"]["unread"], baseline,
+		"repaired retry sends actual count"
+	);
+	Ok(())
 }
 
 /// Synthetic group rooms still need a consistent push-rule count context.
@@ -915,7 +971,7 @@ async fn counts_only_delivery(
 
 	let remaining = pusher
 		.global_notification_count(fixture.user)
-		.await;
+		.await?;
 
 	if remaining != 0 {
 		return Err!("reset left an account-wide unread total of {remaining}");
@@ -964,7 +1020,7 @@ async fn account_wide_count_delivery(fixture: &Fixture<'_>, room_id: &RoomId) ->
 	assert_eq!(thread_notification.get("counts"), Some(&json!({"unread": 7})));
 
 	unread
-		.put((fixture.user, room_id), u64::MAX)
+		.put((fixture.user, room_id), u64::from(UInt::MAX).saturating_sub(7))
 		.await?;
 
 	let (_, body) = deliver(fixture, "pk-badge-max", false, true, r#"{"rejected":[]}"#).await?;

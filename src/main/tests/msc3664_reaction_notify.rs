@@ -139,7 +139,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let before = services
 		.pusher
 		.notification_count(&author, &room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -187,7 +187,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let baseline = services
 		.pusher
 		.notification_count(&author, &room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -281,7 +281,7 @@ async fn replies_notify(
 	let before = services
 		.pusher
 		.highlight_count(author, room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -306,7 +306,7 @@ async fn replies_notify(
 	let baseline = services
 		.pusher
 		.highlight_count(author, room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -361,7 +361,7 @@ async fn cross_room_relations_are_not_followed(
 	let baseline = services
 		.pusher
 		.notification_count(author, room)
-		.await;
+		.await?;
 
 	reader
 		.send(

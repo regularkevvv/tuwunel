@@ -1,14 +1,14 @@
 mod bump_stamp;
 mod heroes;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use futures::{
 	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 	future::{join, join3, join4},
 };
 use ruma::{
-	JsOption, MxcUri, OwnedEventId, OwnedMxcUri, RoomId, UInt, UserId,
+	JsOption, MxcUri, OwnedMxcUri, RoomId, UInt, UserId,
 	api::client::sync::sync_events::{
 		UnreadNotificationsCount,
 		v5::{DisplayName, response, response::Heroes},
@@ -51,7 +51,6 @@ pub(super) enum Failure {
 	Payload(Error),
 }
 
-type ThreadCounts = BTreeMap<OwnedEventId, (u64, u64)>;
 type EventTypeString = SmallString<[u8; 32]>;
 pub(super) type RoomDetails = (usize, HashSet<(StateEventType, StateKey)>);
 
@@ -171,18 +170,24 @@ pub(super) async fn handle_room(
 	let meta = room_meta_future(services, room_id);
 	let events = join3(timeline, required_state, invite_state);
 	let member_counts = member_counts_future(services, room_id, is_invite);
-	let notification_counts = notification_counts_future(services, sender_user, room_id);
+	let notification_counts = services
+		.pusher
+		.notification_state(sender_user, room_id);
 	let (
 		(room_name, room_avatar),
 		(timeline, required_state, invite_state),
 		member_counts,
-		(highlight_count, notification_count, _last_notification_read, thread_counts),
+		notification_counts,
 	) = join4(meta, events, member_counts, notification_counts)
 		.boxed()
 		.await;
 	let timeline = timeline.map_err(Failure::Payload)?;
 	let required_state = required_state.map_err(Failure::Payload)?;
 	let (joined_count, invited_count) = member_counts.map_err(Failure::Payload)?;
+	let (notification_count, highlight_count) = notification_counts
+		.map_err(Failure::Payload)?
+		.totals()
+		.map_err(Failure::Payload)?;
 
 	let (heroes, heroes_name, heroes_avatar) = resolve_heroes(
 		services,
@@ -216,11 +221,10 @@ pub(super) async fn handle_room(
 		bump_stamp,
 		joined_count,
 		invited_count,
-		unread_notifications: merge_unread_notifications(
-			highlight_count,
-			notification_count,
-			&thread_counts,
-		),
+		unread_notifications: UnreadNotificationsCount {
+			highlight_count: Some(highlight_count),
+			notification_count: Some(notification_count),
+		},
 	})
 }
 
@@ -386,56 +390,6 @@ fn response_count(
 			.map_err(|_| Error::bad_database(invalid)),
 		| Err(error) if is_invite && error.is_not_found() => Ok(None),
 		| Err(error) => Err(error),
-	}
-}
-
-fn notification_counts_future<'a>(
-	services: &'a Services,
-	sender_user: &'a UserId,
-	room_id: &'a RoomId,
-) -> impl Future<Output = (Option<UInt>, Option<UInt>, Result<u64>, ThreadCounts)> + Send + 'a {
-	let highlight_count = services
-		.pusher
-		.highlight_count(sender_user, room_id)
-		.map(TryInto::try_into)
-		.map(Result::ok);
-
-	let notification_count = services
-		.pusher
-		.notification_count(sender_user, room_id)
-		.map(TryInto::try_into)
-		.map(Result::ok);
-
-	let last_read_count = services
-		.pusher
-		.last_notification_read(sender_user, room_id);
-
-	let thread_counts = services
-		.pusher
-		.thread_notification_counts(sender_user, room_id);
-
-	join4(highlight_count, notification_count, last_read_count, thread_counts)
-}
-
-// MSC3771/MSC3773: SSS v5 has no per-thread bucket; fold into the room total.
-fn merge_unread_notifications(
-	highlight_count: Option<UInt>,
-	notification_count: Option<UInt>,
-	thread_counts: &ThreadCounts,
-) -> UnreadNotificationsCount {
-	let (thread_notifications, thread_highlights) = thread_counts
-		.values()
-		.fold((0_u64, 0_u64), |(n, h), &(notifs, hl)| {
-			(n.saturating_add(notifs), h.saturating_add(hl))
-		});
-
-	let merge = |total: u64| {
-		move |count: UInt| count.saturating_add(UInt::try_from(total).unwrap_or_default())
-	};
-
-	UnreadNotificationsCount {
-		highlight_count: highlight_count.map(merge(thread_highlights)),
-		notification_count: notification_count.map(merge(thread_notifications)),
 	}
 }
 

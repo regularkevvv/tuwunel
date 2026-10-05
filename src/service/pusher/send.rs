@@ -1,6 +1,6 @@
 use futures::{
 	FutureExt,
-	future::{join, join4},
+	future::{join, join3},
 };
 use ruma::{
 	UInt, UserId,
@@ -14,7 +14,7 @@ use ruma::{
 	push::{Action, HighlightTweakValue, HttpPusherData, PushFormat, Ruleset, Tweak},
 };
 use serde_json::Value;
-use tuwunel_core::{Result, err, error, implement, matrix::Event, trace, utils::BoolExt};
+use tuwunel_core::{Result, err, error, implement, matrix::Event, trace};
 use url::Url;
 
 use super::Evaluate;
@@ -129,7 +129,7 @@ pub async fn send_badge_notice(&self, user_id: &UserId, pusher: &Pusher) -> Resu
 		return Ok(());
 	}
 
-	let unread = UInt::new(self.global_notification_count(user_id).await).unwrap_or(UInt::MAX);
+	let unread = super::count_uint(self.global_notification_count(user_id).await?)?;
 
 	if self.sent_badge(user_id, &pusher.ids.pushkey) == Some(unread) {
 		return Ok(());
@@ -186,13 +186,13 @@ async fn send_http_event_notice<Pdu: Event>(
 	notify.event_id = Some(event.event_id().to_owned());
 	notify.room_id = Some(event.room_id().to_owned());
 
-	let unread = badge_count_disabled(http)
-		.is_false()
-		.then_async(async || {
-			UInt::new(self.global_notification_count(user_id).await).unwrap_or(UInt::MAX)
-		});
+	let unread = if badge_count_disabled(http) {
+		None
+	} else {
+		Some(super::count_uint(self.global_notification_count(user_id).await?)?)
+	};
 
-	let unread = if !event_id_only {
+	if !event_id_only {
 		if *event.kind() == TimelineEventType::RoomEncrypted
 			|| tweaks.iter().any(|t| {
 				matches!(t, Tweak::Highlight(HighlightTweakValue::Yes) | Tweak::Sound(_))
@@ -209,7 +209,7 @@ async fn send_http_event_notice<Pdu: Event>(
 			notify.user_is_target = event.state_key() == Some(event.sender().as_str());
 		}
 
-		let (display_name, room_name, room_alias, unread) = join4(
+		let (display_name, room_name, room_alias) = join3(
 			self.services.profile.displayname(event.sender()),
 			self.services
 				.state_accessor
@@ -217,18 +217,13 @@ async fn send_http_event_notice<Pdu: Event>(
 			self.services
 				.state_accessor
 				.get_canonical_alias(event.room_id()),
-			unread,
 		)
 		.await;
 
 		notify.sender_display_name = display_name.ok();
 		notify.room_name = room_name.ok();
 		notify.room_alias = room_alias.ok();
-
-		unread
-	} else {
-		unread.await
-	};
+	}
 
 	if let Some(unread) = unread {
 		notify.counts = NotificationCounts::new_explicit(Some(unread), None);

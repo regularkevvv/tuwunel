@@ -98,6 +98,29 @@ pub async fn raw_keys_prefix_after(
 	.await
 }
 
+/// A bounded reverse key page within `prefix`, starting at `from` inclusive.
+/// No values or foreign-prefix rows are materialized; the cursor closes here.
+#[implement(super::Map)]
+pub async fn raw_keys_prefix_reverse(
+	self: &Arc<Self>,
+	prefix: &[u8],
+	from: &[u8],
+	limit: usize,
+) -> Result<Vec<Vec<u8>>> {
+	if !from.starts_with(prefix) {
+		return Ok(Vec::new());
+	}
+	seek_stream_bounded::<stream::KeysRev<'_>, _>(self, Direction::Reverse, Some(from), Bound {
+		within: Some(prefix),
+		cap: Some(limit),
+	})
+	.try_take_while(|key| future::ok(key.starts_with(prefix)))
+	.take(limit)
+	.map_ok(<[u8]>::to_vec)
+	.try_collect()
+	.await
+}
+
 /// At most `limit` keys in key order from `from`, inclusive, or from the
 /// start of the map when it is `None`. Like [`Map::raw_rows_after`], the scan
 /// reads no more than `limit` rows and is closed before this returns; a

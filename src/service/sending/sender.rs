@@ -2021,11 +2021,28 @@ impl Service {
 		debug!(?user_id, pushkey, rooms = rooms.len(), "Flushing suppressed pushes ({reason})");
 
 		for (room_id, pdu_ids) in rooms {
-			let unread = self
+			let unread = match self
 				.services
 				.pusher
 				.notification_count(user_id, &room_id)
-				.await;
+				.await
+			{
+				| Ok(unread) => unread,
+				| Err(error) => {
+					for pdu_id in pdu_ids {
+						self.services
+							.pusher
+							.queue_suppressed_push(user_id, pushkey, &room_id, pdu_id);
+					}
+					warn!(
+						?user_id,
+						?room_id,
+						?error,
+						"Unread count failed; suppressed pushes retained"
+					);
+					continue;
+				},
+			};
 
 			if unread == 0 {
 				trace!(?user_id, ?room_id, "Skipping suppressed push flush: no unread");
@@ -2033,14 +2050,26 @@ impl Service {
 			}
 
 			for pdu_id in pdu_ids {
-				let Ok(pdu) = self
+				let pdu = match self
 					.services
 					.timeline
 					.get_pdu_from_id(&pdu_id)
 					.await
-				else {
-					debug!(?user_id, ?pdu_id, "Suppressed PDU missing during flush");
-					continue;
+				{
+					| Ok(pdu) => pdu,
+					| Err(error) if error.is_not_found() => continue,
+					| Err(error) => {
+						self.services
+							.pusher
+							.queue_suppressed_push(user_id, pushkey, &room_id, pdu_id);
+						warn!(
+							?user_id,
+							?room_id,
+							?error,
+							"Suppressed PDU read failed; push retained"
+						);
+						continue;
+					},
 				};
 
 				if pdu.is_redacted() {

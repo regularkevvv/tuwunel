@@ -1284,6 +1284,40 @@ async fn prefix_key_pages_resume_after_deleted_binary_keys() -> Result {
 }
 
 #[tokio::test]
+async fn reverse_prefix_key_pages_are_inclusive_bounded_and_isolated() -> Result {
+	let fixture = new_test_database("reverse-prefix-keys-page").await?;
+	let map = fixture.database.get("global")?;
+	let keys: &[&[u8]] = &[b"o\xff", b"p\0", b"p\0\0", b"p\0\xff", b"p\xff", b"q\0"];
+	let mut txn = fixture.database.txn();
+	for key in keys {
+		txn.insert_raw(map, key, b"opaque");
+	}
+	txn.execute().await?;
+	assert!(
+		map.raw_keys_prefix_reverse(b"p\0", b"p\0\xff", 0)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(
+		map.raw_keys_prefix_reverse(b"p\0", b"p\0\xff", 2)
+			.await?,
+		[b"p\0\xff".to_vec(), b"p\0\0".to_vec()]
+	);
+	assert_eq!(
+		map.raw_keys_prefix_reverse(b"p\0", b"p\0\xfe", 5)
+			.await?,
+		[b"p\0\0".to_vec(), b"p\0".to_vec()]
+	);
+	assert!(
+		map.raw_keys_prefix_reverse(b"p\0", b"o\xff", 2)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(map.get(b"q\0").await?.as_ref(), b"opaque");
+	Ok(())
+}
+
+#[tokio::test]
 async fn txn_insert_raw_preserves_bytes() -> Result {
 	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
 
