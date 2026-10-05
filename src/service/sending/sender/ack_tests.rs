@@ -106,7 +106,7 @@ async fn explicitly_cancelled_selected_row_does_not_expand_ack_membership() -> R
 	verify(Mode::Cancelled).await
 }
 
-async fn rows(services: &Services, map: &str) -> Result<Rows> {
+pub(super) async fn rows(services: &Services, map: &str) -> Result<Rows> {
 	services.db[map]
 		.raw_stream()
 		.map_ok(|(key, value)| (key.to_vec(), value.to_vec()))
@@ -134,7 +134,11 @@ async fn register(services: &Services, endpoint: &Endpoint) -> Result<Destinatio
 	Ok(Destination::Appservice("ack-membership".into()))
 }
 
-async fn enqueue(services: &Services, destination: &Destination, n: usize) -> Result<QueueItem> {
+pub(super) async fn enqueue(
+	services: &Services,
+	destination: &Destination,
+	n: usize,
+) -> Result<QueueItem> {
 	let event = SendingEvent::Edu(EduBuf::from_slice(&serde_json::to_vec(&json!({
 		"type":"m.typing", "room_id":"!ack:localhost",
 		"content":{"user_ids":[format!("@ack-{n}:localhost")]}
@@ -252,7 +256,7 @@ async fn verify(mode: Mode) -> Result {
 	eprintln!("ACK selected=2 unsent active before={} after={}", before.len(), after.len());
 	assert_eq!(
 		after,
-		BTreeMap::from([(tail.0.clone(), tail.1.value_bytes().to_vec())]),
+		BTreeMap::from([(tail.0.clone(), original[&tail.0].clone())]),
 		"ACK must not delete unsent active successor"
 	);
 	assert_eq!(
@@ -386,11 +390,83 @@ async fn verify_refused_ack() -> Result {
 	assert_eq!(stage, QueueRecovery::ResumePending);
 	assert_eq!(
 		rows(services, "servercurrentevent_data").await?,
-		BTreeMap::from([(tail.0, tail.1.value_bytes().to_vec())])
+		BTreeMap::from([(tail.0.clone(), active_before[&tail.0].clone())])
 	);
 	assert_eq!(rows(services, "servernameevent_data").await?, pending_before);
 	assert_eq!(futures.len(), 1, "unsent tail now owns the next attempt");
 	drop(futures);
+	fixture.finish().await;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_ack_cannot_remove_same_key_and_bytes_readmitted_after_cancellation() -> Result {
+	let fixture = Fixture::new().await?;
+	let services = &fixture.services;
+	let destination = Destination::Appservice("readmitted-pdu".into());
+	let mut bytes = [0_u8; 16];
+	bytes[7] = 1;
+	bytes[15] = 1;
+	let event = SendingEvent::Pdu(crate::rooms::timeline::RawPduId::from_bytes(&bytes)?);
+	let first = services
+		.sending
+		.db
+		.queue_requests(std::iter::once((&event, &destination)))
+		.await?;
+	let original = (first[0].clone(), event.clone());
+	services
+		.sending
+		.db
+		.mark_as_active(std::iter::once(&original))
+		.await?;
+	let acknowledgement = services
+		.sending
+		.db
+		.selected_acknowledgement(&destination, std::slice::from_ref(&event))
+		.await?;
+	services
+		.sending
+		.db
+		.delete_all_requests_for(&destination)
+		.await?;
+	let readmitted = services
+		.sending
+		.db
+		.queue_requests(std::iter::once((&event, &destination)))
+		.await?;
+	assert_eq!(readmitted, first, "actual PDU admission reuses the same queue key");
+	services
+		.sending
+		.db
+		.mark_as_active(std::iter::once(&original))
+		.await?;
+	let before = rows(services, "servercurrentevent_data").await?;
+	assert_eq!(before.len(), 1);
+	services
+		.sending
+		.db
+		.acknowledge_active(&destination, &acknowledgement)
+		.await?;
+	assert_eq!(
+		rows(services, "servercurrentevent_data").await?,
+		before,
+		"old acknowledgement must preserve the new same-key delivery"
+	);
+	let own_ack = services
+		.sending
+		.db
+		.selected_acknowledgement(&destination, std::slice::from_ref(&event))
+		.await?;
+	services
+		.sending
+		.db
+		.acknowledge_active(&destination, &own_ack)
+		.await?;
+	assert!(
+		rows(services, "servercurrentevent_data")
+			.await?
+			.is_empty()
+	);
 	fixture.finish().await;
 	Ok(())
 }

@@ -76,6 +76,9 @@ mod compose_tests;
 #[cfg(test)]
 mod ack_tests;
 
+#[cfg(test)]
+mod incarnation_tests;
+
 /// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
 /// in `peer_status` (federation only); appservice/push paths keep their own
 /// status because they are not server-keyed.
@@ -253,7 +256,7 @@ const NETBURST_BATCH: usize = 256;
 /// cursor.
 const EDU_WINDOW_COUNTS: u64 = 128;
 const EDU_ROOM_READ_CONCURRENCY: usize = 8;
-const DEQUEUE_LIMIT: usize = 48;
+const DEQUEUE_LIMIT: usize = super::data::ACTIVE_PROMOTION_LIMIT;
 const PUSH_FAILURE_STREAK: u32 = 4;
 const WAKE_OVERFLOW_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
 const WAKE_OVERFLOW_DELAY: Duration = Duration::from_secs(WAKE_OVERFLOW_DELAY_SECS);

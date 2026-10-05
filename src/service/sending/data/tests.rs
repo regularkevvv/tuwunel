@@ -118,3 +118,23 @@ fn frozen_push_tags_require_a_push_destination_and_a_valid_pdu_id() {
 	decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH])))
 		.expect_err("corrupt ID cannot disappear as an EDU");
 }
+
+#[test]
+fn identity_envelopes_are_active_only_and_reject_corrupt_headers() -> Result {
+	let key = b"remote.example\xff0000000000000001";
+	let event = SendingEvent::Edu(super::super::EduBuf::from_slice(b"{}"));
+	let framed = super::active::encode(&event, 1)?;
+	assert_eq!(decode_outgoing(Ok((key, &framed)))?.1, event);
+	decode_sending(Ok((key, &framed))).expect_err("pending rows cannot own active identities");
+	for end in 1..10 {
+		decode_outgoing(Ok((key, &framed[..end])))
+			.expect_err("a truncated identity must not be an EDU or PDU");
+	}
+	let mut corrupt = framed;
+	corrupt[1] = 2;
+	decode_outgoing(Ok((key, &corrupt))).expect_err("unknown envelope version");
+	corrupt[1] = 1;
+	corrupt[2..10].fill(0);
+	decode_outgoing(Ok((key, &corrupt))).expect_err("zero identity");
+	Ok(())
+}

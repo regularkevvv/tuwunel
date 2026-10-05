@@ -7,9 +7,10 @@ use futures::{Stream, StreamExt, TryStreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
 use tokio::sync::Mutex;
 use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
-use tuwunel_database::{Database, Deserialized, Map, Row, Txn, deserialize_from_slice};
+use tuwunel_database::{Database, Deserialized, Get, Map, Row, Txn, deserialize_from_slice};
 
 mod ack;
+mod active;
 pub(super) use ack::ActiveAcknowledgement;
 
 use super::{
@@ -21,6 +22,7 @@ pub(super) type OutgoingItem = (Key, SendingEvent, Destination);
 pub(super) type SendingItem = (Key, SendingEvent);
 pub(super) type QueueItem = (Key, SendingEvent);
 pub(super) type Key = Vec<u8>;
+pub(super) const ACTIVE_PROMOTION_LIMIT: usize = 48;
 
 pub struct Data {
 	servercurrentevent_data: Arc<Map>,
@@ -66,18 +68,63 @@ impl Data {
 
 	pub(super) async fn mark_as_active<'a, I>(&self, events: I) -> Result
 	where
-		I: Iterator<Item = &'a QueueItem>,
+		I: Iterator<Item = &'a QueueItem> + Send,
 	{
 		let _guard = self.active_write.lock().await;
-		events
+		let events = events
 			.filter(|(key, _)| !key.is_empty())
-			.fold(self.db.txn(), |mut txn, (key, val)| {
-				txn.insert_raw(&self.servercurrentevent_data, key, val.value_bytes());
-				txn.del_raw(&self.servernameevent_data, key);
-				txn
-			})
-			.execute()
-			.await
+			.take(ACTIVE_PROMOTION_LIMIT + 1)
+			.collect::<Vec<_>>();
+		if events.is_empty() {
+			return Ok(());
+		}
+		if events.len() > ACTIVE_PROMOTION_LIMIT {
+			return Err(Error::bad_database("Active promotion exceeds the batch limit"));
+		}
+		self.require_active_schema().await?;
+		let existing = iter(events.iter().map(|(key, _)| key.as_slice()))
+			.get(&self.servercurrentevent_data)
+			.map(|value| value.map(|value| value.as_ref().to_vec()))
+			.collect::<Vec<_>>()
+			.await;
+		if existing.len() != events.len() {
+			return Err(existing
+				.into_iter()
+				.find_map(|value| value.err().filter(|error| !error.is_not_found()))
+				.unwrap_or_else(|| Error::bad_database("Incomplete active promotion lookup")));
+		}
+		let mut txn = self.db.txn();
+		let mut batch_identity = None;
+		for ((key, event), existing) in events.into_iter().zip(existing) {
+			match existing {
+				| Ok(value) => {
+					let (_, existing) = parse_servercurrentevent(key, &value)?;
+					if &existing != event {
+						return Err(Error::bad_database(
+							"Promotion would replace an active delivery",
+						));
+					}
+					// An uncertain promotion may already be durable. Keep its
+					// identity and any independently re-admitted pending row.
+					continue;
+				},
+				| Err(error) if error.is_not_found() => {},
+				| Err(error) => return Err(error),
+			}
+			let identity = if let Some(identity) = batch_identity {
+				identity
+			} else {
+				// A key scopes its incarnation. All new members in this
+				// atomic promotion can share one persisted counter identity.
+				let identity = *self.services.globals.next_count().await?;
+				batch_identity = Some(identity);
+				identity
+			};
+			let value = active::encode(event, identity)?;
+			txn.insert_raw(&self.servercurrentevent_data, key, value);
+			txn.del_raw(&self.servernameevent_data, key);
+		}
+		txn.execute().await
 	}
 
 	/// Persist the selected/overflow EDUs and their consumed source watermark
@@ -91,6 +138,7 @@ impl Data {
 		last_count: u64,
 	) -> Result {
 		let _guard = self.active_write.lock().await;
+		self.require_active_schema().await?;
 		let prefix = Destination::Federation(server.to_owned()).get_prefix();
 
 		let mut txn = self.db.txn();
@@ -109,7 +157,12 @@ impl Data {
 			let count = self.services.globals.next_count().await?;
 			key.extend(&count.to_be_bytes());
 
-			txn.insert_raw(map, key, edu.as_slice());
+			if Arc::ptr_eq(map, &self.servercurrentevent_data) {
+				let value = active::encode(&SendingEvent::Edu(edu.clone()), *count)?;
+				txn.insert_raw(map, key, value);
+			} else {
+				txn.insert_raw(map, key, edu.as_slice());
+			}
 		}
 		txn.raw_put(&self.servername_educount, server, last_count);
 
@@ -154,7 +207,7 @@ impl Data {
 		self.servercurrentevent_data
 			.raw_stream_from(&prefix)
 			.ready_take_while(move |row| within_prefix(row, &prefix))
-			.map(decode_sending)
+			.map(|row| decode_outgoing(row).map(|(key, event, _)| (key, event)))
 	}
 
 	pub(super) fn stage_request(&self, txn: &mut Txn, key: &[u8], event: &SendingEvent) {
@@ -261,7 +314,11 @@ impl Data {
 			if bytes > 4 * 1024 * 1024 {
 				return Err(Error::bad_database("Push wake page exceeds limit"));
 			}
-			let (_, _, destination) = decode_outgoing(Ok((key, &value)))?;
+			let (_, _, destination) = if active {
+				decode_outgoing(Ok((key, &value)))?
+			} else {
+				decode_queued(Ok((key, &value)))?
+			};
 			if !matches!(&destination, Destination::Push(owner, _) if owner == user) {
 				return Err(Error::bad_database("Push wake owner mismatch"));
 			}
@@ -287,10 +344,23 @@ impl Data {
 		let next = next_cursor(&rows, limit);
 		let destinations = rows
 			.iter()
-			.map(|(key, value)| parse_servercurrentevent(key, value).map(at!(0)))
+			.map(|(key, value)| decode_queued(Ok((key.as_slice(), value.as_slice()))).map(at!(2)))
 			.collect::<Result<_>>()?;
 
 		Ok((destinations, next))
+	}
+
+	async fn require_active_schema(&self) -> Result {
+		let version: u64 = self.db["global"]
+			.get(b"version")
+			.await
+			.deserialized()?;
+		if version != crate::migrations::DATABASE_VERSION {
+			return Err(Error::bad_database(
+				"Active delivery identities require the current schema",
+			));
+		}
+		Ok(())
 	}
 
 	pub async fn get_latest_educount(&self, server_name: &ServerName) -> Result<u64> {
@@ -359,7 +429,15 @@ fn decode_outgoing(row: Result<(&[u8], &[u8])>) -> Result<OutgoingItem> {
 }
 
 fn decode_sending(row: Result<(&[u8], &[u8])>) -> Result<SendingItem> {
-	decode_outgoing(row).map(|(key, event, _)| (key, event))
+	decode_queued(row).map(|(key, event, _)| (key, event))
+}
+
+fn decode_queued(row: Result<(&[u8], &[u8])>) -> Result<OutgoingItem> {
+	let (key, value) = row?;
+	if active::identity(value)?.is_some() {
+		return Err(Error::bad_database("Active identity envelope in the pending queue"));
+	}
+	decode_outgoing(Ok((key, value)))
 }
 
 fn retain_existing(item: QueueItem, exists: Result) -> Option<Result<QueueItem>> {
@@ -377,10 +455,11 @@ fn missing_count_is_zero(count: Result<u64>) -> Result<u64> {
 	}
 }
 
-pub(super) fn parse_servercurrentevent(
+pub(crate) fn parse_servercurrentevent(
 	key: &[u8],
 	value: &[u8],
 ) -> Result<(Destination, SendingEvent)> {
+	let value = active::payload(value)?;
 	// Appservices start with a plus
 	Ok::<_, Error>(if key.starts_with(b"+") {
 		let mut parts = key[1..].splitn(2, |&b| b == 0xFF);

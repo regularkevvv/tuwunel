@@ -30,6 +30,7 @@ use tuwunel_core::{
 	warn,
 };
 
+pub(crate) use self::data::parse_servercurrentevent;
 use self::wakes::PushWakes;
 pub use self::{
 	data::Data,

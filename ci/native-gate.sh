@@ -4,6 +4,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true
+# Each native service fixture owns a RocksDB graph until its process exits.
+# Cap simultaneous fixture construction while retaining each test's own tasks.
+export RUST_TEST_THREADS=${RUST_TEST_THREADS:-2}
 
 mode=${1:?usage: native-gate.sh lint|regressions|test|compatibility|traces|release}
 test_root=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tuwunel-native-gate.XXXXXX")

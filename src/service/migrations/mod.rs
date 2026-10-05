@@ -76,7 +76,10 @@ mod tests;
 // cutoffs. Older senders must refuse the new queue semantics before readiness.
 // Version 20 adds a reciprocal room/user notification index. Older writers
 // must refuse before accepting notifications that would omit this index.
-pub(crate) const DATABASE_VERSION: u64 = 20;
+// Version 21 gives active deliveries persistent counter identities. Older
+// senders must not interpret their envelopes as EDUs or acknowledge
+// replacements.
+pub(crate) const DATABASE_VERSION: u64 = 21;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 
@@ -104,21 +107,21 @@ pub(crate) async fn migrations(services: &Services) -> Result {
 		sleep(FORCE_MIGRATION_DELAY).await;
 	}
 
+	let users_count = services.users.count().await;
+	// Computed before check_server_name backfills SERVER_NAME_KEY, which would
+	// otherwise mask a Conduit-lineage database (it carries no foreign marker).
+	let foreign_lineage = is_foreign_lineage(services).await;
+	// An empty account inventory or disabled migrations must not bypass the
+	// incompatible-version gate and rewrite a newer native database as fresh.
+	check_database_version(services, foreign_lineage, users_count != 0).await?;
+
 	if !services.config.database_migrations {
 		warn!("Skipping database migrations due to configuration...");
 		return Ok(());
 	}
-
-	let users_count = services.users.count().await;
 	if users_count == 0 {
 		return fresh(services).await;
 	}
-
-	// Computed before check_server_name backfills SERVER_NAME_KEY, which would
-	// otherwise mask a Conduit-lineage database (it carries no foreign marker).
-	let foreign_lineage = is_foreign_lineage(services).await;
-
-	check_database_version(services, foreign_lineage).await?;
 	check_server_name(services).await?;
 
 	// Repairs residue rather than the schema, so it sits behind the gates
@@ -146,10 +149,22 @@ async fn is_foreign_lineage(services: &Services) -> bool {
 /// gated. Within our lineage a version below 13 is refused as unmigratable and
 /// one above this build as too new to open safely; force_migration overrides
 /// the latter for a deliberate downgrade.
-async fn check_database_version(services: &Services, foreign_lineage: bool) -> Result {
-	let discovered = services.globals.db.database_version().await;
+async fn check_database_version(
+	services: &Services,
+	foreign_lineage: bool,
+	has_users: bool,
+) -> Result {
+	let discovered: u64 = match services.db["global"]
+		.get(b"version")
+		.await
+		.deserialized()
+	{
+		| Ok(version) => version,
+		| Err(error) if error.is_not_found() => 0,
+		| Err(error) => return Err(error),
+	};
 
-	if discovered < 13 {
+	if discovered < 13 && has_users {
 		return Err!(Database("Database schema version {discovered} is no longer supported"));
 	}
 

@@ -39,6 +39,13 @@ impl Fixture {
 		#[cfg(unix)]
 		directory.mode(0o700);
 		directory.create(&root)?;
+		Self::open(&root).await
+	}
+
+	/// Open only a scratch root owned by the invoking fixture. Cold-start
+	/// controls reopen it in a new process after the preceding child exits.
+	pub(super) async fn open(root: &std::path::Path) -> Result<Self> {
+		sys::maximize_fd_limit()?;
 		let raw = Figment::new()
 			.merge(("server_name", "localhost"))
 			.merge(("database_backend", "rocksdb"))
@@ -62,6 +69,13 @@ impl Fixture {
 			Metrics::new(Some(&runtime)),
 		));
 		let services = Services::build(server).await?;
+		// This lower-level fixture does not run startup migrations. Declare the
+		// supported schema before exercising production active-row writers.
+		services
+			.globals
+			.db
+			.bump_database_version(crate::migrations::DATABASE_VERSION)
+			.await?;
 		Ok(Self { services })
 	}
 
