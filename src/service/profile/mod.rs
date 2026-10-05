@@ -375,7 +375,13 @@ where
 		.useridprofilekey_value
 		.qry(&key)
 		.await
-		.map_err(|_| err!(Request(NotFound("The requested profile key does not exist."))))?
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Request(NotFound("The requested profile key does not exist.")))
+			} else {
+				error
+			}
+		})?
 		.deserialized()
 		.map_err(|_| err!(Database("Cannot deserialize database profile value")))?;
 

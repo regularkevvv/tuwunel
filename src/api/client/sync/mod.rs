@@ -1,7 +1,7 @@
 mod v3;
 mod v5;
 
-use futures::{StreamExt, pin_mut};
+use futures::{FutureExt, StreamExt, pin_mut};
 use ruma::{RoomId, UserId, events::TimelineEventType::RoomMember};
 use tuwunel_core::{
 	Error, PduCount, Result,
@@ -15,32 +15,6 @@ pub(crate) use self::{
 	v5::sync_events_v5_route,
 };
 
-#[derive(Clone, Copy)]
-enum TimelineErrors {
-	Ignore,
-	Propagate,
-}
-
-async fn load_timeline(
-	services: &Services,
-	sender_user: &UserId,
-	room_id: &RoomId,
-	roomsincecount: PduCount,
-	next_batch: Option<PduCount>,
-	limit: usize,
-) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
-	load_timeline_with_errors(
-		services,
-		sender_user,
-		room_id,
-		roomsincecount,
-		next_batch,
-		limit,
-		TimelineErrors::Ignore,
-	)
-	.await
-}
-
 async fn load_timeline_fallible(
 	services: &Services,
 	sender_user: &UserId,
@@ -49,27 +23,11 @@ async fn load_timeline_fallible(
 	next_batch: Option<PduCount>,
 	limit: usize,
 ) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
-	load_timeline_with_errors(
-		services,
-		sender_user,
-		room_id,
-		roomsincecount,
-		next_batch,
-		limit,
-		TimelineErrors::Propagate,
-	)
-	.await
-}
-
-async fn load_timeline_with_errors(
-	services: &Services,
-	sender_user: &UserId,
-	room_id: &RoomId,
-	roomsincecount: PduCount,
-	next_batch: Option<PduCount>,
-	limit: usize,
-	errors: TimelineErrors,
-) -> Result<(Vec<(PduCount, PduEvent)>, bool, PduCount), Error> {
+	services
+		.state
+		.validate_timeline_frontier(room_id, roomsincecount, next_batch)
+		.boxed()
+		.await?;
 	let until = next_batch.map(|count| count.saturating_add(1));
 	let pdus = services
 		.timeline
@@ -83,13 +41,7 @@ async fn load_timeline_with_errors(
 	let mut limited = false;
 
 	while let Some(pdu) = pdus.next().await {
-		let (pducount, pdu) = match pdu {
-			| Ok(pdu) => pdu,
-			| Err(error) if first || matches!(errors, TimelineErrors::Propagate) => {
-				return Err(error);
-			},
-			| Err(_) => continue,
-		};
+		let (pducount, pdu) = pdu?;
 
 		if first {
 			first = false;

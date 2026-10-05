@@ -236,10 +236,28 @@ impl Service {
 
 		self.services
 			.state_cache
-			.is_joined(&self.services.globals.server_user, &room_id)
-			.await
+			.is_joined_checked(&self.services.globals.server_user, &room_id)
+			.await?
 			.then_some(room_id)
 			.ok_or_else(|| err!(Request(NotFound("Admin user not joined to admin room"))))
+	}
+
+	/// Checks administrator membership while preserving storage and decoding
+	/// failures. An absent admin room or membership means `false`; an unknown
+	/// read outcome cannot classify a user as a non-administrator.
+	pub async fn user_is_admin_checked(&self, user_id: &UserId) -> Result<bool> {
+		if user_id == self.services.globals.server_user {
+			return Ok(true);
+		}
+		let admin_room = match self.get_admin_room().await {
+			| Ok(room) => room,
+			| Err(error) if error.is_not_found() => return Ok(false),
+			| Err(error) => return Err(error),
+		};
+		self.services
+			.state_cache
+			.is_joined_checked(user_id, &admin_room)
+			.await
 	}
 
 	/// Gets the room reports are posted to: the configured report room when set

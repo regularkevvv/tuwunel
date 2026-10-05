@@ -299,7 +299,7 @@ async fn join_remote(
 		.services
 		.short
 		.get_or_create_shortroomid(room_id)
-		.await;
+		.await?;
 
 	info!(
 		%room_id,
@@ -328,7 +328,7 @@ async fn join_remote(
 
 	let state = self
 		.ingest_send_join_state(room_id, &room_version_id, &room_version_rules, &response.state)
-		.await;
+		.await?;
 
 	self.ingest_send_join_auth_chain(
 		room_id,
@@ -615,7 +615,7 @@ async fn ingest_send_join_state(
 	room_version_id: &RoomVersionId,
 	room_version_rules: &RoomVersionRules,
 	state_pdus: &[Box<RawJsonValue>],
-) -> HashMap<u64, OwnedEventId> {
+) -> Result<HashMap<u64, OwnedEventId>> {
 	info!(events = state_pdus.len(), "Going through send_join response room_state...");
 	let cork = self.services.db.cork_and_flush();
 	let state = state_pdus
@@ -636,24 +636,24 @@ async fn ingest_send_join_state(
 				.map(move |(pdu, value)| (event_id, pdu, value))
 				.ok()
 		})
-		.fold(HashMap::new(), async |mut state, (event_id, pdu, value)| {
+		.map(Ok)
+		.try_fold(HashMap::new(), async |mut state, (event_id, pdu, value)| {
 			self.services
 				.timeline
 				.add_pdu_outlier(&event_id, &value)
-				.await
-				.expect("database write error");
+				.await?;
 
 			if let Some(state_key) = &pdu.state_key {
 				let shortstatekey = self
 					.services
 					.short
 					.get_or_create_shortstatekey(&pdu.kind.to_string().into(), state_key)
-					.await;
+					.await?;
 
 				state.insert(shortstatekey, pdu.event_id.clone());
 			}
 
-			state
+			Ok(state)
 		})
 		.await;
 
@@ -714,8 +714,8 @@ async fn apply_send_join_state(
 		.services
 		.state_compressor
 		.compress_state_events(state.iter().map(|(ssk, eid)| (ssk, eid.borrow())))
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	debug!("Saving compressed state...");
 	let HashSetCompressStateEvent {

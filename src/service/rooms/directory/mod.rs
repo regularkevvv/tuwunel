@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use futures::Stream;
-use ruma::{OwnedRoomAliasId, RoomAliasId, RoomId, api::client::room::Visibility};
-use tuwunel_core::{Result, implement, utils::stream::TryIgnore};
+use ruma::{
+	OwnedRoomAliasId, RoomAliasId, RoomId,
+	api::{client::room::Visibility, error::ErrorKind},
+};
+use tuwunel_core::{Error, Result, implement, utils::stream::TryIgnore};
 use tuwunel_database::{Deserialized, Map};
 
 pub struct Service {
@@ -51,6 +54,28 @@ pub async fn published_alias(&self, room_id: &RoomId) -> Result<OwnedRoomAliasId
 		.deserialized()
 }
 
+/// Reads a publication alias while distinguishing absent/empty values from
+/// corrupted values and failed reads. Mutation callers must preserve failures.
+#[implement(Service)]
+pub async fn published_alias_checked(
+	&self,
+	room_id: &RoomId,
+) -> Result<Option<OwnedRoomAliasId>> {
+	let value = match self.db.publicroomids.get(room_id).await {
+		| Ok(value) => value,
+		| Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		| Err(error) => return Err(error),
+	};
+	if value.is_empty() {
+		return Ok(None);
+	}
+	let alias = std::str::from_utf8(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid published room alias"))?;
+	RoomAliasId::parse(alias)
+		.map(Some)
+		.map_err(|_| Error::bad_database("Invalid published room alias"))
+}
+
 #[implement(Service)]
 pub fn public_rooms(&self) -> impl Stream<Item = &RoomId> + Send {
 	self.db.publicroomids.keys().ignore_err()
@@ -59,6 +84,15 @@ pub fn public_rooms(&self) -> impl Stream<Item = &RoomId> + Send {
 #[implement(Service)]
 pub async fn is_public_room(&self, room_id: &RoomId) -> bool {
 	self.visibility(room_id).await == Visibility::Public
+}
+
+/// Reports public-directory membership without hiding failed storage reads.
+#[implement(Service)]
+pub async fn is_public_room_checked(&self, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.publicroomids
+		.contains_checked(&(room_id,))
+		.await
 }
 
 #[implement(Service)]

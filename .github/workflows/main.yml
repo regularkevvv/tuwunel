@@ -1,14 +1,8 @@
 name: Main
 
 on:
-  push:
-    branches:
-      - "**"
-    tags:
-      - "v*"
-  pull_request:
-    branches:
-      - "**"
+  # The upstream multi-runner matrix is manual in this maintained fork.
+  # ci-native.yml owns automatic native qualification on free standard runners.
   workflow_dispatch:
     inputs:
       pipeline:

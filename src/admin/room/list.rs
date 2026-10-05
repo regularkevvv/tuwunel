@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tuwunel_core::{Err, Result};
 
 use crate::{PAGE_SIZE, admin_command, get_room_info};
@@ -26,8 +26,8 @@ pub(super) async fn room_list(
 				.then_some(room_id)
 		})
 		.then(|room_id| get_room_info(self.services, room_id))
-		.collect::<Vec<_>>()
-		.await;
+		.try_collect::<Vec<_>>()
+		.await?;
 
 	rooms.sort_by_key(|r| r.1);
 	rooms.reverse();

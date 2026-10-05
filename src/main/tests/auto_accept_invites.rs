@@ -7,6 +7,7 @@ use std::{
 
 use futures::future::join;
 use serde_json::{Value, json};
+use tokio::time::{sleep, timeout};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result, err, implement,
@@ -111,9 +112,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.ok_or_else(|| err!("the direct invitation was never accepted"))?;
 
 	invitee
-		.marks_direct(&invitee_id, &inviter_id, &direct)
-		.await?
-		.ok_or_else(|| err!("the accepted room is missing from the invitee's m.direct"))?;
+		.wait_direct(&invitee_id, &inviter_id, &direct)
+		.await?;
 
 	services
 		.account_data
@@ -151,7 +151,7 @@ async fn marks_direct(
 ) -> Result<bool> {
 	let path = format!("user/{user_id}/account_data/m.direct");
 
-	let response: Value = self
+	let response = self
 		.services
 		.client
 		.clients
@@ -159,10 +159,11 @@ async fn marks_direct(
 		.get(self.url(&path))
 		.bearer_auth(self.token)
 		.send()
-		.await?
-		.error_for_status()?
-		.json()
 		.await?;
+	if response.status() == tuwunel_core::http::StatusCode::NOT_FOUND {
+		return Ok(false);
+	}
+	let response: Value = response.error_for_status()?.json().await?;
 
 	let named = response
 		.get(counterparty.as_str())
@@ -175,6 +176,26 @@ async fn marks_direct(
 		});
 
 	Ok(named)
+}
+
+/// Membership becomes visible before the subsequent account-data write.
+/// Wait for that write's exact counterparty/room mapping; retry only absence,
+/// and preserve other HTTP/decoding failures rather than treating them as lag.
+#[implement(Client, params = "<'_>")]
+async fn wait_direct(&self, user_id: &UserId, counterparty: &UserId, room_id: &RoomId) -> Result {
+	timeout(ACCEPT_DEADLINE, async {
+		loop {
+			if self
+				.marks_direct(user_id, counterparty, room_id)
+				.await?
+			{
+				return Ok(());
+			}
+			sleep(Duration::from_millis(20)).await;
+		}
+	})
+	.await
+	.map_err(|_| err!("the accepted room is missing from the invitee's m.direct"))?
 }
 
 /// Whether the user reaches joined membership before the deadline.

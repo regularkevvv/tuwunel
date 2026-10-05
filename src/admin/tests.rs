@@ -2,7 +2,7 @@
 
 use clap::Parser;
 
-use crate::{admin::AdminCommand, media::MediaCommand, query::QueryCommand};
+use crate::{admin::AdminCommand, media::MediaCommand, query::QueryCommand, user::UserCommand};
 
 #[test]
 fn get_help_short() { get_help_inner("-h"); }
@@ -104,6 +104,78 @@ fn query_feds_reject_zero_width() {
 	]);
 
 	assert!(error.contains("invalid value '0'"), "a survey width must be nonzero");
+}
+
+#[test]
+fn local_user_listing_defaults_to_a_bounded_page_and_accepts_a_cursor() {
+	assert!(matches!(
+		parse_ok(&["admin", "users", "list-users"]),
+		AdminCommand::Users(UserCommand::ListUsers { after: None, limit: 16 })
+	));
+	let AdminCommand::Users(UserCommand::ListUsers { after, limit }) = parse_ok(&[
+		"admin",
+		"users",
+		"list-users",
+		"--after",
+		"@disabled:localhost",
+		"--limit",
+		"32",
+	]) else {
+		panic!("expected paginated user listing");
+	};
+	assert_eq!(after.expect("cursor").as_str(), "@disabled:localhost");
+	assert_eq!(usize::from(limit), tuwunel_service::users::MAX_LOCAL_USER_PAGE_ROWS);
+}
+
+#[test]
+fn local_user_listing_refuses_unbounded_limits_and_invalid_cursors() {
+	for limit in ["0", "33", "65536"] {
+		assert!(
+			parse_err(&["admin", "users", "list-users", "--limit", limit])
+				.contains("invalid value")
+		);
+	}
+	assert!(
+		parse_err(&["admin", "users", "list-users", "--after", "not-a-user"])
+			.contains("invalid value")
+	);
+}
+
+#[test]
+fn last_active_defaults_to_48_and_refuses_unbounded_output() {
+	assert!(matches!(
+		parse_ok(&["admin", "users", "last-active"]),
+		AdminCommand::Users(UserCommand::LastActive { limit: 48 })
+	));
+	assert!(matches!(
+		parse_ok(&["admin", "users", "last-active", "--limit", "64"]),
+		AdminCommand::Users(UserCommand::LastActive { limit: 64 })
+	));
+	for limit in ["0", "65", "65536"] {
+		assert!(
+			parse_err(&["admin", "users", "last-active", "--limit", limit])
+				.contains("invalid value")
+		);
+	}
+}
+
+#[test]
+fn query_user_inventory_requires_bounded_limits_and_valid_cursors() {
+	for flags in [&[][..], &["--historical", "--after", "@user:localhost", "--limit", "32"][..]] {
+		let mut args = vec!["admin", "query", "users", "iter-users"];
+		args.extend_from_slice(flags);
+		assert!(matches!(parse_ok(&args), AdminCommand::Query(QueryCommand::Users(_))));
+	}
+	for limit in ["0", "33", "65536"] {
+		assert!(
+			parse_err(&["admin", "query", "users", "iter-users", "--limit", limit])
+				.contains("invalid value")
+		);
+	}
+	assert!(
+		parse_err(&["admin", "query", "users", "iter-users", "--after", "invalid-user"])
+			.contains("invalid value")
+	);
 }
 
 fn get_help_inner(input: &str) {

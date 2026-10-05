@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, pin_mut};
-use ruma::{Mxc, OwnedMxcUri, OwnedUserId, UserId, http_headers::ContentDisposition};
+use ruma::{
+	Mxc, OwnedMxcUri, OwnedUserId, UserId,
+	api::error::{ErrorKind, LimitExceededErrorData},
+	http_headers::ContentDisposition,
+};
 use serde::Deserialize;
 #[cfg(feature = "url_preview")]
 use serde::Serialize;
 use tuwunel_core::{
-	Err, Result, at, debug, debug_info, err,
+	Err, Error, Result, at, debug, debug_info, err,
 	utils::{ReadyExt, str_from_bytes, stream::TryIgnore, string_from_bytes},
 };
 use tuwunel_database::{
@@ -459,14 +463,32 @@ impl Data {
 	}
 
 	/// Gets all the media keys in our database (this includes all the metadata
-	/// associated with it such as width, height, content-type, etc)
-	pub(crate) async fn get_all_media_keys(&self) -> Vec<Vec<u8>> {
-		self.mediaid_file
-			.raw_keys()
-			.ignore_err()
-			.map(<[u8]>::to_vec)
-			.collect()
-			.await
+	/// associated with it such as width, height, content-type, etc). Refuses
+	/// inventories above 4,096 rows or 1 MiB of retained keys, with one
+	/// overflow row for detection, and preserves read failures before caller
+	/// mutations.
+	pub(crate) async fn get_all_media_keys(&self) -> Result<Vec<Vec<u8>>> {
+		const MAX_ROWS: usize = 4096;
+		const MAX_BYTES: usize = 1024 * 1024;
+		let rows = self
+			.mediaid_file
+			.stream_capped::<&[u8], &[u8]>(MAX_ROWS.saturating_add(1));
+		pin_mut!(rows);
+		let mut keys = Vec::new();
+		let mut bytes = 0_usize;
+		while let Some(row) = rows.next().await {
+			let (key, _) = row?;
+			bytes = bytes.saturating_add(key.len());
+			if keys.len() >= MAX_ROWS || bytes > MAX_BYTES {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"Media inventory limit reached; use a bounded media operation".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			keys.push(key.to_vec());
+		}
+		Ok(keys)
 	}
 
 	pub(super) async fn set_url_preview(&self, url: &str, cached: &CachedPreview) -> Result {

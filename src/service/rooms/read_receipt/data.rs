@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{
-	Stream, StreamExt, TryStreamExt,
+	Stream, TryStreamExt,
 	future::{join, try_join},
 };
 use ruma::{
@@ -14,7 +14,6 @@ use tuwunel_core::{
 	Result, error,
 	matrix::pdu::PduCount,
 	smallvec::SmallVec,
-	trace,
 	utils::{ReadyExt, TryReadyExt, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Interfix, Json, KeyBuf, Map, Txn, serialize_key};
@@ -479,61 +478,6 @@ impl Data {
 			.await
 			.deserialized()
 			.or_else(|error| error.is_not_found().then_some(0).ok_or(error))
-	}
-
-	#[inline]
-	pub(super) async fn delete_all_read_receipts(&self, room_id: &RoomId) -> Result {
-		let prefix = (room_id, Interfix);
-
-		self.roomuserid_privateread
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				trace!("Removing key: {key:?}");
-				self.roomuserid_privateread
-					.remove(key)
-					.await
-					.expect("database write error");
-			})
-			.await;
-
-		self.roomuserid_lastprivatereadupdate
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				trace!("Removing key: {key:?}");
-				self.roomuserid_lastprivatereadupdate
-					.remove(key)
-					.await
-					.expect("database write error");
-			})
-			.await;
-
-		self.roomuserid_privatereadsync
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				trace!("Removing key: {key:?}");
-				self.roomuserid_privatereadsync
-					.remove(key)
-					.await
-					.expect("database write error");
-			})
-			.await;
-
-		self.readreceiptid_readreceipt
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				trace!("Removing key: {key:?}");
-				self.readreceiptid_readreceipt
-					.remove(key)
-					.await
-					.expect("database write error");
-			})
-			.await;
-
-		Ok(())
 	}
 }
 

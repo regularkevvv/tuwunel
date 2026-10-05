@@ -19,14 +19,16 @@ use futures::{
 };
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId,
-	UserId, api::Direction, events::room::encrypted::Relation,
+	UserId,
+	api::{Direction, error::ErrorKind},
+	events::room::encrypted::Relation,
 };
 use serde::Deserialize;
 pub use tuwunel_core::matrix::pdu::{PduId, RawPduId};
 use tuwunel_core::{
-	Err, Result, at, err, implement,
+	Err, Error, Result, at, err, implement,
 	matrix::{
-		ShortEventId,
+		Event, ShortEventId,
 		pdu::{PduCount, PduEvent},
 	},
 	utils::{
@@ -541,13 +543,21 @@ pub async fn get<T>(&self, event_id: &EventId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	let accepted = self.get_non_outlier(event_id);
-	let outlier = self.get_outlier(event_id);
-
-	pin_mut!(accepted, outlier);
-	select_ok([Left(accepted), Right(outlier)])
-		.await
-		.map(at!(0))
+	// Accepted records are canonical. An outlier is a fallback only when no
+	// accepted index exists; it cannot mask a failed/corrupt accepted read.
+	match self.get_pdu_id(event_id).await {
+		| Ok(pdu_id) => self.get_from_id(&pdu_id).await.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Missing accepted event record")
+			} else if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+				Error::bad_database("Invalid accepted event record")
+			} else {
+				error
+			}
+		}),
+		| Err(error) if error.kind() == ErrorKind::NotFound => self.get_outlier(event_id).await,
+		| Err(error) => Err(error),
+	}
 }
 
 /// Returns the pdu into T.
@@ -586,7 +596,18 @@ pub async fn get_from_id<T>(&self, pdu_id: &RawPduId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	self.db.pduid_pdu.get(pdu_id).await.deserialized()
+	self.db
+		.pduid_pdu
+		.get(pdu_id)
+		.await
+		.deserialized()
+		.map_err(|error| {
+			if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+				Error::bad_database("Invalid stored accepted event record")
+			} else {
+				error
+			}
+		})
 }
 
 /// Checks if pdu exists
@@ -675,9 +696,49 @@ pub async fn get_pdu_id_from_shorteventid(&self, shorteventid: ShortEventId) -> 
 /// Returns the pdu's id.
 #[implement(Service)]
 pub async fn get_pdu_id(&self, event_id: &EventId) -> Result<RawPduId> {
-	self.db
-		.eventid_pduid
-		.get(event_id)
+	let handle = self.db.eventid_pduid.get(event_id).await?;
+	let encoded: &[u8] = handle.as_ref();
+	RawPduId::from_bytes(encoded)
+}
+
+/// Reads the last canonical room event at or before a membership pagination
+/// boundary. This seeks one row; malformed keys, payloads or reverse indexes
+/// refuse the lookup instead of selecting another event or current state.
+#[implement(Service)]
+pub async fn member_snapshot_boundary(
+	&self,
+	room_id: &RoomId,
+	count: PduCount,
+) -> Result<(PduCount, PduEvent)> {
+	let shortroomid = self
+		.services
+		.short
+		.get_shortroomid(room_id)
+		.await?;
+	let start: RawPduId = PduId { shortroomid, count }.into();
+	let stream = self.db.pduid_pdu.rev_raw_stream_from(&start);
+	pin_mut!(stream);
+	let Some((key, value)) = stream.try_next().await? else {
+		return Err(err!(Request(NotFound("No event at membership boundary"))));
+	};
+	if !key.starts_with(&shortroomid.to_be_bytes()) {
+		return Err(err!(Request(NotFound("No room event at membership boundary"))));
+	}
+	let position = RawPduId::from_bytes(key)?.pdu_count();
+	let event = serde_json::from_slice::<PduEvent>(value)
+		.map_err(|_| Error::bad_database("Invalid membership boundary event"))?;
+	let canonical = self
+		.get_pdu_id(event.event_id())
 		.await
-		.map(|handle| RawPduId::from(&*handle))
+		.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Missing membership boundary reverse index")
+			} else {
+				error
+			}
+		})?;
+	if event.room_id() != room_id || canonical.as_ref() != key || position > count {
+		return Err(Error::bad_database("Mismatched membership boundary event"));
+	}
+	Ok((position, event))
 }

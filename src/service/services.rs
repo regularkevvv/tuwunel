@@ -219,6 +219,11 @@ pub async fn start(self: &Arc<Self>) -> Result<Arc<Self>> {
 	debug_info!("Starting services...");
 
 	super::migrations::migrations(self).await?;
+	if !self.server.config.maintenance {
+		self.state_cache
+			.restore_pending_recounts()
+			.await?;
+	}
 
 	self.manager
 		.lock()

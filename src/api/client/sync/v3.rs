@@ -55,7 +55,9 @@ use tuwunel_core::{
 		math::ruma_from_u64,
 		option::OptionExt,
 		result::MapExpect,
-		stream::{BroadbandExt, Tools, TryBroadbandExt, TryReadyExt, WidebandExt},
+		stream::{
+			BroadbandExt, Tools, TryBroadbandExt, TryReadyExt, TryWidebandExt, WidebandExt,
+		},
 	},
 	warn,
 };
@@ -70,7 +72,7 @@ use tuwunel_service::{
 	},
 };
 
-use super::{load_timeline, share_encrypted_room, strip_prev_state};
+use super::{load_timeline_fallible, share_encrypted_room, strip_prev_state};
 use crate::{
 	ClientIp, Ruma,
 	client::{ignored_filter, is_empty_account_data_event, with_membership},
@@ -147,6 +149,8 @@ enum StateAfter {
 
 type PresenceUpdates = HashMap<OwnedUserId, PresenceEventContent>;
 type TimelineEventIds = SmallVec<[OwnedEventId; 1]>;
+type JoinedRooms =
+	(BTreeMap<OwnedRoomId, JoinedRoom>, HashSet<OwnedUserId>, HashSet<OwnedUserId>);
 
 impl StateAfter {
 	fn requested(self) -> bool { !matches!(self, Self::Off) }
@@ -475,12 +479,7 @@ async fn build_sync_events(
 		keys_changed,
 		presence_updates,
 		(_, to_device_events, device_one_time_keys_count, device_unused_fallback_key_types),
-		(
-			(joined_rooms, mut device_list_updates, left_encrypted_users),
-			left_rooms,
-			invited_rooms,
-			knocked_rooms,
-		),
+		(joined_rooms, left_rooms, invited_rooms, knocked_rooms),
 	) = join5(
 		account_data,
 		keys_changed,
@@ -496,6 +495,8 @@ async fn build_sync_events(
 	.boxed()
 	.await;
 
+	let (joined_rooms, mut device_list_updates, left_encrypted_users) = joined_rooms?;
+	let left_rooms = left_rooms?;
 	device_list_updates.extend(keys_changed);
 
 	let device_list_left =
@@ -535,16 +536,14 @@ fn collect_joined_rooms<'a>(
 	full_state: bool,
 	state_after: StateAfter,
 	filter: &'a FilterDefinition,
-) -> impl Future<
-	Output = (BTreeMap<OwnedRoomId, JoinedRoom>, HashSet<OwnedUserId>, HashSet<OwnedUserId>),
-> + Send
-+ 'a {
+) -> impl Future<Output = Result<JoinedRooms>> + Send + 'a {
 	services
 		.state_cache
 		.rooms_joined(sender_user)
 		.ready_filter(|&room_id| filter.room.matches(room_id))
 		.map(ToOwned::to_owned)
-		.broad_filter_map(move |room_id| {
+		.map(Ok::<_, Error>)
+		.broad_and_then(move |room_id| {
 			load_joined_room(
 				services,
 				sender_user,
@@ -557,9 +556,9 @@ fn collect_joined_rooms<'a>(
 				filter,
 			)
 			.map_ok(move |(joined_room, dlu, jeu)| (room_id, joined_room, dlu, jeu))
-			.ok()
+			.map_err(sync_room_failure)
 		})
-		.ready_fold(
+		.ready_try_fold(
 			(BTreeMap::new(), HashSet::new(), HashSet::new()),
 			|(mut joined_rooms, mut device_list_updates, mut left_encrypted_users),
 			 (room_id, joined_room, dlu, leu)| {
@@ -569,7 +568,7 @@ fn collect_joined_rooms<'a>(
 					joined_rooms.insert(room_id, joined_room);
 				}
 
-				(joined_rooms, device_list_updates, left_encrypted_users)
+				Ok((joined_rooms, device_list_updates, left_encrypted_users))
 			},
 		)
 }
@@ -582,12 +581,13 @@ fn collect_left_rooms<'a>(
 	full_state: bool,
 	state_after: StateAfter,
 	filter: &'a FilterDefinition,
-) -> impl Future<Output = BTreeMap<OwnedRoomId, LeftRoom>> + Send + 'a {
+) -> impl Future<Output = Result<BTreeMap<OwnedRoomId, LeftRoom>>> + Send + 'a {
 	services
 		.state_cache
 		.rooms_left_state(sender_user)
 		.ready_filter(|(room_id, _)| filter.room.matches(room_id))
-		.broad_filter_map(move |(room_id, _)| {
+		.map(Ok::<_, Error>)
+		.broad_and_then(move |(room_id, _)| {
 			handle_left_room(
 				services,
 				since,
@@ -599,10 +599,22 @@ fn collect_left_rooms<'a>(
 				filter,
 			)
 			.map_ok(move |left_room| (room_id, left_room))
-			.ok()
+			.map_err(sync_room_failure)
 		})
-		.ready_filter_map(|(room_id, left_room)| left_room.map(|left_room| (room_id, left_room)))
-		.collect()
+		.ready_try_filter_map(|(room_id, left_room)| {
+			Ok(left_room.map(|left_room| (room_id, left_room)))
+		})
+		.try_collect()
+}
+
+/// A selected room's missing stored material is an integrity failure, not
+/// normal absence. Preserve every other classification, including limits.
+fn sync_room_failure(error: Error) -> Error {
+	if error.is_not_found() {
+		Error::bad_database("Missing stored sync room material")
+	} else {
+		error
+	}
 }
 
 async fn collect_invited_rooms<'a>(
@@ -864,7 +876,7 @@ async fn load_left_room(
 		.unwrap_or(10)
 		.min(100);
 
-	let (timeline_pdus, limited, _) = load_timeline(
+	let (timeline_pdus, limited, _) = load_timeline_fallible(
 		services,
 		sender_user,
 		room_id,
@@ -872,8 +884,7 @@ async fn load_left_room(
 		Some(PduCount::Normal(left_count)),
 		timeline_limit.max(1),
 	)
-	.await
-	.unwrap_or_default();
+	.await?;
 
 	let since_shortstatehash = services
 		.timeline
@@ -986,12 +997,13 @@ async fn load_left_room(
 		.ready_filter(|pdu| filter.room.timeline.matches(pdu))
 		.take(timeline_limit)
 		.wide_then(|pdu| with_membership(services, pdu, sender_user, encrypted))
-		.wide_then(|pdu| {
+		.map(Ok::<_, Error>)
+		.wide_and_then(|pdu| {
 			services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
 		})
-		.collect::<Vec<_>>();
+		.try_collect::<Vec<_>>();
 
 	let account_data_events = services
 		.account_data
@@ -1005,6 +1017,7 @@ async fn load_left_room(
 			.boxed()
 			.await;
 
+	let timeline_events = timeline_events?;
 	let state = state_after.wrap(StateEvents { events: state_events });
 
 	Ok(Some(LeftRoom {
@@ -1174,7 +1187,7 @@ async fn load_joined_room(
 		send_notification_counts,
 		filter,
 	)
-	.await;
+	.await?;
 
 	let (joined_room, device_list_updates, left_encrypted_users) = finalize_joined_room(
 		services,
@@ -1350,7 +1363,7 @@ async fn load_join_timeline(
 		.unwrap_or(10)
 		.min(100);
 
-	load_timeline(
+	load_timeline_fallible(
 		services,
 		sender_user,
 		room_id,
@@ -1388,7 +1401,7 @@ async fn await_join_aggregates(
 	last_privateread_update: u64,
 	send_notification_counts: bool,
 	filter: &FilterDefinition,
-) -> JoinAggregates {
+) -> Result<JoinAggregates> {
 	let (notification_count, highlight_count, thread_counts) =
 		notification_count_futures(services, sender_user, room_id, send_notification_counts);
 
@@ -1437,8 +1450,8 @@ async fn await_join_aggregates(
 	.boxed()
 	.await;
 
-	JoinAggregates {
-		room_events,
+	Ok(JoinAggregates {
+		room_events: room_events?,
 		account_data_events,
 		typing_events,
 		private_read_events,
@@ -1447,7 +1460,7 @@ async fn await_join_aggregates(
 		thread_counts,
 		device_list_updates,
 		left_encrypted_users,
-	}
+	})
 }
 
 struct FinalizeJoinFlags {
@@ -1705,7 +1718,7 @@ fn collect_room_events<'a>(
 	joined_sender_member: Option<PduEvent>,
 	encrypted: bool,
 	filter: &'a FilterDefinition,
-) -> impl Future<Output = Vec<PduEvent>> + Send + 'a {
+) -> impl Future<Output = Result<Vec<PduEvent>>> + Send + 'a {
 	let include_in_timeline = |event: &PduEvent| filter.room.timeline.matches(event);
 	timeline_pdus
 		.into_iter()
@@ -1715,12 +1728,13 @@ fn collect_room_events<'a>(
 		.chain(joined_sender_member.into_iter().stream())
 		.ready_filter(include_in_timeline)
 		.wide_then(move |pdu| with_membership(services, pdu, sender_user, encrypted))
-		.wide_then(move |pdu| {
+		.map(Ok::<_, Error>)
+		.wide_and_then(move |pdu| {
 			services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
 		})
-		.collect::<Vec<_>>()
+		.try_collect::<Vec<_>>()
 }
 
 fn collect_room_account_data<'a>(
@@ -2224,8 +2238,10 @@ async fn calculate_state_changes<'a>(
 	let member_counts = send_member_counts
 		.then_async(|| calculate_counts(services, room_id, sender_user, include_heroes));
 
-	let (joined_member_count, invited_member_count, heroes) =
-		member_counts.await.unwrap_or((None, None, None));
+	let (joined_member_count, invited_member_count, heroes) = member_counts
+		.await
+		.transpose()?
+		.unwrap_or((None, None, None));
 
 	Ok(StateChanges {
 		heroes,
@@ -2267,19 +2283,21 @@ async fn calculate_counts(
 	room_id: &RoomId,
 	sender_user: &UserId,
 	include_heroes: bool,
-) -> (Option<u64>, Option<u64>, Option<Vec<OwnedUserId>>) {
-	let joined_member_count = services
-		.state_cache
-		.room_joined_count(room_id)
-		.unwrap_or(0);
+) -> Result<(Option<u64>, Option<u64>, Option<Vec<OwnedUserId>>)> {
+	let joined_member_count = services.state_cache.room_joined_count(room_id);
 
-	let invited_member_count = services
-		.state_cache
-		.room_invited_count(room_id)
-		.unwrap_or(0);
+	let invited_member_count = services.state_cache.room_invited_count(room_id);
 
 	let (joined_member_count, invited_member_count) =
 		join(joined_member_count, invited_member_count).await;
+	let joined_member_count = u64::from(
+		UInt::try_from(joined_member_count?)
+			.map_err(|_| Error::bad_database("Invalid joined-member count"))?,
+	);
+	let invited_member_count = u64::from(
+		UInt::try_from(invited_member_count?)
+			.map_err(|_| Error::bad_database("Invalid invited-member count"))?,
+	);
 
 	let small_room = joined_member_count.saturating_add(invited_member_count) <= 5;
 
@@ -2290,7 +2308,7 @@ async fn calculate_counts(
 		.and_is(small_room)
 		.then_async(|| calculate_heroes(services, room_id, sender_user));
 
-	(Some(joined_member_count), Some(invited_member_count), heroes.await)
+	Ok((Some(joined_member_count), Some(invited_member_count), heroes.await))
 }
 
 pub(crate) async fn calculate_heroes(

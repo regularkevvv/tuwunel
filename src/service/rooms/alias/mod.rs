@@ -5,14 +5,18 @@ use ruma::{
 	OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId, RoomOrAliasId, UserId,
 	api::federation::query::get_room_information::v1::Request, events::StateEventType,
 };
+use tokio::sync::Mutex;
 use tuwunel_core::{Err, Result, err, matrix::Event, utils::stream::TryIgnore};
 use tuwunel_database::{Deserialized, Ignore, Interfix, Map};
 
 use crate::appservice::RegistrationInfo;
 
+mod inventory;
+
 pub struct Service {
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
+	mutation: Mutex<()>,
 }
 
 struct Data {
@@ -30,6 +34,7 @@ impl crate::Service for Service {
 				aliasid_alias: args.db["aliasid_alias"].clone(),
 			},
 			services: args.services.clone(),
+			mutation: Mutex::new(()),
 		}))
 	}
 
@@ -59,27 +64,21 @@ impl Service {
 			return Err!(Request(Forbidden("Only the server user can set this alias")));
 		}
 
-		let count = self.services.globals.next_count().await?;
-
+		let _guard = self.mutation.lock().await;
 		let localpart = alias.alias();
-
-		// Comes first as we don't want a stuck alias
-		self.db
-			.alias_userid
-			.insert(localpart, user_id)
-			.await?;
-
-		self.db
-			.alias_roomid
-			.insert(localpart, room_id)
-			.await?;
-
-		self.db
-			.aliasid_alias
-			.put_raw((room_id, *count), alias)
-			.await?;
-
-		Ok(())
+		let mut txn = self.services.db.txn();
+		match self.resolve_local_alias(alias).await {
+			| Ok(previous) =>
+				self.stage_removed_alias(alias, &previous, &mut txn)
+					.await?,
+			| Err(error) if error.is_not_found() => {},
+			| Err(error) => return Err(error),
+		}
+		let count = self.services.globals.next_count().await?;
+		txn.insert_raw(&self.db.alias_userid, localpart, user_id);
+		txn.insert_raw(&self.db.alias_roomid, localpart, room_id);
+		txn.put_raw(&self.db.aliasid_alias, (room_id, *count), alias);
+		txn.execute().await
 	}
 
 	pub async fn remove_alias_by(&self, alias: &RoomAliasId, user_id: &UserId) -> Result {
@@ -92,35 +91,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self))]
 	pub async fn remove_alias(&self, alias: &RoomAliasId) -> Result {
-		let alias = alias.alias();
-		let Ok(room_id) = self.db.alias_roomid.get(&alias).await else {
-			return Err!(Request(NotFound("Alias does not exist or is invalid.")));
-		};
-
-		let prefix = (&room_id, Interfix);
-		self.db
-			.aliasid_alias
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.for_each(|key| async move {
-				self.db
-					.aliasid_alias
-					.remove(key)
-					.await
-					.expect("database remove error");
-			})
-			.await;
-
-		self.db
-			.alias_roomid
-			.remove(alias.as_bytes())
+		self.check_alias_local(alias)?;
+		let _guard = self.mutation.lock().await;
+		let room_id = self.resolve_local_alias(alias).await?;
+		let mut txn = self.services.db.txn();
+		self.stage_removed_alias(alias, &room_id, &mut txn)
 			.await?;
-		self.db
-			.alias_userid
-			.remove(alias.as_bytes())
-			.await?;
-
-		Ok(())
+		txn.execute().await
 	}
 
 	#[inline]

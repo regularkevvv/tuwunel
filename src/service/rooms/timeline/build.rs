@@ -76,7 +76,7 @@ pub async fn build_and_append_pdu_with_txnid(
 			.services
 			.short
 			.get_or_create_shortroomid(pdu.room_id())
-			.await;
+			.await?;
 	}
 
 	if self

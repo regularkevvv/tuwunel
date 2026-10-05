@@ -1,3 +1,4 @@
+mod avatars;
 mod data;
 pub(super) mod migrations;
 mod preview;
@@ -696,15 +697,16 @@ impl Service {
 		Ok(urls.next().await)
 	}
 
-	/// Gets all the MXC URIs in our media database
+	/// Gets the complete MXC inventory through 4,096 stored media rows and
+	/// 1 MiB of retained keys. Refuses overflow, malformed URIs or read errors
+	/// before a caller can start deleting media. Thumbnail rows retain their
+	/// existing separate inventory entries.
 	pub async fn get_all_mxcs(&self) -> Result<Vec<OwnedMxcUri>> {
-		let all_keys = self.db.get_all_media_keys().await;
+		let all_keys = self.db.get_all_media_keys().await?;
 
 		let mut mxcs = Vec::with_capacity(all_keys.len());
 
 		for key in all_keys {
-			trace!("Full MXC key from database: {key:?}");
-
 			let mut parts = key.split(|&b| b == 0xFF);
 			let mxc = parts
 				.next()
@@ -718,20 +720,15 @@ impl Service {
 				.transpose()?;
 
 			let Some(mxc_s) = mxc else {
-				debug_warn!(
-					?mxc,
-					"Parsed MXC URL unicode bytes from database but is still invalid"
-				);
-				continue;
+				return Err!(Database("Missing media URI in inventory"));
 			};
 
-			trace!("Parsed MXC key to URL: {mxc_s}");
 			let mxc = OwnedMxcUri::from(mxc_s);
 
 			if mxc.is_valid() {
 				mxcs.push(mxc);
 			} else {
-				debug_warn!("{mxc:?} from database was found to not be valid");
+				return Err!(Database("Invalid media URI in inventory"));
 			}
 		}
 
@@ -820,10 +817,11 @@ impl Service {
 		size_gt: u64,
 		keep_profiles: bool,
 	) -> Result<Vec<OwnedMxcUri>> {
-		let spared = keep_profiles
-			.then_async(|| self.avatar_mxcs())
-			.await
-			.unwrap_or_default();
+		let spared = if keep_profiles {
+			self.avatar_mxcs().await?
+		} else {
+			HashSet::new()
+		};
 
 		let candidates = self.get_all_mxcs().await?;
 
@@ -848,33 +846,6 @@ impl Service {
 			.await;
 
 		Ok(deleted)
-	}
-
-	/// The MXCs of every local user's profile avatar and every room's avatar,
-	/// the spare-set honoured by `keep_profiles`.
-	async fn avatar_mxcs(&self) -> HashSet<OwnedMxcUri> {
-		let user_avatars = self
-			.services
-			.users
-			.list_local_users()
-			.map(ToOwned::to_owned)
-			.broad_filter_map(async |user| self.services.profile.avatar_url(&user).await.ok());
-
-		let room_avatars = self
-			.services
-			.metadata
-			.iter_ids()
-			.map(ToOwned::to_owned)
-			.broad_filter_map(|room_id| async move {
-				self.services
-					.state_accessor
-					.get_avatar(&room_id)
-					.await
-					.ok()
-					.and_then(|avatar| avatar.url)
-			});
-
-		user_avatars.chain(room_avatars).collect().await
 	}
 
 	fn is_local(&self, mxc: &OwnedMxcUri) -> bool {

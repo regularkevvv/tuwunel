@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, collections::HashMap, iter::once, sync::Arc};
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedEventId, OwnedServerName, RoomId,
 	RoomOrAliasId, RoomVersionId, UserId,
@@ -227,7 +227,7 @@ async fn knock_room_local_federation_fallback(
 	self.services
 		.short
 		.get_or_create_shortroomid(room_id)
-		.await;
+		.await?;
 
 	self.finalize_knock_membership(
 		room_id,
@@ -335,7 +335,7 @@ async fn knock_room_helper_remote(
 	self.services
 		.short
 		.get_or_create_shortroomid(room_id)
-		.await;
+		.await?;
 
 	info!("Parsing knock event");
 	let parsed_knock_pdu = PduEvent::from_object_and_eventid(&event_id, knock_event.clone())
@@ -571,7 +571,7 @@ async fn ingest_send_knock_state(
 			.services
 			.short
 			.get_or_create_shortstatekey(&event_type, &state_key)
-			.await;
+			.await?;
 
 		self.services
 			.timeline
@@ -600,8 +600,8 @@ async fn apply_send_knock_state(
 				.iter()
 				.map(|(ssk, eid)| (ssk, eid.borrow())),
 		)
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	debug!("Saving compressed state");
 	let HashSetCompressStateEvent {

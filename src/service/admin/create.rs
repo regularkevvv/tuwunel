@@ -49,7 +49,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 	let _short_id = services
 		.short
 		.get_or_create_shortroomid(&room_id)
-		.await;
+		.await?;
 
 	let state_lock = services.state.mutex.lock(&room_id).await;
 

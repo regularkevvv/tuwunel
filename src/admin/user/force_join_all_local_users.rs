@@ -1,5 +1,4 @@
-use futures::StreamExt;
-use ruma::{OwnedRoomOrAliasId, UserId};
+use ruma::OwnedRoomOrAliasId;
 use tuwunel_core::{Err, Result, debug_warn};
 use tuwunel_service::membership::Join;
 
@@ -19,6 +18,10 @@ pub(super) async fn force_join_all_local_users(
 		);
 	}
 
+	// Complete and close the bounded inventory before resolving or joining.
+	// An oversized/corrupt inventory must not produce a partial bulk operation.
+	let users = self.services.users.bounded_local_users().await?;
+
 	let (room_id, servers) = self
 		.services
 		.alias
@@ -37,14 +40,7 @@ pub(super) async fn force_join_all_local_users(
 	let mut failed_joins: usize = 0;
 	let mut successful_joins: usize = 0;
 
-	for user_id in &self
-		.services
-		.users
-		.list_local_users()
-		.map(UserId::to_owned)
-		.collect::<Vec<_>>()
-		.await
-	{
+	for user_id in &users {
 		if user_id == &self.services.globals.server_user {
 			continue;
 		}

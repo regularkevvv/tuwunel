@@ -224,26 +224,23 @@ impl Data {
 			.map(decode_sending)
 	}
 
-	/// Queued push destinations with a pending badge refresh, among at most
-	/// `limit` queued push rows after the key `after`, and the key to pass
-	/// next, `None` once the push queue ends. The read is closed before this
-	/// returns.
-	pub(super) async fn queued_badge_refresh_destinations(
+	/// Destinations owning durable pending rows, among at most `limit` rows
+	/// after `after`. Validate every row before returning the page. The read
+	/// closes here, before startup promotes any row for delivery.
+	pub(super) async fn queued_destinations_after(
 		&self,
 		after: Option<&[u8]>,
 		limit: usize,
 	) -> Result<(Vec<Destination>, Option<Key>)> {
 		let rows = self
 			.servernameevent_data
-			.raw_rows_prefix_after(b"$", after, limit)
+			.raw_rows_after(after, limit)
 			.await?;
 
 		let next = next_cursor(&rows, limit);
 		let destinations = rows
 			.iter()
-			.filter_map(|(key, value)| {
-				decode_badge_destination(Ok((key.as_slice(), value.as_slice())))
-			})
+			.map(|(key, value)| parse_servercurrentevent(key, value).map(at!(0)))
 			.collect::<Result<_>>()?;
 
 		Ok((destinations, next))
@@ -318,15 +315,6 @@ fn decode_sending(row: Result<(&[u8], &[u8])>) -> Result<SendingItem> {
 	decode_outgoing(row).map(|(key, event, _)| (key, event))
 }
 
-fn decode_badge_destination(row: Result<(&[u8], &[u8])>) -> Option<Result<Destination>> {
-	match row {
-		| Ok((key, value)) if value == [TAG_BADGE_REFRESH] =>
-			Some(parse_servercurrentevent(key, value).map(at!(0))),
-		| Ok(_) => None,
-		| Err(error) => Some(Err(error)),
-	}
-}
-
 fn retain_existing(item: QueueItem, exists: Result) -> Option<Result<QueueItem>> {
 	match exists {
 		| Ok(()) => Some(Ok(item)),
@@ -362,7 +350,7 @@ pub(super) fn parse_servercurrentevent(
 		})?;
 
 		let decoded = match value {
-			| [] => SendingEvent::Pdu(event.into()),
+			| [] => SendingEvent::Pdu(super::RawPduId::from_bytes(event)?),
 			| [TAG_TO_DEVICE, ..] => SendingEvent::ToDevice(value.into()),
 			| [TAG_DEVICE_LIST_CHANGED, ..] => SendingEvent::DeviceListChanged(value.into()),
 			| _ => SendingEvent::Edu(value.into()),
@@ -391,7 +379,7 @@ pub(super) fn parse_servercurrentevent(
 			.ok_or_else(|| Error::bad_database("Invalid bytes in servercurrentpdus."))?;
 
 		(Destination::Push(user_id, pushkey_string), match value {
-			| [] => SendingEvent::Pdu(event.into()),
+			| [] => SendingEvent::Pdu(super::RawPduId::from_bytes(event)?),
 			| [tag] if *tag == TAG_BADGE_REFRESH => SendingEvent::BadgeRefresh,
 			| _ => SendingEvent::Edu(value.into()),
 		})
@@ -414,7 +402,7 @@ pub(super) fn parse_servercurrentevent(
 				Error::bad_database("Invalid server string in server_currenttransaction")
 			})?),
 			if value.is_empty() {
-				SendingEvent::Pdu(event.into())
+				SendingEvent::Pdu(super::RawPduId::from_bytes(event)?)
 			} else {
 				SendingEvent::Edu(value.into())
 			},

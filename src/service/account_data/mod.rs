@@ -237,9 +237,8 @@ pub fn changes_since_fallible<'a>(
 }
 
 /// MSC4025: erase all account data for a user in the given namespace
-/// (global if `room_id` is `None`, otherwise a single room). Mirrors
-/// `threads::delete_all_rooms_threads`: prefix-scan the keys and
-/// remove each.
+/// (global if `room_id` is `None`, otherwise a single room). Prefix-scan
+/// the namespace keys before removing them.
 #[implement(Service)]
 pub async fn erase_user(&self, user_id: &UserId, room_id: Option<&RoomId>) {
 	let prefix = (room_id, user_id, Interfix);

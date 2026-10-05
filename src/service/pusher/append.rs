@@ -127,7 +127,9 @@ pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
 
 	let _cork = self.db.db.cork();
 	for user in &push_target {
-		self.append_pdu_for_user(user, appended).await;
+		self.append_pdu_for_user(user, appended)
+			.await
+			.effect("push rule evaluation", pdu.event_id());
 	}
 
 	Ok(())
@@ -145,7 +147,7 @@ async fn append_pdu_for_user(
 		thread_root,
 		related_events,
 	}: Appended<'_>,
-) {
+) -> Result {
 	let rules_for_user = self
 		.services
 		.account_data
@@ -163,7 +165,7 @@ async fn append_pdu_for_user(
 			room_id: pdu.room_id(),
 			related_events,
 		})
-		.await;
+		.await?;
 
 	let notify = actions.iter().any(Action::should_notify);
 
@@ -234,6 +236,7 @@ async fn append_pdu_for_user(
 			})
 			.await;
 	}
+	Ok(())
 }
 
 #[implement(super::Service)]

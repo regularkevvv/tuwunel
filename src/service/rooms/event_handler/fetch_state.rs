@@ -66,7 +66,7 @@ pub(super) async fn fetch_state(
 			.services
 			.short
 			.get_or_create_shortstatekey(&pdu.kind().to_string().into(), state_key)
-			.await;
+			.await?;
 
 		match state.entry(shortstatekey) {
 			| hash_map::Entry::Vacant(v) => {

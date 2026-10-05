@@ -39,6 +39,30 @@ impl RawId {
 	const MAX_LEN: usize = Self::BACKFILLED_LEN;
 	const NORMAL_LEN: usize = size_of::<ShortRoomId>() + size_of::<u64>();
 
+	/// Decodes a stored key after validating width, marker and count range.
+	pub fn from_bytes(buf: &[u8]) -> crate::Result<Self> {
+		if !matches!(buf.len(), Self::NORMAL_LEN | Self::BACKFILLED_LEN) {
+			return Err(crate::Error::bad_database("Invalid stored PDU key width"));
+		}
+		if buf.len() == Self::BACKFILLED_LEN && buf[INT_LEN..INT_LEN * 2] != [0_u8; INT_LEN] {
+			return Err(crate::Error::bad_database("Invalid stored backfilled PDU key marker"));
+		}
+		let count_offset = if buf.len() == Self::NORMAL_LEN {
+			INT_LEN
+		} else {
+			INT_LEN * 2
+		};
+		let count = &buf[count_offset..];
+		if buf.len() == Self::NORMAL_LEN && count[0] >= 0x80
+			|| buf.len() == Self::BACKFILLED_LEN
+				&& count[0] < 0x80
+				&& count.iter().any(|byte| *byte != 0)
+		{
+			return Err(crate::Error::bad_database("Invalid stored PDU count range"));
+		}
+		Ok(Self::from(buf))
+	}
+
 	/// Checks whether two raw PDU keys belong to the same room.
 	///
 	/// Only the leading compact room identifier is compared. Timeline kind and
@@ -128,7 +152,9 @@ impl serde::de::Visitor<'_> for RawIdVisitor {
 	}
 
 	#[inline]
-	fn visit_bytes<E>(self, buf: &[u8]) -> Result<RawId, E> { Ok(RawId::from(buf)) }
+	fn visit_bytes<E: serde::de::Error>(self, buf: &[u8]) -> Result<RawId, E> {
+		RawId::from_bytes(buf).map_err(E::custom)
+	}
 }
 
 impl From<Id> for RawId {

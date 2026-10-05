@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tuwunel_core::Result;
 
 use crate::{PAGE_SIZE, admin_command, get_room_info};
@@ -11,8 +11,8 @@ pub(super) async fn directory_list(&self, page: Option<usize>) -> Result {
 		.directory
 		.public_rooms()
 		.then(|room_id| get_room_info(self.services, room_id))
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	rooms.sort_by_key(|r| r.1);
 	rooms.reverse();

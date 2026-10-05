@@ -157,8 +157,7 @@ async fn local_room_summary_response(
 
 	let num_joined_members = services
 		.state_cache
-		.room_joined_count(room_id)
-		.unwrap_or(0);
+		.room_joined_count_uint(room_id);
 
 	let membership = sender_user.map_async(|sender_user| {
 		services
@@ -196,7 +195,7 @@ async fn local_room_summary_response(
 			avatar_url,
 			guest_can_join,
 			name,
-			num_joined_members: num_joined_members.try_into().unwrap_or_default(),
+			num_joined_members: num_joined_members?,
 			topic,
 			world_readable,
 			room_type,

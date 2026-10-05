@@ -1,4 +1,3 @@
-use futures::StreamExt;
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use tuwunel_core::{Err, Result, err};
 use tuwunel_service::Services;
@@ -6,26 +5,28 @@ use tuwunel_service::Services;
 pub(crate) async fn get_room_info(
 	services: &Services,
 	room_id: &RoomId,
-) -> (OwnedRoomId, u64, String) {
+) -> Result<(OwnedRoomId, u64, String)> {
 	let join_count = services
 		.state_cache
-		.room_joined_count(room_id)
-		.await
-		.unwrap_or(0);
+		.room_joined_count_uint(room_id)
+		.await?;
+	let join_count = u64::from(join_count);
 
 	let name = match services.state_accessor.get_name(room_id).await {
 		| Ok(name) => name,
+		| Err(error) if !error.is_not_found() => return Err(error),
 		| Err(_) if join_count == 2 => services
 			.state_cache
-			.room_members(room_id)
+			.bounded_room_members(room_id)
+			.await?
+			.iter()
 			.map(ToString::to_string)
 			.collect::<Vec<_>>()
-			.await
 			.join(", "),
 		| Err(_) => room_id.to_string(),
 	};
 
-	(room_id.into(), join_count, name)
+	Ok((room_id.into(), join_count, name))
 }
 
 /// Parses user ID

@@ -7,7 +7,7 @@ use std::{
 	},
 };
 
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Stream, TryFutureExt, TryStreamExt};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
 	Error, Result, err, implement,
@@ -101,10 +101,10 @@ pub async fn resolve_state(
 			self.services
 				.short
 				.get_or_create_shortstatekey(event_type, state_key)
-				.map(move |shortstatekey| (shortstatekey, event_id))
+				.map_ok(move |shortstatekey| (shortstatekey, event_id))
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	trace!("Compressing state...");
 	let new_room_state: CompressedState = self
@@ -115,8 +115,8 @@ pub async fn resolve_state(
 				.iter()
 				.map(|(ssk, eid)| (ssk, (*eid).borrow())),
 		)
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	Ok(Arc::new(new_room_state))
 }

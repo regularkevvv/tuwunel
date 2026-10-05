@@ -19,7 +19,6 @@ use ruma::{
 	events::{AnySyncTimelineEvent, room::power_levels::RoomPowerLevels},
 	push::{Action, FlattenedJson, PushConditionPowerLevelsCtx, PushConditionRoomCtx, Ruleset},
 	serde::Raw,
-	uint,
 };
 use serde::Deserialize;
 use tuwunel_core::{
@@ -27,7 +26,6 @@ use tuwunel_core::{
 	matrix::Event,
 	utils::{
 		MutexMap,
-		future::TryExtExt,
 		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore, WidebandExt},
 	},
 };
@@ -331,7 +329,7 @@ pub async fn get_actions<'a>(
 		room_id,
 		related_events,
 	}: Evaluate<'a, '_>,
-) -> &'a [Action] {
+) -> Result<&'a [Action]> {
 	let user_display_name = self
 		.services
 		.profile
@@ -341,10 +339,7 @@ pub async fn get_actions<'a>(
 	let room_joined_count = self
 		.services
 		.state_cache
-		.room_joined_count(room_id)
-		.map_ok(TryInto::try_into)
-		.map_ok(|res| res.unwrap_or_else(|_| uint!(1)))
-		.unwrap_or_default();
+		.room_joined_count_uint(room_id);
 
 	let (room_joined_count, user_display_name) = join(room_joined_count, user_display_name).await;
 
@@ -357,7 +352,7 @@ pub async fn get_actions<'a>(
 
 	let ctx = PushConditionRoomCtx::new(
 		room_id.to_owned(),
-		room_joined_count,
+		room_joined_count?,
 		user.to_owned(),
 		user_display_name,
 	);
@@ -372,7 +367,7 @@ pub async fn get_actions<'a>(
 		| None => ctx,
 	};
 
-	ruleset.get_actions(pdu, &ctx).await
+	Ok(ruleset.get_actions(pdu, &ctx).await)
 }
 
 /// Resolve the events an event relates to, for the MSC3664 push condition.

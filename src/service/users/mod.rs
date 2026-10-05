@@ -2,6 +2,9 @@ mod dehydrated_device;
 pub mod device;
 mod keys;
 mod ldap;
+mod local_activity;
+mod local_count;
+mod local_page;
 mod register;
 
 use std::sync::Arc;
@@ -26,7 +29,14 @@ use tuwunel_core::{
 use tuwunel_database::{Deserialized, Json, Map};
 
 pub use self::{
-	dehydrated_device::DehydratedDevice, device::ToDeviceTarget, keys::parse_master_key,
+	dehydrated_device::DehydratedDevice,
+	device::ToDeviceTarget,
+	keys::parse_master_key,
+	local_activity::{
+		DeviceMetadataInventory, LocalUserActivity, MAX_ADMIN_DEVICE_BYTES, MAX_ADMIN_DEVICE_ROWS,
+	},
+	local_count::MAX_LOCAL_USER_COUNT_ROWS,
+	local_page::{MAX_LOCAL_USER_PAGE_ROWS, UserInventoryPage},
 	register::Register,
 };
 
@@ -208,7 +218,13 @@ impl Service {
 			.userid_password
 			.get(user_id)
 			.map_ok(|val| val.is_empty())
-			.map_err(|_| err!(Request(NotFound("User does not exist."))))
+			.map_err(|error| {
+				if error.is_not_found() {
+					err!(Request(NotFound("User does not exist.")))
+				} else {
+					error
+				}
+			})
 			.await
 	}
 
@@ -266,10 +282,27 @@ impl Service {
 		self.db.userid_locked.get(user_id).await.is_ok()
 	}
 
+	/// Returns the lock row's presence, preserving storage failures rather than
+	/// interpreting an unavailable row as an unlocked account.
+	pub async fn is_locked_checked(&self, user_id: &UserId) -> Result<bool> {
+		self.db
+			.userid_locked
+			.contains_checked(&(user_id,))
+			.await
+	}
+
 	/// MSC4025: the user's events serve as pruned copies to recipients not
 	/// joined at the event. Presence-only for the serving gate.
 	pub async fn is_erased(&self, user_id: &UserId) -> bool {
 		self.db.userid_erased.get(user_id).await.is_ok()
+	}
+
+	/// Returns the erasure row's presence without masking storage failures.
+	pub async fn is_erased_checked(&self, user_id: &UserId) -> Result<bool> {
+		self.db
+			.userid_erased
+			.contains_checked(&(user_id,))
+			.await
 	}
 
 	/// MSC4025: the global count recorded at erasure, for admin surfacing;

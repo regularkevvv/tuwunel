@@ -1,0 +1,84 @@
+name: ci-native
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.*"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+      - "clippy.toml"
+      - "ci/native-gate.sh"
+      - ".github/workflows/ci-native.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    outputs:
+      rocksdb: ${{ steps.traces.outputs.rocksdb }}
+      remote: ${{ steps.traces.outputs.remote }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          df -h /
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang liburing-dev pkg-config
+      - name: Install pinned toolchains
+        run: |
+          rustup show active-toolchain
+          rustup toolchain install nightly-2026-08-18 --profile minimal --component rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-gate-v1
+          cache-workspace-crates: true
+          cache-on-failure: true
+      - name: Format and clippy
+        run: bash ci/native-gate.sh lint
+      - name: Focused regressions
+        run: bash ci/native-gate.sh regressions
+      - name: Workspace tests
+        run: bash ci/native-gate.sh test
+      - name: RocksDB and remote traces
+        id: traces
+        run: bash ci/native-gate.sh traces
+      - name: Release record decoding
+        run: bash ci/native-gate.sh release
+
+  trace-evidence:
+    needs: native
+    # These public, GitHub-owned job fields let the private gate read the two
+    # digests without a cross-repository artifact-download credential.
+    name: traces ${{ needs.native.outputs.rocksdb }} ${{ needs.native.outputs.remote }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Confirm trace digests
+        env:
+          ROCKSDB: ${{ needs.native.outputs.rocksdb }}
+          REMOTE: ${{ needs.native.outputs.remote }}
+        run: |
+          [[ "$ROCKSDB" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$REMOTE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ROCKSDB" == "$REMOTE" ]]
+          echo "Both trace backends produced SHA-256 $ROCKSDB"

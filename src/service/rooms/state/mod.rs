@@ -1,6 +1,7 @@
+mod frontier;
 mod prune;
 
-use std::{fmt::Write, iter::once, sync::Arc};
+use std::{fmt::Write, iter::once, pin::pin, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::join_all};
@@ -8,27 +9,30 @@ pub(crate) use prune::prune_goal;
 pub use prune::{PruneSummary, Trigger};
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId, UserId,
-	events::{AnyStrippedStateEvent, StateEventType, TimelineEventType},
+	api::error::{ErrorKind, LimitExceededErrorData},
+	events::{
+		AnyStrippedStateEvent, StateEventType, TimelineEventType,
+		room::power_levels::RoomPowerLevelsEventContent,
+	},
 	room_version_rules::AuthorizationRules,
 	serde::Raw,
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Error, Event, PduEvent, Result, err,
+	Error, Event, PduEvent, Result,
 	error::inspect_debug_log,
 	implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
 	result::{AndThenRef, FlatOk},
 	smallvec::SmallVec,
-	trace,
 	utils::{
 		IterStream, MutexMap, MutexMapGuard, calculate_hash,
-		mutex_map::Guard,
-		stream::{BroadbandExt, TryBroadbandExt, TryIgnore, WidebandExt},
+		json::serialized_len,
+		stream::{TryIgnore, WidebandExt},
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
+use tuwunel_database::{Ignore, Interfix, Map, Txn, serialize_key};
 
 use crate::{
 	rooms::{
@@ -199,7 +203,7 @@ pub async fn set_event_state(
 		.services
 		.short
 		.get_or_create_shorteventid(event_id)
-		.await;
+		.await?;
 
 	let state_hash = calculate_hash(state_ids_compressed.iter().map(|s| &s[..]));
 
@@ -294,7 +298,7 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 		.services
 		.short
 		.get_or_create_shorteventid(&new_pdu.event_id)
-		.await;
+		.await?;
 
 	let previous_shortstatehash = self
 		.get_room_shortstatehash(&new_pdu.room_id)
@@ -322,13 +326,13 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 				.services
 				.short
 				.get_or_create_shortstatekey(&new_pdu.kind.to_string().into(), state_key)
-				.await;
+				.await?;
 
 			let new = self
 				.services
 				.state_compressor
 				.compress_state_event(shortstatekey, &new_pdu.event_id)
-				.await;
+				.await?;
 
 			let replaces = states_parents
 				.last()
@@ -435,88 +439,46 @@ where
 
 	let auth_types =
 		auth_types_for_event(kind, sender, state_key, content, auth_rules, include_create)?;
-	let selected = auth_types
-		.iter()
-		.stream()
-		.broad_then(async |key| {
-			let short = match self
-				.services
-				.short
-				.get_shortstatekey(&key.0, &key.1)
-				.await
-			{
-				| Ok(short) => Some(short),
-				| Err(error) if error.is_not_found() => None,
-				| Err(error) => return Err(error),
-			};
-			Ok((short, key))
-		})
-		.try_collect::<Vec<_>>()
-		.await?;
-	let check_all_keys = selected.iter().any(|(short, _)| short.is_none());
-
-	// Select from the actual snapshot. A missing forward key lookup cannot
-	// establish absence: the snapshot may still reference that state cell.
-	// Normally all auth keys are known, so only those cells need reverse reads.
-	// If any dictionary row is absent, inspect the snapshot's keys to distinguish
-	// a genuinely absent optional event from a torn forward mapping.
-	let (state_keys, event_ids) = self
-		.services
-		.state_accessor
-		.state_full_shortids(shortstatehash)
-		.try_fold((Vec::new(), Vec::new()), async |(mut keys, mut ids), (key, id)| {
-			if check_all_keys
-				|| selected
-					.iter()
-					.any(|(short, _)| *short == Some(key))
-			{
-				keys.push(key);
-				ids.push(id);
-			}
-			Ok((keys, ids))
-		})
-		.await?;
-
-	self.services
-		.short
-		.multi_get_statekey_from_short(state_keys.iter().copied().stream())
-		.zip(state_keys.iter().copied().stream())
-		.zip(event_ids.into_iter().stream())
-		.map(|((key, short), id)| {
-			let key = key
-				.map_err(|_| Error::bad_database("Incomplete current-state auth key mapping"))?;
-			if selected
-				.iter()
-				.any(|(known, expected)| *known == Some(short) && **expected != key)
-			{
-				return Err(Error::bad_database("Mismatched current-state auth key mapping"));
-			}
-			Ok((key, id))
-		})
-		.try_filter_map(async |(key, id)| Ok(auth_types.contains(&key).then_some((key, id))))
-		.broad_and_then(async |(key, id)| {
-			let event_id: OwnedEventId = self
-				.services
-				.short
-				.get_eventid_from_short(id)
-				.await?;
-			let pdu = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete current-state auth event"))?;
-			if pdu.room_id() != room_id
-				|| pdu.event_id() != event_id
-				|| pdu.event_type().to_cow_str() != key.0.to_cow_str()
-				|| pdu.state_key() != Some(key.1.as_str())
-			{
-				return Err(Error::bad_database("Mismatched current-state auth event"));
-			}
-			Ok((key, pdu))
-		})
-		.try_collect()
-		.await
+	// Derive optional auth cells from the complete immutable snapshot. Forward
+	// shortcuts cannot prove absence, and no malformed stored cell may disappear
+	// before auth checking or be blamed on the incoming event.
+	let mut state = pin!(
+		self.services
+			.state_accessor
+			.state_full_pdus_strict(shortstatehash)
+	);
+	let mut auth_events = StateMap::new();
+	let mut source_bytes = 0_usize;
+	while let Some((key, pdu)) = state.try_next().await? {
+		source_bytes = source_bytes.saturating_add(
+			serialized_len(pdu.as_pdu())
+				.map_err(|_| Error::bad_database("Invalid auth state serialization"))?,
+		);
+		if source_bytes > 512 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Auth state byte limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		if pdu.room_id() != room_id {
+			return Err(Error::bad_database("Mismatched current-state auth room"));
+		}
+		if !auth_types.contains(&key) {
+			continue;
+		}
+		if key.0 == StateEventType::RoomPowerLevels {
+			pdu.get_content::<RoomPowerLevelsEventContent>()
+				.map_err(|_| Error::bad_database("Invalid stored auth power levels"))?;
+		}
+		if auth_events
+			.insert(key, pdu.as_pdu().clone())
+			.is_some()
+		{
+			return Err(Error::bad_database("Duplicate current-state auth key"));
+		}
+	}
+	Ok(auth_events)
 }
 
 #[implement(Service)]
@@ -625,14 +587,18 @@ pub async fn get_room_version_rules(&self, room_id: &RoomId) -> Result<RoomVersi
 	ret(level = "trace"),
 )]
 pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> {
-	self.services
+	let hash = self.get_room_shortstatehash(room_id).await?;
+	let create = self
+		.services
 		.state_accessor
-		.room_state_get_content(room_id, &StateEventType::RoomCreate, "")
-		.await
-		.as_ref()
-		.map(room_version::from_create_content)
-		.cloned()
-		.map_err(|e| err!(Request(NotFound("No create event found: {e:?}"))))
+		.state_get_optional(hash, &StateEventType::RoomCreate, "")
+		.await?
+		.ok_or_else(|| Error::bad_database("Missing known room create event"))?;
+	if create.room_id() != room_id {
+		return Err(Error::bad_database("Mismatched room create event"));
+	}
+	room_version::from_create_event(&create)
+		.map_err(|_| Error::bad_database("Invalid room create content"))
 }
 
 #[implement(Service)]
@@ -642,11 +608,9 @@ pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> 
 	ret(level = "trace"),
 )]
 pub async fn get_room_shortstatehash(&self, room_id: &RoomId) -> Result<ShortStateHash> {
-	self.db
-		.roomid_shortstatehash
-		.get(room_id)
-		.await
-		.deserialized()
+	let value = self.db.roomid_shortstatehash.get(room_id).await?;
+	tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid room state hash"))
 }
 
 /// Returns the state hash at this event.
@@ -668,26 +632,13 @@ pub async fn pdu_shortstatehash(&self, event_id: &EventId) -> Result<ShortStateH
 )]
 pub async fn get_shortstatehash(&self, shorteventid: ShortEventId) -> Result<ShortStateHash> {
 	const BUFSIZE: usize = size_of::<ShortEventId>();
-
-	self.db
+	let value = self
+		.db
 		.shorteventid_shortstatehash
 		.aqry::<BUFSIZE, _>(&shorteventid)
-		.await
-		.deserialized()
-}
-
-#[implement(Service)]
-pub(super) async fn delete_room_shortstatehash(
-	&self,
-	room_id: &RoomId,
-	_mutex_lock: &Guard<OwnedRoomId, ()>,
-) -> Result {
-	self.db
-		.roomid_shortstatehash
-		.remove(room_id)
 		.await?;
-
-	Ok(())
+	tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid historical state hash"))
 }
 
 /// Collapses the room to a single forward extremity, keeping the one furthest
@@ -837,25 +788,4 @@ pub async fn set_forward_extremities_txn<'a, I>(
 	for (key, event_id) in &leaves {
 		txn.insert_raw(&self.db.roomid_pduleaves, key, event_id.as_bytes());
 	}
-}
-
-#[implement(Service)]
-pub(super) async fn delete_all_rooms_forward_extremities(&self, room_id: &RoomId) -> Result {
-	let prefix = (room_id, Interfix);
-
-	self.db
-		.roomid_pduleaves
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			trace!("Removing key: {key:?}");
-			self.db
-				.roomid_pduleaves
-				.remove(key)
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	Ok(())
 }

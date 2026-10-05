@@ -192,7 +192,7 @@ where
 
 	let started = Instant::now();
 	let room_rules = room_version::rules(room_version)?;
-	let starting_events_count = starting_events.clone().count();
+	let starting_events_count = starting_events.len();
 	let starting_ids = self
 		.services
 		.short
@@ -202,6 +202,7 @@ where
 	pin_mut!(starting_ids);
 	let mut buckets = [BUCKET; NUM_BUCKETS];
 	while let Some((short, starting_event)) = starting_ids.next().await {
+		let short = short?;
 		let bucket: usize = short.try_into()?;
 		let bucket: usize = validated!(bucket % NUM_BUCKETS);
 		buckets[bucket].insert((short, starting_event));
@@ -299,8 +300,12 @@ where
 		let event_complete = AtomicBool::new(true);
 		let auth_chain: Vec<_> = self
 			.get_event_auth_chain(room_id, event_id, room_rules, &event_complete)
-			.collect()
-			.await;
+			.try_collect()
+			.await
+			.unwrap_or_else(|_| {
+				event_complete.store(false, Ordering::Relaxed);
+				Vec::new()
+			});
 
 		match event_complete.load(Ordering::Relaxed) {
 			| true => self
@@ -363,7 +368,7 @@ fn get_event_auth_chain<'a>(
 	event_id: &'a EventId,
 	room_rules: &'a RoomVersionRules,
 	complete: &'a AtomicBool,
-) -> impl Stream<Item = ShortEventId> + Send + 'a {
+) -> impl Stream<Item = Result<ShortEventId>> + Send + 'a {
 	self.get_event_auth_chain_ids(room_id, event_id, room_rules, complete)
 		.broad_then(async move |auth_event| {
 			self.services

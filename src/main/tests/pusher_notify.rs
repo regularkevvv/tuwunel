@@ -199,6 +199,7 @@ async fn prepare_push_retry(services: &Services) -> Result<PushRetry> {
 	let user = UserId::parse_with_server_name("push-retry", server_name)?;
 	let pushkey = "pk-push-retry";
 	let room_id = OwnedRoomId::from_parts('!', "push-retry", Some(server_name.as_str()))?;
+	prepare_room_membership(services, &room_id, &user).await?;
 
 	let listener = TcpListener::bind("127.0.0.1:0").await?;
 	let url = format!("http://{}{NOTIFY_PATH}", listener.local_addr()?);
@@ -504,6 +505,7 @@ async fn verify_permanent_push_error(services: &Services) -> Result {
 	let user = UserId::parse_with_server_name("push-permanent", server_name)?;
 	let pushkey = "pk-push-permanent";
 	let room_id = OwnedRoomId::from_parts('!', "push-permanent", Some(server_name.as_str()))?;
+	prepare_room_membership(services, &room_id, &user).await?;
 	let action =
 		pusher_action(pushkey, "ftp://127.0.0.1/_matrix/push/v1/notify".to_owned(), false, false);
 
@@ -598,6 +600,7 @@ async fn run_cases(services: &Services) -> Result {
 	let unread = services.db.get("userroomid_notificationcount")?;
 
 	for room_id in [&room_id, &other_room_id] {
+		prepare_room_membership(services, room_id, &user).await?;
 		joined.put((&user, room_id), 1_u64).await?;
 		unread.put((&user, room_id), 1_u64).await?;
 	}
@@ -626,6 +629,38 @@ async fn run_cases(services: &Services) -> Result {
 	badge_count_opt_out(&fixture).await?;
 	badge_delivery_memo(&fixture, &room_id).await?;
 	badge_bypasses_suppression(&fixture).await
+}
+
+/// Synthetic group rooms still need a consistent push-rule count context.
+/// Three members preserve the low-priority group-message case exercised below.
+/// Reconcile the count from their indexes instead of inventing it.
+async fn prepare_room_membership(
+	services: &Services,
+	room_id: &RoomId,
+	recipient: &UserId,
+) -> Result {
+	let sender = UserId::parse(SENDER)?;
+	let peer = UserId::parse("@bob:remote.example")?;
+	for member in [recipient, &sender, &peer] {
+		services.db["roomuserid_joined"]
+			.put((room_id, member), 1_u64)
+			.await?;
+		services.db["userroomid_joined"]
+			.put((member, room_id), 1_u64)
+			.await?;
+	}
+	services
+		.state_cache
+		.update_joined_count(room_id)
+		.await?;
+	assert_eq!(
+		services
+			.state_cache
+			.room_joined_count_uint(room_id)
+			.await?,
+		UInt::from(3_u8)
+	);
+	Ok(())
 }
 
 fn message_event(room_id: &str, event_id: &str) -> Result<Pdu> {

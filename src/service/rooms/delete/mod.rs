@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use ruma::{OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId};
 use serde::{Deserialize, Serialize};
-use tuwunel_core::{Result, debug, result::LogErr, trace, utils::future::BoolExt, warn};
+use tuwunel_core::{Err, Result, debug, trace, warn};
 
 use crate::rooms::timeline::RoomMutexGuard;
+
+mod erasure;
+mod inventory;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -37,35 +40,34 @@ impl Service {
 			"Caller must checking if delete_rooms_after_leave configured."
 		);
 
-		let has_local_users = self
+		match self
 			.services
 			.state_cache
-			.local_users_in_room(room_id)
-			.boxed()
-			.into_future()
-			.map(|(next, ..)| next.as_ref().is_some());
-
-		let has_local_invites = self
-			.services
-			.state_cache
-			.local_users_invited_to_room(room_id)
-			.boxed()
-			.into_future()
-			.map(|(next, ..)| next.as_ref().is_some());
-
-		if has_local_users.or(has_local_invites).await {
-			trace!(?room_id, "Not deleting with local joined or invited");
-			return;
+			.has_local_membership_checked(room_id)
+			.await
+		{
+			| Ok(true) => {
+				trace!(?room_id, "Not deleting with local joined or invited");
+				return;
+			},
+			| Err(error) => {
+				warn!(%error, "Not deleting room with incomplete membership inventory");
+				return;
+			},
+			| Ok(false) => {},
 		}
 
 		debug!(?room_id, "Preparing to delete room...");
 
-		self.services
+		if let Err(error) = self
+			.services
 			.delete
 			.delete_room(room_id, false, state_lock)
 			.boxed()
 			.await
-			.expect("unhandled error during room deletion");
+		{
+			warn!(%error, %room_id, "Room cleanup refused");
+		}
 	}
 
 	pub async fn delete_room(
@@ -74,9 +76,12 @@ impl Service {
 		force: bool,
 		state_lock: RoomMutexGuard,
 	) -> Result<ShutdownRoom> {
-		let summary = self.shutdown_room(room_id, &state_lock).await;
+		self.require_unprotected_room(room_id).await?;
+		self.preflight_erasure(room_id, force).await?;
+		let summary = self.shutdown_room(room_id, &state_lock).await?;
 
-		self.purge_room(room_id, force, &state_lock).await;
+		self.purge_room(room_id, force, &state_lock)
+			.await?;
 
 		debug!(?room_id, "Successfully deleted room from our database");
 
@@ -90,153 +95,94 @@ impl Service {
 		&self,
 		room_id: &RoomId,
 		state_lock: &RoomMutexGuard,
-	) -> ShutdownRoom {
-		debug!(?room_id, "Making all local users leave the room and forgetting it");
-		let (kicked_users, failed_to_kick_users) = self
+	) -> Result<ShutdownRoom> {
+		self.require_unprotected_room(room_id).await?;
+		// Validate every source before any eviction or alias mutation.
+		let members = self
 			.services
 			.state_cache
-			.local_users_in_room(room_id)
-			.map(ToOwned::to_owned)
-			.fold((Vec::new(), Vec::new()), async |(mut kicked, mut failed), user_id| {
-				match self
-					.services
-					.membership
-					.leave(&user_id, room_id, Some("Room Deleted".into()), true, state_lock)
-					.await
-				{
-					| Ok(()) => kicked.push(user_id),
-					| Err(e) => {
-						warn!(%e, "Failed to leave room");
-						failed.push(user_id);
-					},
-				}
+			.bounded_room_members(room_id)
+			.await?;
+		self.services
+			.alias
+			.preflight_room_alias_shutdown(room_id)
+			.await?;
+		let (mut kicked_users, mut failed_to_kick_users) = (Vec::new(), Vec::new());
+		debug!(?room_id, "Making all local users leave the room and forgetting it");
+		for user_id in members
+			.into_iter()
+			.filter(|user| self.services.globals.user_is_local(user))
+		{
+			match self
+				.services
+				.membership
+				.leave(&user_id, room_id, Some("Room Deleted".into()), true, state_lock)
+				.await
+			{
+				| Ok(()) => kicked_users.push(user_id),
+				| Err(e) => {
+					warn!(%e, "Failed to leave room");
+					failed_to_kick_users.push(user_id);
+				},
+			}
+		}
 
-				(kicked, failed)
-			})
-			.await;
-
-		debug!("Deleting all our room aliases for the room");
+		debug!("Deleting room aliases and directory publication");
 		let local_aliases = self
 			.services
 			.alias
-			.local_aliases_for_room(room_id)
-			.map(ToOwned::to_owned)
-			.collect::<Vec<_>>()
-			.await;
+			.remove_room_aliases(room_id)
+			.await?;
 
-		for alias in &local_aliases {
-			self.services
-				.alias
-				.remove_alias(alias)
-				.await
-				.log_err()
-				.ok();
-		}
-
-		debug!("Removing/unpublishing room from our room directory");
-		self.services
-			.directory
-			.set_not_public(room_id)
-			.await
-			.expect("database write error");
-
-		ShutdownRoom {
+		Ok(ShutdownRoom {
 			kicked_users,
 			failed_to_kick_users,
 			local_aliases,
 			new_room_id: None,
-		}
+		})
+	}
+
+	async fn preflight_erasure(&self, room_id: &RoomId, force: bool) -> Result {
+		let _insert = self
+			.services
+			.timeline
+			.mutex_insert
+			.lock(room_id)
+			.await;
+		let txn = self.prepare_storage_erasure(room_id).await?;
+		self.services
+			.state_cache
+			.preflight_room_storage_erasure(room_id, force, txn)
+			.await
 	}
 
 	/// Wipes the room's storage. `force` widens the erasure of local users'
 	/// left-state (it is not Synapse's `force_purge`).
-	async fn purge_room(&self, room_id: &RoomId, force: bool, state_lock: &RoomMutexGuard) {
-		debug!("Deleting room's threads from database");
-		self.services
-			.threads
-			.delete_all_rooms_threads(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting all the room's search token IDs from our database");
-		self.services
-			.search
-			.delete_all_search_tokenids_for_room(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting all room's forward extremities from our database");
-		self.services
-			.state
-			.delete_all_rooms_forward_extremities(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting all the room's event (PDU) references");
-		self.services
-			.pdu_metadata
-			.delete_all_referenced_for_room(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting all the room's typed relation index entries");
-		self.services
-			.pdu_metadata
-			.delete_all_relatesto_typed_for_room(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting all the room's member counts");
+	async fn purge_room(
+		&self,
+		room_id: &RoomId,
+		force: bool,
+		_state_lock: &RoomMutexGuard,
+	) -> Result {
+		let _insert = self
+			.services
+			.timeline
+			.mutex_insert
+			.lock(room_id)
+			.await;
+		let txn = self.prepare_storage_erasure(room_id).await?;
 		self.services
 			.state_cache
-			.delete_room_join_counts(room_id, force)
+			.commit_room_storage_erasure(room_id, force, txn)
 			.await
-			.log_err()
-			.ok();
+	}
 
-		debug!("Deleting all the room's private read receipts");
-		self.services
-			.read_receipt
-			.delete_all_read_receipts(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting the room's last notifications read.");
-		self.services
-			.pusher
-			.delete_room_notification_read(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting room state hash from our database");
-		self.services
-			.state
-			.delete_room_shortstatehash(room_id, state_lock)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting PDUs");
-		self.services
-			.timeline
-			.delete_pdus(room_id)
-			.await
-			.log_err()
-			.ok();
-
-		debug!("Deleting internal room ID from our database");
-		self.services
-			.short
-			.delete_shortroomid(room_id)
-			.await
-			.log_err()
-			.ok();
+	async fn require_unprotected_room(&self, room_id: &RoomId) -> Result {
+		// Unknown protection is a refusal, never permission to erase.
+		let admin = self.services.admin.get_admin_room().await?;
+		if admin == room_id {
+			return Err!(Request(Forbidden("Cannot delete or shut down the admin room")));
+		}
+		Ok(())
 	}
 }

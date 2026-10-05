@@ -22,7 +22,8 @@ pub(crate) async fn admin_delete_room_v1_route(
 	require_admin(&services, body.sender_user()).await?;
 
 	let summary =
-		run_shutdown(&services, &body.room_id, body.sender_user(), body.block, body.purge).await;
+		run_shutdown(&services, &body.room_id, body.sender_user(), body.block, body.purge)
+			.await?;
 
 	Ok(V1Response { result: into_response(summary) })
 }
@@ -42,7 +43,7 @@ pub(crate) async fn admin_delete_room_v2_route(
 	let (block, purge) = (body.block, body.purge);
 
 	let work = async move {
-		let summary = run_shutdown(&services, &room_id, &sender, block, purge).await;
+		let summary = run_shutdown(&services, &room_id, &sender, block, purge).await?;
 
 		Ok(serde_json::to_value(summary)?)
 	};
@@ -64,31 +65,29 @@ async fn run_shutdown(
 	sender: &UserId,
 	block: bool,
 	purge: bool,
-) -> Summary {
+) -> Result<Summary> {
 	let state_lock = services.state.mutex.lock(room_id).await;
 
 	let summary = if purge {
 		services
 			.delete
 			.delete_room(room_id, false, state_lock)
-			.await
-			.unwrap_or_default()
+			.await?
 	} else {
 		services
 			.delete
 			.shutdown_room(room_id, &state_lock)
-			.await
+			.await?
 	};
 
 	if block {
 		services
 			.metadata
 			.block_room(room_id, sender)
-			.await
-			.expect("database insert error");
+			.await?;
 	}
 
-	summary
+	Ok(summary)
 }
 
 fn into_response(summary: Summary) -> ShutdownRoom {

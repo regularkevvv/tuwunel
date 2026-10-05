@@ -89,7 +89,7 @@ pub(crate) async fn checkup_sha256_media(services: &Services) -> Result {
 		.filter_map(|ent| ent.map_or(None, |ent| Some(ent.path().into_os_string())))
 		.collect();
 
-	for key in media.db.get_all_media_keys().await {
+	for key in media.db.get_all_media_keys().await? {
 		let new_path = media.get_media_path_sha256(&key).into_os_string();
 		let old_path = media.get_media_path_b64(&key).into_os_string();
 		if let Err(e) =

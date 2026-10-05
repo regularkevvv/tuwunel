@@ -1,10 +1,10 @@
-use futures::{StreamExt, pin_mut};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
+	events::AnyStrippedStateEvent,
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Result, err, implement,
+	Error, Result, err, implement,
 	matrix::{event::gen_event_id, room_version},
 	result::FlatOk,
 };
@@ -39,10 +39,11 @@ pub async fn parse_incoming_pdu(&self, pdu: &RawJsonValue) -> Result<Parsed> {
 		| Ok(room_version_id) => room_version_id,
 		// We may not be resident (e.g. a rescinded out-of-band invite); recover the
 		// version from a locally-invited member's stored stripped state.
-		| Err(_) => self
+		| Err(error) if error.is_not_found() => self
 			.invited_room_version(&room_id)
-			.await
+			.await?
 			.ok_or_else(|| err!("Server is not in room {room_id}"))?,
+		| Err(error) => return Err(error),
 	};
 
 	gen_event_id(&value, &room_version_id)
@@ -99,25 +100,48 @@ fn room_id_of(value: &CanonicalJsonObject) -> Result<OwnedRoomId> {
 /// state, for a room we are not resident in (e.g. a rescinded out-of-band
 /// invite). The create event in the stripped state carries the version.
 #[implement(super::Service)]
-async fn invited_room_version(&self, room_id: &RoomId) -> Option<RoomVersionId> {
+async fn invited_room_version(&self, room_id: &RoomId) -> Result<Option<RoomVersionId>> {
 	let invited = self
 		.services
 		.state_cache
-		.room_members_invited(room_id)
-		.map(ToOwned::to_owned);
-
-	pin_mut!(invited);
-	while let Some(user_id) = invited.next().await {
-		if self.services.globals.user_is_local(&user_id)
-			&& let Ok(stripped) = self
-				.services
-				.state_cache
-				.invite_state(&user_id, room_id)
-				.await && let Some(room_version) = super::room_version_of(&stripped)
-		{
-			return Some(room_version);
+		.bounded_invited_members(room_id)
+		.await?;
+	let mut events = 4096_usize;
+	let mut bytes = 256 * 1024_usize;
+	let mut version = None;
+	for user in invited {
+		if !self.services.globals.user_is_local(&user) {
+			continue;
+		}
+		let stripped = self
+			.services
+			.state_cache
+			.bounded_invite_state(&user, room_id, events, bytes)
+			.await?;
+		events = events.saturating_sub(stripped.events.len());
+		bytes = bytes.saturating_sub(stripped.bytes);
+		let mut candidate = None;
+		for event in stripped.events {
+			let event = event
+				.deserialize()
+				.map_err(|_| Error::bad_database("Invalid stripped invitation event"))?;
+			if let AnyStrippedStateEvent::RoomCreate(create) = event {
+				if candidate.is_some() {
+					return Err(Error::bad_database("Invalid invitation create event"));
+				}
+				room_version::rules(&create.content.room_version)?;
+				candidate = Some(create.content.room_version);
+			}
+		}
+		if let Some(candidate) = candidate {
+			if version
+				.as_ref()
+				.is_some_and(|prior| prior != &candidate)
+			{
+				return Err(Error::bad_database("Conflicting invitation room versions"));
+			}
+			version = Some(candidate);
 		}
 	}
-
-	None
+	Ok(version)
 }

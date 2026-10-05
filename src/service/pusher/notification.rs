@@ -318,25 +318,3 @@ pub async fn thread_last_notification_reads(
 		.collect()
 		.await
 }
-
-#[implement(super::Service)]
-pub async fn delete_room_notification_read(&self, room_id: &RoomId) -> Result {
-	let key = (room_id, Interfix);
-	{
-		let stream = self
-			.db
-			.roomuserid_lastnotificationread
-			.keys_prefix_raw(&key)
-			.ignore_err();
-		futures::pin_mut!(stream);
-		while let Some(key) = stream.next().await {
-			trace!("Removing key: {key:?}");
-			self.db
-				.roomuserid_lastnotificationread
-				.remove(key)
-				.await?;
-		}
-	}
-
-	Ok(())
-}
