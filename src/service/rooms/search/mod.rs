@@ -7,7 +7,6 @@ use tuwunel_core::{
 	arrayvec::ArrayVec,
 	implement,
 	matrix::event::{Event, Matches},
-	trace,
 	utils::{
 		ArrayVecExt, IterStream, ReadyExt, set,
 		stream::{TryIgnore, WidebandExt},
@@ -203,29 +202,6 @@ fn search_pdu_ids_query_word(
 		.rev_raw_keys_from(&end)
 		.ignore_err()
 		.ready_take_while(move |key| key.starts_with(&prefix))
-}
-
-#[implement(Service)]
-pub async fn delete_all_search_tokenids_for_room(&self, room_id: &RoomId) -> Result {
-	let Ok(shortroomid) = self.services.short.get_shortroomid(room_id).await else {
-		return Ok(());
-	};
-
-	let txn = self
-		.db
-		.tokenids
-		.keys_prefix_raw(&shortroomid)
-		.ignore_err()
-		.ready_fold(self.services.db.txn(), |mut txn, key| {
-			trace!("Removing key: {key:?}");
-			txn.del_raw(&self.db.tokenids, key);
-			txn
-		})
-		.await;
-
-	txn.execute().await?;
-
-	Ok(())
 }
 
 /// Splits a string into tokens used as keys in the search inverted index

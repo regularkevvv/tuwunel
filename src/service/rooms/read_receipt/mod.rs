@@ -471,10 +471,6 @@ impl Service {
 			.last_privateread_update_fallible(user_id, room_id)
 			.await
 	}
-
-	pub async fn delete_all_read_receipts(&self, room_id: &RoomId) -> Result {
-		self.db.delete_all_read_receipts(room_id).await
-	}
 }
 
 /// Reverse of `ReceiptThread::as_str`: parse a stored thread tag into the

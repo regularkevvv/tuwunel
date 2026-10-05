@@ -38,12 +38,32 @@ impl ErasureBudget {
 }
 
 impl Service {
-	/// Check all membership erasure sources before shutdown can evict a user
-	/// or remove an alias. An unexecuted transaction changes no storage.
-	pub(crate) async fn preflight_room_erasure(&self, room: &RoomId, force: bool) -> Result {
+	/// Validate the complete storage/member batch before shutdown changes it.
+	pub(crate) async fn preflight_room_storage_erasure(
+		&self,
+		room: &RoomId,
+		force: bool,
+		mut txn: Txn,
+	) -> Result {
 		let _guard = self.membership_mutex.lock(room).await;
-		let mut txn = self.services.db.txn();
 		self.stage_membership_erasure(room, force, &mut txn)
+			.await?;
+		check_storage_batch(&txn)
+	}
+
+	/// Merge room storage and membership erasure into one backend transaction.
+	/// Retain membership exclusion through the commit and cache invalidation.
+	pub(crate) async fn commit_room_storage_erasure(
+		&self,
+		room: &RoomId,
+		force: bool,
+		mut txn: Txn,
+	) -> Result {
+		let guard = self.membership_mutex.lock(room).await;
+		self.stage_membership_erasure(room, force, &mut txn)
+			.await?;
+		check_storage_batch(&txn)?;
+		self.commit_membership_erasure_locked(room, txn, &guard)
 			.await
 	}
 
@@ -123,4 +143,18 @@ impl Service {
 		}
 		Ok(())
 	}
+}
+
+fn check_storage_batch(txn: &Txn) -> Result {
+	// commit_membership_erasure_locked adds the two recount metadata deletes.
+	if txn.len().saturating_add(2) > tuwunel_bridge::MAX_COMMIT_OPS
+		|| txn.size_in_bytes().saturating_add(1024) > 512 * 1024
+	{
+		return Err(Error::Request(
+			ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+			"Room erasure mutation limit reached".into(),
+			http::StatusCode::TOO_MANY_REQUESTS,
+		));
+	}
+	Ok(())
 }

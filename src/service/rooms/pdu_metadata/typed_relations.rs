@@ -1,6 +1,6 @@
-use futures::{StreamExt, TryStreamExt, pin_mut};
+use futures::{TryStreamExt, pin_mut};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, RoomId,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId,
 	api::error::ErrorKind,
 	events::{relation::RelationType, room::encrypted::Relation},
 };
@@ -9,7 +9,7 @@ use tuwunel_core::{
 	arrayvec::ArrayVec,
 	implement,
 	matrix::{Event, Pdu, PduCount, PduId, RawPduId},
-	utils::{bytes::u64_from_bytes, stream::TryIgnore, u64_from_u8},
+	utils::{bytes::u64_from_bytes, u64_from_u8},
 };
 
 use super::{ExtractRelatesTo, RelationReadBudget, Service};
@@ -323,29 +323,6 @@ pub async fn delete_typed_relation(&self, child_id: &RawPduId, child: &Canonical
 		.remove(key.as_slice())
 		.await
 		.expect("database write error");
-}
-
-#[implement(Service)]
-#[tracing::instrument(skip(self), level = "debug")]
-pub async fn delete_all_relatesto_typed_for_room(&self, room_id: &RoomId) -> Result {
-	let Ok(shortroomid) = self.services.short.get_shortroomid(room_id).await else {
-		return Ok(());
-	};
-
-	self.db
-		.relatesto_typed
-		.keys_prefix_raw(&shortroomid)
-		.ignore_err()
-		.for_each(|key| async move {
-			self.db
-				.relatesto_typed
-				.remove(key)
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	Ok(())
 }
 
 pub(super) fn prefix(shortroomid: ShortRoomId, parent: PduCount, tag: Tag) -> Prefix {

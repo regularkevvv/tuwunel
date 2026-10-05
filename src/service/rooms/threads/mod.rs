@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join3};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonValue, EventId, OwnedEventId, OwnedUserId, RoomId, UserId,
 	api::{
@@ -471,26 +471,6 @@ impl Service {
 			})?;
 
 		self.is_participant(&root_id, user_id).await
-	}
-
-	#[tracing::instrument(skip(self), level = "debug")]
-	pub(super) async fn delete_all_rooms_threads(&self, room_id: &RoomId) -> Result {
-		let Ok(shortroomid) = self.services.short.get_shortroomid(room_id).await else {
-			return Ok(());
-		};
-
-		try_join3(
-			self.db.threadid_userids.del_prefix(&shortroomid),
-			self.db
-				.threadactivityid_rootid
-				.del_prefix(&shortroomid),
-			self.db
-				.threadrootid_latestcount
-				.del_prefix(&shortroomid),
-		)
-		.await?;
-
-		Ok(())
 	}
 
 	/// Rebuild the thread activity index from every thread root. Run once at

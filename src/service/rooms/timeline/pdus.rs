@@ -1,12 +1,11 @@
 use futures::{
-	Stream, StreamExt, TryFutureExt, TryStreamExt,
+	Stream, TryFutureExt, TryStreamExt,
 	future::Either::{Left, Right},
 };
 use ruma::{MilliSecondsSinceUnixEpoch, RoomId, UInt, UserId, api::Direction};
 use tuwunel_core::{
 	Error, Result, at, err, implement,
 	matrix::pdu::{PduCount, PduEvent},
-	trace,
 	utils::{
 		result::LogErr,
 		stream::{TryIgnore, TryReadyExt, TryWidebandExt},
@@ -26,44 +25,6 @@ pub fn bias_count(count: [u8; 8]) -> u64 {
 	i64::from_be_bytes(count)
 		.wrapping_sub(i64::MIN)
 		.cast_unsigned()
-}
-
-#[implement(super::Service)]
-pub async fn delete_pdus(&self, room_id: &RoomId) -> Result {
-	let current = self
-		.count_to_id(room_id, PduCount::min(), Direction::Forward)
-		.await?;
-
-	let prefix = current.shortroomid();
-	let stream = self
-		.db
-		.pduid_pdu
-		.raw_stream_from(&current)
-		.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)));
-	futures::pin_mut!(stream);
-	while let Some(item) = stream.next().await {
-		let (key, value) = item?;
-		{
-			let pdu = serde_json::from_slice::<PduEvent>(value)?;
-			let ts: u64 = pdu.origin_server_ts.into();
-			let event_id = &pdu.event_id;
-
-			let mut txn = self.db.db.txn();
-
-			txn.del_raw(&self.db.pduid_pdu, key);
-			txn.del_raw(&self.db.eventid_pduid, event_id);
-			txn.del_raw(&self.db.eventid_outlierpdu, event_id);
-
-			let room_id_ts_key = (room_id, ts, bias_count(RawPduId::from(key).count()));
-			txn.del(&self.db.roomid_tscount_pducount, room_id_ts_key);
-
-			txn.execute().await?;
-
-			trace!(?event_id, ?room_id, ?ts, ?key, "Removed");
-		}
-	}
-
-	Ok(())
 }
 
 #[implement(super::Service)]

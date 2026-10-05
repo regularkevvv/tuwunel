@@ -3,10 +3,9 @@ use ruma::{EventId, OwnedEventId, RoomId};
 use tuwunel_core::{
 	Result, implement,
 	matrix::{Event, Pdu},
-	trace,
 	utils::stream::TryIgnore,
 };
-use tuwunel_database::{Interfix, Txn};
+use tuwunel_database::Txn;
 
 use super::{RelationReadBudget, Service, typed_relations::Tag};
 
@@ -113,26 +112,4 @@ pub fn soft_failed_event_ids(&self) -> impl Stream<Item = OwnedEventId> + Send +
 #[implement(Service)]
 pub async fn clear_event_soft_failed(&self, event_id: &EventId) -> Result {
 	self.db.softfailedeventids.remove(event_id).await
-}
-
-#[implement(Service)]
-#[tracing::instrument(skip(self), level = "debug")]
-pub async fn delete_all_referenced_for_room(&self, room_id: &RoomId) -> Result {
-	let prefix = (room_id, Interfix);
-
-	self.db
-		.referencedevents
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			trace!(?key, "Removing key");
-			self.db
-				.referencedevents
-				.remove(key)
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	Ok(())
 }

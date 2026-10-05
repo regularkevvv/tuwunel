@@ -279,6 +279,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
 similar.workspace = true
+tuwunel-bridge.workspace = true
 # Arms commit refusals for the integration tests (tuwunel_database::refusal).
 tuwunel-database = { workspace = true, features = ["commit_refusals"] }
 

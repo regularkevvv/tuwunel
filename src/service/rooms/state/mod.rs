@@ -25,11 +25,9 @@ use tuwunel_core::{
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
 	result::{AndThenRef, FlatOk},
 	smallvec::SmallVec,
-	trace,
 	utils::{
 		IterStream, MutexMap, MutexMapGuard, calculate_hash,
 		json::serialized_len,
-		mutex_map::Guard,
 		stream::{TryIgnore, WidebandExt},
 	},
 	warn,
@@ -643,20 +641,6 @@ pub async fn get_shortstatehash(&self, shorteventid: ShortEventId) -> Result<Sho
 		.map_err(|_| Error::bad_database("Invalid historical state hash"))
 }
 
-#[implement(Service)]
-pub(super) async fn delete_room_shortstatehash(
-	&self,
-	room_id: &RoomId,
-	_mutex_lock: &Guard<OwnedRoomId, ()>,
-) -> Result {
-	self.db
-		.roomid_shortstatehash
-		.remove(room_id)
-		.await?;
-
-	Ok(())
-}
-
 /// Collapses the room to a single forward extremity, keeping the one furthest
 /// along in stream order, and returns the number removed.
 #[implement(Service)]
@@ -804,25 +788,4 @@ pub async fn set_forward_extremities_txn<'a, I>(
 	for (key, event_id) in &leaves {
 		txn.insert_raw(&self.db.roomid_pduleaves, key, event_id.as_bytes());
 	}
-}
-
-#[implement(Service)]
-pub(super) async fn delete_all_rooms_forward_extremities(&self, room_id: &RoomId) -> Result {
-	let prefix = (room_id, Interfix);
-
-	self.db
-		.roomid_pduleaves
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			trace!("Removing key: {key:?}");
-			self.db
-				.roomid_pduleaves
-				.remove(key)
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	Ok(())
 }

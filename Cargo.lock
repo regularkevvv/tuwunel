@@ -5344,6 +5344,7 @@ dependencies = [
  "tracing-subscriber",
  "tuwunel_admin",
  "tuwunel_api",
+ "tuwunel_bridge",
  "tuwunel_core",
  "tuwunel_database",
  "tuwunel_macros",

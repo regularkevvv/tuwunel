@@ -3,10 +3,11 @@ use std::sync::Arc;
 use futures::FutureExt;
 use ruma::{OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId};
 use serde::{Deserialize, Serialize};
-use tuwunel_core::{Result, debug, trace, warn};
+use tuwunel_core::{Err, Result, debug, trace, warn};
 
 use crate::rooms::timeline::RoomMutexGuard;
 
+mod erasure;
 mod inventory;
 
 pub struct Service {
@@ -75,10 +76,8 @@ impl Service {
 		force: bool,
 		state_lock: RoomMutexGuard,
 	) -> Result<ShutdownRoom> {
-		self.services
-			.state_cache
-			.preflight_room_erasure(room_id, force)
-			.await?;
+		self.require_unprotected_room(room_id).await?;
+		self.preflight_erasure(room_id, force).await?;
 		let summary = self.shutdown_room(room_id, &state_lock).await?;
 
 		self.purge_room(room_id, force, &state_lock)
@@ -97,6 +96,7 @@ impl Service {
 		room_id: &RoomId,
 		state_lock: &RoomMutexGuard,
 	) -> Result<ShutdownRoom> {
+		self.require_unprotected_room(room_id).await?;
 		// Validate every source before any eviction or alias mutation.
 		let members = self
 			.services
@@ -142,79 +142,47 @@ impl Service {
 		})
 	}
 
+	async fn preflight_erasure(&self, room_id: &RoomId, force: bool) -> Result {
+		let _insert = self
+			.services
+			.timeline
+			.mutex_insert
+			.lock(room_id)
+			.await;
+		let txn = self.prepare_storage_erasure(room_id).await?;
+		self.services
+			.state_cache
+			.preflight_room_storage_erasure(room_id, force, txn)
+			.await
+	}
+
 	/// Wipes the room's storage. `force` widens the erasure of local users'
 	/// left-state (it is not Synapse's `force_purge`).
 	async fn purge_room(
 		&self,
 		room_id: &RoomId,
 		force: bool,
-		state_lock: &RoomMutexGuard,
+		_state_lock: &RoomMutexGuard,
 	) -> Result {
-		debug!("Deleting room's threads from database");
-		self.services
-			.threads
-			.delete_all_rooms_threads(room_id)
-			.await?;
-
-		debug!("Deleting all the room's search token IDs from our database");
-		self.services
-			.search
-			.delete_all_search_tokenids_for_room(room_id)
-			.await?;
-
-		debug!("Deleting all room's forward extremities from our database");
-		self.services
-			.state
-			.delete_all_rooms_forward_extremities(room_id)
-			.await?;
-
-		debug!("Deleting all the room's event (PDU) references");
-		self.services
-			.pdu_metadata
-			.delete_all_referenced_for_room(room_id)
-			.await?;
-
-		debug!("Deleting all the room's typed relation index entries");
-		self.services
-			.pdu_metadata
-			.delete_all_relatesto_typed_for_room(room_id)
-			.await?;
-
-		debug!("Deleting all the room's member counts");
+		let _insert = self
+			.services
+			.timeline
+			.mutex_insert
+			.lock(room_id)
+			.await;
+		let txn = self.prepare_storage_erasure(room_id).await?;
 		self.services
 			.state_cache
-			.delete_room_join_counts(room_id, force)
-			.await?;
+			.commit_room_storage_erasure(room_id, force, txn)
+			.await
+	}
 
-		debug!("Deleting all the room's private read receipts");
-		self.services
-			.read_receipt
-			.delete_all_read_receipts(room_id)
-			.await?;
-
-		debug!("Deleting the room's last notifications read.");
-		self.services
-			.pusher
-			.delete_room_notification_read(room_id)
-			.await?;
-
-		debug!("Deleting room state hash from our database");
-		self.services
-			.state
-			.delete_room_shortstatehash(room_id, state_lock)
-			.await?;
-
-		debug!("Deleting PDUs");
-		self.services
-			.timeline
-			.delete_pdus(room_id)
-			.await?;
-
-		debug!("Deleting internal room ID from our database");
-		self.services
-			.short
-			.delete_shortroomid(room_id)
-			.await?;
+	async fn require_unprotected_room(&self, room_id: &RoomId) -> Result {
+		// Unknown protection is a refusal, never permission to erase.
+		let admin = self.services.admin.get_admin_room().await?;
+		if admin == room_id {
+			return Err!(Request(Forbidden("Cannot delete or shut down the admin room")));
+		}
 		Ok(())
 	}
 }

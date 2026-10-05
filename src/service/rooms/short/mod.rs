@@ -13,7 +13,7 @@ use ruma::{
 use serde::Deserialize;
 pub use tuwunel_core::matrix::{ShortEventId, ShortId, ShortRoomId, ShortStateKey};
 use tuwunel_core::{
-	Err, Error, Result, err, implement,
+	Error, Result, err, implement,
 	matrix::StateKey,
 	utils,
 	utils::{IterStream, MutexMap, hash::sha256::Digest},
@@ -535,20 +535,4 @@ async fn create_shortroomid(&self, room_id: &RoomId) -> Result<ShortRoomId> {
 		.await?;
 
 	Ok(*short)
-}
-
-#[implement(Service)]
-pub async fn delete_shortroomid(&self, room_id: &RoomId) -> Result {
-	if self
-		.db
-		.roomid_shortroomid
-		.exists(room_id)
-		.await
-		.is_ok()
-	{
-		self.db.roomid_shortroomid.remove(room_id).await?;
-		Ok(())
-	} else {
-		Err!(Database("not found"))
-	}
 }
