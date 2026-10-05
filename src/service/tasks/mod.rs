@@ -1,11 +1,11 @@
 //! Durable admission and status records for long-running admin requests.
 //!
 //! Requests are stored before an id is returned and outcomes before they are
-//! exposed as complete. Interrupted work is retained with an explicit failure;
-//! replaying partially completed destructive operations requires progress
-//! records coupled to their individual commits.
+//! exposed as complete. Typed history jobs resume from mutation-coupled
+//! progress; generic futures retain an explicit interruption failure.
 
 mod data;
+pub(crate) mod history;
 
 use std::{
 	collections::BTreeMap,
@@ -64,6 +64,7 @@ pub struct TaskInfo {
 	pub error: Option<String>,
 }
 
+#[derive(Clone)]
 struct Task {
 	action: &'static str,
 	resource_id: String,
@@ -119,6 +120,43 @@ where
 	F: Future<Output = Result<JsonValue>> + Send + 'static,
 {
 	let _guard = self.journal.lock().await;
+	if parameters.get("executor").is_some() {
+		return Err(err!("Typed admin requests require their registered handler"));
+	}
+	let id = self
+		.admit(action, resource_id, parameters)
+		.await?;
+
+	let this = Arc::clone(self);
+	let handle = self.services.server.runtime().spawn(async move {
+		let result = async {
+			this.set_active(&id).await?;
+			let outcome = AssertUnwindSafe(work)
+				.catch_unwind()
+				.await
+				.unwrap_or_else(|_| Err(err!("Admin task panicked; partial changes may exist")));
+			this.finish(&id, outcome).await
+		}
+		.await;
+		if let Err(error) = result {
+			error!(%id, %error, "Admin task journal transition failed; task remains unresolved");
+		}
+		this.handles.lock().expect("locked").remove(&id);
+	});
+	self.handles
+		.lock()
+		.expect("locked")
+		.insert(id, handle);
+	Ok(id)
+}
+
+#[implement(Service)]
+async fn admit(
+	&self,
+	action: &'static str,
+	resource_id: String,
+	parameters: JsonValue,
+) -> Result<TaskId> {
 	if self.services.server.config.maintenance {
 		return Err(err!("Admin tasks are unavailable in maintenance mode"));
 	}
@@ -159,26 +197,6 @@ where
 		.await?;
 	self.db.put(&id, &task).await?;
 
-	let this = Arc::clone(self);
-	let handle = self.services.server.runtime().spawn(async move {
-		let result = async {
-			this.set_active(&id).await?;
-			let outcome = AssertUnwindSafe(work)
-				.catch_unwind()
-				.await
-				.unwrap_or_else(|_| Err(err!("Admin task panicked; partial changes may exist")));
-			this.finish(&id, outcome).await
-		}
-		.await;
-		if let Err(error) = result {
-			error!(%id, %error, "Admin task journal transition failed; task remains unresolved");
-		}
-		this.handles.lock().expect("locked").remove(&id);
-	});
-	self.handles
-		.lock()
-		.expect("locked")
-		.insert(id, handle);
 	Ok(id)
 }
 
@@ -204,7 +222,11 @@ pub async fn by_resource(&self, resource_id: &str) -> Result<Vec<TaskInfo>> {
 }
 
 fn matches_nonterminal(task: &Task, action: &str, resource_id: &str) -> bool {
-	task.action == action && task.resource_id == resource_id && !task.status.is_terminal()
+	task.resource_id == resource_id
+		&& !task.status.is_terminal()
+		&& (task.action == action
+			|| (matches!(task.action, "purge_history" | "shutdown_and_purge_room")
+				&& matches!(action, "purge_history" | "shutdown_and_purge_room")))
 }
 
 #[implement(Service)]
@@ -217,24 +239,6 @@ pub async fn list(&self) -> Result<Vec<TaskInfo>> {
 		.iter()
 		.map(|(id, task)| task.info(id))
 		.collect())
-}
-
-/// Validate the entire inventory before changing it. Preserve interrupted
-/// requests rather than disappearing or blindly repeating partial changes.
-/// This is a journal foundation; operation-level resumable receipts remain
-/// necessary for automatic completion after a kill.
-#[implement(Service)]
-pub async fn restore_interrupted(&self) -> Result {
-	let _guard = self.journal.lock().await;
-	let tasks = self.db.load().await?;
-	for (id, mut task) in tasks {
-		if !task.status.is_terminal() {
-			task.status = Status::Failed;
-			task.error = Some("Interrupted by server restart; partial changes may exist".into());
-			self.db.put(&id, &task).await?;
-		}
-	}
-	Ok(())
 }
 
 #[implement(Service)]

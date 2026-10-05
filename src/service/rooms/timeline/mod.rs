@@ -4,6 +4,7 @@ mod build;
 mod create;
 mod pdus;
 mod purge;
+mod purge_resume;
 mod redact;
 
 use std::{fmt::Write, sync::Arc};

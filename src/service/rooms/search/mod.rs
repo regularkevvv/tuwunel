@@ -257,3 +257,35 @@ fn deindex_tokenid(shortroomid: ShortRoomId, word: &str, pdu_id: &RawPduId) -> V
 	key.extend_from_slice(pdu_id.as_ref());
 	key
 }
+
+/// A deterministic page from the immutable event body's token dictionary.
+/// The source value is bounded by the backend; only this page enters a commit.
+#[implement(Service)]
+pub(crate) fn append_deindex_page(
+	&self,
+	txn: &mut Txn,
+	short: ShortRoomId,
+	raw: &RawPduId,
+	body: &str,
+	after: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, bool)> {
+	let keys: std::collections::BTreeSet<Vec<u8>> = tokenize(body)
+		.map(|word| deindex_tokenid(short, &word, raw))
+		.collect();
+	if after.is_some_and(|after| !keys.contains(after)) {
+		return Err(tuwunel_core::Error::bad_database(
+			"History search cursor is outside frozen body",
+		));
+	}
+	let mut page = keys
+		.into_iter()
+		.filter(|key| after.is_none_or(|after| key.as_slice() > after))
+		.take(65)
+		.collect::<Vec<_>>();
+	let done = page.len() <= 64;
+	page.truncate(64);
+	for key in &page {
+		txn.del_raw(&self.db.tokenids, key);
+	}
+	Ok((page.last().cloned(), done))
+}

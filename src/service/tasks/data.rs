@@ -14,7 +14,7 @@ use tuwunel_core::{
 	Error, Result,
 	ruma::api::error::{ErrorKind, LimitExceededErrorData},
 };
-use tuwunel_database::{Database, Map};
+use tuwunel_database::{Database, Map, Txn};
 
 use super::{CAPACITY, Status, TASK_ID_LEN, Task, TaskId};
 
@@ -83,6 +83,10 @@ impl Data {
 	}
 
 	pub(super) async fn put(&self, id: &TaskId, task: &Task) -> Result {
+		self.put_with_txn(id, task, self.db.txn()).await
+	}
+
+	pub(super) async fn put_with_txn(&self, id: &TaskId, task: &Task, mut txn: Txn) -> Result {
 		self.ensure_healthy()?;
 		let value = encode(id, task)?;
 		// Enforce the same complete-inventory bounds for writes and startup.
@@ -127,9 +131,9 @@ impl Data {
 			}
 		}
 
-		let mut txn = self.db.txn();
 		txn.insert_raw(&self.records, id.as_bytes(), &value);
-		txn.execute().await?;
+		crate::rooms::timeline::check_purge_batch(&txn)?;
+		let outcome = txn.execute().await;
 		// Task acceptance/activation must survive a process kill even if a
 		// different service has a native batching cork open. Remote commits
 		// already acknowledge their durable backend boundary.
@@ -142,7 +146,7 @@ impl Data {
 			self.uncertain.store(true, Ordering::Release);
 			return Err(error);
 		}
-		Ok(())
+		outcome
 	}
 
 	fn ensure_healthy(&self) -> Result {
@@ -153,6 +157,8 @@ impl Data {
 		}
 		Ok(())
 	}
+
+	pub(super) fn is_uncertain(&self) -> bool { self.uncertain.load(Ordering::Acquire) }
 
 	pub(super) async fn remove(&self, ids: &[TaskId]) -> Result {
 		self.ensure_healthy()?;
@@ -193,7 +199,13 @@ pub(super) fn validate_record(id: &TaskId, task: &Task) -> Result { encode(id, t
 fn encode(id: &TaskId, task: &Task) -> Result<Vec<u8>> {
 	validate_parameters(&task.parameters)?;
 	let value = serde_json::to_vec(&Record {
-		version: 1,
+		// Older executors must refuse resumable requests rather than marking
+		// them failed and releasing their frozen room/original exclusions.
+		version: if task.parameters.get("executor").is_some() {
+			2
+		} else {
+			1
+		},
 		id: id.to_string(),
 		action: task.action.into(),
 		resource_id: task.resource_id.clone(),
@@ -219,7 +231,12 @@ fn decode(key: &[u8], value: &[u8]) -> Result<(TaskId, Task)> {
 	}
 	let record: Record = serde_json::from_slice(value)
 		.map_err(|_| Error::bad_database("Invalid admin task record"))?;
-	if record.version != 1 || record.id.as_bytes() != key {
+	let expected_version = if record.parameters.get("executor").is_some() {
+		2
+	} else {
+		1
+	};
+	if record.version != expected_version || record.id.as_bytes() != key {
 		return Err(Error::bad_database("Invalid admin task record binding"));
 	}
 	let id = TaskId::from(record.id.as_str())
@@ -236,6 +253,13 @@ fn decode(key: &[u8], value: &[u8]) -> Result<(TaskId, Task)> {
 		},
 	}
 	validate_parameters(&record.parameters)?;
+	super::history::validate_parameters(
+		action,
+		&record.resource_id,
+		&record.parameters,
+		record.status,
+		record.result.as_ref(),
+	)?;
 	let valid_outcome = match record.status {
 		| Status::Scheduled | Status::Active => record.result.is_none() && record.error.is_none(),
 		| Status::Complete => record.result.is_some() && record.error.is_none(),

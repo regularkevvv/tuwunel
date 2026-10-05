@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use ruma::{CanonicalJsonObject, EventId};
+use tokio::sync::{Mutex, MutexGuard};
 use tuwunel_core::{
 	Error, Result, debug_info, implement, matrix::pdu::PduEvent, utils::time::now,
 };
@@ -13,6 +14,7 @@ use crate::rooms::timeline::RoomMutexGuard;
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	db: Arc<Database>,
+	originals: Mutex<()>,
 	eventid_originalpdu: Arc<Map>,
 	timeredacted_eventid: Arc<Map>,
 }
@@ -23,6 +25,7 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
 			db: args.db.clone(),
+			originals: Mutex::new(()),
 			eventid_originalpdu: args.db["eventid_originalpdu"].clone(),
 			timeredacted_eventid: args.db["timeredacted_eventid"].clone(),
 		}))
@@ -73,6 +76,8 @@ pub async fn expire_originals(&self) -> Result<usize> {
 		if rows.is_empty() {
 			return Ok(count);
 		}
+		let _originals = self.lock_originals().await;
+		let pins = self.services.tasks.pinned_history_rooms().await?;
 		for (key, value) in rows {
 			let (time_redacted, event_id): (u64, &EventId) = deserialize_from_slice(&key)?;
 			if !value.is_empty() {
@@ -80,6 +85,14 @@ pub async fn expire_originals(&self) -> Result<usize> {
 			}
 			if time_redacted.saturating_add(retention_seconds) >= at {
 				return Ok(count);
+			}
+			if !pins.is_empty()
+				&& self
+					.original_room_is_pinned(event_id, &pins)
+					.await?
+			{
+				after = Some(key);
+				continue;
 			}
 			let mut txn = self.db.txn();
 			txn.del_raw(&self.eventid_originalpdu, event_id);
@@ -118,6 +131,7 @@ pub async fn save_original_pdu(
 		return Ok(());
 	}
 
+	let _originals = self.lock_originals().await;
 	match self.eventid_originalpdu.get(event_id).await {
 		| Ok(_) => return Ok(()),
 		| Err(error) if error.is_not_found() => {},
@@ -152,4 +166,53 @@ pub async fn purge_original(&self, event_id: &EventId) -> Result {
 #[implement(Service)]
 pub(crate) fn append_purge_original(&self, txn: &mut Txn, event_id: &EventId) {
 	txn.del_raw(&self.eventid_originalpdu, event_id);
+}
+
+#[implement(Service)]
+pub(crate) async fn lock_originals(&self) -> MutexGuard<'_, ()> { self.originals.lock().await }
+
+#[implement(Service)]
+pub(crate) async fn original_snapshot(
+	&self,
+	event_id: &EventId,
+) -> Result<Option<(PduEvent, tuwunel_core::utils::hash::sha256::Digest)>> {
+	let value = match self.eventid_originalpdu.get(event_id).await {
+		| Ok(value) => value,
+		| Err(error) if error.is_not_found() => return Ok(None),
+		| Err(error) => return Err(error),
+	};
+	if value.len() > tuwunel_bridge::MAX_VALUE_BYTES {
+		return Err(Error::bad_database("History original exceeds backend value bound"));
+	}
+	let pdu = serde_json::from_slice(&value)
+		.map_err(|_| Error::bad_database("Invalid retained history original"))?;
+	Ok(Some((pdu, tuwunel_core::utils::hash::sha256::hash(value.as_ref()))))
+}
+
+#[derive(serde::Deserialize)]
+struct OriginalBinding {
+	event_id: ruma::OwnedEventId,
+	room_id: ruma::OwnedRoomId,
+}
+
+#[implement(Service)]
+async fn original_room_is_pinned(
+	&self,
+	event: &EventId,
+	pins: &std::collections::BTreeSet<ruma::OwnedRoomId>,
+) -> Result<bool> {
+	let value = match self.eventid_originalpdu.get(event).await {
+		| Ok(value) => value,
+		| Err(error) if error.is_not_found() => return Ok(false),
+		| Err(error) => return Err(error),
+	};
+	if value.len() > tuwunel_bridge::MAX_VALUE_BYTES {
+		return Err(Error::bad_database("Original retention value exceeds backend bound"));
+	}
+	let binding: OriginalBinding = serde_json::from_slice(&value)
+		.map_err(|_| Error::bad_database("Invalid original retention binding"))?;
+	if binding.event_id != event {
+		return Err(Error::bad_database("Original retention event binding changed"));
+	}
+	Ok(pins.contains(&binding.room_id))
 }

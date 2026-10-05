@@ -50,6 +50,7 @@ type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
 #[derive(Serialize, Deserialize)]
 struct Manifest {
 	room: OwnedRoomId,
+	shutdown_room: OwnedRoomId,
 	complete: String,
 	failed: String,
 	interrupted: Vec<String>,
@@ -212,6 +213,9 @@ async fn prepare(services: &Services, base: &str, directory: &Path) -> Result {
 	let room = client
 		.create_room(&json!({"preset":"public_chat"}))
 		.await?;
+	let shutdown_room = client
+		.create_room(&json!({"preset":"public_chat"}))
+		.await?;
 	let parameters = json!({"boundary": 1, "delete_local_events": false});
 
 	let executed = Arc::new(AtomicBool::new(false));
@@ -260,6 +264,7 @@ async fn prepare(services: &Services, base: &str, directory: &Path) -> Result {
 		directory.join("manifest.json"),
 		serde_json::to_vec(&Manifest {
 			room,
+			shutdown_room,
 			complete,
 			failed,
 			interrupted: Vec::new(),
@@ -292,13 +297,24 @@ async fn accept(services: &Services, directory: &Path) -> Result {
 		.await;
 	duplicate.expect_err("duplicate admission must refuse");
 	assert_eq!(rows(services).await?, before, "duplicate admission has no journal mutation");
+	services
+		.tasks
+		.spawn(
+			"shutdown_and_purge_room",
+			manifest.room.to_string(),
+			json!({"sender":"@journal-admin:example.com", "block":false,"purge":true}),
+			pending(),
+		)
+		.await
+		.expect_err("same-room destructive actions conflict");
+	assert_eq!(rows(services).await?, before, "cross-action refusal has no mutation");
 
 	let (release, wait) = oneshot::channel();
 	let second = services
 		.tasks
 		.spawn(
 			"shutdown_and_purge_room",
-			manifest.room.to_string(),
+			manifest.shutdown_room.to_string(),
 			json!({"sender":"@journal-admin:example.com", "block":false,"purge":true}),
 			async {
 				wait.await
@@ -311,6 +327,13 @@ async fn accept(services: &Services, directory: &Path) -> Result {
 		.await?
 		.to_string();
 	wait_status(services, &second, Status::Active).await?;
+	let before = rows(services).await?;
+	services
+		.tasks
+		.spawn(ACTION, manifest.shutdown_room.to_string(), parameters.clone(), pending())
+		.await
+		.expect_err("purge cannot overlap an active shutdown");
+	assert_eq!(rows(services).await?, before, "reverse cross-action refusal has no mutation");
 	refusal::refuse_next(MAP);
 	release.send(()).expect("live owned task");
 	timeout(Duration::from_secs(10), async {

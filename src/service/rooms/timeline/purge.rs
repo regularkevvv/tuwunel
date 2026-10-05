@@ -97,28 +97,7 @@ async fn prepare_history_erasure(
 	raw: &RawPduId,
 	pdu: &PduEvent,
 ) -> Result<Txn> {
-	let mut txn = self.db.db.txn();
-	txn.del_raw(&self.db.pduid_pdu, raw);
-	txn.del_raw(&self.db.eventid_pduid, &pdu.event_id);
-	txn.del_raw(&self.db.eventid_outlierpdu, &pdu.event_id);
-	let ts: u64 = pdu.origin_server_ts.into();
-	let key = (&pdu.room_id, ts, bias_count(raw.count()));
-	let timestamp_binding = self
-		.db
-		.roomid_tscount_pducount
-		.qry(&key)
-		.await
-		.map_err(|error| {
-			if error.is_not_found() {
-				Error::bad_database("History purge timestamp binding is missing")
-			} else {
-				error
-			}
-		})?;
-	if timestamp_binding.as_ref() != raw.count() {
-		return Err(Error::bad_database("History purge timestamp indexes disagree"));
-	}
-	txn.del(&self.db.roomid_tscount_pducount, key);
+	let mut txn = self.prepare_history_base(raw, pdu).await?;
 	self.append_history_search(&mut txn, short, raw, pdu)?;
 	// Redaction can already have stripped the current body. Include the
 	// retained original so interrupted older redactions cannot strand tokens.
@@ -188,4 +167,31 @@ fn purge_limit() -> Error {
 		"History purge event batch limit exceeded".into(),
 		http::StatusCode::TOO_MANY_REQUESTS,
 	)
+}
+
+#[implement(super::Service)]
+pub(super) async fn prepare_history_base(&self, raw: &RawPduId, pdu: &PduEvent) -> Result<Txn> {
+	let mut txn = self.db.db.txn();
+	txn.del_raw(&self.db.pduid_pdu, raw);
+	txn.del_raw(&self.db.eventid_pduid, &pdu.event_id);
+	txn.del_raw(&self.db.eventid_outlierpdu, &pdu.event_id);
+	let ts: u64 = pdu.origin_server_ts.into();
+	let key = (&pdu.room_id, ts, bias_count(raw.count()));
+	let timestamp_binding = self
+		.db
+		.roomid_tscount_pducount
+		.qry(&key)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("History purge timestamp binding is missing")
+			} else {
+				error
+			}
+		})?;
+	if timestamp_binding.as_ref() != raw.count() {
+		return Err(Error::bad_database("History purge timestamp indexes disagree"));
+	}
+	txn.del(&self.db.roomid_tscount_pducount, key);
+	Ok(txn)
 }

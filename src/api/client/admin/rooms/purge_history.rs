@@ -10,7 +10,7 @@ use synapse_admin_api::purge_history::{
 	},
 	status::v1::{PurgeStatus, Request as StatusRequest, Response as StatusResponse},
 };
-use tuwunel_core::{Err, Result, err, matrix::pdu::PduCount};
+use tuwunel_core::{Err, Error, Result, err, matrix::pdu::PduCount};
 use tuwunel_service::tasks::Status;
 
 use crate::{Ruma, client::admin::require_admin};
@@ -95,7 +95,7 @@ async fn resolve_boundary(
 			.timeline
 			.get_pdu(event_id)
 			.await
-			.map_err(|_| err!(Request(NotFound("Event not found"))))?;
+			.map_err(boundary_error)?;
 
 		if pdu.room_id != *room_id {
 			return Err!(Request(BadJson("Event is for wrong room")));
@@ -105,7 +105,7 @@ async fn resolve_boundary(
 			.timeline
 			.get_pdu_count(event_id)
 			.await
-			.map_err(|_| err!(Request(NotFound("Event not found"))));
+			.map_err(boundary_error);
 	}
 
 	let Some(ts) = ts else {
@@ -128,29 +128,24 @@ async fn resolve_boundary(
 		.ok_or_else(|| err!(Request(NotFound("No event found before the given timestamp"))))
 }
 
-/// Spawns the purge on the tasks service, returning its id. Takes `services` by
-/// value (it is `Copy`) so the detached task owns a `'static` handle.
+fn boundary_error(error: Error) -> Error {
+	if error.is_not_found() {
+		err!(Request(NotFound("Event not found")))
+	} else {
+		error
+	}
+}
+
+/// Admits the typed history handler and returns its durable request id.
 async fn schedule_purge(
 	services: crate::State,
 	room_id: OwnedRoomId,
 	boundary: PduCount,
 	delete_local_events: bool,
 ) -> Result<String> {
-	let resource_id = room_id.to_string();
-	let parameters = serde_json::json!({ "boundary": boundary.into_signed(), "delete_local_events": delete_local_events });
-
-	let work = async move {
-		let purged = services
-			.timeline
-			.purge_history(&room_id, boundary, delete_local_events)
-			.await?;
-
-		Ok(serde_json::json!({ "purged": purged }))
-	};
-
 	Ok(services
 		.tasks
-		.spawn(super::PURGE_HISTORY_ACTION, resource_id, parameters, work)
+		.spawn_history(room_id, boundary, delete_local_events)
 		.await?
 		.to_string())
 }

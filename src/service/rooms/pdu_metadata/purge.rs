@@ -60,18 +60,8 @@ async fn append_relation_removals(
 			return Ok(());
 		}
 		for key in &keys {
-			let value = map.get(key).await?;
-			let valid = if typed {
-				key.len() == super::typed_relations::KEY_LEN
-					&& matches!(key[16], 1 | 2)
-					&& value.len() == 8
-			} else {
-				key.len() == 16 && value.is_empty()
-			};
-			if !valid {
-				return Err(Error::bad_database("Invalid purge relation row"));
-			}
-			txn.del_raw(map, key);
+			self.append_relation_key(txn, map, key, typed)
+				.await?;
 			crate::rooms::timeline::check_purge_batch(txn)?;
 		}
 		after = keys.last().cloned();
@@ -120,4 +110,90 @@ async fn index_pdu_relations(&self, pdu_id: PduId, pdu: &Pdu) -> Result {
 
 	self.add_typed_relation(pdu_id.shortroomid, pdu_id.count, &parent, pdu, rel_type)
 		.await
+}
+
+#[implement(Service)]
+async fn append_relation_key(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	map: &std::sync::Arc<tuwunel_database::Map>,
+	key: &[u8],
+	typed: bool,
+) -> Result {
+	let value = map.get(key).await?;
+	let valid = if typed {
+		key.len() == super::typed_relations::KEY_LEN
+			&& matches!(key[16], 1 | 2)
+			&& value.len() == 8
+	} else {
+		key.len() == 16 && value.is_empty()
+	};
+	if !valid {
+		return Err(Error::bad_database("Invalid purge relation row"));
+	}
+	txn.del_raw(map, key);
+	Ok(())
+}
+
+#[implement(Service)]
+pub(crate) async fn append_history_relation_page(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	short: ShortRoomId,
+	parent: PduCount,
+	typed: bool,
+	after: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, bool)> {
+	let mut prefix = Vec::new();
+	if typed {
+		prefix.extend_from_slice(&short.to_be_bytes());
+	}
+	prefix.extend_from_slice(&parent.to_be_bytes());
+	let map = if typed {
+		&self.db.relatesto_typed
+	} else {
+		&self.db.tofrom_relation
+	};
+	let keys = map
+		.raw_keys_prefix_after(&prefix, after, 64)
+		.await?;
+	for key in &keys {
+		self.append_relation_key(txn, map, key, typed)
+			.await?;
+	}
+	Ok((keys.last().cloned(), keys.len() < 64))
+}
+
+#[implement(Service)]
+pub(crate) async fn append_history_points(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	short: ShortRoomId,
+	parent: PduCount,
+	room: &RoomId,
+	event: &EventId,
+) -> Result {
+	for typed in [false, true] {
+		let mut prefix = Vec::new();
+		if typed {
+			prefix.extend_from_slice(&short.to_be_bytes());
+		}
+		prefix.extend_from_slice(&parent.to_be_bytes());
+		let map = if typed {
+			&self.db.relatesto_typed
+		} else {
+			&self.db.tofrom_relation
+		};
+		if !map
+			.raw_keys_prefix_after(&prefix, None, 1)
+			.await?
+			.is_empty()
+		{
+			return Err(Error::bad_database("History relation cleanup is unfinished"));
+		}
+	}
+	txn.del(&self.db.referencedevents, (room, event));
+	txn.del_raw(&self.db.softfailedeventids, event);
+	txn.del_raw(&self.services.db["eventid_policysigstate"], event);
+	Ok(())
 }

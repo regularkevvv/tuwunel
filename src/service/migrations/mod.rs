@@ -67,16 +67,18 @@ mod tests;
 /// - If database is opened at lesser version we apply migrations up to this.
 ///   Note that named-feature migrations may also be performed when opening at
 ///   equal or lesser version. These are expected to be backward-compatible.
-pub(crate) const DATABASE_VERSION: u64 = 17;
+// Version 18 introduces resumable destructive jobs. Builds without the typed
+// executor must refuse this database, even if they predate the job journal.
+pub(crate) const DATABASE_VERSION: u64 = 18;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 
 const FORCE_MIGRATION_DELAY: Duration = Duration::from_secs(15);
 
 /// A marker written by a sibling conduwuit-lineage server but never by tuwunel.
-/// Its presence identifies a foreign database at a higher schema number even
-/// after tuwunel has stamped its own `server_name`, so a database opened by
-/// both servers in turn keeps booting rather than being refused as too new.
+/// Its presence identifies a foreign database at a higher schema number.
+/// A completed import removes it when claiming our incompatible schema, so
+/// older tuwunel builds cannot misclassify our version as a foreign import.
 const FOREIGN_LINEAGE_MARKER: &[u8] = b"populate_userroomid_leftstate_table";
 
 /// Inline budget for a local user id assembled from a foreign localpart.
@@ -484,14 +486,13 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 			.await?;
 	}
 
-	// A newer same-lineage database was already refused; stamping ours is safe. A
-	// foreign import above our version was already stamped down before the import
-	// ran, so this is a no-op for it.
-	services
-		.globals
-		.db
-		.bump_database_version(target_version)
-		.await?;
+	// Claim our schema and lineage together after the import finishes. Retaining
+	// the foreign marker would let older builds bypass their newer-schema gate
+	// and open a database containing destructive jobs they cannot resume.
+	let mut txn = db.txn();
+	txn.raw_put(&db["global"], b"version", target_version);
+	txn.del_raw(&db["global"], FOREIGN_LINEAGE_MARKER);
+	txn.execute().await?;
 
 	match discovered.cmp(&target_version) {
 		| Ordering::Less =>
