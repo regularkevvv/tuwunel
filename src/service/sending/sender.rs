@@ -852,12 +852,12 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
-		let keep =
-			usize::try_from(self.server.config.startup_netburst_keep).unwrap_or(usize::MAX);
+		if !self.server.config.startup_netburst {
+			return Ok(());
+		}
 
-		// The queue is read in bounded batches from a cursor, each read closed
-		// before the batch's surplus is deleted, so no deletion drains a scan
-		// of the queue this start-up holds open.
+		// Close each bounded page before reading the next. Active rows remain
+		// canonical delivery obligations until their send is acknowledged.
 		let mut txns = HashMap::<Destination, Vec<SendingEvent>>::new();
 		let mut after: Option<Vec<u8>> = None;
 		loop {
@@ -866,18 +866,14 @@ impl Service {
 				.active_requests_after(after.as_deref(), NETBURST_BATCH)
 				.await?;
 
-			for (key, event, dest) in active {
+			for (_, event, dest) in active {
 				if self.shard_id(&dest) != id {
 					continue;
 				}
 
-				let entry = txns.entry(dest.clone()).or_default();
-				if self.server.config.startup_netburst_keep >= 0 && entry.len() >= keep {
-					warn!("Dropping unsent event {dest:?} {:?}", String::from_utf8_lossy(&key));
-					self.db.delete_active_request(&key).await?;
-				} else {
-					entry.push(event);
-				}
+				// These rows are accepted delivery obligations. Startup settings
+				// must not acknowledge or discard any of them.
+				txns.entry(dest).or_default().push(event);
 			}
 
 			match next {
@@ -887,7 +883,7 @@ impl Service {
 		}
 
 		for (dest, events) in txns {
-			if self.server.config.startup_netburst && !events.is_empty() {
+			if !events.is_empty() {
 				statuses.insert(dest.clone(), TransactionStatus::Running);
 				futures.push(self.send_events(dest.clone(), events));
 			}
@@ -895,10 +891,6 @@ impl Service {
 
 		// Active transaction generations must own their queued successors before
 		// queued-only destinations are woken.
-		if !self.server.config.startup_netburst || keep == 0 {
-			return Ok(());
-		}
-
 		let mut destinations = HashSet::new();
 		let mut after: Option<Vec<u8>> = None;
 		loop {
@@ -977,7 +969,7 @@ impl Service {
 			RetryAction::None
 		};
 
-		let (allow, retry) = self
+		let (allow, _retry) = self
 			.select_events_current(dest, statuses, retry_action)
 			.await?;
 
@@ -988,13 +980,16 @@ impl Service {
 
 		let mut events = Vec::new();
 
-		// Must retry any previous transaction for this remote.
-		if retry {
-			let active = self
-				.db
-				.active_requests_for(dest)
-				.try_collect::<Vec<_>>()
-				.await?;
+		// Durable active rows own the previous transaction even after all
+		// volatile status is lost or startup recovery was disabled. Send it
+		// before promoting successors; its ACK cleanup must never erase a
+		// previously unsent active generation.
+		let active = self
+			.db
+			.active_requests_for(dest)
+			.try_collect::<Vec<_>>()
+			.await?;
+		if !active.is_empty() {
 			events.extend(active.into_iter().map(|(_, event)| event));
 
 			return Ok(Some(events));

@@ -3249,12 +3249,11 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub startup_netburst: bool,
 
-	/// Messages are dropped and not reattempted. The `startup_netburst` option
-	/// must be enabled for this value to have any effect. Do not change this
-	/// value unless you know what you are doing. Set this value to -1 to
-	/// reattempt every message without trimming the queues; this may consume
-	/// significant disk. Set this value to 0 to drop all messages without any
-	/// attempt at redelivery.
+	/// Legacy queue-trimming setting, retained for configuration compatibility.
+	///
+	/// This value is ignored. Accepted delivery rows are never discarded during
+	/// startup. Use `startup_netburst` to control automatic recovery; disabling
+	/// it preserves active and queued work for subsequent delivery hints.
 	///
 	/// default: 50
 	#[serde(default = "default_startup_netburst_keep")]
