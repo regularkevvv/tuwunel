@@ -151,6 +151,37 @@ impl Service {
 			})
 	}
 
+	pub(crate) async fn user_is_ignored_checked(
+		&self,
+		sender: &UserId,
+		recipient: &UserId,
+	) -> Result<bool> {
+		match self
+			.services
+			.account_data
+			.get_global::<IgnoredUserListEvent>(
+				recipient,
+				GlobalAccountDataEventType::IgnoredUserList,
+			)
+			.await
+		{
+			| Ok(event) => Ok(event.content.ignored_users.contains_key(sender)),
+			| Err(error) if error.is_not_found() => Ok(false),
+			| Err(error) => Err(error),
+		}
+	}
+
+	pub(crate) async fn notification_recipient_active(&self, user: &UserId) -> Result<bool> {
+		if !self.services.globals.user_is_local(user) || self.is_erased_checked(user).await? {
+			return Ok(false);
+		}
+		match self.is_deactivated(user).await {
+			| Ok(disabled) => Ok(!disabled),
+			| Err(error) if error.is_not_found() => Ok(false),
+			| Err(error) => Err(error),
+		}
+	}
+
 	/// MSC4380: `m.invite_permission_config.default_action == "block"`.
 	pub async fn invites_blocked(&self, user_id: &UserId) -> bool {
 		self.services
@@ -359,6 +390,11 @@ impl Service {
 
 	/// MSC4025: mark the user erased, recording the current global count.
 	pub async fn set_erased(&self, user_id: &UserId) -> Result {
+		let _notifications = self
+			.services
+			.pusher
+			.lock_notification_user(user_id)
+			.await;
 		let count = self.services.globals.current_count();
 
 		self.db
@@ -370,6 +406,11 @@ impl Service {
 	/// MSC4025: erasure is reversible; clearing the marker restores the
 	/// unredacted view.
 	pub async fn clear_erased(&self, user_id: &UserId) -> Result {
+		let _notifications = self
+			.services
+			.pusher
+			.lock_notification_user(user_id)
+			.await;
 		self.db.userid_erased.remove(user_id).await
 	}
 
@@ -475,6 +516,11 @@ impl Service {
 
 	/// Hash and set the user's password to the Argon2 hash
 	pub async fn set_password(&self, user_id: &UserId, password: Option<&str>) -> Result {
+		let _notifications = self
+			.services
+			.pusher
+			.lock_notification_user(user_id)
+			.await;
 		// Cannot change the password of a LDAP user. There are two special cases :
 		// - a `None` password can be used to deactivate a LDAP user
 		// - a "*" password is used as the default password of an active LDAP user

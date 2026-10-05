@@ -68,6 +68,8 @@ impl Service {
 			"threadrootid_latestcount",
 			"tokenids",
 			"relatesto_typed",
+			"pduid_notificationplan",
+			"notificationreceiptid_record",
 		] {
 			let map = &self.services.db[name];
 			let keys = map.keys_prefix_raw_capped(&short, budget.cap());
@@ -85,6 +87,7 @@ impl Service {
 			"roomuserid_privatereadsync",
 			"readreceiptid_readreceipt",
 			"roomuserid_lastnotificationread",
+			"roomuserid_notificationcutoff",
 			"roomid_tscount_pducount",
 		] {
 			let map = &self.services.db[name];

@@ -29,11 +29,14 @@ pub(crate) struct NotificationGuard {
 	user: OwnedUserId,
 	room: OwnedRoomId,
 	_guard: tuwunel_core::utils::mutex_map::Guard<(OwnedRoomId, OwnedUserId), ()>,
+	_user_guard: tuwunel_core::utils::mutex_map::Guard<OwnedUserId, ()>,
 }
 
 #[implement(super::Service)]
 pub(crate) async fn lock_notification(&self, user: &UserId, room: &RoomId) -> NotificationGuard {
+	let user_guard = self.lock_notification_user(user).await;
 	NotificationGuard {
+		_user_guard: user_guard,
 		user: user.to_owned(),
 		room: room.to_owned(),
 		_guard: self
@@ -93,6 +96,8 @@ pub async fn reset_notification_counts_for_thread(
 	// The permit stays alive through execute so sync cannot pass this stamp.
 	let count = self.services.globals.next_count().await?;
 	self.stage_notification_read_stamp(&mut txn, &guard, thread, *count)?;
+	self.stage_notification_cutoff(&mut txn, &guard, thread, *count)
+		.await?;
 	check_mutation(&txn)?;
 	txn.execute().await?;
 	self.notification_reset_committed(&guard, thread);
@@ -186,8 +191,9 @@ async fn stage_thread_keys(
 	} else {
 		tuwunel_database::serialize_key((user, room, Interfix))?
 	};
-	// Main reset needs three operations; the extra key detects overflow.
-	let stream = map.keys_prefix_raw_capped(&prefix, 898_usize.saturating_sub(txn.len()));
+	// Main reset needs four operations including the read cutoff. The extra
+	// key detects overflow before any part of the sweep commits.
+	let stream = map.keys_prefix_raw_capped(&prefix, 897_usize.saturating_sub(txn.len()));
 	pin_mut!(stream);
 	while let Some(key) = stream.try_next().await? {
 		if room_first {
@@ -204,7 +210,7 @@ async fn stage_thread_keys(
 			}
 		}
 		txn.del_raw(map, key);
-		if txn.len() > 897 || txn.size_in_bytes() > 512 * 1024 - 4096 {
+		if txn.len() > 896 || txn.size_in_bytes() > 512 * 1024 - 4096 {
 			return notification_limit();
 		}
 	}
@@ -361,4 +367,95 @@ pub async fn thread_last_notification_reads(
 		.map(|((_, _, root), count): ((Ignore, Ignore, OwnedEventId), u64)| (root, count))
 		.collect()
 		.await
+}
+
+/// Unlike the sync stamp, this is the actual addressed event position. Main
+/// and thread cutoffs are independent; an unthreaded cutoff covers both.
+#[implement(super::Service)]
+pub(crate) async fn stage_notification_cutoff(
+	&self,
+	txn: &mut Txn,
+	guard: &NotificationGuard,
+	thread: &ReceiptThread,
+	position: u64,
+) -> Result {
+	if position > i64::MAX.unsigned_abs() {
+		return Err(Error::bad_database("Invalid notification cutoff position"));
+	}
+	let kind = match thread {
+		| ReceiptThread::Main => "main",
+		| ReceiptThread::Unthreaded => "",
+		| ReceiptThread::Thread(root) => root.as_str(),
+		| _ => return Err(Error::bad_database("Invalid notification cutoff scope")),
+	};
+	let key = tuwunel_database::serialize_key((&*guard.room, &*guard.user, kind))?;
+	let previous = match self
+		.db
+		.roomuserid_notificationcutoff
+		.get(&key)
+		.await
+	{
+		| Ok(value) => decode_cutoff(&value)?,
+		| Err(error) if error.is_not_found() => 0,
+		| Err(error) => return Err(error),
+	};
+	if position > previous {
+		txn.insert_raw(&self.db.roomuserid_notificationcutoff, key, position.to_be_bytes());
+	}
+	check_mutation(txn)
+}
+
+#[implement(super::Service)]
+pub(super) async fn notification_already_read(
+	&self,
+	user: &UserId,
+	room: &RoomId,
+	thread: Option<&EventId>,
+	position: u64,
+) -> Result<bool> {
+	let kind = thread.map_or("main", EventId::as_str);
+	let mut read = false;
+	for kind in ["", kind] {
+		match self
+			.db
+			.roomuserid_notificationcutoff
+			.qry(&(room, user, kind))
+			.await
+		{
+			| Ok(value) => {
+				let cutoff = decode_cutoff(&value)?;
+				read |= position <= cutoff;
+			},
+			| Err(error) if error.is_not_found() => {},
+			| Err(error) => return Err(error),
+		}
+	}
+	Ok(read)
+}
+
+fn decode_cutoff(value: &[u8]) -> Result<u64> {
+	let cutoff = u64::from_be_bytes(
+		value
+			.try_into()
+			.map_err(|_| Error::bad_database("Invalid notification read cutoff"))?,
+	);
+	if cutoff > i64::MAX.unsigned_abs() {
+		return Err(Error::bad_database("Invalid notification read cutoff position"));
+	}
+	Ok(cutoff)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::decode_cutoff;
+	#[test]
+	fn read_cutoffs_require_a_valid_normal_timeline_position() {
+		for position in [0, 1, i64::MAX.unsigned_abs()] {
+			assert_eq!(decode_cutoff(&position.to_be_bytes()).expect("normal cutoff"), position);
+		}
+		for invalid in [vec![], vec![0; 7], vec![0; 9], u64::MAX.to_be_bytes().to_vec()] {
+			decode_cutoff(&invalid)
+				.expect_err("corruption cannot cancel all future notifications");
+		}
+	}
 }

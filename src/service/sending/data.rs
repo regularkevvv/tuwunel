@@ -9,7 +9,8 @@ use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
 use tuwunel_database::{Database, Deserialized, Map, Row, Txn, deserialize_from_slice};
 
 use super::{
-	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED, TAG_TO_DEVICE,
+	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED,
+	TAG_FROZEN_PUSH, TAG_TO_DEVICE,
 };
 
 pub(super) type OutgoingItem = (Key, SendingEvent, Destination);
@@ -157,6 +158,10 @@ impl Data {
 			.map(decode_sending)
 	}
 
+	pub(super) fn stage_request(&self, txn: &mut Txn, key: &[u8], event: &SendingEvent) {
+		txn.insert_raw(&self.servernameevent_data, key, event.value_bytes());
+	}
+
 	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>
 	where
 		I: Iterator<Item = (&'a SendingEvent, &'a Destination)> + Clone + Debug + Send,
@@ -164,7 +169,8 @@ impl Data {
 		let mut keys: Vec<Vec<u8>> = Vec::new();
 		for (event, dest) in requests.clone() {
 			keys.push(match event {
-				| SendingEvent::Pdu(pdu_id) => dest.event_key(pdu_id),
+				| SendingEvent::Pdu(pdu_id) | SendingEvent::FrozenPush(pdu_id) =>
+					dest.event_key(pdu_id),
 				| _ => {
 					let count = self.services.globals.next_count().await?;
 					let count = count.to_be_bytes();
@@ -353,6 +359,8 @@ pub(super) fn parse_servercurrentevent(
 			| [] => SendingEvent::Pdu(super::RawPduId::from_bytes(event)?),
 			| [TAG_TO_DEVICE, ..] => SendingEvent::ToDevice(value.into()),
 			| [TAG_DEVICE_LIST_CHANGED, ..] => SendingEvent::DeviceListChanged(value.into()),
+			| [TAG_FROZEN_PUSH, ..] =>
+				return Err(Error::bad_database("Frozen push has a non-push destination")),
 			| _ => SendingEvent::Edu(value.into()),
 		};
 
@@ -381,9 +389,15 @@ pub(super) fn parse_servercurrentevent(
 		(Destination::Push(user_id, pushkey_string), match value {
 			| [] => SendingEvent::Pdu(super::RawPduId::from_bytes(event)?),
 			| [tag] if *tag == TAG_BADGE_REFRESH => SendingEvent::BadgeRefresh,
+			| [TAG_FROZEN_PUSH] => SendingEvent::FrozenPush(super::RawPduId::from_bytes(event)?),
+			| [TAG_FROZEN_PUSH, ..] =>
+				return Err(Error::bad_database("Invalid frozen push queue tag")),
 			| _ => SendingEvent::Edu(value.into()),
 		})
 	} else {
+		if value.first() == Some(&TAG_FROZEN_PUSH) {
+			return Err(Error::bad_database("Frozen push has a non-push destination"));
+		}
 		let mut parts = key.splitn(2, |&b| b == 0xFF);
 
 		let server = parts

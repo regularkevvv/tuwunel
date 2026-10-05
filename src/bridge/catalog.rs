@@ -170,6 +170,9 @@ pub static MAP_IDS: &[(&str, MapId)] = &[
 	("oauthidpuserid_pendingclaims", MapId(141)),
 	("eventid_rejectedpdu", MapId(142)),
 	("adminjobid_record", MapId(143)),
+	("pduid_notificationplan", MapId(144)),
+	("notificationreceiptid_record", MapId(145)),
+	("roomuserid_notificationcutoff", MapId(146)),
 ];
 
 /// Looks up the immutable id for a catalog map name.

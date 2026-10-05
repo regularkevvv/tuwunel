@@ -110,6 +110,61 @@ impl Service {
 		None
 	}
 
+	pub(crate) async fn get_thread_id_checked<E: Event>(
+		&self,
+		event: &E,
+	) -> Result<Option<OwnedEventId>> {
+		let mut relation = event
+			.get_content::<ExtractThreadRelation>()
+			.ok()
+			.map(|value| value.relates_to);
+		if relation.is_none() && *event.kind() == TimelineEventType::RoomRedaction {
+			let rules = self
+				.services
+				.state
+				.get_room_version_rules(event.room_id())
+				.await?;
+			if let Some(target) = event.redacts_id(&rules) {
+				match self.services.timeline.get_pdu(&target).await {
+					| Ok(pdu) if pdu.room_id() == event.room_id() =>
+						relation = pdu
+							.get_content::<ExtractThreadRelation>()
+							.ok()
+							.map(|value| value.relates_to),
+					| Ok(_) => return Ok(None),
+					| Err(error) if error.is_not_found() => return Ok(None),
+					| Err(error) => return Err(error),
+				}
+			}
+		}
+		let Some(mut relation) = relation else {
+			return Ok(None);
+		};
+		for _ in 0..MAX_THREAD_HOPS {
+			let pdu = match self
+				.services
+				.timeline
+				.get_pdu(&relation.event_id)
+				.await
+			{
+				| Ok(pdu) => pdu,
+				| Err(error) if error.is_not_found() => return Ok(None),
+				| Err(error) => return Err(error),
+			};
+			if pdu.room_id() != event.room_id() {
+				return Ok(None);
+			}
+			if relation.rel_type == RelationType::Thread {
+				return Ok(Some(relation.event_id));
+			}
+			let Ok(next) = pdu.get_content::<ExtractThreadRelation>() else {
+				return Ok(None);
+			};
+			relation = next.relates_to;
+		}
+		Ok(None)
+	}
+
 	/// Resolve a redaction event's thread by looking through to the
 	/// redacted target. Returns `None` for non-redaction events and for
 	/// redactions whose target is unknown or carries no thread relation.

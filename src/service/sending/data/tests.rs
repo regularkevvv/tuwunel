@@ -95,3 +95,26 @@ fn edu_watermark_defaults_only_when_missing() {
 	missing_count_is_zero(Err(Error::bad_database("malformed watermark")))
 		.expect_err("corrupt counters never rewind to zero");
 }
+
+#[test]
+fn frozen_push_tags_require_a_push_destination_and_a_valid_pdu_id() {
+	let mut raw = 1_u64.to_be_bytes().to_vec();
+	raw.extend_from_slice(&2_u64.to_be_bytes());
+	let mut key = b"$@u:remote.example\xffkey\xff".to_vec();
+	key.extend_from_slice(&raw);
+	let (_, event, _) =
+		decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH]))).expect("frozen queue row");
+	assert!(matches!(event, SendingEvent::FrozenPush(_)));
+	decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH, 0])))
+		.expect_err("exact frozen tag shape required");
+	for prefix in [b"+as\xff".as_slice(), b"remote.example\xff"] {
+		let mut key = prefix.to_vec();
+		key.extend_from_slice(&raw);
+		decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH])))
+			.expect_err("frozen decisions are push-only");
+	}
+	let mut key = b"$@u:remote.example\xffkey\xff".to_vec();
+	key.extend_from_slice(b"invalid");
+	decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH])))
+		.expect_err("corrupt ID cannot disappear as an EDU");
+}

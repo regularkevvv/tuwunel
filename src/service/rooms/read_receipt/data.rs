@@ -136,6 +136,29 @@ impl Data {
 				.pusher
 				.stage_notification_reset(&mut txn, &guard, thread, Some(*count))
 				.await?;
+			match self.services.timeline.get_pdu_id(event_id).await {
+				| Ok(raw) => {
+					let pdu = self
+						.services
+						.timeline
+						.get_pdu_from_id(&raw)
+						.await?;
+					if pdu.room_id != room_id {
+						return Err(Error::bad_database("Receipt cutoff room mismatch"));
+					}
+					self.services
+						.pusher
+						.stage_notification_cutoff(
+							&mut txn,
+							&guard,
+							thread,
+							raw.pdu_count().into_normal().into_unsigned(),
+						)
+						.await?;
+				},
+				| Err(error) if error.is_not_found() => {},
+				| Err(error) => return Err(error),
+			}
 		}
 		check_receipt_mutation(&txn)?;
 		txn.execute().await?;
@@ -363,6 +386,10 @@ impl Data {
 			self.services
 				.pusher
 				.stage_notification_reset(txn, &guard, thread, Some(stamp))
+				.await?;
+			self.services
+				.pusher
+				.stage_notification_cutoff(txn, &guard, thread, count)
 				.await?;
 		}
 		check_receipt_mutation(txn)?;

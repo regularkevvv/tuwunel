@@ -13,7 +13,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{
-	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
+	FutureExt, StreamExt, TryStreamExt,
 	future::{BoxFuture, join, join3, try_join3},
 	pin_mut,
 	stream::FuturesUnordered,
@@ -1524,8 +1524,9 @@ impl Service {
 					(pdus, edus, to_device.saturating_add(1), device_list),
 				| SendingEvent::DeviceListChanged(_) =>
 					(pdus, edus, to_device, device_list.saturating_add(1)),
-				| SendingEvent::BadgeRefresh | SendingEvent::Flush =>
-					(pdus, edus, to_device, device_list),
+				| SendingEvent::FrozenPush(_)
+				| SendingEvent::BadgeRefresh
+				| SendingEvent::Flush => (pdus, edus, to_device, device_list),
 			},
 		);
 
@@ -1593,6 +1594,11 @@ impl Service {
 						changed.push(user_id);
 					}
 				},
+				| SendingEvent::FrozenPush(_) =>
+					return Err((
+						Destination::Appservice(id),
+						Error::bad_database("Frozen push queued to appservice"),
+					)),
 				| SendingEvent::BadgeRefresh | SendingEvent::Flush => {},
 			}
 		}
@@ -1602,7 +1608,8 @@ impl Service {
 			| SendingEvent::ToDevice(b)
 			| SendingEvent::DeviceListChanged(b) => Some(b.as_ref()),
 			| SendingEvent::Pdu(b) => Some(b.as_ref()),
-			| SendingEvent::BadgeRefresh | SendingEvent::Flush => None,
+			| SendingEvent::FrozenPush(_) | SendingEvent::BadgeRefresh | SendingEvent::Flush =>
+				None,
 		}));
 
 		let txn_id = &*URL_SAFE_NO_PAD.encode(txn_hash);
@@ -1755,9 +1762,20 @@ impl Service {
 					.account_data
 					.get_global::<PushRulesEvent>(&user_id, GlobalAccountDataEventType::PushRules)
 					.await
-					.map_or_else(|_| Ruleset::server_default(&user_id), |ev| ev.content.global)
+					.map(|ev| ev.content.global)
+					.or_else(|error| {
+						if error.is_not_found() {
+							Ok(Ruleset::server_default(&user_id))
+						} else {
+							Err(error)
+						}
+					})
 			})
-			.map(Ok);
+			.map(|result| {
+				result
+					.transpose()
+					.map_err(|error| (destination(), error))
+			});
 
 		let (pusher, rules_for_user, suppressed) =
 			try_join3(pusher, rules_for_user, suppressed).await?;
@@ -1787,6 +1805,17 @@ impl Service {
 		}
 
 		if suppressed {
+			// Frozen work stays in the durable queue while suppression is
+			// active; the legacy in-memory cache cannot acknowledge it.
+			if events
+				.iter()
+				.any(|event| matches!(event, SendingEvent::FrozenPush(_)))
+			{
+				return Err((
+					destination(),
+					err!(Request(Unknown("Push delivery deferred while user is active"))),
+				));
+			}
 			let queued = self
 				.enqueue_suppressed_push_events(&user_id, &pushkey, &events)
 				.await;
@@ -1807,51 +1836,22 @@ impl Service {
 			"non-suppressed push",
 		);
 
-		let failures = match rules_for_user {
-			| None => PushFailures::default(),
-			| Some(rules_for_user) =>
-				events
-					.iter()
-					.stream()
-					.ready_filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
-					.wide_filter_map(async |pdu_id| {
-						self.services
-							.timeline
-							.get_pdu_from_id(pdu_id)
-							.map_ok(|pdu| (*pdu_id, pdu))
-							.await
-							.ok()
-					})
-					.ready_filter(|(_, pdu)| !pdu.is_redacted())
-					.wide_then(async |(pdu_id, pdu)| {
-						let result = self
-							.services
-							.pusher
-							.send_push_notice(&user_id, &pusher, &rules_for_user, &pdu)
-							.await;
-
-						(pdu_id, result)
-					})
-					.ready_fold(
-						PushFailures::default(),
-						|failures, (pdu_id, result)| match result {
-							| Ok(()) => failures,
-							| Err(error) if is_permanent_push_error(&error) => {
-								warn!(
-									%user_id,
-									%pushkey,
-									?pdu_id,
-									chain = %error_chain(&error),
-									"Dropping a push with a permanent local error",
-								);
-
-								failures
-							},
-							| Err(error) => failures.retain(pdu_id, error),
-						},
-					)
-					.await,
-		};
+		let mut failures = PushFailures::default();
+		for event in &events {
+			let Some(pdu_id) = event.pdu_id() else {
+				continue;
+			};
+			let result = self
+				.send_one_push(&user_id, &pusher, event, rules_for_user.as_ref())
+				.await;
+			match result {
+				| Ok(()) => {},
+				| Err(error) if is_permanent_push_error(&error) => warn!(
+					%user_id, %pushkey, ?pdu_id, chain = %error_chain(&error), "Dropping a push with a permanent local error",
+				),
+				| Err(error) => failures = failures.retain(*pdu_id, error),
+			}
+		}
 
 		let PushFailures { ids, error: Some(error) } = failures else {
 			return Ok(Destination::Push(user_id, pushkey));
@@ -1861,16 +1861,52 @@ impl Service {
 
 		for pdu_id in events
 			.iter()
-			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
+			.filter_map(SendingEvent::pdu_id)
 			.filter(|pdu_id| !ids.contains(*pdu_id))
 		{
 			self.db
 				.delete_active_request(&dest.event_key(pdu_id))
 				.await
-				.expect("database remove error");
+				.map_err(|error| (dest.clone(), error))?;
 		}
 
 		Err((dest, error))
+	}
+
+	async fn send_one_push(
+		&self,
+		user: &UserId,
+		pusher: &Pusher,
+		event: &SendingEvent,
+		rules: Option<&Ruleset>,
+	) -> Result {
+		let Some(raw) = event.pdu_id() else {
+			return Ok(());
+		};
+		let pdu = match self.services.timeline.get_pdu_from_id(raw).await {
+			| Ok(pdu) => pdu,
+			| Err(error) if error.is_not_found() => return Ok(()),
+			| Err(error) => return Err(error),
+		};
+		if pdu.is_redacted() {
+			return Ok(());
+		}
+		match event {
+			| SendingEvent::FrozenPush(_) =>
+				self.services
+					.pusher
+					.send_frozen_push_notice(user, pusher, raw, &pdu)
+					.await,
+			| SendingEvent::Pdu(_) => {
+				let rules = rules
+					.ok_or_else(|| Error::bad_database("Legacy push rules were not resolved"))?;
+				self.services
+					.pusher
+					.send_push_notice(user, pusher, rules, &pdu)
+					.await
+			},
+			| _ => Ok(()),
+		}
 	}
 }
 

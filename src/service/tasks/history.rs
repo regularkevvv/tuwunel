@@ -52,6 +52,7 @@ pub(crate) enum Phase {
 	SearchOriginal,
 	LegacyRelations,
 	TypedRelations,
+	Notifications,
 	Final,
 }
 
@@ -117,6 +118,16 @@ impl History {
 						after.len() == 33
 							&& after.starts_with(&self.shortroomid.to_be_bytes())
 							&& after[8..16] == RawPduId::from_bytes(&target.key)?.count(),
+					| Phase::Notifications => {
+						let mut prefix = target.key.clone();
+						prefix.push(tuwunel_database::SEP);
+						after.starts_with(&prefix)
+							&& after.len() <= tuwunel_bridge::MAX_KEY_BYTES
+							&& std::str::from_utf8(&after[prefix.len()..])
+								.ok()
+								.and_then(|user| ruma::UserId::parse(user).ok())
+								.is_some()
+					},
 					| Phase::Final => false,
 				};
 				if !valid {
@@ -302,6 +313,40 @@ async fn run_history(&self, id: &TaskId, room: &RoomId) -> Result {
 }
 
 /// Validate the complete journal and frozen targets before changing any task.
+/// Preflight every interrupted job before another startup recovery mutates
+/// storage. Notification completion must precede retained history room locks.
+#[implement(Service)]
+pub(crate) async fn preflight_interrupted(&self) -> Result {
+	let tasks = {
+		let _journal = self.journal.lock().await;
+		self.db.load().await?
+	};
+	let pending: Vec<_> = tasks
+		.values()
+		.filter(|task| !task.status.is_terminal())
+		.collect();
+	if pending.len() > MAX_RUNNING {
+		return super::data::limit();
+	}
+	for (index, task) in pending.iter().enumerate() {
+		if pending
+			.iter()
+			.skip(index.saturating_add(1))
+			.any(|other| matches_nonterminal(other, task.action, &task.resource_id))
+		{
+			return Err(Error::bad_database("Conflicting interrupted admin requests"));
+		}
+		if let Some(history) = History::decode(&task.parameters)? {
+			let room = OwnedRoomId::try_from(task.resource_id.as_str())?;
+			self.services
+				.timeline
+				.validate_history_progress(&room, &history)
+				.await?;
+		}
+	}
+	Ok(())
+}
+
 /// Restore room exclusion before workers/readiness, then resume in background.
 #[implement(Service)]
 pub(crate) async fn restore_interrupted(self: &Arc<Self>) -> Result {

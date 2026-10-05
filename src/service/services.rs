@@ -220,6 +220,8 @@ pub async fn start(self: &Arc<Self>) -> Result<Arc<Self>> {
 
 	super::migrations::migrations(self).await?;
 	if !self.server.config.maintenance {
+		self.tasks.preflight_interrupted().await?;
+		self.pusher.restore_notifications().await?;
 		self.tasks.restore_interrupted().await?;
 		self.state_cache
 			.restore_pending_recounts()

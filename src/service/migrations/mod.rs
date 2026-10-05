@@ -67,9 +67,9 @@ mod tests;
 /// - If database is opened at lesser version we apply migrations up to this.
 ///   Note that named-feature migrations may also be performed when opening at
 ///   equal or lesser version. These are expected to be backward-compatible.
-// Version 18 introduces resumable destructive jobs. Builds without the typed
-// executor must refuse this database, even if they predate the job journal.
-pub(crate) const DATABASE_VERSION: u64 = 18;
+// Version 19 adds durable notification plans, frozen push decisions and read
+// cutoffs. Older senders must refuse the new queue semantics before readiness.
+pub(crate) const DATABASE_VERSION: u64 = 19;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 

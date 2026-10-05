@@ -18,6 +18,8 @@ crate-type = [
 ]
 
 [features]
+# Native fixture control only; excluded from default and release feature sets.
+notification_recovery_tests = []
 brotli_compression = [
 	"reqwest/brotli",
 	"tuwunel-core/brotli_compression",

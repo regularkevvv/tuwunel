@@ -307,6 +307,14 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "notificationreceiptid_record",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "pduid_notificationplan",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "pduid_pdu",
 		cache_disp: CacheDisp::SharedWith("eventid_outlierpdu"),
 		key_size_hint: Some(16),
@@ -417,6 +425,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "roomuserid_lastprivatereadupdate",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "roomuserid_notificationcutoff",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {

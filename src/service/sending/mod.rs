@@ -51,7 +51,7 @@ pub struct Service {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Msg {
+pub(crate) struct Msg {
 	dest: Destination,
 	event: SendingEvent,
 	queue_id: Vec<u8>,
@@ -61,6 +61,7 @@ struct Msg {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SendingEvent {
 	Pdu(RawPduId),             // pduid
+	FrozenPush(RawPduId),      // Requires its committed push-decision receipt
 	Edu(EduBuf),               // edu json
 	ToDevice(EduBuf),          // msc4203 to-device
 	DeviceListChanged(EduBuf), // msc3202 device list
@@ -82,9 +83,17 @@ const EDU_VEC_CAP: usize = 1;
 const TAG_TO_DEVICE: u8 = 0x01;
 const TAG_DEVICE_LIST_CHANGED: u8 = 0x02;
 const TAG_BADGE_REFRESH: u8 = 0x03;
+const TAG_FROZEN_PUSH: u8 = 0x04;
 const TAG_PREFIX_LEN: usize = 1 + size_of::<u64>();
 
 impl SendingEvent {
+	pub(super) const fn pdu_id(&self) -> Option<&RawPduId> {
+		match self {
+			| Self::Pdu(raw) | Self::FrozenPush(raw) => Some(raw),
+			| _ => None,
+		}
+	}
+
 	/// Return bytes written verbatim as the queue row value.
 	///
 	/// PDUs keep their ID in the row key and flushes are not persisted. EDU
@@ -93,6 +102,7 @@ impl SendingEvent {
 		match self {
 			| Self::Edu(bytes) | Self::ToDevice(bytes) | Self::DeviceListChanged(bytes) => bytes,
 			| Self::BadgeRefresh => &[TAG_BADGE_REFRESH],
+			| Self::FrozenPush(_) => &[TAG_FROZEN_PUSH],
 			| Self::Pdu(_) | Self::Flush => &[],
 		}
 	}
@@ -182,6 +192,22 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	pub(crate) fn stage_frozen_push(
+		&self,
+		txn: &mut tuwunel_database::Txn,
+		raw: RawPduId,
+		user: &UserId,
+		pushkey: &str,
+	) -> Msg {
+		let dest = Destination::Push(user.to_owned(), pushkey.to_owned());
+		let event = SendingEvent::FrozenPush(raw);
+		let queue_id = dest.event_key(&raw);
+		self.db.stage_request(txn, &queue_id, &event);
+		Msg { dest, event, queue_id }
+	}
+
+	pub(crate) fn wake_frozen_push(&self, message: Msg) -> Result { self.dispatch(message) }
+
 	#[tracing::instrument(skip(self, pdu_id, user, pushkey), level = "debug")]
 	pub async fn send_pdu_push(
 		&self,

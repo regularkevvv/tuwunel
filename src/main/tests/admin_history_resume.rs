@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-//! Actual API admission, three SIGKILL boundaries, multi-batch cleanup and
+//! Actual API admission, four SIGKILL boundaries, multi-batch cleanup and
 //! restart totals. These owned native fixtures do not qualify remote acks.
 mod client;
 
@@ -41,6 +41,9 @@ const LEGACY: &str = "0000000000000000";
 const TABLES: &[&str] = &[
 	JOURNAL,
 	"global",
+	"pduid_notificationplan",
+	"notificationreceiptid_record",
+	"roomuserid_notificationcutoff",
 	"pduid_pdu",
 	"eventid_pduid",
 	"eventid_outlierpdu",
@@ -109,7 +112,7 @@ fn history_progress_resumes_each_kill_and_never_double_counts() -> Result {
 			run_child(&directory.0, phase)?;
 		}
 	}
-	for phase in ["relations", "final"] {
+	for phase in ["relations", "notifications", "final"] {
 		kill_child(&directory.0, phase)?;
 		run_child(&directory.0, &format!("inspect-{phase}"))?;
 	}
@@ -194,6 +197,9 @@ fn child(directory: &Path, phase: &str) -> Result {
 	if phase == "relations" {
 		refusal::refuse_next("relatesto_typed");
 	}
+	if phase == "notifications" {
+		refusal::refuse_after("notificationreceiptid_record", 1);
+	}
 	if phase == "final" {
 		refusal::refuse_next("pduid_pdu");
 	}
@@ -232,7 +238,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 			let outcome = match phase {
 				| "prepare" => prepare(&services, &base, directory).await,
 				| "import" => {
-					assert_eq!(services.globals.db.database_version().await, 18);
+					assert_eq!(services.globals.db.database_version().await, 19);
 					assert!(
 						services.db["global"]
 							.get(b"populate_userroomid_leftstate_table")
@@ -240,7 +246,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 							.expect_err("completed import claims native lineage")
 							.is_not_found()
 					);
-					// Acceptance must also perform a native 17 -> 18 upgrade.
+					// Acceptance must also perform a native 17 -> 19 upgrade.
 					services
 						.globals
 						.db
@@ -253,7 +259,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 						.db
 						.bump_database_version(17)
 						.await,
-				| "accept" | "relations" | "final" =>
+				| "accept" | "relations" | "notifications" | "final" =>
 					paused(&services, &base, directory, phase).await,
 				| "recover" | "again" => complete(&services, directory, phase).await,
 				| "corrupt" | "corrupt-terminal" | "corrupt-version" | "repair" =>
@@ -399,6 +405,45 @@ async fn seed_cleanup(services: &Services, manifest: &Manifest) -> Result {
 		}
 		txn.execute().await?;
 	}
+	// Completed decision records are seeded directly to exercise cleanup
+	// beyond one transaction's budget, without claiming 1,024 real clients.
+	for start in (0..1024_usize).step_by(128) {
+		let mut txn = services.db.txn();
+		for index in start..start.saturating_add(128) {
+			let mut key = raw.as_ref().to_vec();
+			key.push(0xFF);
+			key.extend_from_slice(format!("@historyreceipt{index:04}:localhost").as_bytes());
+			txn.insert_raw(
+				&services.db["notificationreceiptid_record"],
+				key,
+				serde_json::to_vec(
+					&json!({"format":1,"room":manifest.room,"event":manifest.large,
+                    "thread":null,"actions":["notify"],"push_everything":false,"canceled":false}),
+				)?,
+			);
+		}
+		txn.execute().await?;
+	}
+	let foreign = services
+		.timeline
+		.get_pdu_id(&manifest.foreign)
+		.await?;
+	let foreign_pdu = services
+		.timeline
+		.get_pdu(&manifest.foreign)
+		.await?;
+	let mut key = foreign.as_ref().to_vec();
+	key.push(0xFF);
+	key.extend_from_slice(b"@historyreceiptforeign:localhost");
+	services.db["notificationreceiptid_record"]
+		.insert(
+			&key,
+			serde_json::to_vec(
+				&json!({"format":1,"room":foreign_pdu.room_id,"event":manifest.foreign,
+            "thread":null,"actions":["notify"],"push_everything":false,"canceled":false}),
+			)?,
+		)
+		.await?;
 	Ok(())
 }
 
@@ -539,6 +584,7 @@ async fn inspect(services: &Services, directory: &Path, phase: &str) -> Result {
 	let expected = match phase {
 		| "accept" => "search_current",
 		| "relations" => "typed_relations",
+		| "notifications" => "notifications",
 		| "final" => "final",
 		| _ => panic!("owned inspection phase"),
 	};
@@ -573,7 +619,7 @@ async fn inspect(services: &Services, directory: &Path, phase: &str) -> Result {
 		.raw_keys_prefix_after(&typed_prefix, None, 1)
 		.await?;
 	if phase == "accept" {
-		assert_eq!(services.globals.db.database_version().await, 18);
+		assert_eq!(services.globals.db.database_version().await, 19);
 		services.timeline.get_pdu(&manifest.small).await?;
 		assert!(!legacy.is_empty());
 	} else {
@@ -587,7 +633,26 @@ async fn inspect(services: &Services, directory: &Path, phase: &str) -> Result {
 		);
 		assert!(legacy.is_empty());
 	}
-	assert_eq!(typed.is_empty(), phase == "final");
+	assert_eq!(typed.is_empty(), matches!(phase, "notifications" | "final"));
+	let mut prefix = raw.as_ref().to_vec();
+	prefix.push(0xFF);
+	let receipts = services.db["notificationreceiptid_record"]
+		.raw_keys_prefix_after(&prefix, None, 1025)
+		.await?;
+	assert_eq!(receipts.len(), match phase {
+		| "notifications" => 960,
+		| "final" => 0,
+		| _ => 1024,
+	});
+	if phase == "notifications" {
+		let mut cursor = prefix;
+		cursor.extend_from_slice(b"@historyreceipt0063:localhost");
+		assert_eq!(
+			progress["current"]["after"],
+			json!(cursor),
+			"first receipt page and exclusive cursor committed together"
+		);
+	}
 	Ok(())
 }
 
@@ -640,6 +705,28 @@ async fn complete(services: &Services, directory: &Path, phase: &str) -> Result 
 			.expect_err("original removed")
 			.is_not_found()
 	);
+	let prefix = services
+		.timeline
+		.get_pdu_id(&manifest.boundary)
+		.await?
+		.shortroomid();
+	assert!(
+		services.db["notificationreceiptid_record"]
+			.raw_keys_prefix_after(&prefix, None, 1)
+			.await?
+			.is_empty(),
+		"selected room's completed receipts were removed"
+	);
+	let foreign_raw = services
+		.timeline
+		.get_pdu_id(&manifest.foreign)
+		.await?;
+	let mut foreign_key = foreign_raw.as_ref().to_vec();
+	foreign_key.push(0xFF);
+	foreign_key.extend_from_slice(b"@historyreceiptforeign:localhost");
+	services.db["notificationreceiptid_record"]
+		.get(&foreign_key)
+		.await?;
 	let short = services
 		.short
 		.get_shortroomid(&manifest.room)

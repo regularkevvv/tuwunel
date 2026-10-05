@@ -165,6 +165,9 @@ fn every_effect_of_a_stored_event_runs() -> Result {
 
 async fn exercise(services: &Services, base: &str) -> Result {
 	wait_until_ready(services, base).await?;
+	services
+		.pusher
+		.pause_notification_retry_for_test(true);
 
 	let logged = Logged::default();
 	let capture = logged.capture(services);
@@ -207,7 +210,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		}),
 	)
 	.await?;
-	refused(services, &logged, "notification row", &root).await?;
+	refused(services, &logged, "push", &root).await?;
 	if notification_snapshot(services, &bob, &room).await? != before {
 		return Err!("refused notification entry left partial counts or recipient metadata");
 	}
@@ -264,6 +267,7 @@ async fn notification_snapshot(
 		"userroomid_highlightcount",
 		"useridcount_notification",
 		"roomuserid_lastnotificationread",
+		"roomuserid_notificationcutoff",
 		"roomuserid_privateread",
 		"roomuserid_lastprivatereadupdate",
 		"roomuserid_privatereadsync",

@@ -11,22 +11,34 @@
 //! Only the `tuwunel` package's dev-dependencies enable the feature, so a
 //! release build compiles none of this.
 
-use std::sync::{Mutex, PoisonError};
+use std::{
+	collections::BTreeSet,
+	sync::{Mutex, PoisonError},
+};
 
 use tuwunel_core::{Err, Result};
 
 /// Maps whose next commit is refused, one entry per refusal.
-static ARMED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+struct Armed {
+	map: &'static str,
+	skip: usize,
+}
 
 /// Refuses the next commit that writes `map`, a batch or a single key.
 ///
 /// Arming is process-wide, which suits the integration tests: each runs one
 /// server in its own process. Arming a map twice refuses its next two commits.
-pub fn refuse_next(map: &'static str) {
+pub fn refuse_next(map: &'static str) { refuse_after(map, 0); }
+
+/// Refuse after `skip` otherwise permitted commits that write this map. Each
+/// commit counts once even when its batch contains multiple keys in the map.
+pub fn refuse_after(map: &'static str, skip: usize) {
 	ARMED
 		.lock()
 		.unwrap_or_else(PoisonError::into_inner)
-		.push(map);
+		.push(Armed { map, skip });
 }
 
 /// How many armed refusals have not fired yet.
@@ -47,8 +59,16 @@ where
 		.lock()
 		.unwrap_or_else(PoisonError::into_inner);
 
+	let mut seen = BTreeSet::new();
 	for map in maps {
-		if let Some(at) = armed.iter().position(|armed| *armed == map) {
+		if !seen.insert(map) {
+			continue;
+		}
+		if let Some(at) = armed.iter().position(|armed| armed.map == map) {
+			if armed[at].skip > 0 {
+				armed[at].skip = armed[at].skip.saturating_sub(1);
+				continue;
+			}
 			armed.remove(at);
 
 			return Err!(Database("commit refused before dispatch: {map} was armed to refuse"));
@@ -56,4 +76,20 @@ where
 	}
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{check, pending, refuse_after};
+	#[test]
+	fn delayed_refusal_counts_commits_instead_of_batch_operations() {
+		refuse_after("delayed-refusal-fixture", 1);
+		check(["unrelated-map", "delayed-refusal-fixture", "delayed-refusal-fixture"])
+			.expect("first matching commit is allowed once");
+		assert_eq!(pending(), 1);
+		check(["unrelated-map"]).expect("unrelated commit does not consume refusal");
+		check(["delayed-refusal-fixture"]).expect_err("second matching commit refuses");
+		assert_eq!(pending(), 0);
+		check(["delayed-refusal-fixture"]).expect("refusal was consumed");
+	}
 }

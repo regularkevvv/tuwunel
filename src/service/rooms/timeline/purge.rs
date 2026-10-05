@@ -98,6 +98,10 @@ async fn prepare_history_erasure(
 	pdu: &PduEvent,
 ) -> Result<Txn> {
 	let mut txn = self.prepare_history_base(raw, pdu).await?;
+	self.services
+		.pusher
+		.stage_notification_erasure(&mut txn, raw)
+		.await?;
 	self.append_history_search(&mut txn, short, raw, pdu)?;
 	// Redaction can already have stripped the current body. Include the
 	// retained original so interrupted older redactions cannot strand tokens.

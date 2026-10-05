@@ -69,9 +69,28 @@ impl Service {
 					error
 				}
 			})?;
-		let create = self.state_get(snapshot, &StateEventType::RoomCreate, "");
-		let power_levels =
-			self.state_get_optional(snapshot, &StateEventType::RoomPowerLevels, "");
+		self.get_power_levels_at(room_id, snapshot, None)
+			.await
+	}
+
+	/// Evaluate permissions in the candidate state accepted with a new event.
+	pub(crate) async fn get_power_levels_at(
+		&self,
+		room_id: &RoomId,
+		snapshot: crate::rooms::short::ShortStateHash,
+		pending: Option<&Pdu>,
+	) -> Result<RoomPowerLevels> {
+		let create = async {
+			self.state_get_optional_for_append(snapshot, &StateEventType::RoomCreate, "", pending)
+				.await?
+				.ok_or_else(|| Error::bad_database("Missing room creation event"))
+		};
+		let power_levels = self.state_get_optional_for_append(
+			snapshot,
+			&StateEventType::RoomPowerLevels,
+			"",
+			pending,
+		);
 		let (create, power_levels) = try_join(create, power_levels)
 			.await
 			.map_err(|error| {

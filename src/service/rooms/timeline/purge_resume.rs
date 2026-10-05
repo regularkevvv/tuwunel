@@ -138,9 +138,18 @@ pub(crate) async fn prepare_history_step(
 					target.after.as_deref(),
 				)
 				.await?,
+		| Phase::Notifications =>
+			self.services
+				.pusher
+				.stage_notification_erasure_page(&mut txn, &raw, target.after.as_deref())
+				.await?,
 		| Phase::Final => {
 			txn = self
 				.prepare_history_base(&raw, &snapshot.pdu)
+				.await?;
+			self.services
+				.pusher
+				.stage_notification_erasure(&mut txn, &raw)
 				.await?;
 			self.services
 				.pdu_metadata
@@ -169,7 +178,8 @@ pub(crate) async fn prepare_history_step(
 			| Phase::SearchCurrent => Phase::SearchOriginal,
 			| Phase::SearchOriginal => Phase::LegacyRelations,
 			| Phase::LegacyRelations => Phase::TypedRelations,
-			| Phase::TypedRelations | Phase::Final => Phase::Final,
+			| Phase::TypedRelations => Phase::Notifications,
+			| Phase::Notifications | Phase::Final => Phase::Final,
 		};
 	} else {
 		target.after = after;

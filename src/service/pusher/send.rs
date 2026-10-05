@@ -51,6 +51,37 @@ where
 		})
 		.await?;
 
+	self.send_push_actions(user_id, pusher, actions, self.services.config.push_everything, event)
+		.await
+}
+
+#[implement(super::Service)]
+pub(crate) async fn send_frozen_push_notice(
+	&self,
+	user: &UserId,
+	pusher: &Pusher,
+	raw: &tuwunel_core::matrix::pdu::RawPduId,
+	event: &tuwunel_core::matrix::pdu::Pdu,
+) -> Result {
+	let (actions, push_everything, canceled) = self
+		.frozen_push_decision(raw, user, event)
+		.await?;
+	if canceled {
+		return Ok(());
+	}
+	self.send_push_actions(user, pusher, &actions, push_everything, event)
+		.await
+}
+
+#[implement(super::Service)]
+async fn send_push_actions<E: Event>(
+	&self,
+	user_id: &UserId,
+	pusher: &Pusher,
+	actions: &[Action],
+	push_everything: bool,
+	event: &E,
+) -> Result {
 	let notify = actions.iter().any(Action::should_notify);
 	let tweak_count = actions
 		.iter()
@@ -66,7 +97,7 @@ where
 		"Push notice decision",
 	);
 
-	if notify || self.services.config.push_everything {
+	if notify || push_everything {
 		let tweaks: Vec<Tweak> = actions
 			.iter()
 			.filter_map(|action| match action {

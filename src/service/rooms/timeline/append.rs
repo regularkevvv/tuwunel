@@ -263,6 +263,12 @@ where
 		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
 		.await;
 
+	let notifications = self
+		.services
+		.pusher
+		.stage_notification_plan(&mut txn, pdu_id, pdu, room_state)
+		.await?;
+
 	let sender_read = self
 		.services
 		.read_receipt
@@ -280,6 +286,7 @@ where
 		.await?;
 
 	txn.execute().await?;
+	drop(notifications);
 
 	if let Some(sender_read) = sender_read {
 		sender_read.committed(&self.services.pusher);

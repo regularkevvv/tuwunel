@@ -187,6 +187,21 @@ pub async fn state_get_optional(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<Option<Pdu>> {
+	self.state_get_optional_for_append(shortstatehash, event_type, state_key, None)
+		.await
+}
+
+/// The authenticated event being accepted may already be named by its
+/// candidate state snapshot. Resolve only that exact ID from the caller's
+/// event; every stored cell retains its normal strict binding checks.
+#[implement(super::Service)]
+pub(crate) async fn state_get_optional_for_append(
+	&self,
+	shortstatehash: ShortStateHash,
+	event_type: &StateEventType,
+	state_key: &str,
+	pending: Option<&Pdu>,
+) -> Result<Option<Pdu>> {
 	let direct_shortstatekey = match self
 		.services
 		.short
@@ -232,7 +247,7 @@ pub async fn state_get_optional(
 		// Even a valid shortcut outside the snapshot cannot establish absence.
 		| None => {
 			let Some(shorteventid) = self
-				.state_cell_from_snapshot(shortstatehash, event_type, state_key)
+				.state_cell_from_snapshot(shortstatehash, event_type, state_key, pending)
 				.await?
 			else {
 				return Ok(None);
@@ -248,11 +263,8 @@ pub async fn state_get_optional(
 		.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
 
 	let pdu = self
-		.services
-		.timeline
-		.get_pdu(&event_id)
-		.await
-		.map_err(|_| Error::bad_database("Incomplete state event"))?;
+		.state_event_for_append(&event_id, pending)
+		.await?;
 	if pdu.event_id() != event_id
 		|| pdu.event_type().to_cow_str() != event_type.to_cow_str()
 		|| pdu.state_key() != Some(state_key)
@@ -270,6 +282,7 @@ async fn state_cell_from_snapshot(
 	shortstatehash: ShortStateHash,
 	event_type: &StateEventType,
 	state_key: &str,
+	pending: Option<&Pdu>,
 ) -> Result<Option<ShortEventId>> {
 	let entries = self
 		.state_full_shortids(shortstatehash)
@@ -313,17 +326,8 @@ async fn state_cell_from_snapshot(
 	let mut snapshot_room: Option<OwnedRoomId> = None;
 	for (candidate_type, candidate_key, event_id) in decoded {
 		let pdu = self
-			.services
-			.timeline
-			.get_pdu(&event_id)
-			.await
-			.map_err(|error| {
-				if error.kind() == ErrorKind::NotFound {
-					Error::bad_database("Incomplete state event")
-				} else {
-					error
-				}
-			})?;
+			.state_event_for_append(&event_id, pending)
+			.await?;
 		source_bytes = source_bytes.saturating_add(
 			serialized_len(pdu.as_pdu())
 				.map_err(|_| Error::bad_database("Invalid state event serialization"))?,
@@ -343,6 +347,24 @@ async fn state_cell_from_snapshot(
 		snapshot_room = Some(pdu.room_id().to_owned());
 	}
 	Ok(shorteventid)
+}
+
+#[implement(super::Service)]
+async fn state_event_for_append(&self, event: &EventId, pending: Option<&Pdu>) -> Result<Pdu> {
+	if let Some(pdu) = pending.filter(|pdu| pdu.event_id() == event) {
+		return Ok(pdu.clone());
+	}
+	self.services
+		.timeline
+		.get_pdu(event)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("Incomplete state event")
+			} else {
+				error
+			}
+		})
 }
 
 /// Gets history visibility from an event's state without converting corrupt
