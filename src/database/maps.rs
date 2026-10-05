@@ -83,6 +83,10 @@ pub(crate) fn descriptor(name: &str) -> &'static Descriptor {
 /// tombstones but are not opened for use.
 pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
+		name: "adminjobid_record",
+		..descriptor::RANDOM
+	},
+	Descriptor {
 		name: "alias_roomid",
 		..descriptor::RANDOM_SMALL
 	},

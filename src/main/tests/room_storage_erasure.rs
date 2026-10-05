@@ -259,7 +259,11 @@ async fn failed_task_status(services: &Services, client: &Client<'_>, id: &str) 
 	.map_err(|_| err!("erasure task exceeded its deadline"))??;
 	assert_eq!(status["status"], "failed");
 	assert!(status["shutdown_room"].is_null());
-	let task = services.tasks.get(id).expect("owned failed task");
+	let task = services
+		.tasks
+		.get(id)
+		.await?
+		.expect("owned failed task");
 	assert_eq!(task.status, tuwunel_service::tasks::Status::Failed);
 	assert!(task.result.is_none());
 	Ok(status)

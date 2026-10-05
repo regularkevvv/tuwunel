@@ -34,7 +34,8 @@ pub(crate) async fn admin_purge_history_route(
 	.await?;
 
 	let purge_id =
-		schedule_purge(services, body.room_id.clone(), boundary, body.delete_local_events);
+		schedule_purge(services, body.room_id.clone(), boundary, body.delete_local_events)
+			.await?;
 
 	Ok(PurgeResponse { purge_id })
 }
@@ -51,7 +52,8 @@ pub(crate) async fn admin_purge_history_by_event_route(
 	let boundary = resolve_boundary(&services, &body.room_id, Some(&body.event_id), None).await?;
 
 	let purge_id =
-		schedule_purge(services, body.room_id.clone(), boundary, body.delete_local_events);
+		schedule_purge(services, body.room_id.clone(), boundary, body.delete_local_events)
+			.await?;
 
 	Ok(PurgeByEventResponse { purge_id })
 }
@@ -69,6 +71,7 @@ pub(crate) async fn admin_purge_history_status_route(
 	let task = services
 		.tasks
 		.get(&body.purge_id)
+		.await?
 		.filter(|task| task.action == super::PURGE_HISTORY_ACTION)
 		.ok_or_else(|| err!(Request(NotFound("Unknown purge task"))))?;
 
@@ -127,13 +130,14 @@ async fn resolve_boundary(
 
 /// Spawns the purge on the tasks service, returning its id. Takes `services` by
 /// value (it is `Copy`) so the detached task owns a `'static` handle.
-fn schedule_purge(
+async fn schedule_purge(
 	services: crate::State,
 	room_id: OwnedRoomId,
 	boundary: PduCount,
 	delete_local_events: bool,
-) -> String {
+) -> Result<String> {
 	let resource_id = room_id.to_string();
+	let parameters = serde_json::json!({ "boundary": boundary.into_signed(), "delete_local_events": delete_local_events });
 
 	let work = async move {
 		let purged = services
@@ -144,10 +148,11 @@ fn schedule_purge(
 		Ok(serde_json::json!({ "purged": purged }))
 	};
 
-	services
+	Ok(services
 		.tasks
-		.spawn(super::PURGE_HISTORY_ACTION, resource_id, work)
-		.to_string()
+		.spawn(super::PURGE_HISTORY_ACTION, resource_id, parameters, work)
+		.await?
+		.to_string())
 }
 
 fn purge_status(status: Status) -> PurgeStatus {

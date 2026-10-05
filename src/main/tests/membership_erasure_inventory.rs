@@ -734,6 +734,7 @@ async fn async_purge_refusal(services: &Services, client: &Client<'_>, room: &Ro
 	let task = services
 		.tasks
 		.get(delete_id)
+		.await?
 		.expect("owned failed task");
 	assert_eq!(task.status, tuwunel_service::tasks::Status::Failed);
 	assert!(task.result.is_none(), "failed task has no fabricated success summary");

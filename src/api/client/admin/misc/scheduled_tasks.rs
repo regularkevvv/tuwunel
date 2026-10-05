@@ -22,6 +22,7 @@ pub(crate) async fn admin_scheduled_tasks_route(
 	let scheduled_tasks = services
 		.tasks
 		.list()
+		.await?
 		.into_iter()
 		.filter(|task| matches_filters(task, &body))
 		.sorted_by_key(|task| task.timestamp_ms)

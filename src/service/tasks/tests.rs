@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{CAPACITY, RETENTION_MS, Status, Task, TaskId, matches_nonterminal, prune_tasks};
+use super::{CAPACITY, RETENTION_MS, Status, Task, TaskId, matches_nonterminal, prune_ids};
 
 fn key(s: &str) -> TaskId { TaskId::from(s).expect("id fits") }
 
@@ -14,7 +14,7 @@ fn task_for(action: &'static str, resource_id: &str, status: Status, timestamp_m
 		timestamp_ms,
 		result: None,
 		error: None,
-		handle: None,
+		parameters: serde_json::json!({}),
 	}
 }
 
@@ -51,7 +51,9 @@ fn prune_keeps_active_and_recent() {
 		(key("fresh_done"), task(Status::Complete, now)),
 	]);
 
-	prune_tasks(&mut tasks, now);
+	for id in prune_ids(&tasks, now, 0) {
+		tasks.remove(&id);
+	}
 
 	assert!(tasks.contains_key("stale_active"), "non-terminal survives any age");
 	assert!(!tasks.contains_key("stale_done"), "terminal past retention is pruned");
@@ -68,8 +70,25 @@ fn prune_caps_terminal_tasks() {
 		tasks.insert(key(&format!("t{i}")), task(Status::Complete, ts));
 	}
 
-	prune_tasks(&mut tasks, now);
+	for id in prune_ids(&tasks, now, 0) {
+		tasks.remove(&id);
+	}
 
 	assert!(tasks.len() <= CAPACITY, "terminal tasks capped");
 	assert!(tasks.contains_key("t0"), "the newest survivor is kept");
+}
+
+#[test]
+fn prune_caps_identical_timestamps_and_reserves_admission() {
+	let now = 100_000;
+	let mut tasks = BTreeMap::new();
+	for i in 0..CAPACITY + 50 {
+		tasks.insert(key(&format!("t{i:06}")), task(Status::Complete, now));
+	}
+	for id in prune_ids(&tasks, now, 1) {
+		tasks.remove(&id);
+	}
+	assert_eq!(tasks.len(), CAPACITY - 1);
+	assert!(!tasks.contains_key("t000000"));
+	assert!(tasks.contains_key("t001073"));
 }

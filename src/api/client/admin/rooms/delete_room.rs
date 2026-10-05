@@ -42,6 +42,7 @@ pub(crate) async fn admin_delete_room_v2_route(
 	let sender = body.sender_user().to_owned();
 	let (block, purge) = (body.block, body.purge);
 
+	let parameters = serde_json::json!({ "sender": sender, "block": block, "purge": purge });
 	let work = async move {
 		let summary = run_shutdown(&services, &room_id, &sender, block, purge).await?;
 
@@ -50,7 +51,8 @@ pub(crate) async fn admin_delete_room_v2_route(
 
 	let delete_id = services
 		.tasks
-		.spawn(super::DELETE_ROOM_ACTION, body.room_id.to_string(), work)
+		.spawn(super::DELETE_ROOM_ACTION, body.room_id.to_string(), parameters, work)
+		.await?
 		.to_string();
 
 	Ok(V2Response { delete_id })
