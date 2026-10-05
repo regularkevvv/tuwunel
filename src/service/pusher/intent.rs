@@ -22,7 +22,7 @@ use tuwunel_core::{
 use tuwunel_database::{Interfix, Map, Txn, serialize_key};
 
 use super::{Evaluate, Notified, notification::check_mutation};
-use crate::rooms::short::ShortStateHash;
+use crate::rooms::{short::ShortStateHash, state::RoomMutexGuard};
 
 const MAX_PENDING: usize = 64;
 const MAX_PLAN_BYTES: usize = 64 * 1024;
@@ -372,8 +372,8 @@ pub(crate) async fn restore_notifications(&self) -> Result {
 		self.validate_notification_source(plan).await?;
 	}
 	for plan in plans {
-		let _state = self.services.state.mutex.lock(&plan.room).await;
-		self.finish_notification_plan(&plan.raw_id)
+		let state = self.services.state.mutex.lock(&plan.room).await;
+		self.finish_notification_plan(&plan.raw_id, &state)
 			.await?;
 	}
 	Ok(())
@@ -382,12 +382,18 @@ pub(crate) async fn restore_notifications(&self) -> Result {
 /// Live append already holds room state. The retry worker acquires it before
 /// calling this method; history/room deletion therefore cannot race replay.
 #[implement(super::Service)]
-pub(crate) async fn append_pdu(&self, raw: RawPduId, _pdu: &Pdu) -> Result {
-	self.finish_notification_plan(raw.as_ref()).await
+pub(crate) async fn append_pdu(
+	&self,
+	raw: RawPduId,
+	_pdu: &Pdu,
+	state: &RoomMutexGuard,
+) -> Result {
+	self.finish_notification_plan(raw.as_ref(), state)
+		.await
 }
 
 #[implement(super::Service)]
-async fn finish_notification_plan(&self, key: &[u8]) -> Result {
+async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) -> Result {
 	let _plan = self.notification_plans.lock(&key.to_vec()).await;
 	let mut validated = false;
 	loop {
@@ -492,6 +498,8 @@ async fn finish_notification_plan(&self, key: &[u8]) -> Result {
 			None
 		};
 		check_mutation(&txn)?;
+		#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+		self.wait_notification_commit_for_test(&raw).await;
 		txn.execute().await?;
 		drop(update);
 		drop(guard);
@@ -525,11 +533,14 @@ pub(super) async fn notification_worker(self: Arc<Self>) -> Result {
 			},
 		};
 		for plan in plans {
-			let _state = tokio::select! {
+			let state = tokio::select! {
 				() = self.notification_stop.notified() => return Ok(()),
 				state = self.services.state.mutex.lock(&plan.room) => state,
 			};
-			if let Err(error) = self.finish_notification_plan(&plan.raw_id).await {
+			if let Err(error) = self
+				.finish_notification_plan(&plan.raw_id, &state)
+				.await
+			{
 				error!(event_id = %plan.event, "Notification recovery remains pending: {error}");
 			}
 		}
@@ -600,7 +611,69 @@ pub(crate) async fn stage_notification_erasure(&self, txn: &mut Txn, raw: &RawPd
 }
 
 #[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub(super) struct CommitPause {
+	raw: RawPduId,
+	entered: tokio::sync::oneshot::Sender<RawPduId>,
+	release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub struct NotificationCommitPause {
+	entered: tokio::sync::oneshot::Receiver<RawPduId>,
+	release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+impl NotificationCommitPause {
+	pub async fn entered(&mut self) -> Result<RawPduId> {
+		(&mut self.entered)
+			.await
+			.map_err(|_| Error::bad_database("Notification commit pause was abandoned"))
+	}
+}
+
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+impl Drop for NotificationCommitPause {
+	fn drop(&mut self) { self.release.notify_one(); }
+}
+
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
 impl super::Service {
+	/// Holds one actual recipient commit after preparation. Only debug test
+	/// builds expose this owned, automatically released pause.
+	pub fn pause_notification_commit_for_test(&self, raw: RawPduId) -> NotificationCommitPause {
+		let (entered, receiver) = tokio::sync::oneshot::channel();
+		let release = Arc::new(tokio::sync::Notify::new());
+		let mut gate = self
+			.notification_commit_pause
+			.lock()
+			.expect("locked");
+		assert!(gate.is_none(), "one owned notification commit pause");
+		*gate = Some(CommitPause { raw, entered, release: release.clone() });
+		NotificationCommitPause { entered: receiver, release }
+	}
+
+	async fn wait_notification_commit_for_test(&self, raw: &RawPduId) {
+		let pause = {
+			let mut gate = self
+				.notification_commit_pause
+				.lock()
+				.expect("locked");
+			if gate.as_ref().is_some_and(|gate| &gate.raw == raw) {
+				gate.take()
+			} else {
+				None
+			}
+		};
+		if let Some(pause) = pause {
+			pause.entered.send(*raw).ok();
+			tokio::select! {
+				() = pause.release.notified() => {},
+				() = self.services.server.until_shutdown() => {},
+			}
+		}
+	}
+
 	/// Pauses only background retry. Immediate append still attempts its
 	/// transaction, allowing deterministic pre-dispatch refusal fixtures.
 	pub fn pause_notification_retry_for_test(&self, paused: bool) {

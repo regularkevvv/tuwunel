@@ -34,6 +34,8 @@ use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Json, Map};
 use url::Url;
 
 use self::badge::SentBadges;
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub use self::intent::NotificationCommitPause;
 pub(crate) use self::notification::NotificationGuard;
 pub use self::{
 	append::Notified,
@@ -96,6 +98,8 @@ pub struct Service {
 	notification_stop: tokio::sync::Notify,
 	#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
 	notification_retry_paused: std::sync::atomic::AtomicBool,
+	#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+	notification_commit_pause: std::sync::Mutex<Option<intent::CommitPause>>,
 	db: Data,
 	sent_badges: SentBadges,
 }
@@ -125,6 +129,8 @@ impl crate::Service for Service {
 			notification_stop: tokio::sync::Notify::new(),
 			#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
 			notification_retry_paused: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+			notification_commit_pause: std::sync::Mutex::new(None),
 			db: Data {
 				db: args.db.clone(),
 				pduid_notificationplan: args.db["pduid_notificationplan"].clone(),

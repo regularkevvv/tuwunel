@@ -309,7 +309,7 @@ where
 
 	self.services
 		.pusher
-		.append_pdu(pdu_id, pdu)
+		.append_pdu(pdu_id, pdu, state_lock)
 		.await
 		.effect("push", event_id);
 
