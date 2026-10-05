@@ -5,7 +5,10 @@ use ruma::{
 	EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
 	events::receipt::ReceiptThread,
 };
-use tuwunel_core::{Error, Result, implement, matrix::Event, trace};
+use tuwunel_core::{
+	Error, Result, implement,
+	matrix::{Event, PduId},
+};
 use tuwunel_database::{
 	Interfix, Map, Txn, deserialize_from_slice as deserialize_key, serialize_key,
 };
@@ -223,11 +226,10 @@ pub async fn reset_notification_counts_for_thread(
 ) -> Result {
 	let guard = self.lock_notification(user, room).await;
 	let mut txn = self.db.db.txn();
-	self.stage_notification_reset(&mut txn, &guard, thread, None)
-		.await?;
 	// The permit stays alive through execute so sync cannot pass this stamp.
 	let count = self.services.globals.next_count().await?;
-	self.stage_notification_read_stamp(&mut txn, &guard, thread, *count)?;
+	self.stage_notification_reset(&mut txn, &guard, thread, Some(*count), None)
+		.await?;
 	self.stage_notification_cutoff(&mut txn, &guard, thread, *count)
 		.await?;
 	check_mutation(&txn)?;
@@ -245,28 +247,173 @@ pub(crate) async fn stage_notification_reset(
 	guard: &NotificationGuard,
 	thread: &ReceiptThread,
 	stamp: Option<u64>,
+	position: Option<u64>,
 ) -> Result {
 	let user = &*guard.user;
 	let room = &*guard.room;
 	match thread {
-		| ReceiptThread::Unthreaded => self.stage_thread_clear(txn, user, room).await?,
-		| ReceiptThread::Main | ReceiptThread::Thread(_) => {},
+		| ReceiptThread::Unthreaded | ReceiptThread::Main | ReceiptThread::Thread(_) => {},
 		| _ => return Err(tuwunel_core::err!(Request(InvalidParam("Unknown receipt thread")))),
 	}
-	match thread {
-		| ReceiptThread::Thread(root) => {
-			txn.put(&self.db.userroomid_notificationcount, (user, room, root), 0_u64);
-			txn.put(&self.db.userroomid_highlightcount, (user, room, root), 0_u64);
-		},
-		| _ => {
-			txn.put(&self.db.userroomid_notificationcount, (user, room), 0_u64);
-			txn.put(&self.db.userroomid_highlightcount, (user, room), 0_u64);
-		},
+	let mut counts = if let Some(position) = position {
+		self.notification_counts_after(guard, thread, position)
+			.await?
+	} else {
+		NotificationState::default()
+	};
+	if matches!(thread, ReceiptThread::Unthreaded) {
+		// Keep zero rows/change stamps for previously known roots so clients
+		// receive explicit resets, including when newer unread events survive.
+		let mut budget = ReadBudget::default();
+		for (map, room_first) in [
+			(&self.db.userroomid_notificationcount, false),
+			(&self.db.userroomid_highlightcount, false),
+			(&self.db.roomuserid_lastnotificationread, true),
+		] {
+			for root in thread_rows(map, user, room, room_first, &mut budget)
+				.await?
+				.into_keys()
+			{
+				counts.threads.entry(root).or_default();
+			}
+		}
+		for (root, &(notifications, highlights)) in &counts.threads {
+			txn.put(&self.db.userroomid_notificationcount, (user, room, root), notifications);
+			txn.put(&self.db.userroomid_highlightcount, (user, room, root), highlights);
+			if let Some(stamp) = stamp {
+				txn.put(&self.db.roomuserid_lastnotificationread, (room, user, root), stamp);
+			}
+		}
+	}
+	if let ReceiptThread::Thread(root) = thread {
+		let (notifications, highlights) = counts
+			.threads
+			.get(root)
+			.copied()
+			.unwrap_or_default();
+		txn.put(&self.db.userroomid_notificationcount, (user, room, root), notifications);
+		txn.put(&self.db.userroomid_highlightcount, (user, room, root), highlights);
+	} else {
+		txn.put(&self.db.userroomid_notificationcount, (user, room), counts.notifications);
+		txn.put(&self.db.userroomid_highlightcount, (user, room), counts.highlights);
 	}
 	if let Some(stamp) = stamp {
 		self.stage_notification_read_stamp(txn, guard, thread, stamp)?;
 	}
 	check_mutation(txn)
+}
+
+/// Rebuild only the reset scope from completed notifications strictly after
+/// the actual receipt position. The guard excludes recipient completion and
+/// other read resets until this result and its cutoff commit together.
+#[implement(super::Service)]
+async fn notification_counts_after(
+	&self,
+	guard: &NotificationGuard,
+	scope: &ReceiptThread,
+	position: u64,
+) -> Result<NotificationState> {
+	if position > i64::MAX.unsigned_abs() {
+		return Err(Error::bad_database("Invalid notification reset position"));
+	}
+	let user = &*guard.user;
+	let room = &*guard.room;
+	let prefix = serialize_key((user, Interfix))?;
+	let mut after = Some(serialize_key((user, position))?.to_vec());
+	let mut budget = ReadBudget::default();
+	let mut result = NotificationState::default();
+	loop {
+		let keys = self
+			.db
+			.useridcount_notification
+			.raw_keys_prefix_after(
+				&prefix,
+				after.as_deref(),
+				READ_PAGE.min(
+					READ_ROWS
+						.saturating_sub(budget.rows)
+						.saturating_add(1),
+				),
+			)
+			.await?;
+		for key in &keys {
+			let (owner, count): (&UserId, u64) = deserialize_key(key)?;
+			if owner != user
+				|| count <= position
+				|| count > i64::MAX.unsigned_abs()
+				|| serialize_key((owner, count))?.as_slice() != key.as_slice()
+			{
+				return Err(Error::bad_database("Invalid notification reset source key"));
+			}
+			let value = self.db.useridcount_notification.get(key).await?;
+			budget.charge(key, &value)?;
+			let notified = super::append::parse_notified(&value)?;
+			let id = PduId {
+				shortroomid: notified.sroomid,
+				count: count.into(),
+			};
+			let pdu = match self
+				.services
+				.timeline
+				.get_pdu_from_id(&id.into())
+				.await
+			{
+				| Ok(pdu) => pdu,
+				| Err(error) if error.is_not_found() => continue,
+				| Err(error) => return Err(error),
+			};
+			if pdu.room_id() != room || pdu.is_redacted() {
+				continue;
+			}
+			if self.services.short.get_shortroomid(room).await? != notified.sroomid {
+				return Err(Error::bad_database("Notification reset room binding mismatch"));
+			}
+			let root = self
+				.services
+				.threads
+				.get_thread_id_checked(&pdu)
+				.await?;
+			let selected = match scope {
+				| ReceiptThread::Unthreaded => true,
+				| ReceiptThread::Main => root.is_none(),
+				| ReceiptThread::Thread(expected) => root.as_deref() == Some(expected.as_ref()),
+				| _ => false,
+			};
+			if !selected
+				|| self
+					.notification_already_read(user, room, root.as_deref(), count)
+					.await?
+			{
+				continue;
+			}
+			let notifications = u64::from(
+				notified
+					.actions
+					.iter()
+					.any(ruma::push::Action::should_notify),
+			);
+			let highlights = u64::from(
+				notified
+					.actions
+					.iter()
+					.any(ruma::push::Action::is_highlight),
+			);
+			if let Some(root) = root {
+				let entry = result.threads.entry(root).or_default();
+				entry.0 = checked_add(entry.0, notifications)?;
+				entry.1 = checked_add(entry.1, highlights)?;
+			} else {
+				result.notifications = checked_add(result.notifications, notifications)?;
+				result.highlights = checked_add(result.highlights, highlights)?;
+			}
+		}
+		if keys.is_empty() {
+			break;
+		}
+		after = keys.last().cloned();
+	}
+	result.totals()?;
+	Ok(result)
 }
 
 #[implement(super::Service)]
@@ -293,14 +440,13 @@ fn stage_notification_read_stamp(
 pub(crate) fn notification_reset_committed(
 	&self,
 	guard: &NotificationGuard,
-	thread: &ReceiptThread,
+	_thread: &ReceiptThread,
 ) {
-	if matches!(thread, ReceiptThread::Main | ReceiptThread::Unthreaded) {
-		let removed = self.clear_suppressed_room(&guard.user, &guard.room);
-		if removed > 0 {
-			trace!(user = %guard.user, room = %guard.room, removed, "Cleared suppressed push events after read");
-		}
-	}
+	// Persisted event cutoffs determine cancellation at delivery. A main
+	// reset must never erase independent thread obligations.
+	self.services
+		.sending
+		.schedule_resume_pushes_for_user(guard.user.clone(), "read receipt committed");
 }
 
 #[implement(super::Service)]

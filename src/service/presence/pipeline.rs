@@ -206,7 +206,7 @@ impl Service {
 
 			self.services
 				.sending
-				.schedule_flush_suppressed_for_user(
+				.schedule_resume_pushes_for_user(
 					user_id.to_owned(),
 					"presence->inactive (aggregate)",
 				);
@@ -394,7 +394,7 @@ impl Service {
 				if matches!(new_state, PresenceState::Unavailable | PresenceState::Offline) {
 					self.services
 						.sending
-						.schedule_flush_suppressed_for_user(
+						.schedule_resume_pushes_for_user(
 							user_id.to_owned(),
 							"presence->inactive",
 						);
@@ -416,7 +416,7 @@ impl Service {
 		if matches!(aggregated.state, PresenceState::Unavailable | PresenceState::Offline) {
 			self.services
 				.sending
-				.schedule_flush_suppressed_for_user(user_id.to_owned(), "presence->inactive");
+				.schedule_resume_pushes_for_user(user_id.to_owned(), "presence->inactive");
 		}
 
 		let status_msg = aggregated.status_msg.or(presence.status_msg);

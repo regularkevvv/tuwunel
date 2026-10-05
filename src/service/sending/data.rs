@@ -230,6 +230,45 @@ impl Data {
 			.map(decode_sending)
 	}
 
+	/// A bounded, checked page of a user's owed push destinations. This only
+	/// schedules wakes; the sender and durable rows retain delivery ownership.
+	pub(super) async fn push_destinations_for_user_after(
+		&self,
+		user: &UserId,
+		active: bool,
+		after: Option<&[u8]>,
+	) -> Result<(Vec<Destination>, Option<Key>)> {
+		let mut prefix = Vec::from(b"$");
+		prefix.extend_from_slice(user.as_bytes());
+		prefix.push(0xFF);
+		let map = if active {
+			&self.servercurrentevent_data
+		} else {
+			&self.servernameevent_data
+		};
+		let keys = map
+			.raw_keys_prefix_after(&prefix, after, 64)
+			.await?;
+		let mut destinations = std::collections::BTreeSet::new();
+		let mut bytes = 0_usize;
+		for key in &keys {
+			let value = map.get(key).await?;
+			bytes = bytes
+				.saturating_add(key.len())
+				.saturating_add(value.len());
+			if bytes > 4 * 1024 * 1024 {
+				return Err(Error::bad_database("Push wake page exceeds limit"));
+			}
+			let (_, _, destination) = decode_outgoing(Ok((key, &value)))?;
+			if !matches!(&destination, Destination::Push(owner, _) if owner == user) {
+				return Err(Error::bad_database("Push wake owner mismatch"));
+			}
+			destinations.insert(destination);
+		}
+		let next = (keys.len() == 64).then(|| keys.last().expect("full page").clone());
+		Ok((destinations.into_iter().collect(), next))
+	}
+
 	/// Destinations owning durable pending rows, among at most `limit` rows
 	/// after `after`. Validate every row before returning the page. The read
 	/// closes here, before startup promotes any row for delivery.

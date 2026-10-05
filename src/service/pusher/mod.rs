@@ -4,7 +4,6 @@ mod intent;
 mod notification;
 mod request;
 mod send;
-mod suppressed;
 #[cfg(test)]
 mod tests;
 
@@ -98,7 +97,6 @@ pub struct Service {
 	#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
 	notification_retry_paused: std::sync::atomic::AtomicBool,
 	db: Data,
-	suppressed: suppressed::SuppressedQueue,
 	sent_badges: SentBadges,
 }
 
@@ -140,7 +138,6 @@ impl crate::Service for Service {
 				roomuserid_lastnotificationread: args.db["roomuserid_lastnotificationread"]
 					.clone(),
 			},
-			suppressed: suppressed::SuppressedQueue::default(),
 			sent_badges: SentBadges::default(),
 		}))
 	}
@@ -257,7 +254,6 @@ pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
 		.remove(pushkey)
 		.await
 		.expect("database write error");
-	self.clear_suppressed_pushkey(sender, pushkey);
 	self.forget_sent_badge(sender, pushkey);
 
 	self.services
@@ -361,19 +357,7 @@ pub async fn get_notifications(
 			return Err(tuwunel_core::Error::bad_database("Invalid notification key"));
 		}
 		let value = self.db.useridcount_notification.get(&key).await?;
-		if value.len() > 64 * 1024 {
-			return Err(tuwunel_core::Error::bad_database("Notification metadata exceeds limit"));
-		}
-		let notified: Notified = serde_json::from_slice(&value)
-			.map_err(|_| tuwunel_core::Error::bad_database("Invalid notification metadata"))?;
-		if notified.actions.len() > 64
-			|| UInt::new(notified.ts).is_none()
-			|| notified.sroomid == 0
-		{
-			return Err(tuwunel_core::Error::bad_database(
-				"Invalid notification metadata fields",
-			));
-		}
+		let notified = append::parse_notified(&value)?;
 		page.push((count, notified, key.len().saturating_add(value.len())));
 	}
 	Ok(page)

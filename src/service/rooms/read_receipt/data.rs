@@ -132,10 +132,6 @@ impl Data {
 			.ok_or_else(|| Error::bad_database("Receipt has no thread context"))?;
 		let local = self.services.globals.user_is_local(user_id);
 		if local {
-			self.services
-				.pusher
-				.stage_notification_reset(&mut txn, &guard, thread, Some(*count))
-				.await?;
 			match self.services.timeline.get_pdu_id(event_id).await {
 				| Ok(raw) => {
 					let pdu = self
@@ -146,6 +142,16 @@ impl Data {
 					if pdu.room_id != room_id {
 						return Err(Error::bad_database("Receipt cutoff room mismatch"));
 					}
+					self.services
+						.pusher
+						.stage_notification_reset(
+							&mut txn,
+							&guard,
+							thread,
+							Some(*count),
+							Some(raw.pdu_count().into_normal().into_unsigned()),
+						)
+						.await?;
 					self.services
 						.pusher
 						.stage_notification_cutoff(
@@ -385,7 +391,7 @@ impl Data {
 			let stamp = next_count.as_deref().copied().unwrap_or(count);
 			self.services
 				.pusher
-				.stage_notification_reset(txn, &guard, thread, Some(stamp))
+				.stage_notification_reset(txn, &guard, thread, Some(stamp), Some(count))
 				.await?;
 			self.services
 				.pusher

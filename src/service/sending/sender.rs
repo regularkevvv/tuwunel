@@ -80,6 +80,7 @@ enum TransactionStatus {
 	RunningForceRetry,
 	Failed(u32, Instant), // push backoff: tries, last failure
 	Retrying(u32),        // number of times failed
+	Deferred,             // user active; durable active rows remain owed
 }
 
 enum RetryAction {
@@ -88,7 +89,13 @@ enum RetryAction {
 }
 
 type SendingError = (Destination, Error);
-type SendingResult = Result<Destination, SendingError>;
+enum Delivery {
+	Acknowledged(Destination),
+	Deferred(Destination),
+}
+
+type TransactionResult = Result<Destination, SendingError>;
+type SendingResult = Result<Delivery, SendingError>;
 type SendingFuture<'a> = BoxFuture<'a, SendingResult>;
 type SendingFutures<'a> = FuturesUnordered<SendingFuture<'a>>;
 type CurTransactionStatus = HashMap<Destination, TransactionStatus>;
@@ -310,8 +317,8 @@ impl Service {
 			tokio::select! {
 				Some(response) = futures.next() => {
 					let (dest, mut stage) = match &response {
-						Ok(dest) => (dest.clone(), QueueRecovery::CleanupAcknowledged),
-						Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
+						Ok(Delivery::Acknowledged(dest)) => (dest.clone(), QueueRecovery::CleanupAcknowledged),
+						Ok(Delivery::Deferred(dest)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
 					};
 					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage).await {
 						defer_queue_error(&mut retries, dest, stage, error)?;
@@ -350,7 +357,16 @@ impl Service {
 		stage: &mut QueueRecovery,
 	) -> Result {
 		match response {
-			| Ok(dest) =>
+			| Ok(Delivery::Deferred(dest)) => {
+				let prompt =
+					matches!(statuses.get(&dest), Some(TransactionStatus::RunningForceRetry));
+				statuses.insert(dest.clone(), TransactionStatus::Deferred);
+				// Presence/read wakes may precede an existing timer. Keep one
+				// deferral wake per destination rather than accumulating copies.
+				wakes.retain(|Reverse((_, armed))| armed != &dest);
+				arm_wake_in(wakes, dest, Duration::from_secs(if prompt { 1 } else { 5 }));
+			},
+			| Ok(Delivery::Acknowledged(dest)) =>
 				self.resume_queue(&dest, futures, statuses, stage)
 					.await?,
 			| Err((dest, e)) => {
@@ -517,7 +533,7 @@ impl Service {
 		};
 
 		let (tries, retry_action) = match status {
-			| TransactionStatus::Running => (1, RetryAction::None),
+			| TransactionStatus::Running | TransactionStatus::Deferred => (1, RetryAction::None),
 			| TransactionStatus::RunningForceRetry => (1, RetryAction::Force),
 			| TransactionStatus::Failed(n, _) | TransactionStatus::Retrying(n) =>
 				(n.saturating_add(1), RetryAction::None),
@@ -817,7 +833,7 @@ impl Service {
 			select! {
 				() = sleep_until(deadline) => return Ok(()),
 				response = futures.next() => match response {
-					Some(Ok(dest)) => self.db.delete_all_active_requests_for(&dest).await?,
+					Some(Ok(Delivery::Acknowledged(dest))) => self.db.delete_all_active_requests_for(&dest).await?,
 					Some(_) => {},
 					None => return Ok(()),
 				},
@@ -952,7 +968,7 @@ impl Service {
 		new_events: Vec<QueueItem>, // Events we want to send: event and full key
 		statuses: &mut CurTransactionStatus,
 	) -> Result<Option<Vec<SendingEvent>>> {
-		let retry_action = if matches!(dest, Destination::Appservice(_))
+		let retry_action = if matches!(dest, Destination::Appservice(_) | Destination::Push(..))
 			&& new_events
 				.iter()
 				.any(|(_, event)| matches!(event, SendingEvent::Flush))
@@ -1048,6 +1064,10 @@ impl Service {
 					if matches!(retry_action, RetryAction::Force) {
 						*e = TransactionStatus::RunningForceRetry;
 					}
+				},
+				| TransactionStatus::Deferred => {
+					retry = true;
+					*e = TransactionStatus::Retrying(0);
 				},
 				| TransactionStatus::Failed(tries, time) => {
 					// Push backoff: hold off until the exponential window elapses.
@@ -1477,9 +1497,11 @@ impl Service {
 		match dest {
 			| Destination::Federation(server) => self
 				.send_events_dest_federation(server, events)
+				.map(|result| result.map(Delivery::Acknowledged))
 				.boxed(),
 			| Destination::Appservice(id) => self
 				.send_events_dest_appservice(id, events)
+				.map(|result| result.map(Delivery::Acknowledged))
 				.boxed(),
 			| Destination::Push(user_id, pushkey) => self
 				.send_events_dest_push(user_id, pushkey, events)
@@ -1499,7 +1521,7 @@ impl Service {
 		&self,
 		id: String,
 		events: Vec<SendingEvent>,
-	) -> SendingResult {
+	) -> TransactionResult {
 		let Some(info) = self
 			.services
 			.appservice
@@ -1781,7 +1803,7 @@ impl Service {
 			try_join3(pusher, rules_for_user, suppressed).await?;
 
 		let Some(pusher) = pusher else {
-			return Ok(Destination::Push(user_id, pushkey));
+			return Ok(Delivery::Acknowledged(Destination::Push(user_id, pushkey)));
 		};
 
 		// Reconciliation, not an alert: a suppressed drop strands a stale badge.
@@ -1804,37 +1826,15 @@ impl Service {
 			}
 		}
 
-		if suppressed {
-			// Frozen work stays in the durable queue while suppression is
-			// active; the legacy in-memory cache cannot acknowledge it.
-			if events
+		if suppressed
+			&& events
 				.iter()
-				.any(|event| matches!(event, SendingEvent::FrozenPush(_)))
-			{
-				return Err((
-					destination(),
-					err!(Request(Unknown("Push delivery deferred while user is active"))),
-				));
-			}
-			let queued = self
-				.enqueue_suppressed_push_events(&user_id, &pushkey, &events)
-				.await;
-
-			debug!(
-				?user_id,
-				pushkey,
-				queued,
-				events = events.len(),
-				"Push suppressed; queued events"
-			);
-			return Ok(Destination::Push(user_id, pushkey));
+				.any(|event| event.pdu_id().is_some())
+		{
+			// Both legacy and frozen pushes keep their original active rows.
+			// Deferral is neither gateway failure nor acknowledgement.
+			return Ok(Delivery::Deferred(Destination::Push(user_id, pushkey)));
 		}
-
-		self.schedule_flush_suppressed_for_pushkey(
-			user_id.clone(),
-			pushkey.clone(),
-			"non-suppressed push",
-		);
 
 		let mut failures = PushFailures::default();
 		for event in &events {
@@ -1854,7 +1854,7 @@ impl Service {
 		}
 
 		let PushFailures { ids, error: Some(error) } = failures else {
-			return Ok(Destination::Push(user_id, pushkey));
+			return Ok(Delivery::Acknowledged(Destination::Push(user_id, pushkey)));
 		};
 
 		let dest = Destination::Push(user_id, pushkey);
@@ -1898,6 +1898,14 @@ impl Service {
 					.send_frozen_push_notice(user, pusher, raw, &pdu)
 					.await,
 			| SendingEvent::Pdu(_) => {
+				if self
+					.services
+					.pusher
+					.notification_is_read(user, &pdu, raw.pdu_count().into_unsigned())
+					.await?
+				{
+					return Ok(());
+				}
 				let rules = rules
 					.ok_or_else(|| Error::bad_database("Legacy push rules were not resolved"))?;
 				self.services
@@ -1916,37 +1924,38 @@ fn is_permanent_push_error(error: &Error) -> bool {
 }
 
 impl Service {
-	/// Schedule a flush of the pushes suppressed for one pushkey.
-	///
-	/// The flush runs as a task this service owns, so the caller never waits on
-	/// the push gateway.
-	pub fn schedule_flush_suppressed_for_pushkey(
-		&self,
-		user_id: OwnedUserId,
-		pushkey: String,
-		reason: &'static str,
-	) {
+	/// Wake durable push destinations without taking ownership from storage.
+	pub fn schedule_resume_pushes_for_user(&self, user: OwnedUserId, reason: &'static str) {
 		let sending = self.services.sending.clone();
-
 		self.spawn_flush(async move {
-			sending
-				.flush_suppressed_for_pushkey(user_id, pushkey, reason)
-				.await;
+			if let Err(error) = sending.resume_pushes_for_user(&user).await {
+				warn!(?user, reason, ?error, "Push wake failed; durable rows remain owed");
+			}
 		});
 	}
 
-	/// Schedule a flush of the pushes suppressed for every pushkey a user owns.
-	///
-	/// The flush runs as a task this service owns, so the caller never waits on
-	/// the push gateway.
-	pub fn schedule_flush_suppressed_for_user(&self, user_id: OwnedUserId, reason: &'static str) {
-		let sending = self.services.sending.clone();
-
-		self.spawn_flush(async move {
-			sending
-				.flush_suppressed_for_user(user_id, reason)
-				.await;
-		});
+	async fn resume_pushes_for_user(&self, user: &UserId) -> Result {
+		for active in [true, false] {
+			let mut after = None;
+			loop {
+				let (destinations, next) = self
+					.db
+					.push_destinations_for_user_after(user, active, after.as_deref())
+					.await?;
+				for dest in destinations {
+					self.dispatch(Msg {
+						dest,
+						event: SendingEvent::Flush,
+						queue_id: Vec::new(),
+					})?;
+				}
+				match next {
+					| Some(next) => after = Some(next),
+					| None => break,
+				}
+			}
+		}
+		Ok(())
 	}
 
 	fn spawn_flush<F>(&self, flush: F)
@@ -1962,241 +1971,6 @@ impl Service {
 
 		reap_flushes(&mut flushes);
 		let _abort = flushes.spawn_on(flush, self.server.runtime());
-	}
-
-	async fn enqueue_suppressed_push_events(
-		&self,
-		user_id: &UserId,
-		pushkey: &str,
-		events: &[SendingEvent],
-	) -> usize {
-		let mut queued = 0_usize;
-		for event in events {
-			let SendingEvent::Pdu(pdu_id) = event else {
-				continue;
-			};
-
-			let Ok(pdu) = self
-				.services
-				.timeline
-				.get_pdu_from_id(pdu_id)
-				.await
-			else {
-				debug!(?user_id, ?pdu_id, "Suppressing push but PDU is missing");
-				continue;
-			};
-
-			if pdu.is_redacted() {
-				trace!(?user_id, ?pdu_id, "Suppressing push for redacted PDU");
-				continue;
-			}
-
-			if self.services.pusher.queue_suppressed_push(
-				user_id,
-				pushkey,
-				pdu.room_id(),
-				*pdu_id,
-			) {
-				queued = queued.saturating_add(1);
-			}
-		}
-
-		queued
-	}
-
-	async fn flush_suppressed_rooms(
-		&self,
-		user_id: &UserId,
-		pushkey: &str,
-		pusher: &Pusher,
-		rules_for_user: &Ruleset,
-		rooms: Vec<(OwnedRoomId, Vec<RawPduId>)>,
-		reason: &'static str,
-	) {
-		if rooms.is_empty() {
-			return;
-		}
-
-		let mut sent = 0_usize;
-		debug!(?user_id, pushkey, rooms = rooms.len(), "Flushing suppressed pushes ({reason})");
-
-		for (room_id, pdu_ids) in rooms {
-			let unread = match self
-				.services
-				.pusher
-				.notification_count(user_id, &room_id)
-				.await
-			{
-				| Ok(unread) => unread,
-				| Err(error) => {
-					for pdu_id in pdu_ids {
-						self.services
-							.pusher
-							.queue_suppressed_push(user_id, pushkey, &room_id, pdu_id);
-					}
-					warn!(
-						?user_id,
-						?room_id,
-						?error,
-						"Unread count failed; suppressed pushes retained"
-					);
-					continue;
-				},
-			};
-
-			if unread == 0 {
-				trace!(?user_id, ?room_id, "Skipping suppressed push flush: no unread");
-				continue;
-			}
-
-			for pdu_id in pdu_ids {
-				let pdu = match self
-					.services
-					.timeline
-					.get_pdu_from_id(&pdu_id)
-					.await
-				{
-					| Ok(pdu) => pdu,
-					| Err(error) if error.is_not_found() => continue,
-					| Err(error) => {
-						self.services
-							.pusher
-							.queue_suppressed_push(user_id, pushkey, &room_id, pdu_id);
-						warn!(
-							?user_id,
-							?room_id,
-							?error,
-							"Suppressed PDU read failed; push retained"
-						);
-						continue;
-					},
-				};
-
-				if pdu.is_redacted() {
-					trace!(?user_id, ?pdu_id, "Suppressed PDU redacted during flush");
-					continue;
-				}
-
-				if let Err(error) = self
-					.services
-					.pusher
-					.send_push_notice(user_id, pusher, rules_for_user, &pdu)
-					.await
-				{
-					let requeued = self
-						.services
-						.pusher
-						.queue_suppressed_push(user_id, pushkey, &room_id, pdu_id);
-
-					warn!(
-						?user_id,
-						?room_id,
-						?error,
-						requeued,
-						"Failed to send suppressed push notification"
-					);
-				} else {
-					sent = sent.saturating_add(1);
-				}
-			}
-		}
-
-		debug!(?user_id, pushkey, sent, "Flushed suppressed push notifications");
-	}
-
-	async fn flush_suppressed_for_pushkey(
-		&self,
-		user_id: OwnedUserId,
-		pushkey: String,
-		reason: &'static str,
-	) {
-		let suppressed = self
-			.services
-			.pusher
-			.take_suppressed_for_pushkey(&user_id, &pushkey);
-
-		if suppressed.is_empty() {
-			return;
-		}
-
-		let pusher = match self
-			.services
-			.pusher
-			.get_pusher(&user_id, &pushkey)
-			.await
-		{
-			| Ok(pusher) => pusher,
-			| Err(error) => {
-				warn!(?user_id, pushkey, ?error, "Missing pusher for suppressed flush");
-				return;
-			},
-		};
-
-		let rules_for_user = match self
-			.services
-			.account_data
-			.get_global::<PushRulesEvent>(&user_id, GlobalAccountDataEventType::PushRules)
-			.await
-		{
-			| Ok(ev) => ev.content.global,
-			| Err(_) => Ruleset::server_default(&user_id),
-		};
-
-		self.flush_suppressed_rooms(
-			&user_id,
-			&pushkey,
-			&pusher,
-			&rules_for_user,
-			suppressed,
-			reason,
-		)
-		.await;
-	}
-
-	pub async fn flush_suppressed_for_user(&self, user_id: OwnedUserId, reason: &'static str) {
-		let suppressed = self
-			.services
-			.pusher
-			.take_suppressed_for_user(&user_id);
-
-		if suppressed.is_empty() {
-			return;
-		}
-
-		let rules_for_user = match self
-			.services
-			.account_data
-			.get_global::<PushRulesEvent>(&user_id, GlobalAccountDataEventType::PushRules)
-			.await
-		{
-			| Ok(ev) => ev.content.global,
-			| Err(_) => Ruleset::server_default(&user_id),
-		};
-
-		for (pushkey, rooms) in suppressed {
-			let pusher = match self
-				.services
-				.pusher
-				.get_pusher(&user_id, &pushkey)
-				.await
-			{
-				| Ok(pusher) => pusher,
-				| Err(error) => {
-					warn!(?user_id, pushkey, ?error, "Missing pusher for suppressed flush");
-					continue;
-				},
-			};
-
-			self.flush_suppressed_rooms(
-				&user_id,
-				&pushkey,
-				&pusher,
-				&rules_for_user,
-				rooms,
-				reason,
-			)
-			.await;
-		}
 	}
 
 	// optional suppression: heuristic combining presence age and recent sync
@@ -2263,7 +2037,7 @@ impl Service {
 		&self,
 		server: OwnedServerName,
 		events: Vec<SendingEvent>,
-	) -> SendingResult {
+	) -> TransactionResult {
 		let pdus: Vec<_> = events
 			.iter()
 			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
