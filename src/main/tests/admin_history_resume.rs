@@ -86,27 +86,7 @@ fn history_progress_resumes_each_kill_and_never_double_counts() -> Result {
 	if let Ok(phase) = var(PHASE) {
 		return child(&PathBuf::from(var(DIRECTORY).expect("owned directory")), &phase);
 	}
-	let directory = temp_dir().join(format!("history-resume-{}", id()));
-	let mut builder = DirBuilder::new();
-	#[cfg(unix)]
-	builder.mode(0o700);
-	builder.create(&directory)?;
-	let directory = OwnedDirectory(directory);
-	run_child(&directory.0, "prepare")?;
-	run_child(&directory.0, "import")?;
-	kill_child(&directory.0, "accept")?;
-	run_child(&directory.0, "inspect-accept")?;
-	if let Ok(binary) = var(OLDER_BINARY) {
-		run_child(&directory.0, "snapshot-compat")?;
-		older_refuses(&directory.0, &binary)?;
-		run_child(&directory.0, "verify-compat")?;
-		// Exercise the record gate separately from the schema gate. This
-		// deliberately lowered disposable schema never leaves the fixture.
-		run_child(&directory.0, "record-gate")?;
-		run_child(&directory.0, "snapshot-compat")?;
-		older_refuses(&directory.0, &binary)?;
-		run_child(&directory.0, "verify-compat")?;
-	}
+	let directory = prepare_interrupted_history()?;
 	for corrupt in ["corrupt", "corrupt-terminal", "corrupt-version"] {
 		run_child(&directory.0, corrupt)?;
 		for phase in ["snapshot-corrupt", "reject", "verify-corrupt", "repair"] {
@@ -120,6 +100,39 @@ fn history_progress_resumes_each_kill_and_never_double_counts() -> Result {
 	run_child(&directory.0, "recover")?;
 	run_child(&directory.0, "again")?;
 	Ok(())
+}
+
+#[test]
+#[ignore = "requires the pinned predecessor journal test executable; mandatory in native CI"]
+fn older_journal_refuses_schema_and_record_changes_without_mutation() -> Result {
+	let binary =
+		var(OLDER_BINARY).expect("pinned predecessor journal test executable is required");
+	let directory = prepare_interrupted_history()?;
+	for phase in ["schema-gate", "record-gate"] {
+		if phase == "record-gate" {
+			// Isolate the record-version refusal from the schema-version refusal.
+			// This deliberate downgrade is confined to the disposable database.
+			run_child(&directory.0, phase)?;
+		}
+		run_child(&directory.0, "snapshot-compat")?;
+		older_refuses(&directory.0, &binary)?;
+		run_child(&directory.0, "verify-compat")?;
+	}
+	Ok(())
+}
+
+fn prepare_interrupted_history() -> Result<OwnedDirectory> {
+	let directory = temp_dir().join(format!("history-resume-{}", id()));
+	let mut builder = DirBuilder::new();
+	#[cfg(unix)]
+	builder.mode(0o700);
+	builder.create(&directory)?;
+	let directory = OwnedDirectory(directory);
+	run_child(&directory.0, "prepare")?;
+	run_child(&directory.0, "import")?;
+	kill_child(&directory.0, "accept")?;
+	run_child(&directory.0, "inspect-accept")?;
+	Ok(directory)
 }
 
 fn command(directory: &Path, phase: &str) -> Result<Command> {

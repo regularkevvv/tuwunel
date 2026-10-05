@@ -5,11 +5,59 @@ cd "$(dirname "$0")/.."
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-mode=${1:?usage: native-gate.sh lint|regressions|test|traces|release}
+mode=${1:?usage: native-gate.sh lint|regressions|test|compatibility|traces|release}
 test_root=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tuwunel-native-gate.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT
 export TMPDIR="$test_root" TUWUNEL_DATABASE_PATH="$test_root/default-database"
 unset TUWUNEL_TRACE_OUT TUWUNEL_TRACE_GOLDEN TUWUNEL_TRACE_BACKEND
+
+prepare_predecessor() {
+  local revision=8b0659fb9c3218b4fe964793dfbdba0c24b2466a
+  # Build only the predecessor's committed fixture, from reachable history.
+  # Its own .cargo configuration must apply; candidate code is never overlaid.
+  git merge-base --is-ancestor "$revision" HEAD
+  mkdir "$test_root/predecessor"
+  git archive "$revision" | tar -x -C "$test_root/predecessor"
+  # Reuse dependency outputs, but freeze the old executable before candidate
+  # compilation can overwrite an artifact with the same Cargo target name.
+  local target_directory=${CARGO_TARGET_DIR:-"$PWD/target"}
+  mkdir -p -- "$target_directory"
+  target_directory=$(cd -- "$target_directory" && pwd -P)
+  (
+    cd "$test_root/predecessor"
+    CARGO_TARGET_DIR="$target_directory" cargo test --locked --no-run \
+      -p tuwunel --test admin_task_journal --message-format=json
+  ) > "$test_root/predecessor-artifacts.jsonl"
+  local executable
+  executable=$(python3 - "$test_root/predecessor-artifacts.jsonl" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+artifacts = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+executables = [item['executable'] for item in artifacts
+               if item.get('reason') == 'compiler-artifact'
+               and item.get('target', {}).get('name') == 'admin_task_journal'
+               and item.get('target', {}).get('kind') == ['test']
+               and item.get('profile', {}).get('test') is True
+               and item.get('executable')]
+if len(executables) != 1 or not Path(executables[0]).is_file() or not os.access(executables[0], os.X_OK):
+    sys.exit('Expected one executable predecessor journal test artifact')
+print(executables[0])
+PY
+  )
+  cp -- "$executable" "$test_root/older-journal"
+  chmod 500 "$test_root/older-journal"
+  export TUWUNEL_HISTORY_OLDER_JOURNAL_BINARY="$test_root/older-journal"
+  unset TUWUNEL_HISTORY_RESUME_PHASE TUWUNEL_HISTORY_RESUME_DIRECTORY
+  unset TUWUNEL_ADMIN_JOURNAL_PHASE TUWUNEL_ADMIN_JOURNAL_DIRECTORY
+}
+
+history_compatibility() {
+  cargo test --locked -p tuwunel --test admin_history_resume -- --ignored \
+    | tee "$test_root/history-compatibility.log"
+  grep -Fq 'test older_journal_refuses_schema_and_record_changes_without_mutation ... ok' "$test_root/history-compatibility.log"
+  grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$test_root/history-compatibility.log"
+}
 
 case "$mode" in
   lint)
@@ -32,7 +80,9 @@ case "$mode" in
       --test sync_v5_state_completeness
     ;;
   test)
+    prepare_predecessor
     cargo test --workspace --locked
+    history_compatibility
     # These targets compile to zero tests without direct_tls. Require each
     # named case so a successful empty harness cannot qualify federation.
     cargo test --locked -p tuwunel --features direct_tls \
@@ -40,6 +90,10 @@ case "$mode" in
       | tee "$test_root/direct-tls.log"
     grep -Fq 'test tests::feds_queries_report_this_server ... ok' "$test_root/direct-tls.log"
     grep -Fq 'test tests::a_refused_transaction_waits_for_the_backoff ... ok' "$test_root/direct-tls.log"
+    ;;
+  compatibility)
+    prepare_predecessor
+    history_compatibility
     ;;
   traces)
     for backend in rocksdb remote; do
