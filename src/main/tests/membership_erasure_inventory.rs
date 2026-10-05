@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result, err,
-	ruma::{RoomId, UserId},
+	ruma::{RoomAliasId, RoomId, UserId},
 };
 use tuwunel_database::{Interfix, refusal, serialize_key};
 use tuwunel_service::Services;
@@ -163,6 +163,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	assert_eq!(snapshot(services, &room).await?, baseline);
 	exact_row_boundary(services, &room).await?;
 	retained_departures(services, &room, &user).await?;
+	alias_shutdown_refusal(services, &client, &user).await?;
 	purge_http_refusal(services, &client).await?;
 	auto_cleanup_refusal(services, &client).await
 }
@@ -274,6 +275,366 @@ async fn retained_departures(services: &Services, room: &RoomId, user: &UserId) 
 			.expect_err("force erases local departure")
 			.is_not_found()
 	);
+	Ok(())
+}
+
+async fn alias_shutdown_refusal(
+	services: &Services,
+	client: &Client<'_>,
+	user: &UserId,
+) -> Result {
+	let room = client
+		.create_room(&json!({"preset":"public_chat"}))
+		.await?;
+	let other = client
+		.create_room(&json!({"preset":"public_chat"}))
+		.await?;
+	let first = RoomAliasId::parse("#erasure-first:localhost")?;
+	let second = RoomAliasId::parse(format!("#{}:localhost", "b".repeat(210)))?;
+	services
+		.alias
+		.set_alias_by(&first, &room, user)
+		.await?;
+	services
+		.alias
+		.set_alias_by(&second, &room, user)
+		.await?;
+	let aliases = services
+		.alias
+		.bounded_local_aliases_for_room(&room)
+		.await?;
+	assert_eq!(aliases.len(), 2);
+	refusal::refuse_next("aliasid_alias");
+	services
+		.alias
+		.remove_alias(&first)
+		.await
+		.expect_err("alias removal is one atomic batch");
+	assert_eq!(refusal::pending(), 0);
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&room)
+			.await?,
+		aliases
+	);
+	assert_eq!(services.alias.resolve_local_alias(&first).await?, room);
+	services.db["alias_userid"]
+		.get(first.alias())
+		.await?;
+	services.alias.remove_alias(&first).await?;
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&room)
+			.await?,
+		vec![second.clone()]
+	);
+	assert_eq!(
+		services
+			.alias
+			.resolve_local_alias(&second)
+			.await?,
+		room
+	);
+	services
+		.alias
+		.set_alias_by(&first, &room, user)
+		.await?;
+	refusal::refuse_next("alias_roomid");
+	services
+		.alias
+		.set_alias_by(&first, &other, user)
+		.await
+		.expect_err("replacement cannot split alias indexes");
+	assert_eq!(refusal::pending(), 0);
+	assert_eq!(services.alias.resolve_local_alias(&first).await?, room);
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&room)
+			.await?
+			.len(),
+		2
+	);
+	assert!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&other)
+			.await?
+			.is_empty()
+	);
+	services
+		.alias
+		.set_alias_by(&first, &other, user)
+		.await?;
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&room)
+			.await?,
+		vec![second.clone()]
+	);
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&other)
+			.await?,
+		vec![first.clone()]
+	);
+	alias_shutdown_inventory(services, client, &room, &first, &second, user).await?;
+	alias_publication_refusal(services, client, &room, &second).await?;
+	alias_shutdown_boundary(services, client, user).await
+}
+
+async fn alias_shutdown_inventory(
+	services: &Services,
+	client: &Client<'_>,
+	room: &RoomId,
+	first: &RoomAliasId,
+	second: &RoomAliasId,
+	user: &UserId,
+) -> Result {
+	services.db["global"]
+		.put((PENDING, room), b"".as_slice())
+		.await?;
+	let baseline = snapshot(services, room).await?;
+	for (suffix, value) in [
+		(vec![0xFF], second.as_bytes().to_vec()),
+		(8_000_001_u64.to_be_bytes().to_vec(), vec![0xFF]),
+		(8_000_002_u64.to_be_bytes().to_vec(), first.as_bytes().to_vec()),
+	] {
+		let mut key = serialize_key((room, Interfix))?.to_vec();
+		key.extend_from_slice(&suffix);
+		services.db["aliasid_alias"]
+			.insert(&key, &value)
+			.await?;
+		services
+			.alias
+			.bounded_local_aliases_for_room(room)
+			.await
+			.expect_err("malformed or foreign alias refuses complete inventory");
+		assert_shutdown_refused(services, client, room, &baseline).await?;
+		assert_eq!(
+			services.db["aliasid_alias"]
+				.get(&key)
+				.await?
+				.as_ref(),
+			value
+		);
+		services.db["aliasid_alias"].remove(&key).await?;
+	}
+	// Joined records must be validated even when the request does not purge.
+	let mut key = serialize_key((room, Interfix))?.to_vec();
+	key.extend_from_slice(b"\xffbroken-member");
+	services.db["roomuserid_joined"]
+		.insert(&key, b"retained")
+		.await?;
+	assert_shutdown_refused(services, client, room, &baseline).await?;
+	services.db["roomuserid_joined"]
+		.remove(&key)
+		.await?;
+	let budget_alias = RoomAliasId::parse("#erasure-budget:localhost")?;
+	services
+		.alias
+		.set_alias_by(&budget_alias, room, user)
+		.await?;
+	for count in [1025, 700, 900] {
+		let mut txn = services.db.txn();
+		let mut keys = Vec::new();
+		for n in 0..count {
+			let key = serialize_key((room, 9_000_000_u64.saturating_add(n)))?.to_vec();
+			// The long alias charges its bytes again for each physical row.
+			let alias = if count == 700 { second } else { &budget_alias };
+			txn.insert_raw(&services.db["aliasid_alias"], &key, alias);
+			keys.push(key);
+		}
+		txn.execute().await?;
+		assert_shutdown_refused(services, client, room, &baseline).await?;
+		services.db["aliasid_alias"]
+			.get(&keys[0])
+			.await
+			.expect("overflow record is preserved");
+		services.db["aliasid_alias"]
+			.get(keys.last().expect("seeded rows"))
+			.await
+			.expect("overflow record is preserved");
+		let mut txn = services.db.txn();
+		for key in keys {
+			txn.del_raw(&services.db["aliasid_alias"], key);
+		}
+		txn.execute().await?;
+	}
+	services.alias.remove_alias(&budget_alias).await?;
+	Ok(())
+}
+
+async fn alias_publication_refusal(
+	services: &Services,
+	client: &Client<'_>,
+	room: &RoomId,
+	second: &RoomAliasId,
+) -> Result {
+	// Closing aliases and directory publication shares a commit; a late refusal
+	// cannot delete the aliases while leaving the room published.
+	services.directory.set_public(room, None).await?;
+	refusal::refuse_next("publicroomids");
+	let response = services
+		.client
+		.clients
+		.default
+		.delete(format!("{}/_synapse/admin/v1/rooms/{room}", client.base))
+		.bearer_auth(TOKEN)
+		.json(&json!({"purge":false}))
+		.send()
+		.await?;
+	assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(refusal::pending(), 0);
+	assert_eq!(services.alias.resolve_local_alias(second).await?, room);
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(room)
+			.await?,
+		vec![second.to_owned()]
+	);
+	assert!(
+		services
+			.directory
+			.is_public_room_checked(room)
+			.await?
+	);
+	let response = services
+		.client
+		.clients
+		.default
+		.delete(format!("{}/_synapse/admin/v1/rooms/{room}", client.base))
+		.bearer_auth(TOKEN)
+		.json(&json!({"purge":false}))
+		.send()
+		.await?;
+	assert!(response.status().is_success());
+	assert!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(room)
+			.await?
+			.is_empty()
+	);
+	assert!(
+		!services
+			.directory
+			.is_public_room_checked(room)
+			.await?
+	);
+	assert!(services.metadata.exists_checked(room).await?);
+	Ok(())
+}
+
+async fn alias_shutdown_boundary(
+	services: &Services,
+	client: &Client<'_>,
+	user: &UserId,
+) -> Result {
+	let room = client
+		.create_room(&json!({"preset":"public_chat"}))
+		.await?;
+	let alias = RoomAliasId::parse("#erasure-boundary:localhost")?;
+	services
+		.alias
+		.set_alias_by(&alias, &room, user)
+		.await?;
+	services.directory.set_public(&room, None).await?;
+	services.db["global"]
+		.put((PENDING, &room), b"".as_slice())
+		.await?;
+	let baseline = snapshot(services, &room).await?;
+	let mut txn = services.db.txn();
+	let mut keys = Vec::new();
+	for n in 0..897_u64 {
+		let key = serialize_key((&room, 10_000_000_u64.saturating_add(n)))?.to_vec();
+		txn.insert_raw(&services.db["aliasid_alias"], &key, &alias);
+		keys.push(key);
+	}
+	txn.execute().await?;
+	assert_shutdown_refused(services, client, &room, &baseline).await?;
+	assert_eq!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&room)
+			.await?,
+		vec![alias.clone()],
+		"duplicates are examined before deduplication"
+	);
+	// Original inverse + 896 duplicates + forward + owner + publication = 900.
+	services.db["aliasid_alias"]
+		.remove(keys.last().expect("boundary rows"))
+		.await?;
+	let response = services
+		.client
+		.clients
+		.default
+		.delete(format!("{}/_synapse/admin/v1/rooms/{room}", client.base))
+		.bearer_auth(TOKEN)
+		.json(&json!({"purge":false}))
+		.send()
+		.await?;
+	assert!(
+		response.status().is_success(),
+		"the exact bridge mutation boundary must succeed"
+	);
+	let body: Value = response.json().await?;
+	assert_eq!(
+		body["local_aliases"],
+		json!([alias]),
+		"one alias is reported despite duplicate rows"
+	);
+	assert!(
+		services
+			.alias
+			.bounded_local_aliases_for_room(&room)
+			.await?
+			.is_empty()
+	);
+	for key in keys {
+		assert!(
+			services.db["aliasid_alias"]
+				.get(&key)
+				.await
+				.expect_err("all duplicate inverse rows removed")
+				.is_not_found()
+		);
+	}
+	assert!(
+		!services
+			.directory
+			.is_public_room_checked(&room)
+			.await?
+	);
+	assert!(services.metadata.exists_checked(&room).await?);
+	Ok(())
+}
+
+async fn assert_shutdown_refused(
+	services: &Services,
+	client: &Client<'_>,
+	room: &RoomId,
+	baseline: &[Vec<u8>],
+) -> Result {
+	let response = services
+		.client
+		.clients
+		.default
+		.delete(format!("{}/_synapse/admin/v1/rooms/{room}", client.base))
+		.bearer_auth(TOKEN)
+		.json(&json!({"purge":false}))
+		.send()
+		.await?;
+	assert!(
+		!response.status().is_success(),
+		"shutdown cannot succeed with an incomplete inventory"
+	);
+	assert_eq!(&snapshot(services, room).await?, baseline, "refusal precedes user eviction");
 	Ok(())
 }
 

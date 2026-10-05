@@ -77,7 +77,7 @@ async fn run_shutdown(
 		services
 			.delete
 			.shutdown_room(room_id, &state_lock)
-			.await
+			.await?
 	};
 
 	if block {

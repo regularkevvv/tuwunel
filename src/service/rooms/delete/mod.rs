@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use ruma::{OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId};
 use serde::{Deserialize, Serialize};
-use tuwunel_core::{Result, debug, result::LogErr, trace, warn};
+use tuwunel_core::{Result, debug, trace, warn};
 
 use crate::rooms::timeline::RoomMutexGuard;
 
@@ -79,7 +79,7 @@ impl Service {
 			.state_cache
 			.preflight_room_erasure(room_id, force)
 			.await?;
-		let summary = self.shutdown_room(room_id, &state_lock).await;
+		let summary = self.shutdown_room(room_id, &state_lock).await?;
 
 		self.purge_room(room_id, force, &state_lock)
 			.await?;
@@ -96,62 +96,50 @@ impl Service {
 		&self,
 		room_id: &RoomId,
 		state_lock: &RoomMutexGuard,
-	) -> ShutdownRoom {
-		debug!(?room_id, "Making all local users leave the room and forgetting it");
-		let (kicked_users, failed_to_kick_users) = self
+	) -> Result<ShutdownRoom> {
+		// Validate every source before any eviction or alias mutation.
+		let members = self
 			.services
 			.state_cache
-			.local_users_in_room(room_id)
-			.map(ToOwned::to_owned)
-			.fold((Vec::new(), Vec::new()), async |(mut kicked, mut failed), user_id| {
-				match self
-					.services
-					.membership
-					.leave(&user_id, room_id, Some("Room Deleted".into()), true, state_lock)
-					.await
-				{
-					| Ok(()) => kicked.push(user_id),
-					| Err(e) => {
-						warn!(%e, "Failed to leave room");
-						failed.push(user_id);
-					},
-				}
+			.bounded_room_members(room_id)
+			.await?;
+		self.services
+			.alias
+			.preflight_room_alias_shutdown(room_id)
+			.await?;
+		let (mut kicked_users, mut failed_to_kick_users) = (Vec::new(), Vec::new());
+		debug!(?room_id, "Making all local users leave the room and forgetting it");
+		for user_id in members
+			.into_iter()
+			.filter(|user| self.services.globals.user_is_local(user))
+		{
+			match self
+				.services
+				.membership
+				.leave(&user_id, room_id, Some("Room Deleted".into()), true, state_lock)
+				.await
+			{
+				| Ok(()) => kicked_users.push(user_id),
+				| Err(e) => {
+					warn!(%e, "Failed to leave room");
+					failed_to_kick_users.push(user_id);
+				},
+			}
+		}
 
-				(kicked, failed)
-			})
-			.await;
-
-		debug!("Deleting all our room aliases for the room");
+		debug!("Deleting room aliases and directory publication");
 		let local_aliases = self
 			.services
 			.alias
-			.local_aliases_for_room(room_id)
-			.map(ToOwned::to_owned)
-			.collect::<Vec<_>>()
-			.await;
+			.remove_room_aliases(room_id)
+			.await?;
 
-		for alias in &local_aliases {
-			self.services
-				.alias
-				.remove_alias(alias)
-				.await
-				.log_err()
-				.ok();
-		}
-
-		debug!("Removing/unpublishing room from our room directory");
-		self.services
-			.directory
-			.set_not_public(room_id)
-			.await
-			.expect("database write error");
-
-		ShutdownRoom {
+		Ok(ShutdownRoom {
 			kicked_users,
 			failed_to_kick_users,
 			local_aliases,
 			new_room_id: None,
-		}
+		})
 	}
 
 	/// Wipes the room's storage. `force` widens the erasure of local users'
