@@ -9,6 +9,8 @@
 //! Legacy active generations are modeled by atomically promoting only those
 //! accepted rows before the same barrier. Disabled startup must preserve them;
 //! automatic recovery and later real service hints must both drain them.
+//! Corrupt accepted PDU storage must prevent partial appservice ACK/cleanup;
+//! repairing that owned record permits a later cold restart to deliver it.
 
 mod client;
 
@@ -108,9 +110,15 @@ fn durable_pending_and_active_deliveries_survive_kill_and_disabled_startup() -> 
 	if var(SCENARIO).as_deref() == Ok("active-wake") {
 		return run_case("active-queue", "wake");
 	}
-	for (kind, recovery) in
-		[("queue", "resume"), ("active-queue", "resume"), ("active-queue", "wake")]
-	{
+	if var(SCENARIO).as_deref() == Ok("corrupt-pdu") {
+		return run_case("corrupt-active", "resume");
+	}
+	for (kind, recovery) in [
+		("queue", "resume"),
+		("active-queue", "resume"),
+		("active-queue", "wake"),
+		("corrupt-active", "resume"),
+	] {
 		run_case(kind, recovery)?;
 	}
 	Ok(())
@@ -122,6 +130,9 @@ fn run_case(kind: &str, recovery: &str) -> Result {
 	let directory = OwnedDirectory(directory);
 	if recovery == "wake" {
 		write(directory.0.join("wake-case"), b"owned disabled-startup wake case")?;
+	}
+	if kind == "corrupt-active" {
+		write(directory.0.join("corrupt-case"), b"owned accepted-record corruption case")?;
 	}
 	run_child(&directory.0, "prepare")?;
 	let mut queued = OwnedChild(command(&directory.0, kind)?.spawn()?);
@@ -140,7 +151,11 @@ fn run_case(kind: &str, recovery: &str) -> Result {
 	assert!(!status.success(), "the acknowledged queue must survive an actual process kill");
 	#[cfg(unix)]
 	assert_eq!(status.signal(), Some(9), "exercise SIGKILL rather than graceful cleanup");
-	for phase in ["disabled", recovery, "again"] {
+	run_child(&directory.0, "disabled")?;
+	if kind == "corrupt-active" {
+		run_child(&directory.0, "corrupt")?;
+	}
+	for phase in [recovery, "again"] {
 		run_child(&directory.0, phase)?;
 	}
 	Ok(())
@@ -185,9 +200,9 @@ fn child(directory: &Path, phase: &str) -> Result {
 	let server = Server::new(Some(&args), Some(&runtime))?;
 	drop(listener);
 	let result = runtime.block_on(async {
-		if matches!(phase, "queue" | "active-queue") {
+		if matches!(phase, "queue" | "active-queue" | "corrupt-active") {
 			let services = Services::build(server.server.clone()).await?;
-			queue(&services, directory, phase == "active-queue").await?;
+			queue(&services, directory, phase != "queue", phase == "corrupt-active").await?;
 			// The parent kills this process. No destructors, flush-on-drop,
 			// sender workers or stale in-memory wake can supply the recovery.
 			loop {
@@ -198,6 +213,13 @@ fn child(directory: &Path, phase: &str) -> Result {
 			(async_start(&server).await?, None)
 		} else {
 			let services = Services::build(server.server.clone()).await?;
+			if phase == "resume" && directory.join("corrupt-case").exists() {
+				let key = read(directory.join("corrupt-pdu-key"))?;
+				let value = read(directory.join("corrupt-pdu-original"))?;
+				let mut txn = services.db.txn();
+				txn.insert_raw(&services.db["pduid_pdu"], &key, &value);
+				txn.execute().await?;
+			}
 			let manifest = manifest(directory)?;
 			let stub = prepare_stub(&services, &manifest).await?;
 			let services = services.start().await?;
@@ -221,7 +243,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 					verify(&services, stub.as_mut().expect("restart stub"), directory, "resume")
 						.await
 				},
-				| "disabled" | "resume" | "again" =>
+				| "disabled" | "corrupt" | "resume" | "again" =>
 					verify(&services, stub.as_mut().expect("restart stub"), directory, phase)
 						.await,
 				| _ => panic!("unexpected queue fixture phase"),
@@ -304,12 +326,14 @@ async fn rows(services: &Services, map: &str) -> Result<Rows> {
 	Ok(out)
 }
 
-async fn queue(services: &Services, directory: &Path, active: bool) -> Result {
+async fn queue(services: &Services, directory: &Path, active: bool, corrupt: bool) -> Result {
 	let manifest = manifest(directory)?;
 	for appservice in [AS_FIRST, AS_LAST] {
 		persist_appservice(services, appservice, "http://127.0.0.1:9".into()).await?;
 	}
-	register_pusher(services, &manifest, "http://127.0.0.1:9").await?;
+	if !corrupt {
+		register_pusher(services, &manifest, "http://127.0.0.1:9").await?;
+	}
 	for event in &manifest.events {
 		let pdu = services.timeline.get_pdu_id(event).await?;
 		for appservice in [AS_FIRST, AS_LAST] {
@@ -318,10 +342,12 @@ async fn queue(services: &Services, directory: &Path, active: bool) -> Result {
 				.send_pdu_appservice(appservice.into(), pdu)
 				.await?;
 		}
-		services
-			.sending
-			.send_pdu_push(&pdu, &manifest.recipient, PUSHKEY.into())
-			.await?;
+		if !corrupt {
+			services
+				.sending
+				.send_pdu_push(&pdu, &manifest.recipient, PUSHKEY.into())
+				.await?;
+		}
 	}
 	for n in 0..EDUS {
 		let edu = serde_json::to_vec(&json!({
@@ -334,7 +360,7 @@ async fn queue(services: &Services, directory: &Path, active: bool) -> Result {
 			.await?;
 	}
 	let pending = rows(services, "servernameevent_data").await?;
-	assert_eq!(pending.len(), EDUS + 9);
+	assert_eq!(pending.len(), if corrupt { EDUS + 6 } else { EDUS + 9 });
 	assert!(pending.len() > 256, "last appservice must lie beyond the first startup page");
 	assert!(
 		pending
@@ -391,6 +417,18 @@ async fn queue(services: &Services, directory: &Path, active: bool) -> Result {
 				.collect::<Vec<_>>(),
 		)?,
 	)?;
+	if corrupt {
+		let raw = services
+			.timeline
+			.get_pdu_id(&manifest.events[0])
+			.await?;
+		let original = services.db["pduid_pdu"].get(&raw).await?;
+		write(directory.join("corrupt-pdu-key"), raw.as_ref())?;
+		write(directory.join("corrupt-pdu-original"), original.as_ref())?;
+		let mut txn = services.db.txn();
+		txn.insert_raw(&services.db["pduid_pdu"], raw, b"{");
+		txn.execute().await?;
+	}
 	// Queue APIs cork native writes; without workers there is no periodic
 	// flush. Establish the on-disk prerequisite explicitly before SIGKILL.
 	services.db.engine()?.sync()?;
@@ -459,50 +497,77 @@ async fn register_pusher(services: &Services, manifest: &Manifest, base: &str) -
 	Ok(())
 }
 
-async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &str) -> Result {
-	let manifest = manifest(directory)?;
-	if phase != "resume" {
-		assert!(
-			timeout(Duration::from_millis(300), stub.receiver.recv())
-				.await
-				.is_err(),
-			"disabled recovery and an empty later start must emit no fabricated delivery"
-		);
-		let expected_active: Rows = if phase == "disabled" {
-			serde_json::from_slice::<Vec<(Vec<u8>, Vec<u8>)>>(&read(
-				directory.join("active.json"),
-			)?)?
-			.into_iter()
-			.collect()
-		} else {
-			BTreeMap::new()
-		};
-		let actual_active = rows(services, "servercurrentevent_data").await?;
-		eprintln!(
-			"{phase}: active rows expected={}, actual={}",
-			expected_active.len(),
-			actual_active.len()
-		);
-		assert_eq!(
-			actual_active.len(),
-			expected_active.len(),
-			"disabled startup preserves every accepted active row"
-		);
-		assert_eq!(actual_active, expected_active, "active rows remain byte-for-byte intact");
-		let expected = if phase == "disabled" {
-			serde_json::from_slice::<Vec<(Vec<u8>, Vec<u8>)>>(&read(
-				directory.join("pending.json"),
-			)?)?
-			.into_iter()
-			.collect()
-		} else {
-			BTreeMap::new()
-		};
-		assert_eq!(rows(services, "servernameevent_data").await?, expected);
-		return Ok(());
+async fn verify_retained_or_empty(
+	services: &Services,
+	stub: &mut Stub,
+	directory: &Path,
+	phase: &str,
+) -> Result {
+	let observed = timeout(Duration::from_millis(300), stub.receiver.recv()).await;
+	if phase == "corrupt"
+		&& let Ok(Some((owner, _, body))) = &observed
+	{
+		let started = Instant::now();
+		loop {
+			let active = rows(services, "servercurrentevent_data").await?;
+			if active.is_empty() || started.elapsed() >= Duration::from_secs(1) {
+				eprintln!(
+					"corrupt baseline: owner={owner} PDUs={} EDUs={} active after ACK={}",
+					body["events"]
+						.as_array()
+						.expect("appservice PDUs")
+						.len(),
+					body["ephemeral"].as_array().map_or(0, Vec::len),
+					active.len()
+				);
+				break;
+			}
+			sleep(Duration::from_millis(20)).await;
+		}
 	}
+	assert!(
+		observed.is_err(),
+		"corrupt, disabled and empty recovery must emit no partial or fabricated delivery"
+	);
+	let expected_active: Rows = if matches!(phase, "disabled" | "corrupt") {
+		serde_json::from_slice::<Vec<(Vec<u8>, Vec<u8>)>>(&read(directory.join("active.json"))?)?
+			.into_iter()
+			.collect()
+	} else {
+		BTreeMap::new()
+	};
+	let actual_active = rows(services, "servercurrentevent_data").await?;
+	eprintln!(
+		"{phase}: active rows expected={}, actual={}",
+		expected_active.len(),
+		actual_active.len()
+	);
+	assert_eq!(
+		actual_active.len(),
+		expected_active.len(),
+		"unacknowledged recovery preserves every accepted active row"
+	);
+	assert_eq!(actual_active, expected_active, "active rows remain byte-for-byte intact");
+	let expected = if matches!(phase, "disabled" | "corrupt") {
+		serde_json::from_slice::<Vec<(Vec<u8>, Vec<u8>)>>(&read(directory.join("pending.json"))?)?
+			.into_iter()
+			.collect()
+	} else {
+		BTreeMap::new()
+	};
+	assert_eq!(rows(services, "servernameevent_data").await?, expected);
+	Ok(())
+}
+
+async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &str) -> Result {
+	if phase != "resume" {
+		return verify_retained_or_empty(services, stub, directory, phase).await;
+	}
+	let manifest = manifest(directory)?;
 	let mut received = BTreeMap::<String, Vec<String>>::new();
 	let mut edus = BTreeSet::new();
+	let corrupt_case = directory.join("corrupt-case").exists();
+	let expected_deliveries = if corrupt_case { 6 } else { 9 };
 	timeout(Duration::from_secs(15), async {
 		loop {
 			let (owner, path, body) = stub
@@ -555,7 +620,9 @@ async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &
 					}
 				}
 			}
-			if received.values().map(Vec::len).sum::<usize>() == 9 && edus.len() == EDUS {
+			if received.values().map(Vec::len).sum::<usize>() == expected_deliveries
+				&& edus.len() == EDUS
+			{
 				break;
 			}
 		}
@@ -577,7 +644,10 @@ async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &
 		.map(ToString::to_string)
 		.collect();
 	expected.sort();
-	for owner in [AS_FIRST, AS_LAST, "push"] {
+	for owner in [AS_FIRST, AS_LAST]
+		.into_iter()
+		.chain((!corrupt_case).then_some("push"))
+	{
 		let values = received
 			.get_mut(owner)
 			.expect("every destination resumed");

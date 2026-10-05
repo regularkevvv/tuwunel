@@ -45,17 +45,16 @@ use ruma::{
 	serde::Raw,
 	uint,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::time::Instant as TokioInstant;
 use tuwunel_core::{
-	Error, Event, Result, debug, debug_warn, err, error,
+	Error, Event, Result, debug, error,
 	error::error_chain,
 	extract_variant, implement,
 	smallvec::SmallVec,
 	trace,
 	utils::{
 		BoolExt, ReadyExt, calculate_hash, exponential_backoff_remaining_secs,
-		future::TryExtExt,
 		rand::secs as rand_secs,
 		stream::{BroadbandExt, IterStream, WidebandExt},
 	},
@@ -69,6 +68,9 @@ use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 
 #[cfg(test)]
 mod edu_tests;
+
+#[cfg(test)]
+mod compose_tests;
 
 /// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
 /// in `peer_status` (federation only); appservice/push paths keep their own
@@ -91,14 +93,18 @@ type SendingError = (Destination, Error);
 enum Delivery {
 	Acknowledged(Destination),
 	Deferred(Destination),
+	Unprepared(Destination, Box<Error>),
 }
 
-type TransactionResult = Result<Destination, SendingError>;
 type SendingResult = Result<Delivery, SendingError>;
 type SendingFuture<'a> = BoxFuture<'a, SendingResult>;
 type SendingFutures<'a> = FuturesUnordered<SendingFuture<'a>>;
 type CurTransactionStatus = HashMap<Destination, TransactionStatus>;
 type FailedPushIds = SmallVec<[RawPduId; 1]>;
+
+fn unprepared(destination: Destination, error: Error) -> Delivery {
+	Delivery::Unprepared(destination, Box::new(error))
+}
 
 /// MSC3202 `device_one_time_keys_count`: unclaimed one-time-key counts per
 /// algorithm, keyed by user then device. Matches the ruma request field type.
@@ -193,6 +199,24 @@ struct Selected {
 struct ToDeviceRecipient {
 	to_user_id: OwnedUserId,
 	to_device_id: OwnedDeviceId,
+}
+
+fn queued_to_device<T>(buf: &[u8], msc3202: bool) -> Result<(T, Option<ToDeviceRecipient>)>
+where
+	T: DeserializeOwned,
+{
+	let bytes = buf
+		.get(TAG_PREFIX_LEN..)
+		.ok_or_else(|| Error::bad_database("Truncated queued to-device event"))?;
+	let recipient = msc3202
+		.then(|| {
+			serde_json::from_slice(bytes)
+				.map_err(|_| Error::bad_database("Invalid queued to-device recipient"))
+		})
+		.transpose()?;
+	let raw = serde_json::from_slice(bytes)
+		.map_err(|_| Error::bad_database("Invalid queued to-device event"))?;
+	Ok((raw, recipient))
 }
 
 #[derive(Default)]
@@ -317,9 +341,9 @@ impl Service {
 				Some(response) = futures.next() => {
 					let (dest, mut stage) = match &response {
 						Ok(Delivery::Acknowledged(dest)) => (dest.clone(), QueueRecovery::CleanupAcknowledged),
-						Ok(Delivery::Deferred(dest)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
+						Ok(Delivery::Deferred(dest) | Delivery::Unprepared(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
 					};
-					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage).await {
+					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage, &mut retries).await {
 						defer_queue_error(&mut retries, dest, stage, error)?;
 					}
 				},
@@ -354,8 +378,15 @@ impl Service {
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
 		stage: &mut QueueRecovery,
+		retries: &mut QueueRetries,
 	) -> Result {
 		match response {
+			| Ok(Delivery::Unprepared(dest, error)) => {
+				warn!(?dest, chain = %error_chain(&error), "Local delivery preparation failed; accepted work retained");
+				statuses.remove(&dest);
+				let (deadline, _) = wake_deadline(Duration::from_secs(1));
+				retries.insert(dest, (deadline, QueueRecovery::ResumePending));
+			},
 			| Ok(Delivery::Deferred(dest)) => {
 				let prompt =
 					matches!(statuses.get(&dest), Some(TransactionStatus::RunningForceRetry));
@@ -1491,11 +1522,9 @@ impl Service {
 		match dest {
 			| Destination::Federation(server) => self
 				.send_events_dest_federation(server, events)
-				.map(|result| result.map(Delivery::Acknowledged))
 				.boxed(),
 			| Destination::Appservice(id) => self
 				.send_events_dest_appservice(id, events)
-				.map(|result| result.map(Delivery::Acknowledged))
 				.boxed(),
 			| Destination::Push(user_id, pushkey) => self
 				.send_events_dest_push(user_id, pushkey, events)
@@ -1515,7 +1544,7 @@ impl Service {
 		&self,
 		id: String,
 		events: Vec<SendingEvent>,
-	) -> TransactionResult {
+	) -> SendingResult {
 		let Some(info) = self
 			.services
 			.appservice
@@ -1523,9 +1552,9 @@ impl Service {
 			.await
 		else {
 			//TODO: appservice queue cleanup.
-			return Err((
-				Destination::Appservice(id.clone()),
-				err!(Database(debug_warn!(?id, "Missing appservice registration"))),
+			return Ok(unprepared(
+				Destination::Appservice(id),
+				Error::bad_database("Missing appservice registration"),
 			));
 		};
 
@@ -1562,56 +1591,66 @@ impl Service {
 		for event in &events {
 			match event {
 				| SendingEvent::Pdu(pdu_id) => {
-					if let Ok(pdu) = self
+					let pdu = match self
 						.services
 						.timeline
 						.get_pdu_from_id(pdu_id)
 						.await
 					{
-						if msc3202 && info.is_user_match(pdu.sender()) {
-							otk_users.insert(pdu.sender().to_owned());
-						}
-
-						pdu_jsons.push(pdu.to_format());
+						| Ok(pdu) => pdu,
+						// Canonical erasure can remove a queued PDU. Failed or
+						// corrupt reads must retain its delivery obligation.
+						| Err(error) if error.is_not_found() => continue,
+						| Err(error) =>
+							return Ok(unprepared(Destination::Appservice(id), error)),
+					};
+					if msc3202 && info.is_user_match(pdu.sender()) {
+						otk_users.insert(pdu.sender().to_owned());
 					}
+					pdu_jsons.push(pdu.to_format());
 				},
 				| SendingEvent::Edu(edu) => {
-					if info.registration.receive_ephemeral
-						&& let Ok(edu) =
-							serde_json::from_slice(edu).and_then(|edu| Raw::new(&edu))
-					{
-						edu_jsons.push(edu);
+					if !info.registration.receive_ephemeral {
+						continue;
+					}
+					match serde_json::from_slice(edu).and_then(|edu| Raw::new(&edu)) {
+						| Ok(edu) => edu_jsons.push(edu),
+						| Err(_) =>
+							return Ok(unprepared(
+								Destination::Appservice(id),
+								Error::bad_database("Invalid queued appservice EDU"),
+							)),
 					}
 				},
 				| SendingEvent::ToDevice(buf) => {
-					let Some(bytes) = buf.get(TAG_PREFIX_LEN..) else {
-						debug_warn!("skipping malformed queued to-device event");
-						continue;
+					let (raw, recipient) = match queued_to_device(buf, msc3202) {
+						| Ok(prepared) => prepared,
+						| Err(error) =>
+							return Ok(unprepared(Destination::Appservice(id), error)),
 					};
-
-					if msc3202
-						&& let Ok(recipient) = serde_json::from_slice::<ToDeviceRecipient>(bytes)
-					{
+					if let Some(recipient) = recipient {
 						otk_recipients.insert((recipient.to_user_id, recipient.to_device_id));
 					}
-
-					if let Ok(raw) = serde_json::from_slice(bytes) {
-						to_device.push(raw);
-					} else {
-						debug_warn!("skipping malformed queued to-device event");
-					}
+					to_device.push(raw);
 				},
 				| SendingEvent::DeviceListChanged(buf) => {
-					if msc3202
-						&& let Some(bytes) = buf.get(TAG_PREFIX_LEN..)
-						&& let Ok(user) = from_utf8(bytes)
-						&& let Ok(user_id) = UserId::parse(user)
-					{
-						changed.push(user_id);
+					if !msc3202 {
+						continue;
 					}
+					let user = buf
+						.get(TAG_PREFIX_LEN..)
+						.and_then(|bytes| from_utf8(bytes).ok())
+						.and_then(|user| UserId::parse(user).ok());
+					let Some(user) = user else {
+						return Ok(unprepared(
+							Destination::Appservice(id),
+							Error::bad_database("Invalid queued device-list user"),
+						));
+					};
+					changed.push(user);
 				},
 				| SendingEvent::FrozenPush(_) =>
-					return Err((
+					return Ok(unprepared(
 						Destination::Appservice(id),
 						Error::bad_database("Frozen push queued to appservice"),
 					)),
@@ -1651,7 +1690,7 @@ impl Service {
 			&& device_one_time_keys_count.is_empty()
 			&& device_unused_fallback_key_types.is_empty()
 		{
-			return Ok(Destination::Appservice(id));
+			return Ok(Delivery::Acknowledged(Destination::Appservice(id)));
 		}
 
 		match self
@@ -1668,7 +1707,7 @@ impl Service {
 			})
 			.await
 		{
-			| Ok(_) => Ok(Destination::Appservice(id)),
+			| Ok(_) => Ok(Delivery::Acknowledged(Destination::Appservice(id))),
 			| Err(e) => Err((Destination::Appservice(id), e)),
 		}
 	}
@@ -1982,42 +2021,62 @@ impl Service {
 		&self,
 		server: OwnedServerName,
 		events: Vec<SendingEvent>,
-	) -> TransactionResult {
-		let pdus: Vec<_> = events
+	) -> SendingResult {
+		let pdus = events
 			.iter()
 			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
 			.stream()
-			.wide_filter_map(|pdu_id| {
-				self.services
-					.timeline
-					.get_pdu_json_from_id(pdu_id)
-					.ok()
+			.wide_then(|pdu_id| {
+				let server = &server;
+				async move {
+					let pdu = match self
+						.services
+						.timeline
+						.get_pdu_json_from_id(pdu_id)
+						.await
+					{
+						| Ok(pdu) => pdu,
+						| Err(error) if error.is_not_found() => return Ok(None),
+						| Err(error) => return Err(error),
+					};
+					let pdu = self
+						.services
+						.state_accessor
+						.erased_for_server(server, pdu)
+						.await;
+					Ok::<_, Error>(Some(
+						self.services
+							.federation
+							.format_pdu_into(pdu, None)
+							.await,
+					))
+				}
 			})
-			.wide_then(|pdu| {
-				self.services
-					.state_accessor
-					.erased_for_server(&server, pdu)
-			})
-			.wide_then(|pdu| {
-				self.services
-					.federation
-					.format_pdu_into(pdu, None)
-			})
-			.collect()
+			.try_filter_map(|pdu| async move { Ok(pdu) })
+			.try_collect::<Vec<_>>()
 			.await;
+		let pdus = match pdus {
+			| Ok(pdus) => pdus,
+			| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
+		};
 
-		let edus: Vec<Raw<Edu>> = events
+		let edus = events
 			.iter()
 			.filter_map(|edu| match edu {
 				| SendingEvent::Edu(edu) => Some(edu.as_ref()),
 				| _ => None,
 			})
 			.map(serde_json::from_slice)
-			.filter_map(Result::ok)
-			.collect();
+			.collect::<std::result::Result<Vec<Raw<Edu>>, _>>();
+		let Ok(edus) = edus else {
+			return Ok(unprepared(
+				Destination::Federation(server),
+				Error::bad_database("Invalid queued federation EDU"),
+			));
+		};
 
 		if pdus.is_empty() && edus.is_empty() {
-			return Ok(Destination::Federation(server));
+			return Ok(Delivery::Acknowledged(Destination::Federation(server)));
 		}
 
 		let preimage = pdus
@@ -2051,7 +2110,7 @@ impl Service {
 		}
 
 		match result {
-			| Ok(_) => Ok(Destination::Federation(server)),
+			| Ok(_) => Ok(Delivery::Acknowledged(Destination::Federation(server))),
 			| Err(error) => Err((Destination::Federation(server), error)),
 		}
 	}

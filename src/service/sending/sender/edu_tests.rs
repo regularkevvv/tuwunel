@@ -23,12 +23,12 @@ use super::{
 };
 use crate::Services;
 
-struct Fixture {
-	services: Arc<Services>,
+pub(super) struct Fixture {
+	pub(super) services: Arc<Services>,
 }
 
 impl Fixture {
-	async fn new() -> Result<Self> {
+	pub(super) async fn new() -> Result<Self> {
 		// Match the main runtime's per-process descriptor setup. A service
 		// graph is process-lifetime (OnceServices has strong references), so
 		// the outer test runner owns scratch cleanup after this process exits.
@@ -65,7 +65,7 @@ impl Fixture {
 		Ok(Self { services })
 	}
 
-	async fn finish(self) { self.services.stop().await; }
+	pub(super) async fn finish(self) { self.services.stop().await; }
 }
 
 async fn assert_empty_outgoing(services: &Services, server: &ServerName) -> Result {
