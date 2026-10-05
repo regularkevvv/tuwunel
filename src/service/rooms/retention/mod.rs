@@ -1,19 +1,18 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use ruma::{CanonicalJsonObject, EventId};
 use tuwunel_core::{
-	Result, debug_info, expected, implement,
-	matrix::pdu::PduEvent,
-	utils::{TryReadyExt, time::now},
+	Error, Result, debug_info, implement, matrix::pdu::PduEvent, utils::time::now,
 };
-use tuwunel_database::{Deserialized, Json, Map};
+use tuwunel_database::{Database, Deserialized, Json, Map, Txn, deserialize_from_slice};
 
 use crate::rooms::timeline::RoomMutexGuard;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
+	db: Arc<Database>,
 	eventid_originalpdu: Arc<Map>,
 	timeredacted_eventid: Arc<Map>,
 }
@@ -23,38 +22,24 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
+			db: args.db.clone(),
 			eventid_originalpdu: args.db["eventid_originalpdu"].clone(),
 			timeredacted_eventid: args.db["timeredacted_eventid"].clone(),
 		}))
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
+		if self.services.server.config.maintenance {
+			self.services.server.until_shutdown().await;
+			return Ok(());
+		}
 		loop {
 			let retention_seconds = self.services.config.redaction_retention_seconds;
 
 			if retention_seconds != 0 {
 				debug_info!("Cleaning up retained events");
 
-				let now = now().as_secs();
-				let mut count = 0_usize;
-				{
-					let stream = self
-						.timeredacted_eventid
-						.keys::<(u64, &EventId)>()
-						.ready_try_take_while(|(time_redacted, _)| {
-							let time_redacted = *time_redacted;
-							Ok(expected!(time_redacted + retention_seconds) < now)
-						});
-					futures::pin_mut!(stream);
-					while let Some(item) = stream.next().await {
-						let (time_redacted, event_id): (u64, &EventId) = item?;
-						self.eventid_originalpdu.remove(event_id).await?;
-						self.timeredacted_eventid
-							.del((time_redacted, event_id))
-							.await?;
-						count = count.saturating_add(1);
-					}
-				}
+				let count = self.expire_originals().await?;
 
 				debug_info!(?count, "Finished cleaning up retained events");
 			}
@@ -67,6 +52,43 @@ impl crate::Service for Service {
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+}
+
+/// Visit chronological rows in bounded pages, closing each scan before a
+/// mutation. Expiry removes the original and its housekeeping key atomically.
+#[implement(Service)]
+pub async fn expire_originals(&self) -> Result<usize> {
+	let retention_seconds = self.services.config.redaction_retention_seconds;
+	if self.services.server.config.maintenance || retention_seconds == 0 {
+		return Ok(0);
+	}
+	let at = now().as_secs();
+	let mut after = None;
+	let mut count = 0_usize;
+	loop {
+		let rows = self
+			.timeredacted_eventid
+			.raw_rows_after(after.as_deref(), 64)
+			.await?;
+		if rows.is_empty() {
+			return Ok(count);
+		}
+		for (key, value) in rows {
+			let (time_redacted, event_id): (u64, &EventId) = deserialize_from_slice(&key)?;
+			if !value.is_empty() {
+				return Err(Error::bad_database("Invalid original retention index"));
+			}
+			if time_redacted.saturating_add(retention_seconds) >= at {
+				return Ok(count);
+			}
+			let mut txn = self.db.txn();
+			txn.del_raw(&self.eventid_originalpdu, event_id);
+			txn.del_raw(&self.timeredacted_eventid, &key);
+			txn.execute().await?;
+			count = count.saturating_add(1);
+			after = Some(key);
+		}
+	}
 }
 
 #[implement(Service)]
@@ -91,31 +113,23 @@ pub async fn save_original_pdu(
 	event_id: &EventId,
 	pdu: &CanonicalJsonObject,
 	_state_lock: &RoomMutexGuard,
-) {
+) -> Result {
 	if !self.services.config.save_unredacted_events {
-		return;
+		return Ok(());
 	}
 
-	if self
-		.eventid_originalpdu
-		.exists(event_id)
-		.await
-		.is_ok()
-	{
-		return;
+	match self.eventid_originalpdu.get(event_id).await {
+		| Ok(_) => return Ok(()),
+		| Err(error) if error.is_not_found() => {},
+		| Err(error) => return Err(error),
 	}
 
 	let now = now().as_secs();
 
-	self.eventid_originalpdu
-		.raw_put(event_id, Json(pdu))
-		.await
-		.expect("database write error");
-
-	self.timeredacted_eventid
-		.put_raw((now, event_id), [])
-		.await
-		.expect("database write error");
+	let mut txn = self.db.txn();
+	txn.raw_put(&self.eventid_originalpdu, event_id, Json(pdu));
+	txn.put_raw(&self.timeredacted_eventid, (now, event_id), []);
+	txn.execute().await
 }
 
 #[implement(Service)]
@@ -131,4 +145,11 @@ pub fn retained_pdus_raw(&self) -> impl Stream<Item = Result<&[u8]>> + Send {
 #[implement(Service)]
 pub async fn purge_original(&self, event_id: &EventId) -> Result {
 	self.eventid_originalpdu.remove(event_id).await
+}
+
+/// Leave the chronological housekeeping row for the retention worker, while
+/// removing the original in the same transaction as the canonical event.
+#[implement(Service)]
+pub(crate) fn append_purge_original(&self, txn: &mut Txn, event_id: &EventId) {
+	txn.del_raw(&self.eventid_originalpdu, event_id);
 }

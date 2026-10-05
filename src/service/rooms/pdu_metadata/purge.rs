@@ -8,10 +8,7 @@ use tuwunel_core::{
 	arrayvec::ArrayVec,
 	implement,
 	matrix::{Event, Pdu, PduCount, RawPduId},
-	utils::{
-		stream::{ReadyExt, TryIgnore, automatic_width},
-		u64_from_u8,
-	},
+	utils::{stream::automatic_width, u64_from_u8},
 };
 
 use super::{ExtractRelatesTo, Service};
@@ -19,70 +16,66 @@ use crate::rooms::short::ShortRoomId;
 
 type Prefix = ArrayVec<u8, 16>;
 
-/// Purges one event's metadata during a history purge.
-///
-/// Relation rows keyed by this event as parent or target are removed. Rows
-/// keyed by it as a surviving event's child remain dangling because relation
-/// reads discard IDs that no longer resolve. Soft-fail and policy decisions are
-/// cleared after the relation indexes.
+/// Stage the metadata owned by a purged parent alongside the canonical
+/// removal. Dangling child rows are retained, as in the existing reader
+/// contract. Scans close before the caller commits; storage and encoding
+/// errors refuse the entire event mutation.
 #[implement(Service)]
-pub async fn purge_event_relations(
+pub(crate) async fn append_purge_event_relations(
 	&self,
+	txn: &mut tuwunel_database::Txn,
 	shortroomid: ShortRoomId,
 	parent: PduCount,
 	room_id: &RoomId,
 	event_id: &EventId,
-) {
+) -> Result {
 	let target = parent.to_be_bytes();
-
-	self.db
-		.tofrom_relation
-		.raw_keys_from(target.as_slice())
-		.ignore_err()
-		.ready_take_while(move |key| key.starts_with(&target))
-		.for_each(|key| async move {
-			self.db
-				.tofrom_relation
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
+	self.append_relation_removals(txn, &self.db.tofrom_relation, &target, false)
+		.await?;
 	let mut prefix = Prefix::new();
-
 	prefix.extend(shortroomid.to_be_bytes());
 	prefix.extend(parent.to_be_bytes());
+	self.append_relation_removals(txn, &self.db.relatesto_typed, &prefix, true)
+		.await?;
+	txn.del(&self.db.referencedevents, (room_id, event_id));
+	txn.del_raw(&self.services.db["eventid_policysigstate"], event_id);
+	txn.del_raw(&self.db.softfailedeventids, event_id);
+	crate::rooms::timeline::check_purge_batch(txn)
+}
 
-	self.db
-		.relatesto_typed
-		.raw_keys_from(prefix.as_slice())
-		.ignore_err()
-		.ready_take_while(move |key| key.starts_with(&prefix))
-		.for_each(|key| async move {
-			self.db
-				.relatesto_typed
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
-	self.db
-		.referencedevents
-		.del((room_id, event_id))
-		.await
-		.expect("database write error");
-
-	self.services
-		.event_handler
-		.clear_policy_signature_state(event_id)
-		.await
-		.expect("database write error");
-
-	self.clear_event_soft_failed(event_id)
-		.await
-		.expect("database write error");
+#[implement(Service)]
+async fn append_relation_removals(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	map: &std::sync::Arc<tuwunel_database::Map>,
+	prefix: &[u8],
+	typed: bool,
+) -> Result {
+	let mut after = None;
+	loop {
+		let keys = map
+			.raw_keys_prefix_after(prefix, after.as_deref(), 64)
+			.await?;
+		if keys.is_empty() {
+			return Ok(());
+		}
+		for key in &keys {
+			let value = map.get(key).await?;
+			let valid = if typed {
+				key.len() == super::typed_relations::KEY_LEN
+					&& matches!(key[16], 1 | 2)
+					&& value.len() == 8
+			} else {
+				key.len() == 16 && value.is_empty()
+			};
+			if !valid {
+				return Err(Error::bad_database("Invalid purge relation row"));
+			}
+			txn.del_raw(map, key);
+			crate::rooms::timeline::check_purge_batch(txn)?;
+		}
+		after = keys.last().cloned();
+	}
 }
 
 /// Rebuild `relatesto_typed` from every stored PDU. Run once at startup behind

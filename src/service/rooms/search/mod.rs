@@ -82,18 +82,31 @@ pub async fn deindex_pdu(
 	pdu_id: &RawPduId,
 	message_body: &str,
 ) -> Result {
-	let batch = tokenize(message_body).map(|word| {
-		let mut key = shortroomid.to_be_bytes().to_vec();
-		key.extend_from_slice(word.as_bytes());
-		key.push(0xFF);
-		key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
-		key
-	});
-
-	for token in batch {
-		self.db.tokenids.remove(&token).await?;
+	for word in tokenize(message_body) {
+		let key = deindex_tokenid(shortroomid, &word, pdu_id);
+		self.db.tokenids.remove(&key).await?;
 	}
+	Ok(())
+}
 
+/// Stage search removals alongside their owning PDU mutation. Duplicate words
+/// need only one deletion. The caller can add the remaining event indexes to
+/// this batch before deciding whether to commit it.
+#[implement(Service)]
+pub(crate) fn append_deindex_pdu(
+	&self,
+	txn: &mut Txn,
+	shortroomid: ShortRoomId,
+	pdu_id: &RawPduId,
+	message_body: &str,
+) -> Result {
+	let mut words = std::collections::BTreeSet::new();
+	for word in tokenize(message_body) {
+		if words.insert(word.clone()) {
+			txn.del_raw(&self.db.tokenids, deindex_tokenid(shortroomid, &word, pdu_id));
+			super::timeline::check_purge_batch(txn)?;
+		}
+	}
 	Ok(())
 }
 
@@ -233,4 +246,14 @@ fn prefix_len(word: &str) -> usize {
 	size_of::<ShortRoomId>()
 		.saturating_add(word.len())
 		.saturating_add(1)
+}
+
+// Match the writer's variable-width token key, including Unicode lowercase
+// expansions beyond the original word's 50-byte tokenization limit.
+fn deindex_tokenid(shortroomid: ShortRoomId, word: &str, pdu_id: &RawPduId) -> Vec<u8> {
+	let mut key = shortroomid.to_be_bytes().to_vec();
+	key.extend_from_slice(word.as_bytes());
+	key.push(tuwunel_database::SEP);
+	key.extend_from_slice(pdu_id.as_ref());
+	key
 }

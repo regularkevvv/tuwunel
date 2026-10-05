@@ -74,6 +74,30 @@ pub async fn raw_keys_after(
 	self.raw_keys_capped(from.as_deref(), limit).await
 }
 
+/// Owned key-only page within a prefix. Values are not materialized, and the
+/// scan closes before returning so a caller can validate values individually
+/// before preparing a mutation batch.
+#[implement(super::Map)]
+pub async fn raw_keys_prefix_after(
+	self: &Arc<Self>,
+	prefix: &[u8],
+	after: Option<&[u8]>,
+	limit: usize,
+) -> Result<Vec<Vec<u8>>> {
+	let from = after.map_or_else(|| prefix.to_vec(), successor);
+	seek_stream_bounded::<stream::Keys<'_>, _>(
+		self,
+		Direction::Forward,
+		Some(from.as_slice()),
+		Bound { within: Some(prefix), cap: Some(limit) },
+	)
+	.try_take_while(|key| future::ok(key.starts_with(prefix)))
+	.take(limit)
+	.map_ok(<[u8]>::to_vec)
+	.try_collect()
+	.await
+}
+
 /// At most `limit` keys in key order from `from`, inclusive, or from the
 /// start of the map when it is `None`. Like [`Map::raw_rows_after`], the scan
 /// reads no more than `limit` rows and is closed before this returns; a

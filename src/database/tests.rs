@@ -1244,6 +1244,46 @@ fn lazy_media_outlives_url_preview() {
 }
 
 #[tokio::test]
+async fn prefix_key_pages_resume_after_deleted_binary_keys() -> Result {
+	let fixture = new_test_database("prefix-keys-page").await?;
+	let map = fixture.database.get("global")?;
+	let keys: &[&[u8]] = &[b"o\xff", b"p\0", b"p\0\0", b"p\0\xff", b"p\xff", b"q\0"];
+	let mut txn = fixture.database.txn();
+	for key in keys {
+		txn.insert_raw(map, key, b"opaque value is unnecessary for a key page");
+	}
+	txn.execute().await?;
+	assert!(
+		map.raw_keys_prefix_after(b"p\0", None, 0)
+			.await?
+			.is_empty()
+	);
+	let first = map.raw_keys_prefix_after(b"p\0", None, 2).await?;
+	assert_eq!(first, [b"p\0".to_vec(), b"p\0\0".to_vec()]);
+	let mut txn = fixture.database.txn();
+	for key in &first {
+		txn.del_raw(map, key);
+	}
+	txn.execute().await?;
+	let next = map
+		.raw_keys_prefix_after(b"p\0", first.last().map(Vec::as_slice), 2)
+		.await?;
+	assert_eq!(next, [b"p\0\xff".to_vec()]);
+	assert!(
+		map.raw_keys_prefix_after(b"p\0", next.last().map(Vec::as_slice), 2)
+			.await?
+			.is_empty()
+	);
+	assert!(
+		map.raw_keys_prefix_after(b"p\0", Some(b"q"), 2)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(map.get(b"q\0").await?.as_ref(), b"opaque value is unnecessary for a key page");
+	Ok(())
+}
+
+#[tokio::test]
 async fn txn_insert_raw_preserves_bytes() -> Result {
 	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
 

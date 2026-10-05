@@ -32,7 +32,7 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 	self.services
 		.retention
 		.save_original_pdu(event_id, &pdu, state_lock)
-		.await;
+		.await?;
 
 	let body = pdu["content"]
 		.as_object()

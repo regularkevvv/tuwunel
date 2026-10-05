@@ -59,6 +59,11 @@ const MAPS: &[&str] = &[
 	"roomid_invitedcount",
 	"roomid_knockedcount",
 	"roomid_inviteviaservers",
+	"tofrom_relation",
+	"softfailedeventids",
+	"eventid_policysigstate",
+	"eventid_originalpdu",
+	"timeredacted_eventid",
 ];
 
 type Snapshot = BTreeMap<(&'static str, Vec<u8>), sha256::Digest>;
@@ -80,6 +85,7 @@ fn room_storage_erasure_is_atomic_and_protects_operator_access() -> Result {
 		"address=[\"127.0.0.1\"]".into(),
 		format!("port={port}"),
 		"listening=true".into(),
+		"save_unredacted_events=true".into(),
 		"log=\"error\"".into(),
 	]);
 	let runtime = Runtime::new(Some(&args))?;
@@ -114,7 +120,9 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.await?;
 	unknown_admin_protection(services, &foreign).await?;
 	preflight_preservation(services, &client, &foreign).await?;
-	atomic_refusals(services, &client, &foreign).await
+	atomic_refusals(services, &client, &foreign).await?;
+	history_event_atomicity(services, &client).await?;
+	retention_expiry_atomicity(services, &foreign).await
 }
 
 async fn snapshot(services: &Services, room: &RoomId) -> Result<Snapshot> {
@@ -565,5 +573,419 @@ async fn atomic_refusals(services: &Services, client: &Client<'_>, foreign: &Roo
 	{
 		assert_eq!(after.get(at), Some(hash));
 	}
+	Ok(())
+}
+
+/// A real client event plus owned physical relation rows spanning scan pages.
+/// Every refused map preserves the PDU, reverse/timestamp bindings, search,
+/// metadata and retained original, including unrelated events/rooms.
+async fn history_event_atomicity(services: &Services, client: &Client<'_>) -> Result {
+	use tuwunel_core::ruma::OwnedEventId;
+	let room = client
+		.create_room(&json!({"preset":"public_chat"}))
+		.await?;
+	let mut events = Vec::new();
+	for (tx, body) in [
+		("purged", "visible search words İİİİİİİİİİİİİİİİİİİİİİİİİ"),
+		("kept", "boundary retained words"),
+	] {
+		let response: Value = services
+			.client
+			.clients
+			.default
+			.put(client.url(&format!("rooms/{room}/send/m.room.message/{tx}")))
+			.bearer_auth(TOKEN)
+			.json(&json!({"msgtype":"m.text", "body":body}))
+			.send()
+			.await?
+			.error_for_status()?
+			.json()
+			.await?;
+		events.push(OwnedEventId::try_from(
+			response["event_id"]
+				.as_str()
+				.expect("client event"),
+		)?);
+	}
+	let event = &events[0];
+	let raw = services.timeline.get_pdu_id(event).await?;
+	let until = services
+		.timeline
+		.get_pdu_id(&events[1])
+		.await?
+		.pdu_count();
+	let short = services.short.get_shortroomid(&room).await?;
+	history_original_atomicity(services, &room, event, &raw, short).await?;
+	let relation_keys = history_metadata(services, &room, event, &raw, short).await?;
+	let baseline = snapshot(services, &room).await?;
+	assert_eq!(
+		services
+			.timeline
+			.purge_history(&room, until, false)
+			.await?,
+		0
+	);
+	assert_eq!(snapshot(services, &room).await?, baseline, "local retention unchanged");
+	history_refusal_atomicity(services, &room, until, event, &events[1], &relation_keys).await?;
+	history_corruption_and_limits(services, &room, until, event, &raw, short).await?;
+	assert_eq!(
+		services
+			.timeline
+			.purge_history(&room, until, true)
+			.await?,
+		1
+	);
+	assert_eq!(
+		services
+			.timeline
+			.purge_history(&room, until, true)
+			.await?,
+		0,
+		"repeat cannot count deleted event twice"
+	);
+	services.timeline.get_pdu(&events[1]).await?;
+	assert!(
+		services
+			.timeline
+			.get_pdu(event)
+			.await
+			.expect_err("target PDU erased")
+			.is_not_found()
+	);
+	for (map, key) in relation_keys {
+		assert!(
+			services.db[map]
+				.get(&key)
+				.await
+				.expect_err("target relations erased")
+				.is_not_found()
+		);
+	}
+	for map in [
+		"eventid_pduid",
+		"eventid_outlierpdu",
+		"eventid_originalpdu",
+		"softfailedeventids",
+		"eventid_policysigstate",
+	] {
+		assert!(
+			services.db[map]
+				.get(event)
+				.await
+				.expect_err("target metadata erased")
+				.is_not_found()
+		);
+	}
+	let tokens = services.db["tokenids"]
+		.raw_rows_prefix_after(&short.to_be_bytes(), None, 100)
+		.await?;
+	assert!(
+		tokens
+			.iter()
+			.all(|(key, _)| !key.ends_with(raw.as_ref())),
+		"both current and retained-original tokens erased"
+	);
+	// Expiry retains ownership of the timestamp housekeeping row; purge
+	// removes its payload without inventing a retention timestamp.
+	let after = snapshot(services, &room).await?;
+	for (key, hash) in baseline
+		.iter()
+		.filter(|((name, _), _)| *name == "timeredacted_eventid")
+	{
+		assert_eq!(after.get(key), Some(hash));
+	}
+	Ok(())
+}
+
+async fn retention_expiry_atomicity(services: &Services, room: &RoomId) -> Result {
+	let mut txn = services.db.txn();
+	let mut expired = Vec::new();
+	for n in 0..130_u64 {
+		let event =
+			tuwunel_core::ruma::OwnedEventId::try_from(format!("$retention{n}:example.org"))?;
+		let key = serialize_key((1_600_000_000_u64, &event))?;
+		txn.insert_raw(
+			&services.db["eventid_originalpdu"],
+			event.as_bytes(),
+			b"owned expired payload",
+		);
+		txn.insert_raw(&services.db["timeredacted_eventid"], &key, b"");
+		expired.push((event, key.to_vec()));
+	}
+	let future = tuwunel_core::ruma::OwnedEventId::try_from("$retentionFuture:example.org")?;
+	txn.insert_raw(
+		&services.db["eventid_originalpdu"],
+		future.as_bytes(),
+		b"foreign future payload",
+	);
+	txn.put_raw(&services.db["timeredacted_eventid"], (u64::MAX - 1, &future), []);
+	txn.execute().await?;
+	let baseline = snapshot(services, room).await?;
+	for map in ["eventid_originalpdu", "timeredacted_eventid"] {
+		refusal::refuse_next(map);
+		let error =
+			tokio::time::timeout(Duration::from_secs(10), services.retention.expire_originals())
+				.await
+				.map_err(|_| err!("retention refusal exceeded its deadline"))?
+				.expect_err("expiry refuses both rows atomically");
+		assert!(error.to_string().contains("refus"));
+		assert_eq!(refusal::pending(), 0);
+		assert_eq!(snapshot(services, room).await?, baseline);
+	}
+	assert_eq!(services.retention.expire_originals().await?, 130);
+
+	let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+		loop {
+			if services.db["timeredacted_eventid"]
+				.get(&expired.last().expect("expiry rows").1)
+				.await
+				.is_err_and(|error| error.is_not_found())
+			{
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		for (event, key) in &expired {
+			assert!(
+				services.db["eventid_originalpdu"]
+					.get(event)
+					.await
+					.expect_err("expired payload")
+					.is_not_found()
+			);
+			assert!(
+				services.db["timeredacted_eventid"]
+					.get(key)
+					.await
+					.expect_err("expired index")
+					.is_not_found()
+			);
+		}
+		assert_eq!(
+			services.db["eventid_originalpdu"]
+				.get(&future)
+				.await?
+				.as_ref(),
+			b"foreign future payload"
+		);
+		Ok::<(), tuwunel_core::Error>(())
+	})
+	.await;
+	outcome.map_err(|_| err!("retention page cleanup exceeded its deadline"))?
+}
+
+async fn history_original_atomicity(
+	services: &Services,
+	room: &RoomId,
+	event: &tuwunel_core::ruma::EventId,
+	raw: &tuwunel_core::matrix::pdu::RawPduId,
+	short: u64,
+) -> Result {
+	use tuwunel_core::ruma::CanonicalJsonValue;
+	let mut original = services.timeline.get_pdu_json(event).await?;
+	original
+		.get_mut("content")
+		.expect("event content")
+		.as_object_mut()
+		.expect("content object")
+		.insert("body".into(), CanonicalJsonValue::String("original stale words".into()));
+	let before_save = snapshot(services, room).await?;
+	for map in ["eventid_originalpdu", "timeredacted_eventid"] {
+		refusal::refuse_next(map);
+		let lock = services.state.mutex.lock(room).await;
+		services
+			.retention
+			.save_original_pdu(event, &original, &lock)
+			.await
+			.expect_err("retention pair is atomic and propagates refusal");
+		drop(lock);
+		assert_eq!(refusal::pending(), 0);
+		assert_eq!(snapshot(services, room).await?, before_save);
+	}
+	let lock = services.state.mutex.lock(room).await;
+	services
+		.retention
+		.save_original_pdu(event, &original, &lock)
+		.await?;
+	drop(lock);
+	let saved = snapshot(services, room).await?;
+	let lock = services.state.mutex.lock(room).await;
+	services
+		.retention
+		.save_original_pdu(event, &original, &lock)
+		.await?;
+	drop(lock);
+	assert_eq!(snapshot(services, room).await?, saved, "repeat does not extend retention");
+	services
+		.search
+		.index_pdu(short, raw, "original stale words")
+		.await?;
+	Ok(())
+}
+
+async fn history_corruption_and_limits(
+	services: &Services,
+	room: &RoomId,
+	until: tuwunel_core::matrix::pdu::PduCount,
+	event: &tuwunel_core::ruma::EventId,
+	raw: &tuwunel_core::matrix::pdu::RawPduId,
+	short: u64,
+) -> Result {
+	let stored = services.db["pduid_pdu"].get(raw).await?.to_vec();
+	let mut foreign_pdu: Value = serde_json::from_slice(&stored)?;
+	foreign_pdu["room_id"] = json!("!foreign:example.org");
+	for map in ["pduid_pdu", "eventid_originalpdu"] {
+		let key = if map == "pduid_pdu" {
+			raw.as_ref()
+		} else {
+			event.as_bytes()
+		};
+		let original = services.db[map].get(key).await?.to_vec();
+		for value in [b"{".to_vec(), serde_json::to_vec(&foreign_pdu)?] {
+			services.db[map].insert(key, value).await?;
+			let corrupt = snapshot(services, room).await?;
+			services
+				.timeline
+				.purge_history(room, until, true)
+				.await
+				.expect_err("corrupt event or original refuses cleanup");
+			assert_eq!(snapshot(services, room).await?, corrupt);
+		}
+		services.db[map].insert(key, original).await?;
+	}
+	let mut bad_key = short.to_be_bytes().to_vec();
+	bad_key.push(0);
+	services.db["pduid_pdu"]
+		.insert(&bad_key, &stored)
+		.await?;
+	let corrupt = snapshot(services, room).await?;
+	services
+		.timeline
+		.purge_history(room, until, true)
+		.await
+		.expect_err("invalid packed key is fallible");
+	assert_eq!(snapshot(services, room).await?, corrupt);
+	services.db["pduid_pdu"].remove(&bad_key).await?;
+	// Large fan-out requires a future journaled multi-batch executor. Until
+	// then, refuse atomically rather than losing the event before cleanup.
+	let mut txn = services.db.txn();
+	let mut large_keys = Vec::new();
+	for n in 1000..1650_u64 {
+		let mut key = raw.count().to_vec();
+		key.extend_from_slice(&n.to_be_bytes());
+		txn.insert_raw(&services.db["tofrom_relation"], &key, b"");
+		large_keys.push(key);
+	}
+	txn.execute().await?;
+	let large = snapshot(services, room).await?;
+	let error = services
+		.timeline
+		.purge_history(room, until, true)
+		.await
+		.expect_err("oversized event batch refuses cleanup");
+	assert_eq!(error.status_code(), tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS);
+	assert_eq!(snapshot(services, room).await?, large);
+	let mut txn = services.db.txn();
+	for key in large_keys {
+		txn.del_raw(&services.db["tofrom_relation"], key);
+	}
+	txn.execute().await?;
+	Ok(())
+}
+
+async fn history_metadata(
+	services: &Services,
+	room: &RoomId,
+	event: &tuwunel_core::ruma::EventId,
+	raw: &tuwunel_core::matrix::pdu::RawPduId,
+	short: u64,
+) -> Result<Vec<(&'static str, Vec<u8>)>> {
+	let mut txn = services.db.txn();
+	let mut relation_keys = Vec::new();
+	for n in 1..=130_u64 {
+		let mut legacy = raw.count().to_vec();
+		legacy.extend_from_slice(&n.to_be_bytes());
+		txn.insert_raw(&services.db["tofrom_relation"], &legacy, b"");
+		let mut typed = short.to_be_bytes().to_vec();
+		typed.extend_from_slice(&raw.count());
+		typed.push(1);
+		typed.extend_from_slice(&n.to_be_bytes());
+		typed.extend_from_slice(&n.to_be_bytes());
+		txn.insert_raw(&services.db["relatesto_typed"], &typed, n.to_be_bytes());
+		relation_keys.push(("tofrom_relation", legacy));
+		relation_keys.push(("relatesto_typed", typed));
+	}
+	txn.put_raw(&services.db["referencedevents"], (room, event), []);
+	for map in ["softfailedeventids", "eventid_policysigstate", "eventid_outlierpdu"] {
+		txn.insert_raw(&services.db[map], event.as_bytes(), b"owned event metadata");
+	}
+	txn.execute().await?;
+	Ok(relation_keys)
+}
+
+async fn history_refusal_atomicity(
+	services: &Services,
+	room: &RoomId,
+	until: tuwunel_core::matrix::pdu::PduCount,
+	event: &tuwunel_core::ruma::EventId,
+	boundary: &tuwunel_core::ruma::EventId,
+	relation_keys: &[(&'static str, Vec<u8>)],
+) -> Result {
+	let baseline = snapshot(services, room).await?;
+	for map in [
+		"pduid_pdu",
+		"eventid_pduid",
+		"eventid_outlierpdu",
+		"roomid_tscount_pducount",
+		"tokenids",
+		"tofrom_relation",
+		"relatesto_typed",
+		"referencedevents",
+		"softfailedeventids",
+		"eventid_policysigstate",
+		"eventid_originalpdu",
+	] {
+		refusal::refuse_next(map);
+		services
+			.timeline
+			.purge_history(room, until, true)
+			.await
+			.expect_err("refused event cleanup is atomic");
+		assert_eq!(refusal::pending(), 0);
+		assert_eq!(
+			snapshot(services, room).await?,
+			baseline,
+			"{map} refusal preserves all inspected bytes"
+		);
+	}
+	// Corruption on the last relation scan page cannot erase earlier pages.
+	let (map, key) = relation_keys.last().expect("typed row");
+	let value = services.db[map].get(key).await?.to_vec();
+	services.db[map].insert(key, b"invalid").await?;
+	let corrupt = snapshot(services, room).await?;
+	services
+		.timeline
+		.purge_history(room, until, true)
+		.await
+		.expect_err("bad typed relation refuses entire event");
+	assert_eq!(snapshot(services, room).await?, corrupt);
+	services.db[map].insert(key, value).await?;
+	let binding = services.db["eventid_pduid"]
+		.get(event)
+		.await?
+		.to_vec();
+	services.db["eventid_pduid"]
+		.insert(event, services.timeline.get_pdu_id(boundary).await?)
+		.await?;
+	let corrupt = snapshot(services, room).await?;
+	services
+		.timeline
+		.purge_history(room, until, true)
+		.await
+		.expect_err("foreign reverse binding refuses purge");
+	assert_eq!(snapshot(services, room).await?, corrupt);
+	services.db["eventid_pduid"]
+		.insert(event, binding)
+		.await?;
 	Ok(())
 }

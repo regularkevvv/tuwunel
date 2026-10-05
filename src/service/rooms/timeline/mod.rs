@@ -39,8 +39,8 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Database, Deserialized, Json, Map};
 
-pub(crate) use self::append::Effect;
 pub use self::pdus::{PdusIterItem, bias_count};
+pub(crate) use self::{append::Effect, purge::check_purge_batch};
 use crate::rooms::short::{ShortRoomId, ShortStateHash};
 
 pub struct Service {
