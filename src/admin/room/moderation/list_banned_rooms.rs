@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use ruma::OwnedRoomId;
 use tuwunel_core::{Err, Result, utils::IterStream};
 
@@ -22,8 +22,8 @@ pub(super) async fn list_banned_rooms(&self, no_details: bool) -> Result {
 		.iter()
 		.stream()
 		.then(|room_id| get_room_info(self.services, room_id))
-		.collect::<Vec<_>>()
-		.await;
+		.try_collect::<Vec<_>>()
+		.await?;
 
 	rooms.sort_by_key(|r| r.1);
 	rooms.reverse();

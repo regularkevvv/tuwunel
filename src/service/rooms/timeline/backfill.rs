@@ -18,10 +18,7 @@ use tuwunel_core::{
 		event::Event,
 		pdu::{PduCount, PduId, RawPduId},
 	},
-	utils::{
-		BoolExt, IterStream, ReadyExt,
-		future::{BoolExt as FutureBoolExt, TryExtExt},
-	},
+	utils::{BoolExt, IterStream, ReadyExt},
 	validated, warn,
 };
 use tuwunel_database::Json;
@@ -65,8 +62,7 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 	let empty_room = self
 		.services
 		.state_cache
-		.room_joined_count(room_id)
-		.map_ok_or(true, |count| count <= 1);
+		.room_joined_count(room_id);
 
 	let not_world_readable = self
 		.services
@@ -75,7 +71,8 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 		.map(is_false!());
 
 	// Room is empty (1 user or none), there is no one that can backfill
-	if empty_room.and(not_world_readable).await {
+	let (joined_count, not_world_readable) = join(empty_room, not_world_readable).await;
+	if joined_count? <= 1 && not_world_readable {
 		return Ok(());
 	}
 

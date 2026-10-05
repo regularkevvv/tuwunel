@@ -49,7 +49,7 @@ where
 			room_id: event.room_id(),
 			related_events: related_events.as_ref(),
 		})
-		.await;
+		.await?;
 
 	let notify = actions.iter().any(Action::should_notify);
 	let tweak_count = actions

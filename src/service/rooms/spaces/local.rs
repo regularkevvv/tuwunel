@@ -25,13 +25,20 @@ pub(super) async fn get_summary_and_children_local(
 			error!(?current_room, "cache error: {e}");
 			return Err(e);
 		},
-		| Ok(Cached { expires, summary: Some(cached) }) if !timepoint_has_passed(expires) => {
+		| Ok(Cached { expires, summary: Some(mut cached) }) if !timepoint_has_passed(expires) => {
 			debug!(?current_room, ?expires, "cache hit");
-			return self
+			if !self
 				.is_accessible_child(current_room, &cached.summary.join_rule, sender)
 				.await
-				.then(|| Ok(Accessible(cached)))
-				.unwrap_or(Ok(Inaccessible));
+			{
+				return Ok(Inaccessible);
+			}
+			cached.summary.num_joined_members = self
+				.services
+				.state_cache
+				.room_joined_count_uint(current_room)
+				.await?;
+			return Ok(Accessible(cached));
 		},
 		| Ok(Cached { expires, summary: None }) if !timepoint_has_passed(expires) => {
 			// Cache negative: try local computation below.
@@ -127,8 +134,7 @@ pub(super) async fn get_room_summary(
 	let num_joined_members = self
 		.services
 		.state_cache
-		.room_joined_count(room_id)
-		.unwrap_or(0);
+		.room_joined_count_uint(room_id);
 
 	let canonical_alias = self
 		.services
@@ -188,7 +194,7 @@ pub(super) async fn get_room_summary(
 			encryption,
 			room_version,
 			room_id: room_id.to_owned(),
-			num_joined_members: num_joined_members.try_into().unwrap_or_default(),
+			num_joined_members: num_joined_members?,
 			join_rule: join_rule.clone().into(),
 		},
 	};

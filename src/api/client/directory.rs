@@ -2,7 +2,7 @@ use std::cmp;
 
 use axum::extract::State;
 use futures::{
-	FutureExt, StreamExt, TryFutureExt,
+	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 	future::{join, join4, join5},
 };
 use ruma::{
@@ -26,7 +26,7 @@ use tuwunel_core::{
 	utils::{
 		TryFutureExtExt,
 		math::Expected,
-		stream::{IterStream, ReadyExt, WidebandExt},
+		stream::{IterStream, TryReadyExt, WidebandExt},
 	},
 	warn,
 };
@@ -305,45 +305,45 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 		.map(ToOwned::to_owned)
 		.chain(meta_public_rooms)
 		.wide_then(|room_id| public_rooms_chunk(services, room_id))
-		.ready_filter_map(|chunk| {
+		.ready_try_filter_map(|chunk| {
 			if !filter.room_types.is_empty()
 				&& !filter
 					.room_types
 					.contains(&RoomTypeFilter::from(chunk.room_type.clone()))
 			{
-				return None;
+				return Ok(None);
 			}
 
 			if let Some(query) = search_room_id
 				&& chunk.room_id.as_str().contains(query) {
-					return Some(chunk);
+					return Ok(Some(chunk));
 				}
 
 			if let Some(query) = search_term.as_deref() {
 				if let Some(name) = &chunk.name
 					&& name.as_str().to_lowercase().contains(query) {
-						return Some(chunk);
+						return Ok(Some(chunk));
 					}
 
 				if let Some(topic) = &chunk.topic
 					&& topic.to_lowercase().contains(query) {
-						return Some(chunk);
+						return Ok(Some(chunk));
 					}
 
 				if let Some(canonical_alias) = &chunk.canonical_alias
 					&& canonical_alias.as_str().to_lowercase().contains(query) {
-						return Some(chunk);
+						return Ok(Some(chunk));
 					}
 
-				return None;
+				return Ok(None);
 			}
 
 			// No search term
-			Some(chunk)
+			Ok(Some(chunk))
 		})
 		// We need to collect all, so we can sort by member count
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	all_rooms.sort_by_key(|r| cmp::Reverse(r.num_joined_members));
 
@@ -388,7 +388,10 @@ async fn user_can_publish_room(
 	Ok(power_levels.user_can_send_state(user_id, StateEventType::RoomHistoryVisibility))
 }
 
-async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> PublicRoomsChunk {
+async fn public_rooms_chunk(
+	services: &Services,
+	room_id: OwnedRoomId,
+) -> Result<PublicRoomsChunk> {
 	let name = services.state_accessor.get_name(&room_id).ok();
 
 	let room_type = services
@@ -422,12 +425,7 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 
 	let num_joined_members = services
 		.state_cache
-		.room_joined_count(&room_id)
-		.map(|x| {
-			x.ok()
-				.and_then(|x| x.try_into().ok())
-				.unwrap_or_else(|| uint!(0))
-		});
+		.room_joined_count_uint(&room_id);
 
 	let (
 		(avatar_url, canonical_alias, guest_can_join, join_rule, name),
@@ -439,18 +437,18 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 	.boxed()
 	.await;
 
-	PublicRoomsChunk {
+	Ok(PublicRoomsChunk {
 		avatar_url: avatar_url.flatten(),
 		canonical_alias,
 		guest_can_join,
 		join_rule,
 		name,
-		num_joined_members,
+		num_joined_members: num_joined_members?,
 		room_id,
 		room_type,
 		topic,
 		world_readable,
-	}
+	})
 }
 
 /// Alias for the room's directory entry: the alias it was published under

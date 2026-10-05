@@ -18,7 +18,7 @@ use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
 pub use inventory::RoomMemberInventoryCount;
 pub use invite_inventory::InviteStateInventory;
 use ruma::{
-	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
+	OwnedRoomId, OwnedServerName, RoomId, ServerName, UInt, UserId,
 	events::{AnyStrippedStateEvent, AnySyncStateEvent, room::member::MembershipState},
 	serde::Raw,
 };
@@ -377,6 +377,24 @@ pub async fn room_joined_count(&self, room_id: &RoomId) -> Result<u64> {
 		"Invalid joined-member count",
 	))
 	.await
+}
+
+/// Required joined count for a known room in Matrix responses and push rules.
+/// Missing storage and values outside Matrix's integer range cannot become
+/// zero, an omitted field, or a different rule-evaluation context.
+#[implement(Service)]
+pub async fn room_joined_count_uint(&self, room_id: &RoomId) -> Result<UInt> {
+	let count = self
+		.room_joined_count(room_id)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("Missing known room member count")
+			} else {
+				error
+			}
+		})?;
+	UInt::try_from(count).map_err(|_| Error::bad_database("Invalid joined-member count"))
 }
 
 /// Returns the invited count after completing any durable pending recount.
