@@ -58,12 +58,15 @@ impl Service {
 
 		debug!(?room_id, "Preparing to delete room...");
 
-		self.services
+		if let Err(error) = self
+			.services
 			.delete
 			.delete_room(room_id, false, state_lock)
 			.boxed()
 			.await
-			.expect("unhandled error during room deletion");
+		{
+			warn!(%error, %room_id, "Room cleanup refused");
+		}
 	}
 
 	pub async fn delete_room(
@@ -72,9 +75,14 @@ impl Service {
 		force: bool,
 		state_lock: RoomMutexGuard,
 	) -> Result<ShutdownRoom> {
+		self.services
+			.state_cache
+			.preflight_room_erasure(room_id, force)
+			.await?;
 		let summary = self.shutdown_room(room_id, &state_lock).await;
 
-		self.purge_room(room_id, force, &state_lock).await;
+		self.purge_room(room_id, force, &state_lock)
+			.await?;
 
 		debug!(?room_id, "Successfully deleted room from our database");
 
@@ -148,93 +156,77 @@ impl Service {
 
 	/// Wipes the room's storage. `force` widens the erasure of local users'
 	/// left-state (it is not Synapse's `force_purge`).
-	async fn purge_room(&self, room_id: &RoomId, force: bool, state_lock: &RoomMutexGuard) {
+	async fn purge_room(
+		&self,
+		room_id: &RoomId,
+		force: bool,
+		state_lock: &RoomMutexGuard,
+	) -> Result {
 		debug!("Deleting room's threads from database");
 		self.services
 			.threads
 			.delete_all_rooms_threads(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting all the room's search token IDs from our database");
 		self.services
 			.search
 			.delete_all_search_tokenids_for_room(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting all room's forward extremities from our database");
 		self.services
 			.state
 			.delete_all_rooms_forward_extremities(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting all the room's event (PDU) references");
 		self.services
 			.pdu_metadata
 			.delete_all_referenced_for_room(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting all the room's typed relation index entries");
 		self.services
 			.pdu_metadata
 			.delete_all_relatesto_typed_for_room(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting all the room's member counts");
 		self.services
 			.state_cache
 			.delete_room_join_counts(room_id, force)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting all the room's private read receipts");
 		self.services
 			.read_receipt
 			.delete_all_read_receipts(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting the room's last notifications read.");
 		self.services
 			.pusher
 			.delete_room_notification_read(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting room state hash from our database");
 		self.services
 			.state
 			.delete_room_shortstatehash(room_id, state_lock)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting PDUs");
 		self.services
 			.timeline
 			.delete_pdus(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
 
 		debug!("Deleting internal room ID from our database");
 		self.services
 			.short
 			.delete_shortroomid(room_id)
-			.await
-			.log_err()
-			.ok();
+			.await?;
+		Ok(())
 	}
 }

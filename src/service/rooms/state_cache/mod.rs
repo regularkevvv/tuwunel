@@ -1,3 +1,4 @@
+mod erasure;
 mod inventory;
 mod invite_inventory;
 mod recount;
@@ -27,7 +28,6 @@ use serde::de::DeserializeOwned;
 use tuwunel_core::{
 	Error, Result, debug_warn, implement,
 	matrix::{Event, Pdu, event::Owned},
-	trace,
 	utils::{
 		self, BoolExt, MutexMap, MutexMapGuard,
 		future::OptionStream,
@@ -890,94 +890,9 @@ pub async fn is_left_checked(&self, user_id: &UserId, room_id: &RoomId) -> Resul
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Result {
 	let guard = self.membership_mutex.lock(room_id).await;
-	let prefix = (room_id, Interfix);
 	let mut txn = self.services.db.txn();
-
-	txn.del_raw(&self.db.roomid_knockedcount, room_id);
-
-	txn.del_raw(&self.db.roomid_invitedcount, room_id);
-
-	txn.del_raw(&self.db.roomid_inviteviaservers, room_id);
-
-	txn.del_raw(&self.db.roomid_joinedcount, room_id);
-
-	self.db
-		.roomserverids
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &ServerName)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomserverids, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.serverroomids, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_invitecount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_invitecount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_invitestate, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_joinedcount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_joinedcount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_joinedcount, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_knockedcount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_knockedcount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_knockedstate, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_leftcount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_filter(|(_, user_id): &(&RoomId, &UserId)| {
-			force || !self.services.globals.user_is_local(user_id)
-		})
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_leftcount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_leftstate, reverse_key);
-		})
-		.await;
+	self.stage_membership_erasure(room_id, force, &mut txn)
+		.await?;
 
 	self.commit_membership_erasure_locked(room_id, txn, &guard)
 		.await
