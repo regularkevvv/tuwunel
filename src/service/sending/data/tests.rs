@@ -7,8 +7,8 @@ use tuwunel_core::{
 };
 
 use super::{
-	SendingEvent, decode_badge_destination, decode_outgoing, decode_sending,
-	missing_count_is_zero, retain_existing, within_prefix,
+	SendingEvent, decode_outgoing, decode_sending, missing_count_is_zero, retain_existing,
+	within_prefix,
 };
 
 fn unavailable() -> Error { err!(Database("queue read unavailable")) }
@@ -58,14 +58,17 @@ fn prefix_end_and_malformed_rows_remain_distinct_from_scan_failure() {
 }
 
 #[test]
-fn badge_filter_preserves_errors_and_ignores_only_non_badge_rows() {
-	assert!(decode_badge_destination(Ok((b"$unused", b"edu"))).is_none());
-	decode_badge_destination(Err(unavailable()))
-		.expect("failed scan is retained")
-		.expect_err("failed scan is not a destination");
-	decode_badge_destination(Ok((b"$malformed", &[super::TAG_BADGE_REFRESH])))
-		.expect("badge row is retained")
-		.expect_err("malformed badge is reported");
+fn malformed_pending_pdu_ids_are_errors_for_every_destination() {
+	for prefix in
+		[b"+as1\xff".as_slice(), b"$@u:remote.example\xffkey\xff", b"remote.example\xff"]
+	{
+		for suffix in [b"".as_slice(), b"short", &[0x80; 16], &[1; 17]] {
+			let mut key = prefix.to_vec();
+			key.extend_from_slice(suffix);
+			decode_outgoing(Ok((&key, b"")))
+				.expect_err("corrupt pending PDU IDs cannot panic or disappear");
+		}
+	}
 }
 
 #[test]

@@ -656,10 +656,11 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
-		let synthetic_badge =
-			msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::BadgeRefresh);
+		let synthetic_wake = msg.queue_id.is_empty()
+			&& matches!(&msg.event, SendingEvent::BadgeRefresh | SendingEvent::Flush);
+		let flush_wake = msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::Flush);
 
-		let new_events = match (synthetic_badge, statuses.contains_key(&msg.dest)) {
+		let mut new_events = match (synthetic_wake, statuses.contains_key(&msg.dest)) {
 			| (false, _) => vec![(msg.queue_id, msg.event)],
 			| (true, true) => Vec::new(),
 			| (true, false) =>
@@ -669,6 +670,11 @@ impl Service {
 					.try_collect()
 					.await?,
 		};
+		// Preserve explicit appservice retry requests without persisting a
+		// synthetic row or sending a fabricated badge/PDU.
+		if flush_wake {
+			new_events.push((Vec::new(), SendingEvent::Flush));
+		}
 
 		if let Some(events) = self
 			.select_events(&msg.dest, new_events, statuses)
@@ -873,7 +879,7 @@ impl Service {
 		}
 
 		// Active transaction generations must own their queued successors before
-		// queued-only badge destinations are woken.
+		// queued-only destinations are woken.
 		if !self.server.config.startup_netburst || keep == 0 {
 			return Ok(());
 		}
@@ -883,7 +889,7 @@ impl Service {
 		loop {
 			let (found, next) = self
 				.db
-				.queued_badge_refresh_destinations(after.as_deref(), NETBURST_BATCH)
+				.queued_destinations_after(after.as_deref(), NETBURST_BATCH)
 				.await?;
 
 			destinations.extend(
@@ -920,8 +926,8 @@ impl Service {
 
 		for dest in destinations {
 			let event = match &dest {
-				| Destination::Federation(_) => SendingEvent::Flush,
-				| _ => SendingEvent::BadgeRefresh,
+				| Destination::Push(..) => SendingEvent::BadgeRefresh,
+				| Destination::Federation(_) | Destination::Appservice(_) => SendingEvent::Flush,
 			};
 			let msg = Msg { dest, event, queue_id: Vec::new() };
 
