@@ -64,7 +64,6 @@ use tuwunel_core::{
 
 use super::{
 	Destination, EduBuf, EduVec, Msg, SendingEvent, Service, TAG_PREFIX_LEN, data::QueueItem,
-	reap_flushes,
 };
 use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 
@@ -1924,55 +1923,6 @@ fn is_permanent_push_error(error: &Error) -> bool {
 }
 
 impl Service {
-	/// Wake durable push destinations without taking ownership from storage.
-	pub fn schedule_resume_pushes_for_user(&self, user: OwnedUserId, reason: &'static str) {
-		let sending = self.services.sending.clone();
-		self.spawn_flush(async move {
-			if let Err(error) = sending.resume_pushes_for_user(&user).await {
-				warn!(?user, reason, ?error, "Push wake failed; durable rows remain owed");
-			}
-		});
-	}
-
-	async fn resume_pushes_for_user(&self, user: &UserId) -> Result {
-		for active in [true, false] {
-			let mut after = None;
-			loop {
-				let (destinations, next) = self
-					.db
-					.push_destinations_for_user_after(user, active, after.as_deref())
-					.await?;
-				for dest in destinations {
-					self.dispatch(Msg {
-						dest,
-						event: SendingEvent::Flush,
-						queue_id: Vec::new(),
-					})?;
-				}
-				match next {
-					| Some(next) => after = Some(next),
-					| None => break,
-				}
-			}
-		}
-		Ok(())
-	}
-
-	fn spawn_flush<F>(&self, flush: F)
-	where
-		F: Future<Output = ()> + Send + 'static,
-	{
-		// A flush scheduled during shutdown is dropped, not spawned.
-		if !self.server.is_running() {
-			return;
-		}
-
-		let mut flushes = self.flushes.lock().expect("locked");
-
-		reap_flushes(&mut flushes);
-		let _abort = flushes.spawn_on(flush, self.server.runtime());
-	}
-
 	// optional suppression: heuristic combining presence age and recent sync
 	// activity.
 	async fn pushing_suppressed(&self, user_id: &UserId) -> bool {

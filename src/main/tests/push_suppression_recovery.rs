@@ -374,6 +374,12 @@ async fn accept(
 		.await?;
 	assert_eq!(state.notifications, 0, "main reset clears only main counts");
 	assert_eq!(u64::from(state.totals()?.0), 2, "independent unread threads remain");
+	for _ in 0..10_000 {
+		services
+			.sending
+			.schedule_resume_pushes_for_user(m.user.clone(), "duplicate hint fixture");
+	}
+	tokio::task::yield_now().await;
 	let events = owed(services, &m).await?;
 	assert_eq!(events.len(), 5, "read cutoffs do not prematurely remove queue ownership");
 	assert_eq!(

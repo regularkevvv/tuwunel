@@ -3,13 +3,13 @@ mod dest;
 mod sender;
 #[cfg(test)]
 mod tests;
+mod wakes;
 
 use std::{
 	fmt::Debug,
 	hash::{DefaultHasher, Hash, Hasher},
 	io::Write,
 	iter::{once, repeat_with},
-	mem::take,
 	pin::pin,
 	sync::{Arc, Mutex as StdMutex},
 };
@@ -19,12 +19,9 @@ use futures::{FutureExt, Stream, StreamExt};
 use loole::unbounded;
 use ruma::{DeviceId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::Serialize;
-use tokio::{
-	task,
-	task::{JoinError, JoinSet},
-};
+use tokio::{sync::Notify, task, task::JoinSet};
 use tuwunel_core::{
-	Result, Server, debug, debug_warn, err, error,
+	Result, Server, debug, debug_warn, err,
 	smallvec::SmallVec,
 	utils::{
 		IterStream, ReadyExt, TryReadyExt, available_parallelism, future::BoolExt,
@@ -33,6 +30,7 @@ use tuwunel_core::{
 	warn,
 };
 
+use self::wakes::PushWakes;
 pub use self::{
 	data::Data,
 	dest::Destination,
@@ -46,8 +44,9 @@ pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	channels: Vec<(loole::Sender<Msg>, loole::Receiver<Msg>)>,
 
-	// Aborted and joined when the service stops.
-	flushes: StdMutex<JoinSet<()>>,
+	// Hints only; a single owned worker scans one page per user turn.
+	push_wakes: StdMutex<PushWakes>,
+	push_wake_signal: Notify,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,7 +130,8 @@ impl crate::Service for Service {
 			server: args.server.clone(),
 			services: args.services.clone(),
 			channels: repeat_with(unbounded).take(num_senders).collect(),
-			flushes: JoinSet::new().into(),
+			push_wakes: PushWakes::default().into(),
+			push_wake_signal: Notify::new(),
 		}))
 	}
 
@@ -154,6 +154,10 @@ impl crate::Service for Service {
 					joinset
 				});
 
+		let sending = self.clone();
+		let _wake_worker = senders
+			.spawn_on(async move { sending.push_wake_worker().await }, self.server.runtime());
+
 		while let Some(ret) = senders.join_next_with_id().await {
 			match ret {
 				| Ok((id, Ok(()))) => {
@@ -166,18 +170,12 @@ impl crate::Service for Service {
 			}
 		}
 
-		let mut flushes = take(&mut *self.flushes.lock().expect("locked"));
-
-		flushes.abort_all();
-		while let Some(result) = flushes.join_next().await {
-			log_flush(result);
-		}
-
 		Ok(())
 	}
 
 	async fn interrupt(&self) {
-		self.flushes.lock().expect("locked").abort_all();
+		self.push_wakes.lock().expect("locked").stop();
+		self.push_wake_signal.notify_one();
 
 		for (sender, _) in &self.channels {
 			if !sender.is_closed() {
@@ -733,20 +731,4 @@ fn num_senders(args: &crate::Args<'_>) -> usize {
 		.config
 		.sender_workers
 		.clamp(MIN_SENDERS, max_senders)
-}
-
-fn reap_flushes(flushes: &mut JoinSet<()>) {
-	while let Some(result) = flushes.try_join_next() {
-		log_flush(result);
-	}
-}
-
-// A flush that panicked is reported here or nowhere; a cancelled one is the
-// shutdown path.
-fn log_flush(result: Result<(), JoinError>) {
-	if let Err(error) = result
-		&& error.is_panic()
-	{
-		error!(?error, "Suppressed push flush panicked");
-	}
 }

@@ -252,6 +252,9 @@ impl Data {
 		let mut destinations = std::collections::BTreeSet::new();
 		let mut bytes = 0_usize;
 		for key in &keys {
+			if key.len() > super::wakes::MAX_CURSOR_BYTES {
+				return Err(Error::bad_database("Push wake cursor exceeds limit"));
+			}
 			let value = map.get(key).await?;
 			bytes = bytes
 				.saturating_add(key.len())
