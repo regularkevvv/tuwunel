@@ -235,30 +235,6 @@ where
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
 	let next_count = self.services.globals.next_count().await?;
 
-	// Mark as read first so the sending client doesn't get a notification even if
-	// appending fails. Route through the dispatcher so per-thread counts are
-	// also cleared; the sender's own send subsumes any thread receipt.
-	self.services
-		.read_receipt
-		.private_read_set(PrivateRead {
-			room_id: pdu.room_id(),
-			user_id: pdu.sender(),
-			count: *next_count,
-			ts: pdu.origin_server_ts(),
-			thread: &ReceiptThread::Unthreaded,
-			announce: false,
-		})
-		.await;
-
-	self.services
-		.pusher
-		.reset_notification_counts_for_thread(
-			pdu.sender(),
-			pdu.room_id(),
-			&ReceiptThread::Unthreaded,
-		)
-		.await;
-
 	let count = PduCount::Normal(*next_count);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
@@ -287,7 +263,27 @@ where
 		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
 		.await;
 
+	let sender_read = self
+		.services
+		.read_receipt
+		.stage_private_read(
+			PrivateRead {
+				room_id: pdu.room_id(),
+				user_id: pdu.sender(),
+				count: *next_count,
+				ts: pdu.origin_server_ts(),
+				thread: &ReceiptThread::Unthreaded,
+				announce: false,
+			},
+			&mut txn,
+		)
+		.await?;
+
 	txn.execute().await?;
+
+	if let Some(sender_read) = sender_read {
+		sender_read.committed(&self.services.pusher);
+	}
 
 	drop(insert_lock);
 

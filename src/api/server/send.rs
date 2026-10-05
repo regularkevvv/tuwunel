@@ -560,7 +560,9 @@ async fn handle_edu_receipt_room_user(
 					content: ReceiptEventContent(content.into()),
 					room_id: room_id.to_owned(),
 				})
-				.await;
+				.await
+				.log_err()
+				.ok();
 		})
 		.await;
 }

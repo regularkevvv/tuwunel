@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use futures::{
 	Stream, TryStreamExt,
 	future::{join, try_join},
+	pin_mut,
 };
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, RoomId, UserId,
@@ -11,12 +12,14 @@ use ruma::{
 };
 use serde::{Deserialize, de::IgnoredAny};
 use tuwunel_core::{
-	Result, error,
+	Error, Result,
 	matrix::pdu::PduCount,
 	smallvec::SmallVec,
-	utils::{ReadyExt, TryReadyExt, stream::TryIgnore},
+	utils::{TryReadyExt, stream::TryIgnore},
 };
-use tuwunel_database::{Deserialized, Interfix, Json, KeyBuf, Map, Txn, serialize_key};
+use tuwunel_database::{
+	Deserialized, Interfix, Json, KeyBuf, Map, Txn, deserialize_from_slice, serialize_key,
+};
 
 use super::{PrivateRead, ThreadKind};
 
@@ -50,6 +53,21 @@ struct StoredContent {
 	content: BTreeMap<OwnedEventId, IgnoredAny>,
 }
 
+pub(crate) struct PreparedPrivateRead {
+	guard: crate::pusher::NotificationGuard,
+	_permit: Option<tuwunel_core::utils::two_phase_counter::Permit>,
+	thread: ruma::events::receipt::ReceiptThread,
+	local: bool,
+}
+
+impl PreparedPrivateRead {
+	pub(crate) fn committed(self, pusher: &crate::pusher::Service) {
+		if self.local {
+			pusher.notification_reset_committed(&self.guard, &self.thread);
+		}
+	}
+}
+
 impl Data {
 	pub(super) fn new(args: &crate::Args<'_>) -> Self {
 		let db = &args.db;
@@ -74,101 +92,129 @@ impl Data {
 		user_id: &UserId,
 		room_id: &RoomId,
 		event: &ReceiptEvent,
-	) -> bool {
-		// Remote-supplied content reaches this sink over federation, so an
-		// empty receipt is rejected rather than stored as an unreadable row.
+	) -> Result<bool> {
 		let Some(event_id) = event.content.keys().next() else {
-			return false;
+			return Ok(false);
 		};
-
-		let thread_kind = event_thread_kind(event);
-		// MSC3771: storage key suffix is `user_id || 0xFF || thread_kind` so
-		// each (user, thread-context) tuple lives in its own row. Pre-MSC3771
-		// rows have no kind tail; on an Unthreaded sweep also match the
-		// bare-user-id ending so legacy rows are superseded rather than
-		// orphaned. Kind tails ("main", `$root`) never end in `@user:host`,
-		// so the legacy match cannot collide with thread-aware rows.
-		let suffix = serialize_key((user_id, thread_kind))
-			.expect("failed to serialize receipt key suffix");
-
-		let user_id_bytes = user_id.as_bytes();
-		let legacy_match = thread_kind.is_empty();
-
-		// A bare room-id prefix also matches longer room ids, whose rows sort
-		// below ours in reverse iteration and would be reaped by the sweep.
-		let room_prefix =
-			serialize_key((room_id, Interfix)).expect("failed to serialize receipt room prefix");
-
-		let last_possible_key = (room_id, u64::MAX);
-		let (superseded, current) = self
-			.readreceiptid_readreceipt
-			.rev_stream_from_raw(&last_possible_key)
-			.ignore_err()
-			.ready_take_while(|(key, _)| key.starts_with(room_prefix.as_slice()))
-			.ready_filter_map(|(key, val)| {
-				(key.ends_with(suffix.as_slice())
-					|| (legacy_match && key.ends_with(user_id_bytes)))
-				.then_some((key, val))
-			})
-			.ready_fold((Superseded::new(), None), |(mut superseded, current), (key, val)| {
-				let current = superseded
-					.is_empty()
-					.then_some(val)
-					.and_then(stored_event_id)
-					.or(current);
-
-				superseded.push(key.into());
-
-				(superseded, current)
-			})
+		let guard = self
+			.services
+			.pusher
+			.lock_notification(user_id, room_id)
 			.await;
-
+		let thread_kind = event_thread_kind(event);
+		let (superseded, current) = self
+			.receipt_inventory(room_id, user_id, thread_kind)
+			.await?;
 		if !self
 			.receipt_advanced(current.as_deref(), event_id)
-			.await
+			.await?
 		{
-			return false;
+			return Ok(false);
 		}
-
-		let count = self
-			.services
-			.globals
-			.next_count()
-			.await
-			.expect("failed to obtain next sequence number");
-		let latest_id = (room_id, *count, user_id, thread_kind);
-
-		let mut txn = superseded
-			.iter()
-			.fold(self.services.db.txn(), |mut txn, key| {
-				txn.del_raw(&self.readreceiptid_readreceipt, key);
-				txn
-			});
-
-		txn.put(&self.readreceiptid_readreceipt, latest_id, Json(event));
-		txn.execute().await.expect("database write error");
-
-		true
+		let mut txn = self.services.db.txn();
+		for key in &superseded {
+			txn.del_raw(&self.readreceiptid_readreceipt, key);
+		}
+		check_receipt_mutation(&txn)?;
+		let count = self.services.globals.next_count().await?;
+		txn.put(
+			&self.readreceiptid_readreceipt,
+			(room_id, *count, user_id, thread_kind),
+			Json(event),
+		);
+		let thread = event
+			.content
+			.values()
+			.next()
+			.and_then(|by_type| by_type.values().next())
+			.and_then(|by_user| by_user.values().next())
+			.map(|receipt| &receipt.thread)
+			.ok_or_else(|| Error::bad_database("Receipt has no thread context"))?;
+		let local = self.services.globals.user_is_local(user_id);
+		if local {
+			self.services
+				.pusher
+				.stage_notification_reset(&mut txn, &guard, thread, Some(*count))
+				.await?;
+		}
+		check_receipt_mutation(&txn)?;
+		txn.execute().await?;
+		if local {
+			self.services
+				.pusher
+				.notification_reset_committed(&guard, thread);
+		}
+		Ok(true)
 	}
 
-	/// Whether a receipt for `incoming` supersedes the stored one at
-	/// `current`.
-	///
-	/// An identical event id never advances. A position that does not resolve
-	/// to a known PDU falls through to acceptance, so a receipt this server
-	/// cannot order is never silently dropped.
-	async fn receipt_advanced(&self, current: Option<&EventId>, incoming: &EventId) -> bool {
+	/// Inspect complete bounded room pages, including errors and malformed
+	/// matching rows. The latest matching stream position supplies `current`.
+	async fn receipt_inventory(
+		&self,
+		room: &RoomId,
+		user: &UserId,
+		kind: &str,
+	) -> Result<(Superseded, Option<OwnedEventId>)> {
+		let prefix = serialize_key((room, Interfix))?;
+		let mut after = None;
+		let mut superseded = Superseded::new();
+		let mut current = None;
+		let mut rows = 0_usize;
+		let mut bytes = 0_usize;
+		loop {
+			let page = self
+				.readreceiptid_readreceipt
+				.raw_rows_prefix_after(&prefix, after.as_deref(), 64)
+				.await?;
+			if page.is_empty() {
+				break;
+			}
+			for (key, val) in page {
+				rows = rows.saturating_add(1);
+				bytes = bytes
+					.saturating_add(key.len())
+					.saturating_add(val.len());
+				if rows > 4096 || bytes > 4 * 1024 * 1024 {
+					return receipt_limit();
+				}
+				let (stored_room, _, stored_user, stored_kind): (&RoomId, u64, &UserId, &str) =
+					deserialize_from_slice(&key)?;
+				if stored_room != room {
+					return Err(Error::bad_database("Receipt inventory room binding mismatch"));
+				}
+				if stored_user == user && stored_kind == kind {
+					current = Some(stored_event_id(&val)?);
+					superseded.push(key.clone().into());
+					if superseded.len() > 897 {
+						return receipt_limit();
+					}
+				}
+				after = Some(key);
+			}
+		}
+		Ok((superseded, current))
+	}
+
+	async fn receipt_advanced(
+		&self,
+		current: Option<&EventId>,
+		incoming: &EventId,
+	) -> Result<bool> {
 		match current {
-			| None => true,
-			| Some(current) if current == incoming => false,
+			| None => Ok(true),
+			| Some(current) if current == incoming => Ok(false),
 			| Some(current) => {
 				let (current, incoming) = join(
 					self.services.timeline.get_pdu_count(current),
 					self.services.timeline.get_pdu_count(incoming),
 				)
 				.await;
-
-				position_advances(current.ok(), incoming.ok())
+				let position = |result: Result<PduCount>| match result {
+					| Ok(count) => Ok(Some(count)),
+					| Err(error) if error.is_not_found() => Ok(None),
+					| Err(error) => Err(error),
+				};
+				Ok(position_advances(position(current)?, position(incoming)?))
 			},
 		}
 	}
@@ -225,82 +271,75 @@ impl Data {
 	/// mirrored separately so notification-only writes cannot alter a sync
 	/// snapshot without changing its version.
 	#[inline]
-	pub(super) async fn private_read_set(
+	pub(super) async fn private_read_set(&self, read: PrivateRead<'_>) -> Result<bool> {
+		let mut txn = self.services.db.txn();
+		let Some(prepared) = self.stage_private_read(read, &mut txn).await? else {
+			return Ok(false);
+		};
+		txn.execute().await?;
+		prepared.committed(&self.services.pusher);
+		Ok(true)
+	}
+
+	/// Prepare the sender marker/reset inside the transaction accepting its
+	/// event. The guard and optional sequence permit outlive that commit.
+	pub(super) async fn stage_private_read(
 		&self,
-		PrivateRead {
+		read: PrivateRead<'_>,
+		txn: &mut Txn,
+	) -> Result<Option<PreparedPrivateRead>> {
+		let PrivateRead {
 			room_id,
 			user_id,
 			count,
 			ts,
 			thread,
 			announce,
-		}: PrivateRead<'_>,
-	) -> bool {
+		} = read;
+		let guard = self
+			.services
+			.pusher
+			.lock_notification(user_id, room_id)
+			.await;
 		let thread_kind = thread.as_str().unwrap_or_default();
-
-		if self
+		match self
 			.private_read_position(room_id, user_id, thread_kind)
 			.await
-			.is_ok_and(|(stored, _)| count <= stored)
 		{
-			return false;
+			| Ok((stored, _)) if count <= stored => return Ok(None),
+			| Ok(_) => {},
+			| Err(error) if error.is_not_found() => {},
+			| Err(error) => return Err(error),
 		}
-
 		let reset_sync = if announce && !thread_kind.is_empty() {
-			let versions = try_join(
+			let (gate, snapshot) = try_join(
 				self.last_privateread_update_fallible(user_id, room_id),
 				self.private_read_sync_update_fallible(user_id, room_id),
 			)
-			.await;
-
-			match versions {
-				| Ok((gate, snapshot)) => gate != snapshot,
-				| Err(error) => {
-					error!(?error, "Failed to inspect the private read sync snapshot.");
-					return false;
-				},
-			}
+			.await?;
+			gate != snapshot
 		} else {
 			false
 		};
-
-		let mut txn = self
-			.sweep_thread_private_reads(
-				&self.roomuserid_privateread,
-				room_id,
-				user_id,
-				thread_kind,
-				self.services.db.txn(),
-			)
-			.await;
-
+		self.sweep_thread_private_reads(
+			&self.roomuserid_privateread,
+			room_id,
+			user_id,
+			thread_kind,
+			txn,
+		)
+		.await?;
 		if announce && (thread_kind.is_empty() || reset_sync) {
-			txn = match self
-				.sweep_private_read_sync(room_id, user_id, txn)
-				.await
-			{
-				| Ok(txn) => txn,
-				| Err(error) => {
-					error!(?error, "Failed to reset the private read sync snapshot.");
-					return false;
-				},
-			};
+			self.sweep_private_read_sync(room_id, user_id, txn)
+				.await?;
 		}
-
-		// The permit retires the sequence number on drop, so it outlives execute().
+		// The permit outlives the combined marker/reset commit.
 		let next_count = if announce {
-			match self.services.globals.next_count().await {
-				| Ok(permit) => Some(permit),
-				| Err(error) => {
-					error!(?error, "Failed to obtain next sequence number.");
-					return false;
-				},
-			}
+			Some(self.services.globals.next_count().await?)
 		} else {
 			None
 		};
 		let ts = u64::from(ts.get());
-
 		if let Some(next_count) = next_count.as_deref() {
 			txn.put(&self.roomuserid_lastprivatereadupdate, (room_id, user_id), *next_count);
 			txn.put(&self.roomuserid_privatereadsync, (room_id, user_id), *next_count);
@@ -310,8 +349,6 @@ impl Data {
 				(count, ts),
 			);
 		}
-
-		// Additive value tail: ts (millis); old bare-count rows read back None.
 		match thread_kind.is_empty() {
 			| true => txn.put(&self.roomuserid_privateread, (room_id, user_id), (count, ts)),
 			| false => txn.put(
@@ -320,10 +357,21 @@ impl Data {
 				(count, ts),
 			),
 		}
-
-		txn.execute().await.expect("database write error");
-
-		true
+		let local = self.services.globals.user_is_local(user_id);
+		if local {
+			let stamp = next_count.as_deref().copied().unwrap_or(count);
+			self.services
+				.pusher
+				.stage_notification_reset(txn, &guard, thread, Some(stamp))
+				.await?;
+		}
+		check_receipt_mutation(txn)?;
+		Ok(Some(PreparedPrivateRead {
+			guard,
+			_permit: next_count,
+			thread: thread.clone(),
+			local,
+		}))
 	}
 
 	/// Private read position for an exact `(room, user, thread)` context.
@@ -397,21 +445,12 @@ impl Data {
 		room_id: &RoomId,
 		user_id: &UserId,
 		thread_kind: &str,
-		txn: Txn,
-	) -> Txn {
+		txn: &mut Txn,
+	) -> Result {
 		if !thread_kind.is_empty() {
-			return txn;
+			return Ok(());
 		}
-
-		let prefix = (room_id, user_id, Interfix);
-
-		map.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.ready_fold(txn, |mut txn, key| {
-				txn.del_raw(map, key);
-				txn
-			})
-			.await
+		sweep_private_rows(map, room_id, user_id, txn).await
 	}
 
 	#[inline]
@@ -419,17 +458,9 @@ impl Data {
 		&self,
 		room_id: &RoomId,
 		user_id: &UserId,
-		txn: Txn,
-	) -> Result<Txn> {
-		let prefix = (room_id, user_id, Interfix);
-
-		self.roomuserid_privatereadsync
-			.keys_prefix_raw(&prefix)
-			.ready_try_fold(txn, |mut txn, key| {
-				txn.del_raw(&self.roomuserid_privatereadsync, key);
-				Ok(txn)
-			})
-			.await
+		txn: &mut Txn,
+	) -> Result {
+		sweep_private_rows(&self.roomuserid_privatereadsync, room_id, user_id, txn).await
 	}
 
 	#[inline]
@@ -530,16 +561,53 @@ fn event_thread_kind(event: &ReceiptEvent) -> &str {
 		.unwrap_or_default()
 }
 
-/// First event id named by a stored receipt row.
-///
-/// `None` when the row does not deserialize, which the caller treats as an
-/// unknown position and accepts, replacing the row.
-fn stored_event_id(val: &[u8]) -> Option<OwnedEventId> {
-	serde_json::from_slice::<StoredContent>(val)
-		.ok()?
+/// Malformed or empty receipt content is a storage error, not an unknown
+/// position.
+fn stored_event_id(val: &[u8]) -> Result<OwnedEventId> {
+	let content: StoredContent = serde_json::from_slice(val)
+		.map_err(|_| Error::bad_database("Invalid stored receipt content"))?;
+	content
 		.content
 		.into_keys()
 		.next()
+		.ok_or_else(|| Error::bad_database("Stored receipt has no event"))
+}
+
+async fn sweep_private_rows(
+	map: &Arc<Map>,
+	room: &RoomId,
+	user: &UserId,
+	txn: &mut Txn,
+) -> Result {
+	let prefix = (room, user, Interfix);
+	let keys = map.keys_prefix_raw_capped(&prefix, 901_usize.saturating_sub(txn.len()));
+	pin_mut!(keys);
+	while let Some(key) = keys.try_next().await? {
+		let (stored_room, stored_user, _): (&RoomId, &UserId, &str) =
+			deserialize_from_slice(key)?;
+		if stored_room != room || stored_user != user {
+			return Err(Error::bad_database("Private receipt inventory binding mismatch"));
+		}
+		txn.del_raw(map, key);
+		check_receipt_mutation(txn)?;
+	}
+	Ok(())
+}
+
+fn check_receipt_mutation(txn: &Txn) -> Result {
+	if txn.len() > 900 || txn.size_in_bytes() > 512 * 1024 {
+		return receipt_limit();
+	}
+	Ok(())
+}
+
+fn receipt_limit<T>() -> Result<T> {
+	use ruma::api::error::{ErrorKind, LimitExceededErrorData};
+	Err(Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+		"Receipt mutation inventory limit exceeded".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	))
 }
 
 /// Whether an incoming receipt position strictly advances the stored one.

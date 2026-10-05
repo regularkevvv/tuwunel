@@ -907,11 +907,11 @@ async fn counts_only_delivery(
 
 	pusher
 		.reset_notification_counts(fixture.user, room_id)
-		.await;
+		.await?;
 
 	pusher
 		.reset_notification_counts(fixture.user, other_room_id)
-		.await;
+		.await?;
 
 	let remaining = pusher
 		.global_notification_count(fixture.user)

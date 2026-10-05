@@ -1,17 +1,20 @@
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{collections::BTreeMap, sync::Arc};
 
-use futures::{StreamExt, future::join3, stream::select};
-use ruma::{EventId, OwnedEventId, RoomId, UserId, events::receipt::ReceiptThread};
-use serde::Serialize;
+use futures::{StreamExt, TryStreamExt, pin_mut, stream::select};
+use ruma::{
+	EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+	events::receipt::ReceiptThread,
+};
 use tuwunel_core::{
-	Result, implement, trace,
+	Error, Result, implement, trace,
 	utils::{
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
 		u64_from_u8,
 	},
 };
 use tuwunel_database::{
-	Deserialized, Ignore, IgnoreAll, Interfix, KeyBuf, deserialize_from_slice as deserialize_key,
+	Deserialized, Ignore, IgnoreAll, Interfix, KeyBuf, Map, Txn,
+	deserialize_from_slice as deserialize_key,
 };
 
 /// Per-thread unread counts: `(notification, highlight)` keyed by thread root.
@@ -22,165 +25,206 @@ type ThreadCounts = BTreeMap<OwnedEventId, (u64, u64)>;
 /// cursor advanced within the sync window.
 type ThreadLastReads = BTreeMap<OwnedEventId, u64>;
 
-/// Reset the room's main-timeline notification counts.
-///
-/// The last-read stamp gates sync output; callers dispatch the badge refresh
-/// after every reset.
+pub(crate) struct NotificationGuard {
+	user: OwnedUserId,
+	room: OwnedRoomId,
+	_guard: tuwunel_core::utils::mutex_map::Guard<(OwnedRoomId, OwnedUserId), ()>,
+}
+
 #[implement(super::Service)]
-#[tracing::instrument(level = "debug", skip(self))]
-pub async fn reset_notification_counts(&self, user_id: &UserId, room_id: &RoomId) {
-	let count = self
-		.services
-		.globals
-		.next_count()
-		.await
-		.expect("failed to obtain next sequence number");
-
-	let userroom_id = (user_id, room_id);
-
-	self.reset_notification_count(room_id, user_id, userroom_id)
-		.await;
-
-	self.db
-		.userroomid_highlightcount
-		.put(userroom_id, 0_u64)
-		.await
-		.expect("database write error");
-
-	let roomuser_id = (room_id, user_id);
-	self.db
-		.roomuserid_lastnotificationread
-		.put(roomuser_id, *count)
-		.await
-		.expect("database write error");
-
-	let removed = self.clear_suppressed_room(user_id, room_id);
-	if removed > 0 {
-		trace!(?user_id, ?room_id, removed, "Cleared suppressed push events after read");
+pub(crate) async fn lock_notification(&self, user: &UserId, room: &RoomId) -> NotificationGuard {
+	NotificationGuard {
+		user: user.to_owned(),
+		room: room.to_owned(),
+		_guard: self
+			.notification_mutex
+			.lock(&(room.to_owned(), user.to_owned()))
+			.await,
 	}
 }
 
+/// Reset the main count pair and its sync stamp in one transaction.
 #[implement(super::Service)]
-async fn reset_notification_count<K>(&self, room_id: &RoomId, user_id: &UserId, key: K)
-where
-	K: Serialize + Debug + Send + Sync,
-{
-	// The increment path is a read-modify-write under this lock; an unlocked
-	// zero could land inside it and be overwritten by the stale sum.
-	let _lock = self
-		.notification_increment_mutex
-		.lock(&(room_id.to_owned(), user_id.to_owned()))
-		.await;
-
-	self.db
-		.userroomid_notificationcount
-		.put(key, 0_u64)
+pub async fn reset_notification_counts(&self, user: &UserId, room: &RoomId) -> Result {
+	self.reset_notification_counts_for_thread(user, room, &ReceiptThread::Main)
 		.await
-		.expect("database write error");
 }
 
-/// Reset counts for a single thread within a room.
-///
-/// The last-read stamp gates sync output.
+/// Reset a single thread's count pair and sync stamp atomically.
 #[implement(super::Service)]
-#[tracing::instrument(level = "debug", skip(self))]
 pub async fn reset_thread_notification_counts(
 	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
-	thread_root: &EventId,
-) {
-	let count = self
-		.services
-		.globals
-		.next_count()
+	user: &UserId,
+	room: &RoomId,
+	root: &EventId,
+) -> Result {
+	self.reset_notification_counts_for_thread(user, room, &ReceiptThread::Thread(root.to_owned()))
 		.await
-		.expect("failed to obtain next sequence number");
-
-	let userroom_thread = (user_id, room_id, thread_root);
-
-	self.reset_notification_count(room_id, user_id, userroom_thread)
-		.await;
-
-	self.db
-		.userroomid_highlightcount
-		.put(userroom_thread, 0_u64)
-		.await
-		.expect("database write error");
-
-	let roomuser_thread = (room_id, user_id, thread_root);
-	self.db
-		.roomuserid_lastnotificationread
-		.put(roomuser_thread, *count)
-		.await
-		.expect("database write error");
 }
 
-/// Clear all per-thread notification state for this user and room.
-///
-/// The `Interfix` prefix excludes the main row. The notification-count sweep
-/// runs under the increment mutex so a concurrent read-modify-write cannot
-/// resurrect a cleared row.
+/// Clear the thread rows together while preserving the main count pair.
 #[implement(super::Service)]
-#[tracing::instrument(level = "debug", skip(self))]
-pub async fn clear_all_thread_notification_counts(&self, user_id: &UserId, room_id: &RoomId) {
-	let userroom_prefix = (user_id, room_id, Interfix);
-	let roomuser_prefix = (room_id, user_id, Interfix);
-
-	let highlights = self
-		.db
-		.userroomid_highlightcount
-		.del_prefix(&userroom_prefix);
-
-	let last_reads = self
-		.db
-		.roomuserid_lastnotificationread
-		.del_prefix(&roomuser_prefix);
-
-	let notifications = async {
-		let _lock = self
-			.notification_increment_mutex
-			.lock(&(room_id.to_owned(), user_id.to_owned()))
-			.await;
-
-		self.db
-			.userroomid_notificationcount
-			.del_prefix(&userroom_prefix)
-			.await
-			.expect("database write error");
-	};
-
-	let ((), highlights, last_reads) = join3(notifications, highlights, last_reads).await;
-	highlights.expect("database write error");
-	last_reads.expect("database write error");
+pub async fn clear_all_thread_notification_counts(&self, user: &UserId, room: &RoomId) -> Result {
+	let _lock = self
+		.notification_mutex
+		.lock(&(room.to_owned(), user.to_owned()))
+		.await;
+	let mut txn = self.db.db.txn();
+	self.stage_thread_clear(&mut txn, user, room)
+		.await?;
+	check_mutation(&txn)?;
+	txn.execute().await
 }
 
-/// Dispatcher: route a receipt's `ReceiptThread` to the matching reset path.
-///
-/// `Unthreaded` clears all room and thread counts; `Main` clears only the
-/// main-timeline counts; `Thread(id)` clears just that thread.
+/// Reset one thread context. An unthreaded reset includes every thread row
+/// and the main count pair in the same bounded commit. Inventories complete
+/// before mutation; storage/limit errors leave all notification maps intact.
 #[implement(super::Service)]
 pub async fn reset_notification_counts_for_thread(
 	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
+	user: &UserId,
+	room: &RoomId,
 	thread: &ReceiptThread,
-) {
-	match thread {
-		| ReceiptThread::Main =>
-			self.reset_notification_counts(user_id, room_id)
-				.await,
-		| ReceiptThread::Thread(root) =>
-			self.reset_thread_notification_counts(user_id, room_id, root)
-				.await,
-		| _ => {
-			self.reset_notification_counts(user_id, room_id)
-				.await;
+) -> Result {
+	let guard = self.lock_notification(user, room).await;
+	let mut txn = self.db.db.txn();
+	self.stage_notification_reset(&mut txn, &guard, thread, None)
+		.await?;
+	// The permit stays alive through execute so sync cannot pass this stamp.
+	let count = self.services.globals.next_count().await?;
+	self.stage_notification_read_stamp(&mut txn, &guard, thread, *count)?;
+	check_mutation(&txn)?;
+	txn.execute().await?;
+	self.notification_reset_committed(&guard, thread);
+	Ok(())
+}
 
-			self.clear_all_thread_notification_counts(user_id, room_id)
-				.await;
+/// The caller retains `guard` until its receipt/event transaction commits.
+/// A supplied stamp lets the receipt share its existing sequence permit.
+#[implement(super::Service)]
+pub(crate) async fn stage_notification_reset(
+	&self,
+	txn: &mut Txn,
+	guard: &NotificationGuard,
+	thread: &ReceiptThread,
+	stamp: Option<u64>,
+) -> Result {
+	let user = &*guard.user;
+	let room = &*guard.room;
+	match thread {
+		| ReceiptThread::Unthreaded => self.stage_thread_clear(txn, user, room).await?,
+		| ReceiptThread::Main | ReceiptThread::Thread(_) => {},
+		| _ => return Err(tuwunel_core::err!(Request(InvalidParam("Unknown receipt thread")))),
+	}
+	match thread {
+		| ReceiptThread::Thread(root) => {
+			txn.put(&self.db.userroomid_notificationcount, (user, room, root), 0_u64);
+			txn.put(&self.db.userroomid_highlightcount, (user, room, root), 0_u64);
+		},
+		| _ => {
+			txn.put(&self.db.userroomid_notificationcount, (user, room), 0_u64);
+			txn.put(&self.db.userroomid_highlightcount, (user, room), 0_u64);
 		},
 	}
+	if let Some(stamp) = stamp {
+		self.stage_notification_read_stamp(txn, guard, thread, stamp)?;
+	}
+	check_mutation(txn)
+}
+
+#[implement(super::Service)]
+fn stage_notification_read_stamp(
+	&self,
+	txn: &mut Txn,
+	guard: &NotificationGuard,
+	thread: &ReceiptThread,
+	stamp: u64,
+) -> Result {
+	match thread {
+		| ReceiptThread::Thread(root) => txn.put(
+			&self.db.roomuserid_lastnotificationread,
+			(&*guard.room, &*guard.user, root),
+			stamp,
+		),
+		| _ =>
+			txn.put(&self.db.roomuserid_lastnotificationread, (&*guard.room, &*guard.user), stamp),
+	}
+	check_mutation(txn)
+}
+
+#[implement(super::Service)]
+pub(crate) fn notification_reset_committed(
+	&self,
+	guard: &NotificationGuard,
+	thread: &ReceiptThread,
+) {
+	if matches!(thread, ReceiptThread::Main | ReceiptThread::Unthreaded) {
+		let removed = self.clear_suppressed_room(&guard.user, &guard.room);
+		if removed > 0 {
+			trace!(user = %guard.user, room = %guard.room, removed, "Cleared suppressed push events after read");
+		}
+	}
+}
+
+#[implement(super::Service)]
+async fn stage_thread_clear(&self, txn: &mut Txn, user: &UserId, room: &RoomId) -> Result {
+	for map in [&self.db.userroomid_notificationcount, &self.db.userroomid_highlightcount] {
+		stage_thread_keys(map, txn, user, room, false).await?;
+	}
+	stage_thread_keys(&self.db.roomuserid_lastnotificationread, txn, user, room, true).await
+}
+
+async fn stage_thread_keys(
+	map: &Arc<Map>,
+	txn: &mut Txn,
+	user: &UserId,
+	room: &RoomId,
+	room_first: bool,
+) -> Result {
+	let prefix = if room_first {
+		tuwunel_database::serialize_key((room, user, Interfix))?
+	} else {
+		tuwunel_database::serialize_key((user, room, Interfix))?
+	};
+	// Main reset needs three operations; the extra key detects overflow.
+	let stream = map.keys_prefix_raw_capped(&prefix, 898_usize.saturating_sub(txn.len()));
+	pin_mut!(stream);
+	while let Some(key) = stream.try_next().await? {
+		if room_first {
+			let (stored_room, stored_user, _): (&RoomId, &UserId, &EventId) =
+				deserialize_key(key)?;
+			if stored_room != room || stored_user != user {
+				return Err(Error::bad_database("Notification read stamp binding mismatch"));
+			}
+		} else {
+			let (stored_user, stored_room, _): (&UserId, &RoomId, &EventId) =
+				deserialize_key(key)?;
+			if stored_room != room || stored_user != user {
+				return Err(Error::bad_database("Notification counter binding mismatch"));
+			}
+		}
+		txn.del_raw(map, key);
+		if txn.len() > 897 || txn.size_in_bytes() > 512 * 1024 - 4096 {
+			return notification_limit();
+		}
+	}
+	Ok(())
+}
+
+pub(super) fn check_mutation(txn: &Txn) -> Result {
+	if txn.len() > 900 || txn.size_in_bytes() > 512 * 1024 {
+		return notification_limit();
+	}
+	Ok(())
+}
+
+fn notification_limit<T>() -> Result<T> {
+	use ruma::api::error::{ErrorKind, LimitExceededErrorData};
+	Err(Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+		"Notification mutation limit exceeded".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	))
 }
 
 #[implement(super::Service)]

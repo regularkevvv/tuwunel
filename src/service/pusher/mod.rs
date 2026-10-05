@@ -34,6 +34,7 @@ use url::Url;
 
 pub use self::append::Notified;
 use self::badge::SentBadges;
+pub(crate) use self::notification::NotificationGuard;
 
 /// The events an event relates to, keyed by relation type, for MSC3664.
 type RelatedEvents = BTreeMap<String, FlattenedJson>;
@@ -84,8 +85,7 @@ struct InReplyTo {
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
-	notification_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
-	highlight_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
+	notification_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
 	db: Data,
 	suppressed: suppressed::SuppressedQueue,
 	sent_badges: SentBadges,
@@ -105,8 +105,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
-			notification_increment_mutex: MutexMap::new(),
-			highlight_increment_mutex: MutexMap::new(),
+			notification_mutex: MutexMap::new(),
 			db: Data {
 				db: args.db.clone(),
 				senderkey_pusher: args.db["senderkey_pusher"].clone(),

@@ -31,6 +31,7 @@ use tuwunel_core::{
 	warn,
 };
 
+pub(crate) use self::data::PreparedPrivateRead;
 use self::data::{Data, ReceiptItem};
 
 /// Private read receipts surfaced by `private_read_get`. One legacy
@@ -96,14 +97,14 @@ impl Service {
 		user_id: &UserId,
 		room_id: &RoomId,
 		event: &ReceiptEvent,
-	) -> bool {
+	) -> Result<bool> {
 		if self
 			.db
 			.readreceipt_update(user_id, room_id, event)
-			.await
+			.await?
 			.is_false()
 		{
-			return false;
+			return Ok(false);
 		}
 
 		// The receipt is stored. Each delivery that follows runs whether or not the
@@ -139,7 +140,7 @@ impl Service {
 				});
 		}
 
-		true
+		Ok(true)
 	}
 
 	/// Gets every stored private read receipt for `(room, user)`. Returns
@@ -396,8 +397,16 @@ impl Service {
 	/// receipt subsumes thread state. Returns whether the marker advanced; a
 	/// position at or behind the stored one writes nothing.
 	#[tracing::instrument(skip(self), level = "debug", name = "set_private")]
-	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> bool {
+	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> Result<bool> {
 		self.db.private_read_set(private_read).await
+	}
+
+	pub(crate) async fn stage_private_read(
+		&self,
+		read: PrivateRead<'_>,
+		txn: &mut tuwunel_database::Txn,
+	) -> Result<Option<PreparedPrivateRead>> {
+		self.db.stage_private_read(read, txn).await
 	}
 
 	/// Returns the private read marker PDU count.

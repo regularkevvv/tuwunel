@@ -23,7 +23,13 @@ async fn set_private_marker(
 		.timeline
 		.get_pdu_count(event)
 		.await
-		.map_err(|_| err!(Request(NotFound("Event not found."))))?;
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Request(NotFound("Event not found.")))
+			} else {
+				error
+			}
+		})?;
 
 	let PduCount::Normal(count) = count else {
 		return Err!(Request(InvalidParam(
@@ -41,31 +47,23 @@ async fn set_private_marker(
 			thread,
 			announce: true,
 		})
-		.await;
+		.await?;
 
 	Ok(advanced)
 }
 
-/// Clears the receipt's notification counts and refreshes the push badge.
+/// Refresh the badge after the receipt and counts commit together.
 ///
 /// The refresh follows every advance because the gateway can hold a stale
 /// badge while the stored count is already zero; only a delivery reconciles
 /// it.
-async fn reset_and_refresh_badge(
-	services: &Services,
-	user_id: &UserId,
-	room_id: &RoomId,
-	thread: &ReceiptThread,
-) {
-	services
-		.pusher
-		.reset_notification_counts_for_thread(user_id, room_id, thread)
-		.await;
-
+async fn refresh_badge(services: &Services, user_id: &UserId) -> Result {
 	services
 		.sending
 		.refresh_push_badge(user_id)
 		.await
 		.log_err()
 		.ok();
+
+	Ok(())
 }

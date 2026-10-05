@@ -1,9 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use futures::{
-	FutureExt, StreamExt,
-	future::{join, join4},
-};
+use futures::{FutureExt, StreamExt, future::join};
 use ruma::{
 	EventId, RoomId, UserId,
 	api::client::push::ProfileTag,
@@ -17,17 +14,15 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use tracing::Level;
 use tuwunel_core::{
-	Result, implement,
+	Error, Result, implement,
 	matrix::{
 		event::Event,
 		pdu::{Count, Pdu, PduId, RawPduId},
 	},
 	trace,
-	utils::{
-		BoolExt, ReadyExt, future::TryExtExt, option::OptionExt, result::ErrLog, time::now_millis,
-	},
+	utils::{BoolExt, ReadyExt, future::TryExtExt, result::ErrLog, time::now_millis},
 };
-use tuwunel_database::{Deserialized, Json, Map};
+use tuwunel_database::{Map, Txn, serialize_key};
 
 use super::{Evaluate, RelatedEvents};
 use crate::rooms::{short::ShortRoomId, timeline::Effect};
@@ -182,30 +177,6 @@ async fn append_pdu_for_user(
 		"Push rules evaluated",
 	);
 
-	// Mutually-exclusive partition: each notify (and each highlight)
-	// lands in either the room-level or thread bucket, never both.
-	let main_notify = (notify && thread_root.is_none())
-		.then_async(|| self.increment_notificationcount(pdu.room_id(), user));
-
-	let main_highlight = (highlight && thread_root.is_none())
-		.then_async(|| self.increment_highlightcount(pdu.room_id(), user));
-
-	let thread_notify = thread_root
-		.filter(|_| notify)
-		.map_async(|root| self.increment_thread_notificationcount(pdu.room_id(), user, root));
-
-	let thread_highlight = thread_root
-		.filter(|_| highlight)
-		.map_async(|root| self.increment_thread_highlightcount(pdu.room_id(), user, root));
-
-	let counted = join4(main_notify, thread_notify, main_highlight, thread_highlight).await;
-	for counted in [counted.0, counted.1, counted.2, counted.3]
-		.into_iter()
-		.flatten()
-	{
-		counted.effect("push count", pdu.event_id());
-	}
-
 	if notify || highlight {
 		let id: PduId = (*pdu_id).into();
 		let notified = Notified {
@@ -215,13 +186,9 @@ async fn append_pdu_for_user(
 			actions: actions.into(),
 		};
 
-		if matches!(id.count, Count::Normal(_)) {
-			self.db
-				.useridcount_notification
-				.put((user, id.count.into_unsigned()), Json(notified))
-				.await
-				.effect("notification row", pdu.event_id());
-		}
+		self.commit_notification(user, pdu.room_id(), thread_root, id, &notified)
+			.await
+			.effect("notification row", pdu.event_id());
 	}
 
 	if notify || highlight || self.services.config.push_everything {
@@ -239,62 +206,60 @@ async fn append_pdu_for_user(
 	Ok(())
 }
 
+/// Commit one recipient's notification entry and its mutually exclusive
+/// main/thread count pair together. Resets use the same room/user lock.
 #[implement(super::Service)]
-async fn increment_notificationcount(&self, room_id: &RoomId, user_id: &UserId) -> Result {
-	let db = &self.db.userroomid_notificationcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.notification_increment_mutex.lock(&key).await;
-
-	increment(db, (user_id, room_id)).await
-}
-
-#[implement(super::Service)]
-async fn increment_highlightcount(&self, room_id: &RoomId, user_id: &UserId) -> Result {
-	let db = &self.db.userroomid_highlightcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.highlight_increment_mutex.lock(&key).await;
-
-	increment(db, (user_id, room_id)).await
-}
-
-#[implement(super::Service)]
-async fn increment_thread_notificationcount(
+async fn commit_notification(
 	&self,
-	room_id: &RoomId,
-	user_id: &UserId,
-	thread_root: &EventId,
+	user: &UserId,
+	room: &RoomId,
+	thread: Option<&EventId>,
+	id: PduId,
+	notified: &Notified,
 ) -> Result {
-	let db = &self.db.userroomid_notificationcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.notification_increment_mutex.lock(&key).await;
-
-	increment_thread(db, (user_id, room_id, thread_root)).await
+	let _lock = self
+		.notification_mutex
+		.lock(&(room.to_owned(), user.to_owned()))
+		.await;
+	let notify = notified.actions.iter().any(Action::should_notify);
+	let highlight = notified.actions.iter().any(|action| {
+		matches!(action, Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)))
+	});
+	let key = match thread {
+		| Some(root) => serialize_key((user, room, root))?,
+		| None => serialize_key((user, room))?,
+	};
+	let mut txn = self.db.db.txn();
+	if notify {
+		stage_increment(&mut txn, &self.db.userroomid_notificationcount, &key).await?;
+	}
+	if highlight {
+		stage_increment(&mut txn, &self.db.userroomid_highlightcount, &key).await?;
+	}
+	if matches!(id.count, Count::Normal(_)) {
+		let key = serialize_key((user, id.count.into_unsigned()))?;
+		let value = serde_json::to_vec(notified)?;
+		txn.insert_raw(&self.db.useridcount_notification, key, value);
+	}
+	super::notification::check_mutation(&txn)?;
+	txn.execute().await
 }
 
-#[implement(super::Service)]
-async fn increment_thread_highlightcount(
-	&self,
-	room_id: &RoomId,
-	user_id: &UserId,
-	thread_root: &EventId,
-) -> Result {
-	let db = &self.db.userroomid_highlightcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.highlight_increment_mutex.lock(&key).await;
-
-	increment_thread(db, (user_id, room_id, thread_root)).await
-}
-
-async fn increment(db: &Arc<Map>, key: (&UserId, &RoomId)) -> Result {
-	let old: u64 = db.qry(&key).await.deserialized().unwrap_or(0);
-	let new = old.saturating_add(1);
-
-	db.put(key, new).await
-}
-
-async fn increment_thread(db: &Arc<Map>, key: (&UserId, &RoomId, &EventId)) -> Result {
-	let old: u64 = db.qry(&key).await.deserialized().unwrap_or(0);
-	let new = old.saturating_add(1);
-
-	db.put(key, new).await
+async fn stage_increment(txn: &mut Txn, map: &Arc<Map>, key: &[u8]) -> Result {
+	let old = match map.get(key).await {
+		| Ok(value) => {
+			let bytes: [u8; 8] = value
+				.as_ref()
+				.try_into()
+				.map_err(|_| Error::bad_database("Invalid notification counter"))?;
+			u64::from_be_bytes(bytes)
+		},
+		| Err(error) if error.is_not_found() => 0,
+		| Err(error) => return Err(error),
+	};
+	let new = old
+		.checked_add(1)
+		.ok_or_else(|| Error::bad_database("Notification counter overflow"))?;
+	txn.insert_raw(map, key, new.to_be_bytes());
+	Ok(())
 }
