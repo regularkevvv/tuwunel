@@ -144,6 +144,8 @@ sd-notify.workspace = true
 sd-notify.optional = true
 
 [dev-dependencies]
+# Native ACK atomicity control, isolated in its own test process.
+tuwunel-database = { workspace = true, features = ["commit_refusals"] }
 axum.workspace = true
 criterion.workspace = true
 insta.workspace = true

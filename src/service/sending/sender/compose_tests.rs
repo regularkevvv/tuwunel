@@ -177,13 +177,9 @@ async fn verify(federation: bool, fault: Fault) -> Result {
 		.await
 		.expect("compose before network")
 		.expect("one active transaction");
-	let acknowledged = matches!(response, Ok(Delivery::Acknowledged(_)));
+	let acknowledged = matches!(response, Ok(Delivery::Acknowledged(_, _)));
 	let local_refusal = matches!(&response, Ok(Delivery::Unprepared(_, error)) if error.status_code().is_server_error());
-	let mut stage = if acknowledged {
-		QueueRecovery::CleanupAcknowledged
-	} else {
-		QueueRecovery::ResumePending
-	};
+	let mut stage = QueueRecovery::ResumePending;
 	services
 		.sending
 		.handle_response(

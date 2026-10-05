@@ -5,8 +5,12 @@ mod tests;
 
 use futures::{Stream, StreamExt, TryStreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
+use tokio::sync::Mutex;
 use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
 use tuwunel_database::{Database, Deserialized, Map, Row, Txn, deserialize_from_slice};
+
+mod ack;
+pub(super) use ack::ActiveAcknowledgement;
 
 use super::{
 	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED,
@@ -24,6 +28,7 @@ pub struct Data {
 	servername_educount: Arc<Map>,
 	pub(super) db: Arc<Database>,
 	services: Arc<crate::services::OnceServices>,
+	active_write: Mutex<()>,
 }
 
 impl Data {
@@ -35,26 +40,18 @@ impl Data {
 			servername_educount: db["servername_educount"].clone(),
 			db: args.db.clone(),
 			services: args.services.clone(),
+			active_write: Mutex::new(()),
 		}
 	}
 
 	#[inline]
 	pub(super) async fn delete_active_request(&self, key: &[u8]) -> Result {
+		let _guard = self.active_write.lock().await;
 		self.servercurrentevent_data.remove(key).await
 	}
 
-	pub(super) async fn delete_all_active_requests_for(
-		&self,
-		destination: &Destination,
-	) -> Result {
-		let prefix = destination.get_prefix();
-		self.servercurrentevent_data
-			.raw_keys_prefix(&prefix)
-			.try_for_each(|key| async move { self.servercurrentevent_data.remove(key).await })
-			.await
-	}
-
 	pub(super) async fn delete_all_requests_for(&self, destination: &Destination) -> Result {
+		let _guard = self.active_write.lock().await;
 		let prefix = destination.get_prefix();
 		self.servercurrentevent_data
 			.raw_keys_prefix(&prefix)
@@ -71,6 +68,7 @@ impl Data {
 	where
 		I: Iterator<Item = &'a QueueItem>,
 	{
+		let _guard = self.active_write.lock().await;
 		events
 			.filter(|(key, _)| !key.is_empty())
 			.fold(self.db.txn(), |mut txn, (key, val)| {
@@ -92,6 +90,7 @@ impl Data {
 		queued: &[EduBuf],
 		last_count: u64,
 	) -> Result {
+		let _guard = self.active_write.lock().await;
 		let prefix = Destination::Federation(server.to_owned()).get_prefix();
 
 		let mut txn = self.db.txn();

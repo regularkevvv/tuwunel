@@ -62,7 +62,8 @@ use tuwunel_core::{
 };
 
 use super::{
-	Destination, EduBuf, EduVec, Msg, SendingEvent, Service, TAG_PREFIX_LEN, data::QueueItem,
+	Destination, EduBuf, EduVec, Msg, SendingEvent, Service, TAG_PREFIX_LEN,
+	data::{ActiveAcknowledgement, QueueItem},
 };
 use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 
@@ -71,6 +72,9 @@ mod edu_tests;
 
 #[cfg(test)]
 mod compose_tests;
+
+#[cfg(test)]
+mod ack_tests;
 
 /// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
 /// in `peer_status` (federation only); appservice/push paths keep their own
@@ -91,7 +95,7 @@ enum RetryAction {
 
 type SendingError = (Destination, Error);
 enum Delivery {
-	Acknowledged(Destination),
+	Acknowledged(Destination, ActiveAcknowledgement),
 	Deferred(Destination),
 	Unprepared(Destination, Box<Error>),
 }
@@ -101,6 +105,11 @@ type SendingFuture<'a> = BoxFuture<'a, SendingResult>;
 type SendingFutures<'a> = FuturesUnordered<SendingFuture<'a>>;
 type CurTransactionStatus = HashMap<Destination, TransactionStatus>;
 type FailedPushIds = SmallVec<[RawPduId; 1]>;
+
+// The dispatch wrapper attaches exact durable members to transport completion.
+fn transport_acknowledged(destination: Destination) -> Delivery {
+	Delivery::Acknowledged(destination, ActiveAcknowledgement::default())
+}
 
 fn unprepared(destination: Destination, error: Error) -> Delivery {
 	Delivery::Unprepared(destination, Box::new(error))
@@ -130,20 +139,19 @@ type WakeQueue = BinaryHeap<Reverse<(TokioInstant, Destination)>>;
 /// Local database backpressure is not a remote delivery failure. In particular,
 /// once ACK cleanup completes, a retry must never clean up the unsent
 /// successor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueRecovery {
-	CleanupAcknowledged,
+	CleanupAcknowledged(ActiveAcknowledgement),
 	ResumePending,
 }
 
 impl QueueRecovery {
-	async fn clean_acknowledged<F, Fut>(&mut self, cleanup: F) -> Result
+	async fn clean_acknowledged<F>(&mut self, cleanup: F) -> Result
 	where
-		F: FnOnce() -> Fut,
-		Fut: Future<Output = Result>,
+		F: AsyncFnOnce(&ActiveAcknowledgement) -> Result,
 	{
-		if *self == Self::CleanupAcknowledged {
-			cleanup().await?;
+		if let Self::CleanupAcknowledged(rows) = self {
+			cleanup(rows).await?;
 			*self = Self::ResumePending;
 		}
 		Ok(())
@@ -340,8 +348,7 @@ impl Service {
 			tokio::select! {
 				Some(response) = futures.next() => {
 					let (dest, mut stage) = match &response {
-						Ok(Delivery::Acknowledged(dest)) => (dest.clone(), QueueRecovery::CleanupAcknowledged),
-						Ok(Delivery::Deferred(dest) | Delivery::Unprepared(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
+						Ok(Delivery::Acknowledged(dest, _) | Delivery::Deferred(dest) | Delivery::Unprepared(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
 					};
 					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage, &mut retries).await {
 						defer_queue_error(&mut retries, dest, stage, error)?;
@@ -396,9 +403,11 @@ impl Service {
 				wakes.retain(|Reverse((_, armed))| armed != &dest);
 				arm_wake_in(wakes, dest, Duration::from_secs(if prompt { 1 } else { 5 }));
 			},
-			| Ok(Delivery::Acknowledged(dest)) =>
+			| Ok(Delivery::Acknowledged(dest, rows)) => {
+				*stage = QueueRecovery::CleanupAcknowledged(rows);
 				self.resume_queue(&dest, futures, statuses, stage)
-					.await?,
+					.await?;
+			},
 			| Err((dest, e)) => {
 				let retry_action = Self::handle_response_err(&dest, statuses, &e);
 
@@ -588,7 +597,7 @@ impl Service {
 	) -> Result {
 		let _cork = self.db.db.cork();
 		stage
-			.clean_acknowledged(|| self.db.delete_all_active_requests_for(dest))
+			.clean_acknowledged(async |rows| self.db.acknowledge_active(dest, rows).await)
 			.await?;
 
 		// A prior attempt may have promoted queued rows or persisted EDUs before
@@ -863,7 +872,7 @@ impl Service {
 			select! {
 				() = sleep_until(deadline) => return Ok(()),
 				response = futures.next() => match response {
-					Some(Ok(Delivery::Acknowledged(dest))) => self.db.delete_all_active_requests_for(&dest).await?,
+					Some(Ok(Delivery::Acknowledged(dest, rows))) => self.db.acknowledge_active(&dest, &rows).await?,
 					Some(_) => {},
 					None => return Ok(()),
 				},
@@ -1519,17 +1528,31 @@ impl Service {
 
 	fn send_events(&self, dest: Destination, events: Vec<SendingEvent>) -> SendingFuture<'_> {
 		debug_assert!(!events.is_empty(), "sending empty transaction");
-		match dest {
-			| Destination::Federation(server) => self
-				.send_events_dest_federation(server, events)
-				.boxed(),
-			| Destination::Appservice(id) => self
-				.send_events_dest_appservice(id, events)
-				.boxed(),
-			| Destination::Push(user_id, pushkey) => self
-				.send_events_dest_push(user_id, pushkey, events)
-				.boxed(),
+		async move {
+			let rows = match self
+				.db
+				.selected_acknowledgement(&dest, &events)
+				.await
+			{
+				| Ok(rows) => rows,
+				| Err(error) => return Ok(unprepared(dest, error)),
+			};
+			let response = match dest {
+				| Destination::Federation(server) =>
+					self.send_events_dest_federation(server, events)
+						.await,
+				| Destination::Appservice(id) =>
+					self.send_events_dest_appservice(id, events).await,
+				| Destination::Push(user_id, pushkey) =>
+					self.send_events_dest_push(user_id, pushkey, events)
+						.await,
+			};
+			response.map(|response| match response {
+				| Delivery::Acknowledged(dest, _) => Delivery::Acknowledged(dest, rows),
+				| response => response,
+			})
 		}
+		.boxed()
 	}
 
 	#[tracing::instrument(
@@ -1690,7 +1713,7 @@ impl Service {
 			&& device_one_time_keys_count.is_empty()
 			&& device_unused_fallback_key_types.is_empty()
 		{
-			return Ok(Delivery::Acknowledged(Destination::Appservice(id)));
+			return Ok(transport_acknowledged(Destination::Appservice(id)));
 		}
 
 		match self
@@ -1707,7 +1730,7 @@ impl Service {
 			})
 			.await
 		{
-			| Ok(_) => Ok(Delivery::Acknowledged(Destination::Appservice(id))),
+			| Ok(_) => Ok(transport_acknowledged(Destination::Appservice(id))),
 			| Err(e) => Err((Destination::Appservice(id), e)),
 		}
 	}
@@ -1836,7 +1859,7 @@ impl Service {
 			try_join3(pusher, rules_for_user, suppressed).await?;
 
 		let Some(pusher) = pusher else {
-			return Ok(Delivery::Acknowledged(Destination::Push(user_id, pushkey)));
+			return Ok(transport_acknowledged(Destination::Push(user_id, pushkey)));
 		};
 
 		// Reconciliation, not an alert: a suppressed drop strands a stale badge.
@@ -1887,7 +1910,7 @@ impl Service {
 		}
 
 		let PushFailures { ids, error: Some(error) } = failures else {
-			return Ok(Delivery::Acknowledged(Destination::Push(user_id, pushkey)));
+			return Ok(transport_acknowledged(Destination::Push(user_id, pushkey)));
 		};
 
 		let dest = Destination::Push(user_id, pushkey);
@@ -2076,7 +2099,7 @@ impl Service {
 		};
 
 		if pdus.is_empty() && edus.is_empty() {
-			return Ok(Delivery::Acknowledged(Destination::Federation(server)));
+			return Ok(transport_acknowledged(Destination::Federation(server)));
 		}
 
 		let preimage = pdus
@@ -2110,7 +2133,7 @@ impl Service {
 		}
 
 		match result {
-			| Ok(_) => Ok(Delivery::Acknowledged(Destination::Federation(server))),
+			| Ok(_) => Ok(transport_acknowledged(Destination::Federation(server))),
 			| Err(error) => Err((Destination::Federation(server), error)),
 		}
 	}
@@ -2144,15 +2167,15 @@ mod queue_recovery_tests {
 
 	#[tokio::test]
 	async fn cleanup_retry_cannot_delete_an_unsent_successor() {
-		let mut stage = QueueRecovery::CleanupAcknowledged;
+		let mut stage = QueueRecovery::CleanupAcknowledged(Default::default());
 		stage
-			.clean_acknowledged(|| async { Err(busy()) })
+			.clean_acknowledged(async |_| Err(busy()))
 			.await
 			.expect_err("cleanup refused");
-		assert_eq!(stage, QueueRecovery::CleanupAcknowledged);
+		assert_eq!(stage, QueueRecovery::CleanupAcknowledged(Default::default()));
 
 		stage
-			.clean_acknowledged(|| async { Ok(()) })
+			.clean_acknowledged(async |_| Ok(()))
 			.await
 			.expect("acknowledged rows removed");
 		assert_eq!(stage, QueueRecovery::ResumePending);
@@ -2160,7 +2183,7 @@ mod queue_recovery_tests {
 		// Selection may now promote the next batch and then fail. Retrying at
 		// this stage must not run even one deletion against that successor.
 		stage
-			.clean_acknowledged(|| async { panic!("must not delete the successor") })
+			.clean_acknowledged(async |_| panic!("must not delete the successor"))
 			.await
 			.expect("cleanup skipped");
 	}
@@ -2169,12 +2192,22 @@ mod queue_recovery_tests {
 	async fn retries_coalesce_per_destination_and_preserve_cleanup_stage() {
 		let mut retries = QueueRetries::new();
 		let dest = Destination::Appservice("test".into());
-		defer_queue_error(&mut retries, dest.clone(), QueueRecovery::CleanupAcknowledged, busy())
-			.expect("retry admitted");
-		defer_queue_error(&mut retries, dest.clone(), QueueRecovery::CleanupAcknowledged, busy())
-			.expect("retry coalesced");
+		defer_queue_error(
+			&mut retries,
+			dest.clone(),
+			QueueRecovery::CleanupAcknowledged(Default::default()),
+			busy(),
+		)
+		.expect("retry admitted");
+		defer_queue_error(
+			&mut retries,
+			dest.clone(),
+			QueueRecovery::CleanupAcknowledged(Default::default()),
+			busy(),
+		)
+		.expect("retry coalesced");
 		assert_eq!(retries.len(), 1);
-		assert_eq!(retries[&dest].1, QueueRecovery::CleanupAcknowledged);
+		assert_eq!(retries[&dest].1, QueueRecovery::CleanupAcknowledged(Default::default()));
 		assert!(retries[&dest].0 > tokio::time::Instant::now());
 
 		defer_queue_error(&mut retries, dest.clone(), QueueRecovery::ResumePending, busy())
