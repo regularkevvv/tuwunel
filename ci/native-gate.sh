@@ -14,7 +14,7 @@ unset TUWUNEL_TRACE_OUT TUWUNEL_TRACE_GOLDEN TUWUNEL_TRACE_BACKEND
 case "$mode" in
   lint)
     cargo +nightly-2026-08-18 fmt --all --check
-    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy --workspace --all-targets --locked --features tuwunel/direct_tls -- -D warnings
     ;;
   regressions)
     cargo test --locked -p tuwunel -p tuwunel_service --lib \
@@ -33,6 +33,13 @@ case "$mode" in
     ;;
   test)
     cargo test --workspace --locked
+    # These targets compile to zero tests without direct_tls. Require each
+    # named case so a successful empty harness cannot qualify federation.
+    cargo test --locked -p tuwunel --features direct_tls \
+      --test feds_loopback --test federation_transaction_backoff \
+      | tee "$test_root/direct-tls.log"
+    grep -Fq 'test tests::feds_queries_report_this_server ... ok' "$test_root/direct-tls.log"
+    grep -Fq 'test tests::a_refused_transaction_waits_for_the_backoff ... ok' "$test_root/direct-tls.log"
     ;;
   traces)
     for backend in rocksdb remote; do
