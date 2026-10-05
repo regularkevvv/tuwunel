@@ -53,11 +53,15 @@ mod migrate_media;
 mod migrate_profile_keys;
 mod moderation;
 mod notification_cutoffs;
+mod notification_index;
 mod rebuild_roomid_tscount_pducount;
 mod remove_remote_media_userid;
 mod retroactively_fix_bad_data_from_roomuserid_joined;
 mod split_conduit_highlight_counts;
 mod upgrade_legacy_mediaid_user;
+
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub use self::notification_index::NotificationIndexMigrationPause;
 
 #[cfg(test)]
 mod tests;
@@ -70,7 +74,9 @@ mod tests;
 ///   equal or lesser version. These are expected to be backward-compatible.
 // Version 19 adds durable notification plans, frozen push decisions and read
 // cutoffs. Older senders must refuse the new queue semantics before readiness.
-pub(crate) const DATABASE_VERSION: u64 = 19;
+// Version 20 adds a reciprocal room/user notification index. Older writers
+// must refuse before accepting notifications that would omit this index.
+pub(crate) const DATABASE_VERSION: u64 = 20;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 
@@ -272,6 +278,9 @@ async fn fresh(services: &Services) -> Result {
 	db["global"]
 		.insert(b"notification_read_cutoffs_v1", [])
 		.await?;
+	db["global"]
+		.insert(b"notification_index_v1", [])
+		.await?;
 	mark_clean_injectivity(services).await?;
 
 	// Create the admin room and server user on first run
@@ -308,7 +317,7 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 			.await?;
 	}
 
-	migrate_media(services).await?;
+	migrate_media(services).boxed().await?;
 
 	if db["global"]
 		.get(b"fix_pdu_missing_room_id")
@@ -491,6 +500,9 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 	}
 
 	notification_cutoffs::migrate(services, discovered < 19 || foreign_lineage)
+		.boxed()
+		.await?;
+	notification_index::migrate(services)
 		.boxed()
 		.await?;
 

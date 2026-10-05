@@ -24,7 +24,7 @@ pub struct Notified {
 }
 
 /// Validate the stored notification metadata consistently for pages and resets.
-pub(super) fn parse_notified(value: &[u8]) -> tuwunel_core::Result<Notified> {
+pub(crate) fn parse_notified(value: &[u8]) -> tuwunel_core::Result<Notified> {
 	use tuwunel_core::Error;
 	if value.len() > 64 * 1024 {
 		return Err(Error::bad_database("Notification metadata exceeds limit"));

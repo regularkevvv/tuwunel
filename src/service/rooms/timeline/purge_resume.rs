@@ -141,7 +141,7 @@ pub(crate) async fn prepare_history_step(
 		| Phase::Notifications =>
 			self.services
 				.pusher
-				.stage_notification_erasure_page(&mut txn, &raw, target.after.as_deref())
+				.stage_notification_erasure_page(&mut txn, &raw, room, target.after.as_deref())
 				.await?,
 		| Phase::Final => {
 			txn = self
@@ -149,7 +149,7 @@ pub(crate) async fn prepare_history_step(
 				.await?;
 			self.services
 				.pusher
-				.stage_notification_erasure(&mut txn, &raw)
+				.stage_notification_erasure(&mut txn, &raw, room)
 				.await?;
 			self.services
 				.pdu_metadata

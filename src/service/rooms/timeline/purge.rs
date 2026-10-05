@@ -100,7 +100,7 @@ async fn prepare_history_erasure(
 	let mut txn = self.prepare_history_base(raw, pdu).await?;
 	self.services
 		.pusher
-		.stage_notification_erasure(&mut txn, raw)
+		.stage_notification_erasure(&mut txn, raw, &pdu.room_id)
 		.await?;
 	self.append_history_search(&mut txn, short, raw, pdu)?;
 	// Redaction can already have stripped the current body. Include the

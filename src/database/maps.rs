@@ -311,6 +311,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "notificationid_index",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "pduid_notificationplan",
 		..descriptor::RANDOM_SMALL
 	},

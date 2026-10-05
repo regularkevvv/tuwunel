@@ -1,5 +1,6 @@
 mod append;
 mod badge;
+mod index;
 mod intent;
 mod notification;
 mod request;
@@ -36,11 +37,11 @@ use url::Url;
 use self::badge::SentBadges;
 #[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
 pub use self::intent::NotificationCommitPause;
-pub(crate) use self::notification::NotificationGuard;
 pub use self::{
 	append::Notified,
 	notification::{NotificationState, checked_add, count_uint},
 };
+pub(crate) use self::{append::parse_notified, notification::NotificationGuard};
 
 /// The events an event relates to, keyed by relation type, for MSC3664.
 type RelatedEvents = BTreeMap<String, FlattenedJson>;
@@ -115,6 +116,7 @@ struct Data {
 	roomuserid_notificationcutoff: Arc<Map>,
 	pduid_notificationplan: Arc<Map>,
 	notificationreceiptid_record: Arc<Map>,
+	notificationid_index: Arc<Map>,
 }
 
 #[async_trait]
@@ -136,6 +138,7 @@ impl crate::Service for Service {
 				pduid_notificationplan: args.db["pduid_notificationplan"].clone(),
 				roomuserid_notificationcutoff: args.db["roomuserid_notificationcutoff"].clone(),
 				notificationreceiptid_record: args.db["notificationreceiptid_record"].clone(),
+				notificationid_index: args.db["notificationid_index"].clone(),
 				senderkey_pusher: args.db["senderkey_pusher"].clone(),
 				pushkey_deviceid: args.db["pushkey_deviceid"].clone(),
 				useridcount_notification: args.db["useridcount_notification"].clone(),
@@ -363,7 +366,7 @@ pub async fn get_notifications(
 			return Err(tuwunel_core::Error::bad_database("Invalid notification key"));
 		}
 		let value = self.db.useridcount_notification.get(&key).await?;
-		let notified = append::parse_notified(&value)?;
+		let notified = parse_notified(&value)?;
 		page.push((count, notified, key.len().saturating_add(value.len())));
 	}
 	Ok(page)

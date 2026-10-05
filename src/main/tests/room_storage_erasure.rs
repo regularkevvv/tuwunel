@@ -64,6 +64,8 @@ const MAPS: &[&str] = &[
 	"eventid_policysigstate",
 	"eventid_originalpdu",
 	"timeredacted_eventid",
+	"notificationid_index",
+	"useridcount_notification",
 ];
 
 type Snapshot = BTreeMap<(&'static str, Vec<u8>), sha256::Digest>;

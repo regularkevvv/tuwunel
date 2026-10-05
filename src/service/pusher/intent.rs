@@ -452,6 +452,7 @@ async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) ->
 					(&recipient.user, id.count.into_unsigned()),
 					tuwunel_database::Json(&notified),
 				);
+				self.stage_notification_index(&mut txn, raw, &plan.room, &recipient.user)?;
 			}
 			for pushkey in &recipient.pushkeys {
 				wakes.push(self.services.sending.stage_frozen_push(
@@ -590,7 +591,12 @@ pub(crate) async fn frozen_push_decision(
 /// Event erasure and pending-plan cancellation share the canonical deletion
 /// transaction. The caller holds room state through commit.
 #[implement(super::Service)]
-pub(crate) async fn stage_notification_erasure(&self, txn: &mut Txn, raw: &RawPduId) -> Result {
+pub(crate) async fn stage_notification_erasure(
+	&self,
+	txn: &mut Txn,
+	raw: &RawPduId,
+	room: &RoomId,
+) -> Result {
 	txn.del_raw(&self.db.pduid_notificationplan, raw);
 	let mut prefix = raw.as_ref().to_vec();
 	prefix.push(tuwunel_database::SEP);
@@ -606,6 +612,12 @@ pub(crate) async fn stage_notification_erasure(&self, txn: &mut Txn, raw: &RawPd
 			.map_err(|_| Error::bad_database("Invalid notification receipt user"))?;
 		txn.del_raw(&self.db.notificationreceiptid_record, key);
 		check_mutation(txn)?;
+	}
+	if !self
+		.stage_notification_index_erasure(txn, raw, room, 301)
+		.await?
+	{
+		return limit();
 	}
 	Ok(())
 }
@@ -729,9 +741,7 @@ async fn stage_increment(txn: &mut Txn, map: &Arc<Map>, key: &[u8]) -> Result {
 		| Err(error) if error.is_not_found() => 0,
 		| Err(error) => return Err(error),
 	};
-	let new = old
-		.checked_add(1)
-		.ok_or_else(|| Error::bad_database("Notification counter overflow"))?;
+	let new = super::notification::checked_add(old, 1)?;
 	txn.insert_raw(map, key, new.to_be_bytes());
 	Ok(())
 }
@@ -752,6 +762,7 @@ pub(crate) async fn stage_notification_erasure_page(
 	&self,
 	txn: &mut Txn,
 	raw: &RawPduId,
+	room: &RoomId,
 	after: Option<&[u8]>,
 ) -> Result<(Option<Vec<u8>>, bool)> {
 	let mut prefix = raw.as_ref().to_vec();
@@ -765,7 +776,7 @@ pub(crate) async fn stage_notification_erasure_page(
 		.notificationreceiptid_record
 		.raw_keys_prefix_after(&prefix, after, 65)
 		.await?;
-	let done = keys.len() <= 64;
+	let receipts_done = keys.len() <= 64;
 	let mut cursor = None;
 	for key in keys.into_iter().take(64) {
 		if !key.starts_with(&prefix) {
@@ -778,6 +789,10 @@ pub(crate) async fn stage_notification_erasure_page(
 		txn.del_raw(&self.db.notificationreceiptid_record, &key);
 		cursor = Some(key);
 	}
+	let done = receipts_done
+		&& self
+			.stage_notification_index_erasure(txn, raw, room, 64)
+			.await?;
 	check_mutation(txn)?;
-	Ok((cursor, done))
+	Ok((cursor.or_else(|| after.map(<[u8]>::to_vec)), done))
 }

@@ -436,6 +436,7 @@ async fn snapshot(services: &Services) -> Result<Vec<(String, Vec<u8>, sha256::D
 	for map in [
 		PLAN,
 		RECEIPT,
+		"notificationid_index",
 		"useridcount_notification",
 		"userroomid_notificationcount",
 		"userroomid_highlightcount",

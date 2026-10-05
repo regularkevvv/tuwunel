@@ -43,6 +43,7 @@ const TABLES: &[&str] = &[
 	"global",
 	"pduid_notificationplan",
 	"notificationreceiptid_record",
+	"notificationid_index",
 	"roomuserid_notificationcutoff",
 	"pduid_pdu",
 	"eventid_pduid",
@@ -238,7 +239,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 			let outcome = match phase {
 				| "prepare" => prepare(&services, &base, directory).await,
 				| "import" => {
-					assert_eq!(services.globals.db.database_version().await, 19);
+					assert_eq!(services.globals.db.database_version().await, 20);
 					assert!(
 						services.db["global"]
 							.get(b"populate_userroomid_leftstate_table")
@@ -246,7 +247,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 							.expect_err("completed import claims native lineage")
 							.is_not_found()
 					);
-					// Acceptance must also perform a native 17 -> 19 upgrade.
+					// Acceptance must also perform a native 17 -> 20 upgrade.
 					services
 						.globals
 						.db
@@ -619,7 +620,7 @@ async fn inspect(services: &Services, directory: &Path, phase: &str) -> Result {
 		.raw_keys_prefix_after(&typed_prefix, None, 1)
 		.await?;
 	if phase == "accept" {
-		assert_eq!(services.globals.db.database_version().await, 19);
+		assert_eq!(services.globals.db.database_version().await, 20);
 		services.timeline.get_pdu(&manifest.small).await?;
 		assert!(!legacy.is_empty());
 	} else {

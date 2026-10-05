@@ -47,6 +47,7 @@ const TABLES: &[&str] = &[
 	"global",
 	PLAN,
 	RECEIPT,
+	"notificationid_index",
 	"pduid_pdu",
 	"eventid_pduid",
 	"eventid_outlierpdu",

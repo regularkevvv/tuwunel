@@ -7,7 +7,7 @@ use ruma::{
 };
 use tuwunel_core::{
 	Error, Result, implement,
-	matrix::{Event, PduId},
+	matrix::{Event, PduId, pdu::RawPduId},
 };
 use tuwunel_database::{
 	Interfix, Map, Txn, deserialize_from_slice as deserialize_key, serialize_key,
@@ -318,14 +318,14 @@ async fn notification_counts_after(
 	}
 	let user = &*guard.user;
 	let room = &*guard.room;
-	let prefix = serialize_key((user, Interfix))?;
-	let mut after = Some(serialize_key((user, position))?.to_vec());
+	let prefix = super::index::scope_prefix(room, user)?;
+	let mut after = Some(super::index::scope_key(room, user, position)?);
 	let mut budget = ReadBudget::default();
 	let mut result = NotificationState::default();
 	loop {
 		let keys = self
 			.db
-			.useridcount_notification
+			.notificationid_index
 			.raw_keys_prefix_after(
 				&prefix,
 				after.as_deref(),
@@ -337,21 +337,40 @@ async fn notification_counts_after(
 			)
 			.await?;
 		for key in &keys {
-			let (owner, count): (&UserId, u64) = deserialize_key(key)?;
-			if owner != user
-				|| count <= position
-				|| count > i64::MAX.unsigned_abs()
-				|| serialize_key((owner, count))?.as_slice() != key.as_slice()
-			{
+			let (indexed_room, owner, count) = super::index::decode_scope(key)?;
+			if indexed_room != room || owner != user || count <= position {
 				return Err(Error::bad_database("Invalid notification reset source key"));
 			}
-			let value = self.db.useridcount_notification.get(key).await?;
+			let raw = self.notification_index_raw(key).await?;
+			let primary = serialize_key((user, count))?;
+			let value = self
+				.db
+				.useridcount_notification
+				.get(&primary)
+				.await?;
 			budget.charge(key, &value)?;
+			budget.bytes = budget
+				.bytes
+				.saturating_add(primary.len())
+				.saturating_add(
+					raw.as_ref()
+						.len()
+						.saturating_mul(2)
+						.saturating_add(user.as_bytes().len())
+						.saturating_add(2),
+				)
+				.saturating_add(key.len());
+			if budget.bytes > READ_BYTES {
+				return notification_limit();
+			}
 			let notified = super::append::parse_notified(&value)?;
 			let id = PduId {
 				shortroomid: notified.sroomid,
 				count: count.into(),
 			};
+			if RawPduId::from(id) != raw {
+				return Err(Error::bad_database("Notification metadata/index binding mismatch"));
+			}
 			let pdu = match self
 				.services
 				.timeline
@@ -362,7 +381,10 @@ async fn notification_counts_after(
 				| Err(error) if error.is_not_found() => continue,
 				| Err(error) => return Err(error),
 			};
-			if pdu.room_id() != room || pdu.is_redacted() {
+			if pdu.room_id() != room {
+				return Err(Error::bad_database("Notification reset index room mismatch"));
+			}
+			if pdu.is_redacted() {
 				continue;
 			}
 			if self.services.short.get_shortroomid(room).await? != notified.sroomid {
@@ -502,7 +524,7 @@ pub(super) fn check_mutation(txn: &Txn) -> Result {
 	Ok(())
 }
 
-fn notification_limit<T>() -> Result<T> {
+pub(super) fn notification_limit<T>() -> Result<T> {
 	use ruma::api::error::{ErrorKind, LimitExceededErrorData};
 	Err(Error::Request(
 		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),

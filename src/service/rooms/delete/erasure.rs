@@ -98,6 +98,10 @@ impl Service {
 				txn.del_raw(map, key);
 			}
 		}
+		self.services
+			.pusher
+			.stage_room_notification_index_erasure(&mut txn, room)
+			.await?;
 		self.stage_pdus(room, short, &mut budget, &mut txn)
 			.await?;
 		txn.del_raw(&self.services.db["roomid_shortstatehash"], room);

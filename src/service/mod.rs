@@ -45,6 +45,8 @@ pub(crate) type SelfServices = std::sync::Arc<OnceServices>;
 
 use log as _;
 
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub use self::migrations::NotificationIndexMigrationPause;
 pub use crate::services::Services;
 
 tuwunel_core::mod_ctor! {}
