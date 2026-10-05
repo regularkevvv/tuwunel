@@ -78,6 +78,88 @@ where
 	Ok(())
 }
 
+#[cfg(debug_assertions)]
+mod pause {
+	use std::sync::{Arc, Mutex};
+
+	use tokio::sync::{Notify, oneshot};
+	use tuwunel_core::{Error, Result};
+
+	static ARMED: Mutex<Option<Gate>> = Mutex::new(None);
+	struct Gate {
+		map: &'static str,
+		entered: oneshot::Sender<()>,
+		release: Arc<Notify>,
+	}
+
+	/// An owned pause at one actual transaction's pre-dispatch boundary.
+	/// Dropping the owner releases the transaction or disarms an unused gate.
+	pub struct CommitPause {
+		entered: oneshot::Receiver<()>,
+		release: Arc<Notify>,
+	}
+	impl CommitPause {
+		/// Wait until the transaction reaches its pre-dispatch boundary.
+		pub async fn entered(&mut self) -> Result {
+			(&mut self.entered)
+				.await
+				.map_err(|_| Error::bad_database("Owned commit pause was abandoned"))
+		}
+	}
+	impl Drop for CommitPause {
+		fn drop(&mut self) {
+			let mut gate = ARMED.lock().expect("owned commit pause");
+			if gate
+				.as_ref()
+				.is_some_and(|gate| Arc::ptr_eq(&gate.release, &self.release))
+			{
+				gate.take();
+			}
+			self.release.notify_one();
+		}
+	}
+
+	/// Debug-only integration control, enabled by the existing dev dependency.
+	///
+	/// It pauses the next Txn touching this map after preparation and refusal
+	/// checks, before backend dispatch. No environment switch or provider
+	/// input.
+	pub fn pause_next(map: &'static str) -> CommitPause {
+		let (entered, receiver) = oneshot::channel();
+		let release = Arc::new(Notify::new());
+		let mut gate = ARMED.lock().expect("owned commit pause");
+		assert!(gate.is_none(), "one process-owned transaction pause");
+		*gate = Some(Gate { map, entered, release: release.clone() });
+		CommitPause { entered: receiver, release }
+	}
+
+	pub(crate) async fn pause_before_dispatch<'a, I>(maps: I)
+	where
+		I: IntoIterator<Item = &'a str> + Send,
+	{
+		let pause = {
+			let mut gate = ARMED.lock().expect("owned commit pause");
+			if gate
+				.as_ref()
+				.is_some_and(|gate| maps.into_iter().any(|map| map == gate.map))
+			{
+				gate.take()
+			} else {
+				None
+			}
+		};
+		if let Some(pause) = pause {
+			pause.entered.send(()).ok();
+			pause.release.notified().await;
+		}
+	}
+}
+
+#[cfg(debug_assertions)]
+pub(crate) use pause::pause_before_dispatch;
+#[cfg(debug_assertions)]
+pub use pause::{CommitPause, pause_next};
+
 #[cfg(test)]
 mod tests {
 	use super::{check, pending, refuse_after};

@@ -22,6 +22,7 @@ use tuwunel_database::{
 };
 
 use super::{PrivateRead, ThreadKind};
+use crate::rooms::state::RoomMutexGuard;
 
 pub(super) struct Data {
 	roomuserid_privateread: Arc<Map>,
@@ -92,6 +93,7 @@ impl Data {
 		user_id: &UserId,
 		room_id: &RoomId,
 		event: &ReceiptEvent,
+		_state: &RoomMutexGuard,
 	) -> Result<bool> {
 		let Some(event_id) = event.content.keys().next() else {
 			return Ok(false);
@@ -300,9 +302,16 @@ impl Data {
 	/// mirrored separately so notification-only writes cannot alter a sync
 	/// snapshot without changing its version.
 	#[inline]
-	pub(super) async fn private_read_set(&self, read: PrivateRead<'_>) -> Result<bool> {
+	pub(super) async fn private_read_set(
+		&self,
+		read: PrivateRead<'_>,
+		state: &RoomMutexGuard,
+	) -> Result<bool> {
 		let mut txn = self.services.db.txn();
-		let Some(prepared) = self.stage_private_read(read, &mut txn).await? else {
+		let Some(prepared) = self
+			.stage_private_read(read, &mut txn, state)
+			.await?
+		else {
 			return Ok(false);
 		};
 		txn.execute().await?;
@@ -316,6 +325,7 @@ impl Data {
 		&self,
 		read: PrivateRead<'_>,
 		txn: &mut Txn,
+		_state: &RoomMutexGuard,
 	) -> Result<Option<PreparedPrivateRead>> {
 		let PrivateRead {
 			room_id,

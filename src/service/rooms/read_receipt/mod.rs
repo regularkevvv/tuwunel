@@ -33,6 +33,7 @@ use tuwunel_core::{
 
 pub(crate) use self::data::PreparedPrivateRead;
 use self::data::{Data, ReceiptItem};
+use crate::rooms::state::RoomMutexGuard;
 
 /// Private read receipts surfaced by `private_read_get`. One legacy
 /// unthreaded row plus zero or more per-thread rows; inline-1 catches the
@@ -98,12 +99,18 @@ impl Service {
 		room_id: &RoomId,
 		event: &ReceiptEvent,
 	) -> Result<bool> {
-		if self
-			.db
-			.readreceipt_update(user_id, room_id, event)
-			.await?
-			.is_false()
-		{
+		let stored = {
+			let state = self.services.state.mutex.lock(room_id).await;
+			match self.services.short.get_shortroomid(room_id).await {
+				| Ok(_) => {},
+				| Err(error) if error.is_not_found() => return Ok(false),
+				| Err(error) => return Err(error),
+			}
+			self.db
+				.readreceipt_update(user_id, room_id, event, &state)
+				.await?
+		};
+		if stored.is_false() {
 			return Ok(false);
 		}
 
@@ -398,15 +405,40 @@ impl Service {
 	/// position at or behind the stored one writes nothing.
 	#[tracing::instrument(skip(self), level = "debug", name = "set_private")]
 	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> Result<bool> {
-		self.db.private_read_set(private_read).await
+		let state = self
+			.services
+			.state
+			.mutex
+			.lock(private_read.room_id)
+			.await;
+		self.private_read_set_with_state(private_read, &state)
+			.await
+	}
+
+	/// Stores a private marker while the caller owns canonical room state.
+	///
+	/// Client event lookup must use this same guard so deletion cannot strand
+	/// a marker resolved before erasure. Trusted position writers still require
+	/// an existing canonical room.
+	pub async fn private_read_set_with_state(
+		&self,
+		read: PrivateRead<'_>,
+		state: &RoomMutexGuard,
+	) -> Result<bool> {
+		self.services
+			.short
+			.get_shortroomid(read.room_id)
+			.await?;
+		self.db.private_read_set(read, state).await
 	}
 
 	pub(crate) async fn stage_private_read(
 		&self,
 		read: PrivateRead<'_>,
 		txn: &mut tuwunel_database::Txn,
+		state: &RoomMutexGuard,
 	) -> Result<Option<PreparedPrivateRead>> {
-		self.db.stage_private_read(read, txn).await
+		self.db.stage_private_read(read, txn, state).await
 	}
 
 	/// Returns the private read marker PDU count.

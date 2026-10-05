@@ -282,6 +282,7 @@ where
 				announce: false,
 			},
 			&mut txn,
+			state_lock,
 		)
 		.await?;
 

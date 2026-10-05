@@ -61,6 +61,10 @@ fn replayed_receipts_hold_their_stream_position() -> Result {
 async fn exercise(services: &Services) -> Result {
 	let room = room_id!("!receipt-replay:localhost");
 	let user = user_id!("@receipt-replay:localhost");
+	services
+		.short
+		.get_or_create_shortroomid(room)
+		.await?;
 	let receipts = &services.read_receipt;
 	let first = receipt_event(room, user, event_id!("$receipt-replay-first:localhost"));
 	let second = receipt_event(room, user, event_id!("$receipt-replay-second:localhost"));

@@ -19,9 +19,10 @@ async fn set_private_marker(
 	event: &EventId,
 	thread: &ReceiptThread,
 ) -> Result<bool> {
-	let count = services
+	let state = services.state.mutex.lock(room_id).await;
+	let raw = services
 		.timeline
-		.get_pdu_count(event)
+		.get_pdu_id(event)
 		.await
 		.map_err(|error| {
 			if error.is_not_found() {
@@ -30,8 +31,15 @@ async fn set_private_marker(
 				error
 			}
 		})?;
+	let pdu = services.timeline.get_pdu_from_id(&raw).await?;
+	if pdu.event_id != event {
+		return Err!(Database("Private receipt event binding mismatch"));
+	}
+	if pdu.room_id != room_id {
+		return Err!(Request(InvalidParam("Event does not belong to this room.")));
+	}
 
-	let PduCount::Normal(count) = count else {
+	let PduCount::Normal(count) = raw.pdu_count() else {
 		return Err!(Request(InvalidParam(
 			"Event is a backfilled PDU and cannot be marked as read."
 		)));
@@ -39,14 +47,17 @@ async fn set_private_marker(
 
 	let advanced = services
 		.read_receipt
-		.private_read_set(PrivateRead {
-			room_id,
-			user_id,
-			count,
-			ts: MilliSecondsSinceUnixEpoch::now(),
-			thread,
-			announce: true,
-		})
+		.private_read_set_with_state(
+			PrivateRead {
+				room_id,
+				user_id,
+				count,
+				ts: MilliSecondsSinceUnixEpoch::now(),
+				thread,
+				announce: true,
+			},
+			&state,
+		)
 		.await?;
 
 	Ok(advanced)
