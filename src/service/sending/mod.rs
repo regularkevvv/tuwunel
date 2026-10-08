@@ -17,7 +17,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt};
-use loole::unbounded;
+use loole::{TrySendError, bounded};
 use ruma::{DeviceId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::Serialize;
 use tokio::{sync::Notify, task, task::JoinSet};
@@ -76,6 +76,7 @@ pub enum SendingEvent {
 pub type EduBuf = SmallVec<[u8; EDU_BUF_CAP]>;
 pub type EduVec = SmallVec<[EduBuf; EDU_VEC_CAP]>;
 
+const SENDER_HINT_LIMIT: usize = 128;
 const EDU_BUF_CAP: usize = 128 - 16;
 const EDU_VEC_CAP: usize = 1;
 
@@ -131,7 +132,9 @@ impl crate::Service for Service {
 			db: Data::new(args),
 			server: args.server.clone(),
 			services: args.services.clone(),
-			channels: repeat_with(unbounded).take(num_senders).collect(),
+			channels: repeat_with(|| bounded(SENDER_HINT_LIMIT))
+				.take(num_senders)
+				.collect(),
 			push_wakes: PushWakes::default().into(),
 			push_wake_signal: Notify::new(),
 		}))
@@ -663,7 +666,13 @@ impl Service {
 		Ok(())
 	}
 
-	fn dispatch(&self, msg: Msg) -> Result {
+	fn dispatch(&self, mut msg: Msg) -> Result {
+		// The queue has already accepted the event. Hints never own a second
+		// payload/key copy; an empty-key flush remains an explicit retry.
+		if !msg.queue_id.is_empty() {
+			msg.queue_id = Vec::new();
+			msg.event = SendingEvent::BadgeRefresh;
+		}
 		let shard = self.shard_id(&msg.dest);
 		let sender = &self
 			.channels
@@ -671,9 +680,11 @@ impl Service {
 			.expect("missing sender worker channels")
 			.0;
 
-		debug_assert!(!sender.is_full(), "channel full");
-		debug_assert!(!sender.is_closed(), "channel closed");
-		sender.send(msg).map_err(|e| err!("{e}"))
+		match sender.try_send(msg) {
+			// Accepted rows and canonical EDU sources survive dropped hints.
+			| Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+			| Err(error @ TrySendError::Disconnected(_)) => Err(err!("{error}")),
+		}
 	}
 
 	pub(super) fn shard_id(&self, dest: &Destination) -> usize {

@@ -11,6 +11,8 @@ use tuwunel_core::Error;
 
 use super::{Delivery, Destination, SendingFuture, SendingResult};
 
+pub(super) const DELIVERY_LIMIT: usize = 16;
+
 #[derive(Default)]
 pub(super) struct SendingFutures {
 	queued: Vec<(Destination, SendingFuture, Handle)>,
@@ -21,9 +23,30 @@ pub(super) struct SendingFutures {
 impl SendingFutures {
 	pub(super) fn new() -> Self { Self::default() }
 
-	pub(super) fn push(&mut self, owner: Destination, delivery: SendingFuture, runtime: &Handle) {
+	pub(super) fn push(
+		&mut self,
+		owner: Destination,
+		delivery: SendingFuture,
+		runtime: &Handle,
+	) -> bool {
+		if self.is_full() {
+			return false;
+		}
 		self.queued
 			.push((owner, delivery, runtime.clone()));
+		true
+	}
+
+	pub(super) fn is_full(&self) -> bool { self.len() >= DELIVERY_LIMIT }
+
+	pub(super) fn contains_destination(&self, destination: &Destination) -> bool {
+		self.queued
+			.iter()
+			.any(|(owner, ..)| owner == destination)
+			|| self
+				.owners
+				.values()
+				.any(|owner| owner == destination)
 	}
 
 	pub(super) fn len(&self) -> usize { self.queued.len().saturating_add(self.tasks.len()) }

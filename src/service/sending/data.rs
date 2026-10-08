@@ -7,13 +7,17 @@ use futures::{Stream, StreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
 use tokio::sync::Mutex;
 use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
-use tuwunel_database::{Database, Deserialized, Get, Map, Row, Txn, deserialize_from_slice};
+use tuwunel_database::{Database, Deserialized, Get, Map, Txn};
+#[cfg(test)]
+use tuwunel_database::{Row, deserialize_from_slice};
 
 mod ack;
 mod active;
 mod attempt;
+mod discovery;
 pub(super) use ack::ActiveAcknowledgement;
 pub(super) use attempt::{BODY_LIMIT, PreparedAttempt, appservice_owner};
+pub(super) use discovery::{DISCOVERY_PAGE_LIMIT, RecoverySource};
 
 use super::{
 	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED,
@@ -191,28 +195,6 @@ impl Data {
 			.map(decode_outgoing)
 	}
 
-	/// At most `limit` in-flight requests after the key `after`, or from the
-	/// first, and the key to pass next, `None` once the queue ends. The read
-	/// is closed before this returns, so the caller may delete what it got.
-	pub(super) async fn active_requests_after(
-		&self,
-		after: Option<&[u8]>,
-		limit: usize,
-	) -> Result<(Vec<OutgoingItem>, Option<Key>)> {
-		let rows = self
-			.servercurrentevent_data
-			.raw_rows_after(after, limit)
-			.await?;
-
-		let next = next_cursor(&rows, limit);
-		let items = rows
-			.iter()
-			.map(|(key, value)| decode_outgoing(Ok((key.as_slice(), value.as_slice()))))
-			.collect::<Result<_>>()?;
-
-		Ok((items, next))
-	}
-
 	#[inline]
 	pub fn active_requests_for(
 		&self,
@@ -350,28 +332,6 @@ impl Data {
 		Ok((destinations.into_iter().collect(), next))
 	}
 
-	/// Destinations owning durable pending rows, among at most `limit` rows
-	/// after `after`. Validate every row before returning the page. The read
-	/// closes here, before startup promotes any row for delivery.
-	pub(super) async fn queued_destinations_after(
-		&self,
-		after: Option<&[u8]>,
-		limit: usize,
-	) -> Result<(Vec<Destination>, Option<Key>)> {
-		let rows = self
-			.servernameevent_data
-			.raw_rows_after(after, limit)
-			.await?;
-
-		let next = next_cursor(&rows, limit);
-		let destinations = rows
-			.iter()
-			.map(|(key, value)| decode_queued(Ok((key.as_slice(), value.as_slice()))).map(at!(2)))
-			.collect::<Result<_>>()?;
-
-		Ok((destinations, next))
-	}
-
 	async fn require_active_schema(&self) -> Result {
 		let version: u64 = self.db["global"]
 			.get(b"version")
@@ -398,6 +358,7 @@ impl Data {
 	/// the destinations among at most `limit` EDU watermarks after the key
 	/// `after`, and the key to pass next, `None` once the watermarks end. The
 	/// read is closed before this returns.
+	#[cfg(test)]
 	pub(super) async fn pending_edu_destinations(
 		&self,
 		retired: u64,
@@ -430,6 +391,7 @@ impl Data {
 
 /// The key a batch of at most `limit` rows resumes after, `None` when the
 /// batch was short and so reached the end of what it reads.
+#[cfg(test)]
 fn next_cursor(rows: &[Row], limit: usize) -> Option<Key> {
 	rows.last()
 		.filter(|_| rows.len() >= limit)

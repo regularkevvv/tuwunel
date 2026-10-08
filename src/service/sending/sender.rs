@@ -67,7 +67,9 @@ use super::{
 use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 
 mod deliveries;
-use deliveries::SendingFutures;
+mod discovery;
+use deliveries::{DELIVERY_LIMIT, SendingFutures};
+use discovery::{DISCOVERY_INTERVAL, Discovery};
 
 #[cfg(test)]
 mod edu_tests;
@@ -86,6 +88,9 @@ mod attempt_tests;
 
 #[cfg(test)]
 mod retry_restart_tests;
+
+#[cfg(test)]
+mod resources_tests;
 
 /// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
 /// in `peer_status` (federation only); appservice/push paths keep their own
@@ -270,8 +275,6 @@ const SELECT_PRESENCE_LIMIT: usize = 256;
 const SELECT_RECEIPT_LIMIT: usize = 256;
 const SELECT_DEVICE_CHANGE_LIMIT: usize = 256;
 
-/// Rows one start-up netburst batch reads from the send queues.
-const NETBURST_BATCH: usize = 256;
 /// Global source counts are unique across update producers. A complete window
 /// stays below the per-source caps without taking another source's larger
 /// cursor.
@@ -358,8 +361,11 @@ impl Service {
 			.map(|(_, receiver)| receiver.clone())
 			.expect("Missing channel for sender worker");
 		let mut retries = QueueRetries::new();
+		let mut discovery = Discovery::default();
+		let mut discovery_due = Instant::now();
 
 		while !receiver.is_closed() {
+			let capacity = futures.len().saturating_add(retries.len()) < DELIVERY_LIMIT;
 			let next_due = wakes
 				.peek()
 				.map_or_else(Instant::now, |Reverse((instant, _))| *instant);
@@ -374,27 +380,52 @@ impl Service {
 					let (dest, mut stage) = match &response {
 						Ok(Delivery::Acknowledged(dest, _) | Delivery::Deferred(dest) | Delivery::Unprepared(dest, _) | Delivery::LocalFailure(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
 					};
-					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage, &mut retries).await {
+					let result = match response {
+						Ok(Delivery::Acknowledged(owner, rows)) => {
+							// Release this batch's slot before discovering successors.
+							// A hot destination must not keep all slots indefinitely.
+							stage = QueueRecovery::CleanupAcknowledged(rows);
+							let result = stage.clean_acknowledged(async |members| self.db.acknowledge_active(&owner, members).await).await;
+							if result.is_ok() {
+								statuses.remove(&owner);
+							}
+							result
+						},
+						response => self.handle_response(response, futures, statuses, wakes, &mut stage, &mut retries).await,
+					};
+					if let Err(error) = result {
 						defer_queue_error(&mut retries, dest, stage, error)?;
 					}
+					discovery_due = Instant::now();
 				},
 				request = receiver.recv_async() => match request {
 					Ok(request) => {
 						let dest = request.dest.clone();
 						// Requests are durable queue rows (or coalescible empty-key
 						// wakes). The retry owns this destination until it dispatches.
-						if !retries.contains_key(&dest)
+						if (capacity || futures.contains_destination(&dest)) && !retries.contains_key(&dest)
 							&& let Err(error) = self.handle_request(request, futures, statuses).await {
 							defer_queue_error(&mut retries, dest, QueueRecovery::ResumePending, error)?;
 						}
 					},
 					Err(_) => return Ok(()),
 				},
-				() = sleep_until(next_due), if !wakes.is_empty() => {
+				() = sleep_until(next_due), if capacity && !wakes.is_empty() => {
 					self.drain_due_wakes(futures, statuses, wakes, &mut retries).await?;
 				},
 				() = sleep_until(retry_due), if !retries.is_empty() => {
 					self.retry_queue(futures, statuses, &mut retries).await?;
+				},
+				() = sleep_until(discovery_due), if capacity => {
+					let result = self.discover_page(id, futures, statuses, Some(&mut retries), &mut discovery).await;
+					if let Err(error) = result {
+						if error.status_code() != http::StatusCode::TOO_MANY_REQUESTS {
+							return Err(error);
+						}
+						trace!("Durable sender discovery waits for database capacity");
+					}
+					let now = Instant::now();
+					discovery_due = now.checked_add(DISCOVERY_INTERVAL).unwrap_or(now);
 				},
 			}
 		}
@@ -572,6 +603,9 @@ impl Service {
 		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
+		if futures.is_full() {
+			return Ok(());
+		}
 		let Some(events) = self
 			.select_events(&dest, Vec::new(), statuses)
 			.await?
@@ -623,6 +657,10 @@ impl Service {
 		stage
 			.clean_acknowledged(async |rows| self.db.acknowledge_active(dest, rows).await)
 			.await?;
+		if futures.is_full() {
+			statuses.remove(dest);
+			return Ok(());
+		}
 
 		// A prior attempt may have promoted queued rows or persisted EDUs before
 		// backpressure interrupted selection. Replay that durable active set;
@@ -733,6 +771,15 @@ impl Service {
 		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
+		if futures.is_full() {
+			if msg.queue_id.is_empty()
+				&& matches!(msg.event, SendingEvent::Flush)
+				&& let Some(status @ TransactionStatus::Running) = statuses.get_mut(&msg.dest)
+			{
+				*status = TransactionStatus::RunningForceRetry;
+			}
+			return Ok(());
+		}
 		let synthetic_wake = msg.queue_id.is_empty()
 			&& matches!(&msg.event, SendingEvent::BadgeRefresh | SendingEvent::Flush);
 		let flush_wake = msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::Flush);
@@ -772,9 +819,10 @@ impl Service {
 		use tokio::time::Instant;
 
 		let now = Instant::now();
-		while wakes
-			.peek()
-			.is_some_and(|Reverse((due, _))| *due <= now)
+		while futures.len().saturating_add(retries.len()) < DELIVERY_LIMIT
+			&& wakes
+				.peek()
+				.is_some_and(|Reverse((due, _))| *due <= now)
 		{
 			let Reverse((_, dest)) = wakes.pop().expect("peeked entry");
 			if !retries.contains_key(&dest)
@@ -915,99 +963,17 @@ impl Service {
 		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
-		let services_guard = self.services.get();
-		let services_root = services_guard.as_ref();
-
 		if !self.server.config.startup_netburst {
 			return Ok(());
 		}
-
-		// Close each bounded page before reading the next. Active rows remain
-		// canonical delivery obligations until their send is acknowledged.
-		let mut txns = HashSet::<Destination>::new();
-		let mut after: Option<Vec<u8>> = None;
-		loop {
-			let (active, next) = self
-				.db
-				.active_requests_after(after.as_deref(), NETBURST_BATCH)
-				.await?;
-
-			for (_, _, dest) in active {
-				if self.shard_id(&dest) != id {
-					continue;
-				}
-
-				// These rows are accepted delivery obligations. Startup settings
-				// must not acknowledge or discard any of them.
-				txns.insert(dest);
+		let mut discovery = Discovery::default();
+		while !futures.is_full() {
+			if self
+				.discover_page(id, futures, statuses, None, &mut discovery)
+				.await?
+			{
+				break;
 			}
-
-			match next {
-				| Some(next) => after = Some(next),
-				| None => break,
-			}
-		}
-
-		for dest in txns {
-			statuses.insert(dest.clone(), TransactionStatus::Running);
-			futures.push(
-				dest.clone(),
-				self.send_events(dest, vec![SendingEvent::Flush]),
-				self.server.runtime(),
-			);
-		}
-
-		// Active transaction generations must own their queued successors before
-		// queued-only destinations are woken.
-		let mut destinations = HashSet::new();
-		let mut after: Option<Vec<u8>> = None;
-		loop {
-			let (found, next) = self
-				.db
-				.queued_destinations_after(after.as_deref(), NETBURST_BATCH)
-				.await?;
-
-			destinations.extend(
-				found
-					.into_iter()
-					.filter(|dest| self.shard_id(dest) == id),
-			);
-
-			match next {
-				| Some(next) => after = Some(next),
-				| None => break,
-			}
-		}
-
-		let retired = services_root.globals.current_count();
-		let mut after: Option<Vec<u8>> = None;
-		loop {
-			let (found, next) = self
-				.db
-				.pending_edu_destinations(retired, after.as_deref(), NETBURST_BATCH)
-				.await?;
-
-			destinations.extend(
-				found
-					.into_iter()
-					.filter(|dest| self.shard_id(dest) == id),
-			);
-
-			match next {
-				| Some(next) => after = Some(next),
-				| None => break,
-			}
-		}
-
-		for dest in destinations {
-			let event = match &dest {
-				| Destination::Push(..) => SendingEvent::BadgeRefresh,
-				| Destination::Federation(_) | Destination::Appservice(_) => SendingEvent::Flush,
-			};
-			let msg = Msg { dest, event, queue_id: Vec::new() };
-
-			self.handle_request(msg, futures, statuses)
-				.await?;
 		}
 		Ok(())
 	}
