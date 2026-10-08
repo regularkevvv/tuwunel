@@ -70,9 +70,19 @@ pub(crate) async fn services(root: &Path) -> Result<Arc<Services>> {
 		.merge(("database_path", root.join("database")))
 		.merge(("database_migrations", false))
 		.merge(("create_admin_room", false));
-	let config = Config::new(&raw)?;
+	let server = server(Config::new(&raw)?);
+	let services = Services::build(server).await?;
+	services
+		.globals
+		.db
+		.bump_database_version(crate::migrations::DATABASE_VERSION)
+		.await?;
+	Ok(services)
+}
+
+pub(crate) fn server(config: Config) -> Arc<Server> {
 	let runtime = Handle::current();
-	let server = Arc::new(Server::new(
+	Arc::new(Server::new(
 		config,
 		Sources::default(),
 		Some(&runtime),
@@ -82,14 +92,7 @@ pub(crate) async fn services(root: &Path) -> Result<Arc<Services>> {
 			capture: Arc::new(State::new()),
 		},
 		Metrics::new(Some(&runtime)),
-	));
-	let services = Services::build(server).await?;
-	services
-		.globals
-		.db
-		.bump_database_version(crate::migrations::DATABASE_VERSION)
-		.await?;
-	Ok(services)
+	))
 }
 
 pub(crate) async fn released(root: &Weak<Services>, database: &Weak<tuwunel_database::Database>) {

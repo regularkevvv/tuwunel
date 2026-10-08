@@ -95,6 +95,13 @@ struct Shared {
 	tables: Mutex<Tables>,
 	faults: Mutex<Faults>,
 	commit_gate: Mutex<Option<Arc<CommitGate>>>,
+	release_gate: Mutex<Option<Arc<ReleaseGate>>>,
+}
+
+#[derive(Default)]
+pub(super) struct ReleaseGate {
+	pub(super) entered: tokio::sync::Notify,
+	pub(super) release: tokio::sync::Notify,
 }
 
 /// Stops an already-dispatched commit after the backend's drain, before apply.
@@ -119,6 +126,7 @@ impl Fake {
 			tables: Mutex::new(Tables::default()),
 			faults: Mutex::new(Faults::default()),
 			commit_gate: Mutex::new(None),
+			release_gate: Mutex::new(None),
 		});
 
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -155,6 +163,16 @@ impl Fake {
 			.commit_gate
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner) = Some(gate.clone());
+		gate
+	}
+
+	pub(super) fn pause_release(&self) -> Arc<ReleaseGate> {
+		let gate = Arc::new(ReleaseGate::default());
+		*self
+			.shared
+			.release_gate
+			.lock()
+			.expect("release gate") = Some(gate.clone());
 		gate
 	}
 
@@ -248,6 +266,18 @@ async fn kv(
 			.commit_gate
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner)
+			.take();
+		if let Some(gate) = gate {
+			gate.entered.notify_one();
+			gate.release.notified().await;
+		}
+	}
+
+	if matches!(request, Request::LeaseRelease { .. }) {
+		let gate = shared
+			.release_gate
+			.lock()
+			.expect("release gate")
 			.take();
 		if let Some(gate) = gate {
 			gate.entered.notify_one();

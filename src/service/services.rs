@@ -88,6 +88,17 @@ pub struct Services {
 #[implement(Services)]
 pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 	let db = Database::open(&server).await?;
+	let result = Self::build_inner(server, db.clone());
+	if result.is_err() {
+		// No service worker has started yet. Finish closing the acquired
+		// backend rather than leaving its lease release to best-effort drop.
+		db.close().await;
+	}
+	result
+}
+
+#[implement(Services)]
+fn build_inner(server: Arc<Server>, db: Arc<Database>) -> Result<Arc<Self>> {
 	let services = Arc::new(OnceServices::default());
 	let args = Args {
 		db: &db,
@@ -354,3 +365,6 @@ pub async fn memory_usage(&self) -> Result<String> {
 
 #[cfg(test)]
 pub(crate) mod startup_tests;
+
+#[cfg(test)]
+mod build_tests;

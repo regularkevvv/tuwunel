@@ -26,6 +26,8 @@
 
 pub(crate) mod cache;
 pub(crate) mod client;
+#[cfg(test)]
+mod close_tests;
 pub(crate) mod lease;
 mod outcome;
 pub(crate) mod scan;
@@ -107,6 +109,13 @@ pub struct Backend {
 
 	/// The background renewal task, aborted when the backend closes.
 	renewals: Mutex<Option<JoinHandle<()>>>,
+	closing: tokio::sync::Mutex<CloseState>,
+}
+
+enum CloseState {
+	Open,
+	Closing(JoinHandle<()>),
+	Closed,
 }
 
 impl Backend {
@@ -145,6 +154,7 @@ impl Backend {
 			scan_page,
 			commits: AtomicU64::new(0),
 			renewals: Mutex::new(None),
+			closing: tokio::sync::Mutex::new(CloseState::Open),
 		});
 
 		let server = server.clone();
@@ -555,9 +565,41 @@ impl Backend {
 	/// Stops renewals and releases the lease so a successor need not wait
 	/// out its expiry.
 	pub async fn close(&self) {
-		self.scans.close();
-		self.abort_renewals();
-		self.lease.release().await;
+		let mut closing = self.closing.lock().await;
+		if matches!(*closing, CloseState::Open) {
+			self.scans.close();
+			let renewals = self
+				.renewals
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take();
+			if let Some(handle) = &renewals {
+				handle.abort();
+			}
+			let lease = self.lease.clone();
+			// Mark unheld before spawning so backend drop cannot issue a second
+			// release. The task owns both completions without retaining Backend.
+			let identity = lease.releasable();
+			*closing = CloseState::Closing(self.server.runtime().spawn(async move {
+				if let Some(handle) = renewals
+					&& let Err(error) = handle.await
+					&& !error.is_cancelled()
+				{
+					error!(%error, "writer lease renewal task failed during close");
+				}
+				if let Some(identity) = identity {
+					lease.release_identity(identity).await;
+				}
+			}));
+		}
+		// Borrow the stored handle across await: cancellation releases this
+		// mutex but retains the completion for the next close caller to join.
+		if let CloseState::Closing(handle) = &mut *closing {
+			if let Err(error) = handle.await {
+				error!(%error, "writer lease cleanup task failed");
+			}
+			*closing = CloseState::Closed;
+		}
 	}
 
 	/// One bridge call, with the stale-lease reaction applied.
@@ -623,16 +665,14 @@ impl Backend {
 
 	/// Aborts the renewal task if it is still running.
 	///
-	/// The guard is released before the task is aborted so nothing holds the
-	/// lock across the abort.
+	/// Retain its handle so an explicit close can still join the aborted task.
 	fn abort_renewals(&self) {
-		let handle = self
+		let slot = self
 			.renewals
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
-			.take();
+			.unwrap_or_else(PoisonError::into_inner);
 
-		if let Some(handle) = handle {
+		if let Some(handle) = slot.as_ref() {
 			handle.abort();
 		}
 	}

@@ -231,11 +231,7 @@ impl Lease {
 	///
 	/// Best effort: a failure only means the successor waits for the
 	/// natural expiry. The lease reports unheld afterwards either way.
-	pub(crate) async fn release(&self) {
-		let Some(lease) = self.releasable() else {
-			return;
-		};
-
+	pub(crate) async fn release_identity(&self, lease: bridge::Lease) {
 		match self
 			.client
 			.call(&Request::LeaseRelease { lease }, None)
