@@ -55,6 +55,13 @@ pub(crate) const SHARED_POOL: &str = "Shared";
 
 impl Context {
 	pub(crate) fn new(server: &Arc<Server>) -> Result<Arc<Self>> {
+		Self::new_with_env(server, || Env::acquire(server))
+	}
+
+	fn new_with_env(
+		server: &Arc<Server>,
+		acquire: impl FnOnce() -> Result<Arc<Env>>,
+	) -> Result<Arc<Self>> {
 		let config = &server.config;
 		let cache_capacity_bytes = config.db_cache_capacity_mb * 1024.0 * 1024.0;
 
@@ -80,6 +87,9 @@ impl Context {
 			participants: Vec::new(),
 		};
 		let col_cache: ColCaches = [(SHARED_POOL, shared)].into();
+		// Finish fallible environment acquisition before starting workers.
+		// A refused environment must not leave a pool held alive by its threads.
+		let env = acquire()?;
 
 		Ok(Arc::new(Self {
 			pool: Pool::new(server)?,
@@ -87,10 +97,14 @@ impl Context {
 			row_cache: row_cache.into(),
 			col_cache: col_cache.into(),
 			server: server.clone(),
-			env: Env::acquire(server)?,
+			env,
 		}))
 	}
 }
+
+#[cfg(test)]
+#[path = "context_startup_tests.rs"]
+mod startup_tests;
 
 impl Drop for Context {
 	#[cold]

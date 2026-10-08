@@ -1,9 +1,12 @@
 mod configure;
+#[cfg(test)]
+#[path = "pool/startup_tests.rs"]
+pub(crate) mod startup_tests;
 
 use std::{
 	mem::take,
 	sync::{
-		Arc, Mutex,
+		Arc, Mutex, PoisonError,
 		atomic::{AtomicUsize, Ordering},
 	},
 	thread,
@@ -37,6 +40,17 @@ pub(crate) struct Pool {
 	topology: Vec<usize>,
 	busy: AtomicUsize,
 	queued_max: AtomicUsize,
+}
+
+/// Owns rollback until every worker group has started successfully.
+struct Startup(Option<Arc<Pool>>);
+
+impl Drop for Startup {
+	fn drop(&mut self) {
+		if let Some(pool) = self.0.take() {
+			pool.close();
+		}
+	}
 }
 
 /// Represents work accepted by the database thread pool.
@@ -113,20 +127,21 @@ pub(crate) fn new(server: &Arc<Server>) -> Result<Arc<Self>> {
 		.map(|cap| async_channel::bounded_with_queue_strategy(cap, CHAN_SCHED))
 		.unzip();
 
-	let pool = Arc::new(Self {
+	let mut startup = Startup(Some(Arc::new(Self {
 		server: server.clone(),
 		queues: senders,
 		workers: Vec::new().into(),
 		topology,
 		busy: AtomicUsize::default(),
 		queued_max: AtomicUsize::default(),
-	});
+	})));
+	let pool = startup.0.as_ref().expect("startup owns pool");
 
 	for (chan_id, &count) in workers.iter().enumerate() {
 		pool.spawn_group(&receivers, chan_id, count)?;
 	}
 
-	Ok(pool)
+	Ok(startup.0.take().expect("startup owns pool"))
 }
 
 impl Drop for Pool {
@@ -147,7 +162,14 @@ impl Drop for Pool {
 #[implement(Pool)]
 #[tracing::instrument(skip_all)]
 pub(crate) fn close(&self) {
-	let workers = take(&mut *self.workers.lock().expect("locked"));
+	// Retain the inventory lock through all joins: a simultaneous closer must
+	// wait for their completion, not mistake a drained inventory for shutdown.
+	// A spawn panic may poison this lock while startup rollback still needs it.
+	let mut inventory = self
+		.workers
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner);
+	let workers = take(&mut *inventory);
 
 	let senders = self
 		.queues
@@ -186,6 +208,7 @@ pub(crate) fn close(&self) {
 			| Ok(()) => trace!(?id, "worker joined"),
 			| Err(error) => error!(?id, "worker joined with error: {error}"),
 		});
+	drop(inventory);
 }
 
 #[implement(Pool)]
@@ -216,6 +239,8 @@ fn spawn_one(
 	debug_assert!(!recv.is_empty(), "Must have at least one receiver");
 
 	let id = workers.len();
+	#[cfg(test)]
+	startup_tests::before_spawn(&self, id)?;
 	let recv = recv[chan_id].clone();
 
 	let handle = thread::Builder::new()
