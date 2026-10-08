@@ -1,12 +1,18 @@
-use std::{fmt, sync::Arc};
+use std::{
+	fmt,
+	sync::{Arc, Mutex as StdMutex},
+};
 
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tuwunel_core::{
-	Result, Server, debug, debug_info, implement, info, trace, utils::stream::IterStream,
+	Result, Server, debug, debug_info, err, implement, info, trace, utils::stream::IterStream,
 };
 use tuwunel_database::Database;
 
+mod lifecycle;
+
+use self::lifecycle::{CleanupOnDrop, Lifecycle};
 pub(crate) use crate::OnceServices;
 use crate::{
 	account_data, admin, appservice, client, config, deactivate, emergency, federation, fetcher,
@@ -73,6 +79,8 @@ pub struct Services {
 	pub profile: Arc<profile::Service>,
 
 	manager: Mutex<Option<Arc<Manager>>>,
+	lifecycle: Mutex<Lifecycle>,
+	cleanup: StdMutex<Option<JoinHandle<()>>>,
 	pub server: Arc<Server>,
 	pub db: Arc<Database>,
 }
@@ -140,6 +148,8 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		profile: profile::Service::build(&args)?,
 
 		manager: Mutex::new(None),
+		lifecycle: Mutex::new(Lifecycle::Built),
+		cleanup: StdMutex::new(None),
 		server,
 		db,
 	});
@@ -216,6 +226,25 @@ impl fmt::Debug for Services {
 
 #[implement(Services)]
 pub async fn start(self: &Arc<Self>) -> Result<Arc<Self>> {
+	let mut lifecycle = self.lifecycle.lock().await;
+	if *lifecycle != Lifecycle::Built {
+		return Err(err!("Services cannot start from {lifecycle:?}"));
+	}
+	*lifecycle = Lifecycle::Starting;
+	let mut cleanup = CleanupOnDrop::new(self);
+	let result = self.start_inner().await;
+	if result.is_err() {
+		self.stop_inner().await;
+		*lifecycle = Lifecycle::Stopped;
+	} else {
+		*lifecycle = Lifecycle::Running;
+	}
+	cleanup.disarm();
+	result.map(|()| Arc::clone(self))
+}
+
+#[implement(Services)]
+async fn start_inner(self: &Arc<Self>) -> Result {
 	debug_info!("Starting services...");
 
 	super::migrations::migrations(self).await?;
@@ -228,22 +257,36 @@ pub async fn start(self: &Arc<Self>) -> Result<Arc<Self>> {
 			.await?;
 	}
 
-	self.manager
-		.lock()
-		.await
-		.insert(Manager::new(self))
-		.clone()
-		.start()
-		.await?;
+	let manager = Manager::new(self);
+	_ = self.manager.lock().await.insert(manager.clone());
+	manager.start().await?;
 
 	debug_info!("Services startup complete.");
 
-	Ok(Arc::clone(self))
+	Ok(())
 }
 
 #[implement(Services)]
-pub async fn stop(&self) {
+pub async fn stop(self: &Arc<Self>) {
+	let mut cleanup = CleanupOnDrop::new(self);
+	{
+		let mut lifecycle = self.lifecycle.lock().await;
+		if *lifecycle != Lifecycle::Stopped {
+			*lifecycle = Lifecycle::Stopping;
+			self.stop_inner().await;
+			*lifecycle = Lifecycle::Stopped;
+		}
+	}
+	self.join_cleanup().await;
+	cleanup.disarm();
+}
+
+#[implement(Services)]
+async fn stop_inner(&self) {
 	info!("Shutting down services...");
+	// Shutdown is one-shot. A concurrent signal or cleanup owner may have
+	// claimed it already; either outcome leaves workers stopping.
+	self.server.shutdown().ok();
 
 	self.interrupt().await;
 	let mut manager = self.manager.lock().await;
@@ -308,3 +351,6 @@ pub async fn memory_usage(&self) -> Result<String> {
 		})
 		.await
 }
+
+#[cfg(test)]
+mod startup_tests;

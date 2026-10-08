@@ -169,6 +169,9 @@ async fn admit(
 	if services_root.server.config.maintenance {
 		return Err(err!("Admin tasks are unavailable in maintenance mode"));
 	}
+	if !services_root.server.is_running() {
+		return Err(err!("Admin tasks are unavailable during shutdown"));
+	}
 	data::action(action)?;
 	data::validate_parameters(&parameters)?;
 	let tasks = self.db.load().await?;
@@ -294,18 +297,44 @@ async fn prune(&self) -> Result {
 
 #[implement(Service)]
 async fn abort_all(&self) {
-	let handles = std::mem::take(&mut *self.handles.lock().expect("locked"));
-	for handle in handles.values() {
+	// Admission holds the journal until its handle is registered. Once the
+	// server is stopping, reject new admissions and wait for earlier ones
+	// before collecting every handle that shutdown must join.
+	let handles = {
+		let _journal = self.journal.lock().await;
+		std::mem::take(&mut *self.handles.lock().expect("locked"))
+	};
+	let mut joining = AbortedTasks {
+		registry: &self.handles,
+		pending: handles,
+	};
+	for handle in joining.pending.values() {
 		handle.abort();
 	}
-	// Release the handle lock before joining; cancelled tasks may remove
-	// their handle and must drop their database references before shutdown.
-	for (id, handle) in handles {
-		if let Err(error) = handle.await
+	// Borrow each handle until it finishes. Cancellation returns every
+	// unjoined handle to the registry for the next shutdown owner.
+	while let Some(mut entry) = joining.pending.first_entry() {
+		let id = *entry.key();
+		if let Err(error) = entry.get_mut().await
 			&& !error.is_cancelled()
 		{
 			error!(%id, %error, "Admin task failed while shutting down");
 		}
+		entry.remove();
+	}
+}
+
+struct AbortedTasks<'a> {
+	registry: &'a StdMutex<BTreeMap<TaskId, JoinHandle<()>>>,
+	pending: BTreeMap<TaskId, JoinHandle<()>>,
+}
+
+impl Drop for AbortedTasks<'_> {
+	fn drop(&mut self) {
+		self.registry
+			.lock()
+			.expect("locked")
+			.append(&mut self.pending);
 	}
 }
 
