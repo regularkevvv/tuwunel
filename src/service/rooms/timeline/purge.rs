@@ -25,10 +25,12 @@ pub async fn purge_history(
 	until: PduCount,
 	delete_local_events: bool,
 ) -> Result<usize> {
-	let _state = self.services.state.mutex.lock(room_id).await;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let _state = services_root.state.mutex.lock(room_id).await;
 	let _insert = self.mutex_insert.lock(room_id).await;
-	let short = self
-		.services
+	let short = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await?;
@@ -74,7 +76,7 @@ pub async fn purge_history(
 			return Err(Error::bad_database("History purge PDU indexes disagree"));
 		}
 		if pdu.state_key.is_none()
-			&& (delete_local_events || !self.services.globals.user_is_local(&pdu.sender))
+			&& (delete_local_events || !services_root.globals.user_is_local(&pdu.sender))
 		{
 			let txn = self
 				.prepare_history_erasure(short, &raw, &pdu)
@@ -97,16 +99,18 @@ async fn prepare_history_erasure(
 	raw: &RawPduId,
 	pdu: &PduEvent,
 ) -> Result<Txn> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut txn = self.prepare_history_base(raw, pdu).await?;
-	self.services
+	services_root
 		.pusher
 		.stage_notification_erasure(&mut txn, raw, &pdu.room_id)
 		.await?;
 	self.append_history_search(&mut txn, short, raw, pdu)?;
 	// Redaction can already have stripped the current body. Include the
 	// retained original so interrupted older redactions cannot strand tokens.
-	match self
-		.services
+	match services_root
 		.retention
 		.get_original_pdu(&pdu.event_id)
 		.await
@@ -120,7 +124,7 @@ async fn prepare_history_erasure(
 		| Err(error) if error.is_not_found() => {},
 		| Err(error) => return Err(error),
 	}
-	self.services
+	services_root
 		.pdu_metadata
 		.append_purge_event_relations(
 			&mut txn,
@@ -130,7 +134,7 @@ async fn prepare_history_erasure(
 			&pdu.event_id,
 		)
 		.await?;
-	self.services
+	services_root
 		.retention
 		.append_purge_original(&mut txn, &pdu.event_id);
 	Ok(txn)
@@ -144,12 +148,15 @@ fn append_history_search(
 	raw: &RawPduId,
 	pdu: &PduEvent,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if pdu.kind == TimelineEventType::RoomMessage {
 		let ExtractBody { body } = pdu.get_content()?;
 		let Some(body) = body else {
 			return Ok(());
 		};
-		self.services
+		services_root
 			.search
 			.append_deindex_pdu(txn, short, raw, &body)?;
 	}

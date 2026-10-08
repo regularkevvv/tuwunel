@@ -52,7 +52,10 @@ impl Service {
 	/// keys / 512 KiB; inspected PDU values share 4 MiB. The full storage and
 	/// membership transaction is checked against the 900-op bridge cap.
 	pub(super) async fn prepare_storage_erasure(&self, room: &RoomId) -> Result<Txn> {
-		let raw = self.services.db["roomid_shortroomid"]
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let raw = services_root.db["roomid_shortroomid"]
 			.get(room)
 			.await?;
 		let encoded: [u8; 8] = raw
@@ -61,7 +64,7 @@ impl Service {
 			.map_err(|_| Error::bad_database("Invalid room erasure short ID"))?;
 		let short = u64::from_be_bytes(encoded);
 		let mut budget = Budget::default();
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 		for name in [
 			"threadid_userids",
 			"threadactivityid_rootid",
@@ -71,7 +74,7 @@ impl Service {
 			"pduid_notificationplan",
 			"notificationreceiptid_record",
 		] {
-			let map = &self.services.db[name];
+			let map = &services_root.db[name];
 			let keys = map.keys_prefix_raw_capped(&short, budget.cap());
 			pin_mut!(keys);
 			while let Some(key) = keys.try_next().await? {
@@ -90,7 +93,7 @@ impl Service {
 			"roomuserid_notificationcutoff",
 			"roomid_tscount_pducount",
 		] {
-			let map = &self.services.db[name];
+			let map = &services_root.db[name];
 			let keys = map.keys_prefix_raw_capped(&(room, Interfix), budget.cap());
 			pin_mut!(keys);
 			while let Some(key) = keys.try_next().await? {
@@ -98,14 +101,14 @@ impl Service {
 				txn.del_raw(map, key);
 			}
 		}
-		self.services
+		services_root
 			.pusher
 			.stage_room_notification_index_erasure(&mut txn, room)
 			.await?;
 		self.stage_pdus(room, short, &mut budget, &mut txn)
 			.await?;
-		txn.del_raw(&self.services.db["roomid_shortstatehash"], room);
-		txn.del_raw(&self.services.db["roomid_shortroomid"], room);
+		txn.del_raw(&services_root.db["roomid_shortstatehash"], room);
+		txn.del_raw(&services_root.db["roomid_shortroomid"], room);
 		Ok(txn)
 	}
 
@@ -116,7 +119,10 @@ impl Service {
 		budget: &mut Budget,
 		txn: &mut Txn,
 	) -> Result {
-		let map = &self.services.db["pduid_pdu"];
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let map = &services_root.db["pduid_pdu"];
 		let keys = map.keys_prefix_raw_capped(&short, budget.cap());
 		pin_mut!(keys);
 		while let Some(key) = keys.try_next().await? {
@@ -126,7 +132,7 @@ impl Service {
 			budget.value(&value)?;
 			let pdu: PduEvent = serde_json::from_slice(&value)
 				.map_err(|_| Error::bad_database("Invalid stored erasure PDU"))?;
-			let binding = match self.services.db["eventid_pduid"]
+			let binding = match services_root.db["eventid_pduid"]
 				.get(&pdu.event_id)
 				.await
 			{
@@ -139,8 +145,8 @@ impl Service {
 				return Err(Error::bad_database("Room erasure PDU indexes disagree"));
 			}
 			txn.del_raw(map, key);
-			txn.del_raw(&self.services.db["eventid_pduid"], &pdu.event_id);
-			txn.del_raw(&self.services.db["eventid_outlierpdu"], &pdu.event_id);
+			txn.del_raw(&services_root.db["eventid_pduid"], &pdu.event_id);
+			txn.del_raw(&services_root.db["eventid_outlierpdu"], &pdu.event_id);
 		}
 		Ok(())
 	}

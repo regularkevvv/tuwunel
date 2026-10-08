@@ -30,9 +30,11 @@ pub async fn member_snapshot(
 	user_id: &UserId,
 	at: Option<&str>,
 ) -> Result<MemberSnapshot> {
-	let _state_lock = self.services.state.mutex.lock(room_id).await;
-	let joined = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let _state_lock = services_root.state.mutex.lock(room_id).await;
+	let joined = services_root
 		.state_cache
 		.is_joined_checked(user_id, room_id)
 		.await?;
@@ -40,8 +42,7 @@ pub async fn member_snapshot(
 		let count = token
 			.parse::<PduCount>()
 			.map_err(|_| err!(Request(InvalidParam("Invalid membership pagination token"))))?;
-		let (position, event) = self
-			.services
+		let (position, event) = services_root
 			.timeline
 			.member_snapshot_boundary(room_id, count)
 			.await?;
@@ -60,20 +61,17 @@ pub async fn member_snapshot(
 	// A former member retains the exact leave boundary, even if other members
 	// subsequently change the room's state or history policy.
 	let former = !joined
-		&& self
-			.services
+		&& services_root
 			.state_cache
 			.once_joined_checked(user_id, room_id)
 			.await?;
 	if former
-		&& self
-			.services
+		&& services_root
 			.state_cache
 			.is_left_checked(user_id, room_id)
 			.await?
 	{
-		let count = self
-			.services
+		let count = services_root
 			.state_cache
 			.get_left_count(room_id, user_id)
 			.await
@@ -82,8 +80,7 @@ pub async fn member_snapshot(
 			return Err(Error::bad_database("Invalid former-member boundary"));
 		}
 		let position = PduCount::Normal(count);
-		let (stored_position, event) = self
-			.services
+		let (stored_position, event) = services_root
 			.timeline
 			.member_snapshot_boundary(room_id, position)
 			.await?;
@@ -105,8 +102,7 @@ pub async fn member_snapshot(
 			.await;
 	}
 
-	let hash = self
-		.services
+	let hash = services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -125,7 +121,7 @@ pub async fn member_snapshot(
 		let allowed = match self.history_visibility_at(room_id, hash).await? {
 			| HistoryVisibility::WorldReadable => true,
 			| HistoryVisibility::Invited =>
-				self.services
+				services_root
 					.state_cache
 					.is_invited_checked(user_id, room_id)
 					.await?,
@@ -141,11 +137,13 @@ pub async fn member_snapshot(
 
 #[implement(super::Service)]
 async fn member_snapshot_at_event(&self, room_id: &RoomId, event: Pdu) -> Result<MemberSnapshot> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if event.room_id() != room_id {
 		return Err(Error::bad_database("Mismatched membership boundary room"));
 	}
-	let hash = match self
-		.services
+	let hash = match services_root
 		.state
 		.pdu_shortstatehash(event.event_id())
 		.await
@@ -173,6 +171,9 @@ async fn member_snapshot_visible(
 	position: PduCount,
 	snapshot: &MemberSnapshot,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut membership = MembershipState::Leave;
 	let mut visibility = HistoryVisibility::Shared;
 	if let Some(hash) = snapshot.hash {
@@ -215,16 +216,14 @@ async fn member_snapshot_visible(
 		| HistoryVisibility::Invited => Ok(membership == MembershipState::Invite),
 		| _ if joined => Ok(true),
 		| _ => {
-			if !self
-				.services
+			if !services_root
 				.state_cache
 				.once_joined_checked(user_id, room_id)
 				.await?
 			{
 				return Ok(false);
 			}
-			let count = self
-				.services
+			let count = services_root
 				.state_cache
 				.get_left_count(room_id, user_id)
 				.await

@@ -18,17 +18,19 @@ impl Service {
 	/// values. Maintenance mode retains explicit operator/test control over
 	/// repairs.
 	pub(crate) async fn restore_pending_recounts(&self) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let rooms = self.pending_recount_rooms().await?;
 		for room in &rooms {
-			if !self
-				.services
+			if !services_root
 				.metadata
 				.exists_checked(room)
 				.await?
 			{
 				return Err(Error::bad_database("Pending recount refers to an unknown room"));
 			}
-			let marker = self.services.db["global"]
+			let marker = services_root.db["global"]
 				.qry(&(RECOUNT_PENDING, room))
 				.await?;
 			if !marker.is_empty() {
@@ -37,15 +39,18 @@ impl Service {
 			self.recount_is_current(room).await?;
 		}
 		for room in rooms {
-			let _state_lock = self.services.state.mutex.lock(&room).await;
+			let _state_lock = services_root.state.mutex.lock(&room).await;
 			self.repair_joined_count(&room).await?;
 		}
 		Ok(())
 	}
 
 	async fn pending_recount_rooms(&self) -> Result<Vec<OwnedRoomId>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let prefix = (RECOUNT_PENDING, Interfix);
-		let keys = self.services.db["global"]
+		let keys = services_root.db["global"]
 			.keys_prefix_capped::<(Ignore, &RoomId), _>(&prefix, MAX_ROOMS.saturating_add(1));
 		pin_mut!(keys);
 		let mut rooms = Vec::new();

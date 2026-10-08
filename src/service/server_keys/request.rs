@@ -36,6 +36,9 @@ where
 	use get_remote_server_keys_batch::v2::Request;
 	type RumaBatch = BTreeMap<OwnedServerName, BTreeMap<OwnedServerSigningKeyId, QueryCriteria>>;
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let criteria = QueryCriteria {
 		minimum_valid_until_ts: Some(self.minimum_valid_ts()),
 	};
@@ -58,14 +61,12 @@ where
 
 	let requested: BTreeSet<OwnedServerName> = server_keys.keys().cloned().collect();
 
-	let batch_max = self
-		.services
+	let batch_max = services_root
 		.server
 		.config
 		.trusted_server_batch_size;
 
-	let batch_concurrency = self
-		.services
+	let batch_concurrency = services_root
 		.server
 		.config
 		.trusted_server_batch_concurrency;
@@ -110,7 +111,7 @@ where
 		})
 		.ready_filter_map(identity)
 		.broadn_and_then(batch_concurrency, |request| {
-			self.services
+			services_root
 				.federation
 				.execute_synapse(notary, request)
 		})
@@ -152,13 +153,15 @@ pub async fn notary_request(
 ) -> Result<impl Iterator<Item = ServerSigningKeys> + Clone + Debug + Send + use<>> {
 	use get_remote_server_keys::v2::Request;
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let request = Request {
 		server_name: target.into(),
 		minimum_valid_until_ts: self.minimum_valid_ts(),
 	};
 
-	let responses = self
-		.services
+	let responses = services_root
 		.federation
 		.execute(notary, request)
 		.await?
@@ -175,8 +178,10 @@ pub async fn notary_request(
 pub async fn server_request(&self, target: &ServerName) -> Result<ServerSigningKeys> {
 	use get_server_keys::v2::Request;
 
-	let server_signing_key = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let server_signing_key = services_root
 		.federation
 		.execute(target, Request::new())
 		.await

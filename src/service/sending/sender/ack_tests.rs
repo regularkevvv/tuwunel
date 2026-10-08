@@ -1,9 +1,9 @@
 //! Actual appservice responses must acknowledge only their selected durable
 //! rows.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use futures::{FutureExt, TryStreamExt, future::ready};
+use futures::{FutureExt, StreamExt, TryStreamExt, future::ready};
 use serde_json::{Value, json};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -185,6 +185,67 @@ pub(super) async fn enqueue(
 		.queue_requests(std::iter::once((&event, destination)))
 		.await?;
 	Ok((keys.into_iter().next().expect("one durable row"), event))
+}
+
+#[test]
+fn stopped_service_graph_releases_root_and_database_without_process_exit() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::stopped_service_graph_releases_root_and_database_without_process_exit",
+		async {
+			let fixture = Fixture::new().await?;
+			let root = fixture.services.server.config.database_path.parent().expect("owned fixture directory").to_path_buf();
+			let services = Arc::downgrade(&fixture.services);
+			let database = Arc::downgrade(&fixture.services.db);
+			let access = fixture.services.sending.services.clone();
+			fixture.services.db["global"].insert(b"owned-service-lifecycle", b"durable").await?;
+			fixture.finish().await;
+			assert_eq!(services.strong_count(), 0, "stopped graph must release the root even with a retained service-access handle");
+			assert_eq!(database.strong_count(), 0, "stopped graph must release its database");
+			assert!(access.try_get().is_none(), "retained access handle no longer owns a stopped graph");
+			let reopened = Fixture::open(&root).await?;
+			assert_eq!(reopened.services.db["global"].get(b"owned-service-lifecycle").await?.as_ref(), b"durable");
+			let reopened_services = Arc::downgrade(&reopened.services);
+			let reopened_database = Arc::downgrade(&reopened.services.db);
+			reopened.finish().await;
+			assert_eq!(reopened_services.strong_count(), 0);
+			assert_eq!(reopened_database.strong_count(), 0);
+			Ok(())
+		},
+	)
+}
+
+#[test]
+fn lazy_state_queries_retain_root_until_consumed_or_cancelled() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::lazy_state_queries_retain_root_until_consumed_or_cancelled",
+		async {
+			for poll_query in [false, true] {
+				let fixture = Fixture::new().await?;
+				let root = Arc::downgrade(&fixture.services);
+				let database = Arc::downgrade(&fixture.services.db);
+				let accessor = fixture.services.state_accessor.clone();
+				let mut query = Box::pin(accessor.state_full_entries_strict(0));
+				fixture.finish().await;
+				assert!(root.upgrade().is_some(), "unpolled lazy query retains its owner");
+				if poll_query {
+					query
+						.next()
+						.await
+						.expect("missing state yields an error")
+						.expect_err("missing snapshot is refused");
+				}
+				drop(query);
+				assert_eq!(
+					root.strong_count(),
+					0,
+					"finished or cancelled query releases its root"
+				);
+				drop(accessor);
+				assert_eq!(database.strong_count(), 0, "query and accessor release the database");
+			}
+			Ok(())
+		},
+	)
 }
 
 #[test]

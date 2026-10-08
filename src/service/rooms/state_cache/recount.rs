@@ -57,7 +57,10 @@ impl Service {
 	/// A stamp is only a bounded cache hint for this service graph. Missing or
 	/// prior-process stamps require reconciliation; corrupt encodings refuse.
 	pub(super) async fn recount_is_current(&self, room: &RoomId) -> Result<bool> {
-		match self.services.db["global"]
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		match services_root.db["global"]
 			.qry(&(RECOUNT_GENERATION, room))
 			.await
 		{

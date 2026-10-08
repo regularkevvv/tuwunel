@@ -178,8 +178,11 @@ impl Data {
 	}
 
 	pub(super) fn validate_active_identity(&self, value: &[u8]) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if active::identity(value)?
-			.is_some_and(|identity| identity > self.services.globals.current_count())
+			.is_some_and(|identity| identity > services_root.globals.current_count())
 		{
 			return Err(Error::bad_database(
 				"Active delivery identity exceeds the committed counter",

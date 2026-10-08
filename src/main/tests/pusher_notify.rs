@@ -2,7 +2,7 @@
 
 use std::{
 	env::var, fs::remove_dir_all, path::PathBuf, process::id as process_id, str::from_utf8,
-	time::Duration,
+	sync::Arc, time::Duration,
 };
 
 use futures::TryStreamExt;
@@ -114,7 +114,7 @@ fn pusher_notify() -> Result {
 		let services = Services::build(server.server.clone()).await?;
 		let mut recovery = prepare_badge_recovery(&services).await?;
 		let mut push_retry = prepare_push_retry(&services).await?;
-		let services = services.start().await?;
+		drop(services.start().await?);
 		_ = server
 			.services
 			.lock()
@@ -132,10 +132,14 @@ fn pusher_notify() -> Result {
 		.await;
 
 		server.server.shutdown()?;
+		let stopped_services = Arc::downgrade(&services);
+		let stopped_database = Arc::downgrade(&services.db);
 		drop(services);
 
 		async_run(&server).await?;
 		async_stop(&server).await?;
+		assert_eq!(stopped_services.strong_count(), 0, "push shutdown releases its service root");
+		assert_eq!(stopped_database.strong_count(), 0, "push shutdown releases its database");
 
 		outcome
 	});

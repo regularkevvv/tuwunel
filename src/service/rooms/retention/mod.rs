@@ -32,12 +32,15 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		if self.services.server.config.maintenance {
-			self.services.server.until_shutdown().await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if services_root.server.config.maintenance {
+			services_root.server.until_shutdown().await;
 			return Ok(());
 		}
 		loop {
-			let retention_seconds = self.services.config.redaction_retention_seconds;
+			let retention_seconds = services_root.config.redaction_retention_seconds;
 
 			if retention_seconds != 0 {
 				debug_info!("Cleaning up retained events");
@@ -49,7 +52,7 @@ impl crate::Service for Service {
 
 			tokio::select! {
 				() = tokio::time::sleep(Duration::from_hours(1)) => {},
-				() = self.services.server.until_shutdown() => return Ok(())
+				() = services_root.server.until_shutdown() => return Ok(())
 			};
 		}
 	}
@@ -61,8 +64,11 @@ impl crate::Service for Service {
 /// mutation. Expiry removes the original and its housekeeping key atomically.
 #[implement(Service)]
 pub async fn expire_originals(&self) -> Result<usize> {
-	let retention_seconds = self.services.config.redaction_retention_seconds;
-	if self.services.server.config.maintenance || retention_seconds == 0 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let retention_seconds = services_root.config.redaction_retention_seconds;
+	if services_root.server.config.maintenance || retention_seconds == 0 {
 		return Ok(0);
 	}
 	let at = now().as_secs();
@@ -77,7 +83,7 @@ pub async fn expire_originals(&self) -> Result<usize> {
 			return Ok(count);
 		}
 		let _originals = self.lock_originals().await;
-		let pins = self.services.tasks.pinned_history_rooms().await?;
+		let pins = services_root.tasks.pinned_history_rooms().await?;
 		for (key, value) in rows {
 			let (time_redacted, event_id): (u64, &EventId) = deserialize_from_slice(&key)?;
 			if !value.is_empty() {
@@ -127,7 +133,10 @@ pub async fn save_original_pdu(
 	pdu: &CanonicalJsonObject,
 	_state_lock: &RoomMutexGuard,
 ) -> Result {
-	if !self.services.config.save_unredacted_events {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root.config.save_unredacted_events {
 		return Ok(());
 	}
 

@@ -96,7 +96,7 @@ impl crate::Service for Service {
 	level = "debug",
 	skip_all,
 	fields(
-		count = ?self.services.globals.pending_count(),
+		count = ?self.services.get().globals.pending_count(),
 		%shortstatehash,
 	)
 )]
@@ -108,20 +108,22 @@ pub async fn force_state(
 	_statediffremoved: Arc<CompressedState>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	statediffnew
 		.iter()
 		.stream()
 		.map(|&new| parse_compressed_state_event(new).1)
 		.wide_filter_map(async |shorteventid| {
-			let event_id: OwnedEventId = self
-				.services
+			let event_id: OwnedEventId = services_root
 				.short
 				.get_eventid_from_short(shorteventid)
 				.inspect_err(inspect_debug_log)
 				.await
 				.ok()?;
 
-			self.services
+			services_root
 				.timeline
 				.get_pdu(&event_id)
 				.await
@@ -143,8 +145,8 @@ pub async fn force_state(
 					return Ok(());
 				};
 
-				let count = self.services.globals.next_count().await?;
-				self.services
+				let count = services_root.globals.next_count().await?;
+				services_root
 					.state_cache
 					.update_membership(MembershipUpdate {
 						room_id,
@@ -163,7 +165,7 @@ pub async fn force_state(
 		.boxed()
 		.await?;
 
-	self.services
+	services_root
 		.state_cache
 		.update_joined_count(room_id)
 		.await?;
@@ -172,7 +174,7 @@ pub async fn force_state(
 		.await?;
 
 	// Forced state may change this room's cached hierarchy summary.
-	self.services.spaces.cache_evict(room_id).await?;
+	services_root.spaces.cache_evict(room_id).await?;
 
 	Ok(())
 }
@@ -187,7 +189,7 @@ pub async fn force_state(
 	level = "debug",
 	skip(self, state_ids_compressed),
 	fields(
-		count = ?self.services.globals.pending_count(),
+		count = ?self.services.get().globals.pending_count(),
 	)
 )]
 pub async fn set_event_state(
@@ -199,16 +201,17 @@ pub async fn set_event_state(
 	const KEY_LEN: usize = size_of::<ShortEventId>();
 	const VAL_LEN: usize = size_of::<ShortStateHash>();
 
-	let shorteventid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shorteventid = services_root
 		.short
 		.get_or_create_shorteventid(event_id)
 		.await?;
 
 	let state_hash = calculate_hash(state_ids_compressed.iter().map(|s| &s[..]));
 
-	if let Ok(shortstatehash) = self
-		.services
+	if let Ok(shortstatehash) = services_root
 		.short
 		.get_shortstatehash(&state_hash)
 		.await
@@ -224,7 +227,7 @@ pub async fn set_event_state(
 	let previous_shortstatehash = self.get_room_shortstatehash(room_id).await;
 	let states_parents = match previous_shortstatehash {
 		| Ok(p) =>
-			self.services
+			services_root
 				.state_compressor
 				.load_shortstatehash_info(p)
 				.await?,
@@ -249,7 +252,7 @@ pub async fn set_event_state(
 	};
 
 	let save_statediff = |txn: &mut Txn, shortstatehash| {
-		self.services
+		services_root
 			.state_compressor
 			.save_state_from_diff(
 				txn,
@@ -261,8 +264,7 @@ pub async fn set_event_state(
 			)
 	};
 
-	let (shortstatehash, _) = self
-		.services
+	let (shortstatehash, _) = services_root
 		.short
 		.get_or_create_shortstatehash(&state_hash, save_statediff)
 		.await?;
@@ -287,15 +289,17 @@ pub async fn set_event_state(
 	level = "debug",
 	skip(self, new_pdu),
 	fields(
-		count = ?self.services.globals.pending_count(),
+		count = ?self.services.get().globals.pending_count(),
 	)
 )]
 pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 	const KEY_LEN: usize = size_of::<ShortEventId>();
 	const VAL_LEN: usize = size_of::<ShortStateHash>();
 
-	let shorteventid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shorteventid = services_root
 		.short
 		.get_or_create_shorteventid(&new_pdu.event_id)
 		.await?;
@@ -315,21 +319,19 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 		| Some(state_key) => {
 			let states_parents = match previous_shortstatehash {
 				| Ok(p) =>
-					self.services
+					services_root
 						.state_compressor
 						.load_shortstatehash_info(p)
 						.await?,
 				| _ => Vec::new(),
 			};
 
-			let shortstatekey = self
-				.services
+			let shortstatekey = services_root
 				.short
 				.get_or_create_shortstatekey(&new_pdu.kind.to_string().into(), state_key)
 				.await?;
 
-			let new = self
-				.services
+			let new = services_root
 				.state_compressor
 				.compress_state_event(shortstatekey, &new_pdu.event_id)
 				.await?;
@@ -348,8 +350,8 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 			}
 
 			// TODO: statehash with deterministic inputs
-			let shortstatehash = self.services.globals.next_count().await?;
-			let mut txn = self.services.db.txn();
+			let shortstatehash = services_root.globals.next_count().await?;
+			let mut txn = services_root.db.txn();
 
 			let mut statediffnew = CompressedState::new();
 			statediffnew.insert(new);
@@ -359,7 +361,7 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 				statediffremoved.insert(*replaces);
 			}
 
-			self.services
+			services_root
 				.state_compressor
 				.save_state_from_diff(
 					&mut txn,
@@ -430,6 +432,9 @@ where
 	StateEventType: Send + Sync,
 	StateKey: Send + Sync,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let shortstatehash = match self.get_room_shortstatehash(room_id).await {
 		| Ok(hash) => hash,
 		| Err(error) if error.is_not_found() && *kind == TimelineEventType::RoomCreate =>
@@ -443,7 +448,7 @@ where
 	// shortcuts cannot prove absence, and no malformed stored cell may disappear
 	// before auth checking or be blamed on the incoming event.
 	let mut state = pin!(
-		self.services
+		services_root
 			.state_accessor
 			.state_full_pdus_strict(shortstatehash)
 	);
@@ -484,6 +489,9 @@ where
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "debug")]
 pub async fn summary_stripped<Pdu: Event>(&self, event: &Pdu) -> Vec<Raw<AnyStrippedStateEvent>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let cells = [
 		(&StateEventType::RoomCreate, ""),
 		(&StateEventType::RoomJoinRules, ""),
@@ -496,7 +504,7 @@ pub async fn summary_stripped<Pdu: Event>(&self, event: &Pdu) -> Vec<Raw<AnyStri
 	];
 
 	let fetches = cells.into_iter().map(|(event_type, state_key)| {
-		self.services
+		services_root
 			.state_accessor
 			.room_state_get(event.room_id(), event_type, state_key)
 	});
@@ -522,6 +530,9 @@ pub async fn summary_pdus<Pdu: Event>(
 	event_json: &CanonicalJsonObject,
 	room_version: &RoomVersionId,
 ) -> Vec<Box<RawJsonValue>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let cells = [
 		(&StateEventType::RoomCreate, ""),
 		(&StateEventType::RoomJoinRules, ""),
@@ -533,8 +544,7 @@ pub async fn summary_pdus<Pdu: Event>(
 		(&StateEventType::RoomTopic, ""),
 	];
 
-	let membership = self
-		.services
+	let membership = services_root
 		.federation
 		.format_pdu_into(event_json.clone(), Some(room_version))
 		.boxed() // query-depth firewall
@@ -544,22 +554,20 @@ pub async fn summary_pdus<Pdu: Event>(
 		.into_iter()
 		.stream()
 		.wide_filter_map(async |(event_type, state_key)| {
-			let pdu = self
-				.services
+			let pdu = services_root
 				.state_accessor
 				.room_state_get(event.room_id(), event_type, state_key)
 				.await
 				.ok()?;
 
-			let pdu_json = self
-				.services
+			let pdu_json = services_root
 				.timeline
 				.get_pdu_json(pdu.event_id())
 				.await
 				.ok()?;
 
 			Some(
-				self.services
+				services_root
 					.federation
 					.format_pdu_into(pdu_json, Some(room_version))
 					.await,
@@ -587,9 +595,11 @@ pub async fn get_room_version_rules(&self, room_id: &RoomId) -> Result<RoomVersi
 	ret(level = "trace"),
 )]
 pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let hash = self.get_room_shortstatehash(room_id).await?;
-	let create = self
-		.services
+	let create = services_root
 		.state_accessor
 		.state_get_optional(hash, &StateEventType::RoomCreate, "")
 		.await?
@@ -616,7 +626,10 @@ pub async fn get_room_shortstatehash(&self, room_id: &RoomId) -> Result<ShortSta
 /// Returns the state hash at this event.
 #[implement(Service)]
 pub async fn pdu_shortstatehash(&self, event_id: &EventId) -> Result<ShortStateHash> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.short
 		.get_shorteventid(event_id)
 		.and_then(|shorteventid| self.get_shortstatehash(shorteventid))
@@ -654,6 +667,9 @@ pub async fn collapse_forward_extremities(
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> usize {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let extremities: ForwardExtremities = self
 		.get_forward_extremities(room_id)
 		.map(ToOwned::to_owned)
@@ -665,7 +681,7 @@ pub async fn collapse_forward_extremities(
 	}
 
 	let survivor = join_all(extremities.iter().map(async |event_id| {
-		self.services
+		services_root
 			.timeline
 			.get_pdu_count(event_id)
 			.await
@@ -713,7 +729,7 @@ pub fn get_forward_extremities<'a>(
 	fields(%room_id),
 )]
 pub async fn set_forward_extremities<'a, I>(
-	&'a self,
+	&self,
 	room_id: &'a RoomId,
 	event_ids: I,
 	_state_lock: &'a RoomMutexGuard,
@@ -751,7 +767,7 @@ pub async fn set_forward_extremities<'a, I>(
 /// written once, so no key is both deleted and written in one batch.
 #[implement(Service)]
 pub async fn set_forward_extremities_txn<'a, I>(
-	&'a self,
+	&self,
 	txn: &mut Txn,
 	room_id: &'a RoomId,
 	event_ids: I,

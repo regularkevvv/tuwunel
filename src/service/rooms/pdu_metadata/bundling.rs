@@ -20,14 +20,16 @@ use super::{
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> Result<Pdu> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut budget = RelationReadBudget::default();
 	budget.charge(
 		0,
 		serialized_len(pdu.as_pdu())
 			.map_err(|_| Error::bad_database("Invalid stored bundle event"))?,
 	)?;
-	if let Some(pruned) = self
-		.services
+	if let Some(pruned) = services_root
 		.state_accessor
 		.erased_view(sender_user, &pdu)
 		.await
@@ -35,23 +37,21 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> R
 		return Ok(pruned);
 	}
 	if pdu.thread_latest_event()?.is_some() {
-		let participated = self
-			.services
+		let participated = services_root
 			.threads
 			.user_participated(pdu.event_id(), sender_user)
 			.await?;
 		pdu.set_thread_participated(participated)?;
 		self.erase_thread_latest(sender_user, &mut pdu, &mut budget)
 			.await?;
-		if self.services.server.config.bundle_edit_relations {
+		if services_root.server.config.bundle_edit_relations {
 			self.bundle_thread_latest_edit(sender_user, &mut pdu, &mut budget)
 				.await?;
 		}
 	}
-	if self.services.server.config.bundle_edit_relations
+	if services_root.server.config.bundle_edit_relations
 		&& let Some(mut replacement) = self.newest_replacement(&pdu, &mut budget).await?
-		&& !self
-			.services
+		&& !services_root
 			.state_accessor
 			.erased_for(sender_user, &replacement)
 			.await
@@ -59,8 +59,7 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> R
 		replacement.remove_transaction_id_unless_sender(Some(sender_user));
 		pdu.set_replacement_bundle(&replacement.into_format())?;
 	}
-	if self
-		.services
+	if services_root
 		.server
 		.config
 		.bundle_reference_relations
@@ -81,11 +80,13 @@ async fn load_thread_latest(
 	pdu: &Pdu,
 	budget: &mut RelationReadBudget,
 ) -> Result<Option<Pdu>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some((event_id, sender)) = pdu.thread_latest_event()? else {
 		return Ok(None);
 	};
-	let latest_id = self
-		.services
+	let latest_id = services_root
 		.timeline
 		.get_pdu_id(&event_id)
 		.await
@@ -116,19 +117,20 @@ async fn erase_thread_latest(
 	pdu: &mut Pdu,
 	budget: &mut RelationReadBudget,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(latest) = self.load_thread_latest(pdu, budget).await? else {
 		return Ok(());
 	};
-	if !self
-		.services
+	if !services_root
 		.users
 		.is_erased(latest.sender())
 		.await
 	{
 		return Ok(());
 	}
-	if let Some(pruned) = self
-		.services
+	if let Some(pruned) = services_root
 		.state_accessor
 		.erased_view(sender_user, &latest)
 		.await
@@ -145,11 +147,13 @@ async fn bundle_thread_latest_edit(
 	pdu: &mut Pdu,
 	budget: &mut RelationReadBudget,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(mut latest) = self.load_thread_latest(pdu, budget).await? else {
 		return Ok(());
 	};
-	if self
-		.services
+	if services_root
 		.state_accessor
 		.erased_for(sender_user, &latest)
 		.await
@@ -159,8 +163,7 @@ async fn bundle_thread_latest_edit(
 	let Some(mut replacement) = self.newest_replacement(&latest, budget).await? else {
 		return Ok(());
 	};
-	if self
-		.services
+	if services_root
 		.state_accessor
 		.erased_for(sender_user, &replacement)
 		.await
@@ -207,8 +210,10 @@ pub async fn ignored_thread_view(
 	ignored: &BTreeSet<OwnedUserId>,
 	root: &Pdu,
 ) -> Result<IgnoredThreadView> {
-	let root_id = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let root_id = services_root
 		.timeline
 		.get_pdu_id(root.event_id())
 		.await
@@ -223,8 +228,7 @@ pub async fn ignored_thread_view(
 		return Ok(Unchanged);
 	}
 
-	let participants = self
-		.services
+	let participants = services_root
 		.threads
 		.get_participants(&root_id)
 		.await
@@ -291,8 +295,7 @@ pub async fn ignored_thread_view(
 		| Some(reply) => {
 			// MSC4025: the swapped-in reply must not reopen the erased-sender
 			// seam the bundle pass gates on the stored latest.
-			let reply = self
-				.services
+			let reply = services_root
 				.state_accessor
 				.erased_view(sender_user, &reply)
 				.await
@@ -321,11 +324,13 @@ async fn redacted_root(
 	ignored: &BTreeSet<OwnedUserId>,
 	root: &Pdu,
 ) -> Result<Option<Box<Pdu>>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if !ignored.contains(root.sender()) {
 		return Ok(None);
 	}
-	let rules = self
-		.services
+	let rules = services_root
 		.state
 		.get_room_version_rules(root.room_id())
 		.await?;

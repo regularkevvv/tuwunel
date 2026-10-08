@@ -23,6 +23,7 @@ use std::{
 	net::TcpListener,
 	path::{Path, PathBuf},
 	process::{Child, Command, id},
+	sync::Arc,
 	thread,
 	time::{Duration, Instant},
 };
@@ -291,9 +292,25 @@ fn child(directory: &Path, phase: &str) -> Result {
 				"stopping runtime after failed exercise"
 			},
 		)?;
+		let stopped_services = Arc::downgrade(&services);
+		let stopped_database = Arc::downgrade(&services.db);
 		drop(stub);
 		drop(services);
-		outcome.and(run).and(async_stop(&server).await)
+		let stopped = async_stop(&server).await;
+		let result = outcome.and(run).and(stopped);
+		if result.is_ok() {
+			assert_eq!(
+				stopped_services.strong_count(),
+				0,
+				"joined shutdown must release the service graph"
+			);
+			assert_eq!(
+				stopped_database.strong_count(),
+				0,
+				"joined shutdown must release the native database"
+			);
+		}
+		result
 	});
 	drop(server);
 	drop(runtime);

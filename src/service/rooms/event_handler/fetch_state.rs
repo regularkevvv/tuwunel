@@ -33,14 +33,16 @@ pub(super) async fn fetch_state(
 	recursion_level: usize,
 	create_event_id: &EventId,
 ) -> Result<Option<HashMap<u64, OwnedEventId>>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let opts = Opts::new(Op::StateIds, room_id.to_owned())
 		.event_id(event_id.to_owned())
 		.hint(origin.to_owned())
 		.attempt_limit(super::EVENT_FETCH_ATTEMPT_LIMIT)
 		.fanout_for_op();
 
-	let outcome = self
-		.services
+	let outcome = services_root
 		.fetcher
 		.fetch(opts)
 		.await
@@ -62,8 +64,7 @@ pub(super) async fn fetch_state(
 			.state_key()
 			.ok_or_else(|| err!(Database("Found non-state pdu in state events.")))?;
 
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&pdu.kind().to_string().into(), state_key)
 			.await?;
@@ -84,8 +85,7 @@ pub(super) async fn fetch_state(
 	}
 
 	// The original create event must still be in the state
-	let create_shortstatekey = self
-		.services
+	let create_shortstatekey = services_root
 		.short
 		.get_shortstatekey(&StateEventType::RoomCreate, "")
 		.await?;

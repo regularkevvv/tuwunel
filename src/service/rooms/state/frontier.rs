@@ -33,14 +33,16 @@ pub async fn validate_timeline_frontier(
 	since: PduCount,
 	until: Option<PduCount>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let prefix = serialize_key((room_id, Interfix))?;
 	let mut frontier = pin!(
 		self.db
 			.roomid_pduleaves
 			.raw_stream_prefix(prefix.as_ref())
 	);
-	let shortroomid = self
-		.services
+	let shortroomid = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await?;
@@ -65,8 +67,7 @@ pub async fn validate_timeline_frontier(
 		if key != expected_key.as_ref() {
 			return Err(Error::bad_database("Mismatched room frontier index"));
 		}
-		let pdu_id = self
-			.services
+		let pdu_id = services_root
 			.timeline
 			.get_pdu_id(&event_id)
 			.await
@@ -91,7 +92,7 @@ pub async fn validate_timeline_frontier(
 		if count <= since || until.is_some_and(|until| count > until) {
 			continue;
 		}
-		let value = self.services.db["pduid_pdu"]
+		let value = services_root.db["pduid_pdu"]
 			.get(&pdu_id)
 			.await
 			.map_err(|error| {

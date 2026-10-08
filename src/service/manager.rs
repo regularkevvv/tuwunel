@@ -46,12 +46,8 @@ impl Manager {
 	}
 
 	pub(super) async fn poll(&self) -> Result {
-		if let Some(manager) = &mut *self.manager.lock().await {
-			debug!("Polling service manager...");
-			return manager.await?;
-		}
-
-		Ok(())
+		debug!("Polling service manager...");
+		join_manager(&self.manager).await
 	}
 
 	#[tracing::instrument(
@@ -63,12 +59,9 @@ impl Manager {
 		),
 	)]
 	pub(super) async fn stop(&self) {
-		let Some(manager) = self.manager.lock().await.take() else {
-			return;
-		};
-
-		debug!("Waiting for service manager...");
-		if let Err(e) = manager.await {
+		// Keep the handle in its slot until completion, so cancelling a stop
+		// cannot detach a manager that a later stop still needs to join.
+		if let Err(e) = self.poll().await {
 			error!("Manager shutdown error: {e:?}");
 		}
 	}
@@ -253,4 +246,49 @@ async fn worker(service: Arc<dyn Service>, mgr: Arc<Manager>) -> WorkerResult {
 
 	// flattens JoinError for panic into worker's Error
 	(service, result.unwrap_or_else(Err))
+}
+
+/// Await a borrowed handle so cancellation preserves the task's join owner.
+async fn join_manager(manager: &Mutex<Option<JoinHandle<Result>>>) -> Result {
+	let mut slot = manager.lock().await;
+	if let Some(handle) = slot.as_mut() {
+		let result = handle.await;
+		slot.take();
+		return result?;
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn cancelled_join_retains_handle_until_a_later_join_finishes() -> Result {
+		let (release, blocked) = tokio::sync::oneshot::channel();
+		let handle: JoinHandle<Result> = tokio::spawn(async move {
+			blocked
+				.await
+				.expect("fixture releases manager task");
+			Ok(())
+		});
+		let manager = Mutex::new(Some(handle));
+		let mut first_join = Box::pin(join_manager(&manager));
+		assert!(futures::poll!(&mut first_join).is_pending());
+		drop(first_join);
+		assert!(
+			manager
+				.lock()
+				.await
+				.as_ref()
+				.is_some_and(|handle| !handle.is_finished())
+		);
+		release
+			.send(())
+			.expect("manager task remains owned");
+		join_manager(&manager).await?;
+		assert!(manager.lock().await.is_none());
+		join_manager(&manager).await?;
+		Ok(())
+	}
 }

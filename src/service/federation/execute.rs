@@ -34,7 +34,10 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
-	let client = &self.services.client.federation;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let client = &services_root.client.federation;
 	self.execute_on(client, dest, request).await
 }
 
@@ -51,18 +54,21 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if matches!(self.should_attempt(dest).await, ShouldAttempt::No { .. }) {
 		return Err!("{dest} is in federation backoff; skipping key lookup");
 	}
 
 	let timeout_dur = Duration::from_secs(
-		self.services
+		services_root
 			.server
 			.config
 			.federation_keys_timeout,
 	);
 
-	let client = &self.services.client.federation;
+	let client = &services_root.client.federation;
 
 	match timeout(timeout_dur, self.execute_uncounted(client, dest, request)).await {
 		| Ok(result) => result,
@@ -83,7 +89,10 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
-	let client = &self.services.client.synapse;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let client = &services_root.client.synapse;
 	self.execute_on(client, dest, request).await
 }
 
@@ -206,9 +215,11 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.validate_request_destination(dest)?;
-	let actual = self
-		.services
+	let actual = services_root
 		.resolver
 		.get_actual_dest(dest)
 		.await?;
@@ -235,9 +246,11 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.validate_request_destination(dest)?;
-	let actual = self
-		.services
+	let actual = services_root
 		.resolver
 		.get_actual_dest_allow_self(dest)
 		.await?;
@@ -249,12 +262,14 @@ where
 
 #[implement(super::Service)]
 fn validate_request_destination(&self, dest: &ServerName) -> Result {
-	if !self.services.server.config.allow_federation {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root.server.config.allow_federation {
 		return Err!(Config("allow_federation", "Federation is disabled."));
 	}
 
-	if self
-		.services
+	if services_root
 		.server
 		.config
 		.is_forbidden_remote_server_name(dest)
@@ -278,11 +293,14 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let url = request.url().clone();
 	let method = request.method().clone();
 
 	debug!(?method, ?url, "Sending request");
-	let limit = self.services.server.config.max_response_size;
+	let limit = services_root.server.config.max_response_size;
 
 	match client.execute(request).await {
 		| Ok(response) => {
@@ -308,21 +326,27 @@ where
 	T::Authentication: FedAuth,
 	T::PathBuilder: FedPath,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let request = self.to_http_request::<T>(actual, dest, request)?;
 	let request = Request::try_from(request)?;
 	self.validate_url(request.url())?;
-	self.services.server.check_running()?;
+	services_root.server.check_running()?;
 
 	Ok(request)
 }
 
 #[implement(super::Service)]
 fn validate_url(&self, url: &Url) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if let Some(url_host) = url.host_str()
 		&& let Ok(ip) = IPAddress::parse(url_host)
 	{
 		trace!("Checking request URL IP {ip:?}");
-		self.services.resolver.validate_ip(&ip)?;
+		services_root.resolver.validate_ip(&ip)?;
 	}
 
 	Ok(())
@@ -443,12 +467,15 @@ async fn evict_misrouted(&self, dest: &ServerName, actual: &ActualDest, error: &
 // the key resolution wrote (`actual.dest.hostname()`), not the origin name.
 #[implement(super::Service)]
 async fn evict_route(&self, dest: &ServerName, actual: &ActualDest) -> Result {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.resolver
 		.cache
 		.del_destination(dest)
 		.await?;
-	self.services
+	services_root
 		.resolver
 		.cache
 		.del_override(&actual.dest.hostname())
@@ -468,15 +495,18 @@ where
 	T::PathBuilder: FedPath,
 {
 	const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_11];
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let supported = SupportedVersions {
 		versions: VERSIONS.into(),
 		features: Default::default(),
 	};
 
 	let auth = T::Authentication::input(
-		self.services.server.name.clone(),
+		services_root.server.name.clone(),
 		dest.to_owned(),
-		self.services.server_keys.keypair(),
+		services_root.server_keys.keypair(),
 	);
 	let path = T::PathBuilder::input(&supported);
 

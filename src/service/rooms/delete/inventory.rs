@@ -9,13 +9,15 @@ impl Service {
 	/// share 4,096 examined keys / 256 KiB user-ID bytes across the source.
 	/// Protected rooms still consume the work required to exclude them.
 	pub async fn bounded_empty_local_rooms(&self) -> Result<Vec<OwnedRoomId>> {
-		let rooms = self.services.metadata.bounded_room_ids().await?;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let rooms = services_root.metadata.bounded_room_ids().await?;
 		let mut rows = 4096_usize;
 		let mut bytes = 256_usize * 1024;
 		let mut empty = Vec::new();
 		for room in rooms {
-			let joined = self
-				.services
+			let joined = services_root
 				.state_cache
 				.bounded_local_member_count(&room, rows, bytes)
 				.await?;
@@ -24,8 +26,7 @@ impl Service {
 			if joined.local_members > 0 {
 				continue;
 			}
-			let invited = self
-				.services
+			let invited = services_root
 				.state_cache
 				.bounded_local_invited_member_count(&room, rows, bytes)
 				.await?;

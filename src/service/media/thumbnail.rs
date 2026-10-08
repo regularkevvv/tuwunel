@@ -75,6 +75,9 @@ impl super::Service {
 		timeout_ms: Duration,
 		user: &UserId,
 	) -> Result<Media> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if let Ok(media) = self
 			.get_thumbnail(mxc, dim, Some(timeout_ms))
 			.await
@@ -82,8 +85,7 @@ impl super::Service {
 			return Ok(media);
 		}
 
-		if self
-			.services
+		if services_root
 			.globals
 			.server_is_ours(mxc.server_name)
 		{
@@ -316,7 +318,10 @@ async fn get_thumbnail_generate(
 #[implement(super::Service)]
 #[tracing::instrument(name = "decode", level = "trace", skip_all)]
 fn decode(&self, bytes: &[u8]) -> Result<DynamicImage> {
-	let budget = self.services.config.media_thumbnail_max_pixels;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let budget = services_root.config.media_thumbnail_max_pixels;
 	let (width, height) = reader(bytes)?
 		.into_dimensions()
 		.map_err(|error| err!(debug_warn!(?error, "Failed to read picture dimensions.")))?;

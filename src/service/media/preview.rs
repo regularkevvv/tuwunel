@@ -215,6 +215,9 @@ pub async fn get_url_preview(&self, url: &Url) -> Result<UrlPreviewData> {
 
 #[implement(Service)]
 pub async fn request_url_preview(&self, url: &Url) -> Result<UrlPreviewData> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.check_url_host(url)?;
 
 	let response = self.preview_get(url, Agent::Page).send().await?;
@@ -231,8 +234,7 @@ pub async fn request_url_preview(&self, url: &Url) -> Result<UrlPreviewData> {
 	let status = response.status();
 	let (response, via_media_client) = if status.is_success() {
 		(response, false)
-	} else if self
-		.services
+	} else if services_root
 		.config
 		.url_preview_media_user_agent
 		.is_some()
@@ -297,7 +299,7 @@ pub async fn request_url_preview(&self, url: &Url) -> Result<UrlPreviewData> {
 		| _ => return Err!(Request(Unknown("Unsupported Content-Type"))),
 	};
 
-	let ttl = Duration::from_secs(self.services.config.url_preview_cache_ttl);
+	let ttl = Duration::from_secs(services_root.config.url_preview_cache_ttl);
 	let cached = CachedPreview::new(ttl, data)?;
 
 	self.db
@@ -311,7 +313,10 @@ pub async fn request_url_preview(&self, url: &Url) -> Result<UrlPreviewData> {
 /// `preview_headers` applies.
 #[implement(Service)]
 fn preview_get(&self, url: &Url, agent: Agent) -> reqwest::RequestBuilder {
-	let request = self.services.client.url_preview.get(url.as_str());
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let request = services_root.client.url_preview.get(url.as_str());
 
 	self.preview_headers(request, url, agent)
 }
@@ -330,7 +335,10 @@ pub(super) fn preview_headers(
 	url: &Url,
 	agent: Agent,
 ) -> reqwest::RequestBuilder {
-	let config: &Config = &self.services.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config: &Config = &services_root.config;
 	let user_agent = match agent {
 		| Agent::Page => config.url_preview_user_agent.as_deref(),
 		| Agent::Media => config
@@ -363,13 +371,16 @@ fn is_youtube(url: &Url) -> bool {
 /// A missing peer address cannot be screened, so it fails closed.
 #[implement(Service)]
 fn check_remote_addr(&self, response: &reqwest::Response) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(remote_addr) = response.remote_addr() else {
 		return Err!(Request(Forbidden("URL preview response has no peer address")));
 	};
 
 	debug!(url = %response.url(), ?remote_addr, "URL preview response remote address");
 
-	self.services
+	services_root
 		.client
 		.valid_cidr_range_remote_addr(response.url(), remote_addr)
 		.then_some(())
@@ -558,6 +569,9 @@ async fn preview_image(&self, image_url: &Url) -> Result<UrlPreviewData> {
 pub async fn download_image(&self, response: reqwest::Response) -> Result<UrlPreviewData> {
 	use image::ImageReader;
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// the image is fetched once here to measure it; the bytes are staged so the
 	// first client download promotes them instead of refetching the origin
 	let url = response.url().clone();
@@ -573,7 +587,7 @@ pub async fn download_image(&self, response: reqwest::Response) -> Result<UrlPre
 		.and_then(|value| value.to_str().ok())
 		.map(ToOwned::to_owned);
 
-	let limit = self.services.config.url_preview_max_media_size;
+	let limit = services_root.config.url_preview_max_media_size;
 	let image = read_response_capped(response, limit).await?;
 
 	let cursor = std::io::Cursor::new(&image);
@@ -585,7 +599,7 @@ pub async fn download_image(&self, response: reqwest::Response) -> Result<UrlPre
 		},
 	};
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 	let mxc = self.queue_lazy_media(&mut txn, url.as_str());
 
 	self.db.set_lazy_content(
@@ -658,9 +672,11 @@ async fn media_refetch(
 	response: reqwest::Response,
 	via_media_client: bool,
 ) -> Result<reqwest::Response> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if via_media_client
-		|| self
-			.services
+		|| services_root
 			.config
 			.url_preview_media_user_agent
 			.is_none()
@@ -710,8 +726,11 @@ fn queue_lazy_media(&self, txn: &mut Txn, url: &str) -> String {
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
 fn mint_lazy_media(&self) -> String {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	Mxc {
-		server_name: self.services.globals.server_name(),
+		server_name: services_root.globals.server_name(),
 		media_id: &random_string(MXC_LENGTH),
 	}
 	.to_string()
@@ -720,8 +739,11 @@ fn mint_lazy_media(&self) -> String {
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
 pub async fn download_video(&self, response: reqwest::Response) -> Result<UrlPreviewData> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let video_size =
-		checked_media_size(&response, self.services.config.url_preview_max_media_size)?;
+		checked_media_size(&response, services_root.config.url_preview_max_media_size)?;
 
 	Ok(UrlPreviewData {
 		video: Some(
@@ -743,8 +765,11 @@ pub async fn download_video(&self, _response: reqwest::Response) -> Result<UrlPr
 #[cfg(feature = "url_preview")]
 #[implement(Service)]
 pub async fn download_audio(&self, response: reqwest::Response) -> Result<UrlPreviewData> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let audio_size =
-		checked_media_size(&response, self.services.config.url_preview_max_media_size)?;
+		checked_media_size(&response, services_root.config.url_preview_max_media_size)?;
 
 	Ok(UrlPreviewData {
 		audio: Some(
@@ -783,7 +808,10 @@ fn checked_media_size(response: &reqwest::Response, limit: usize) -> Result<Opti
 async fn download_html(&self, url: &Url, response: reqwest::Response) -> Result<UrlPreviewData> {
 	use webpage::HTML;
 
-	let limit = self.services.config.url_preview_max_spider_size;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let limit = services_root.config.url_preview_max_spider_size;
 	let (bytes, truncated) = spider_body(response, limit).await?;
 
 	// the parser needs an owned string, so the read buffer becomes one rather
@@ -983,7 +1011,10 @@ fn declares_media_type(obj: &OpengraphObject, class: &str) -> bool {
 
 #[implement(Service)]
 pub(super) fn check_url_host(&self, url: &Url) -> Result {
-	if self.services.client.proxy.resolver_alias(url) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.client.proxy.resolver_alias(url) {
 		return Err!(Request(Forbidden(
 			"Requesting a locally resolved proxy endpoint is forbidden"
 		)));
@@ -999,7 +1030,7 @@ pub(super) fn check_url_host(&self, url: &Url) -> Result {
 		| Host::Ipv6(v6) => IpAddr::V6(v6),
 	};
 
-	if !self.services.client.valid_cidr_range_ip(ip) {
+	if !services_root.client.valid_cidr_range_ip(ip) {
 		return Err!(Request(Forbidden("Requesting from this address is forbidden")));
 	}
 
@@ -1008,6 +1039,9 @@ pub(super) fn check_url_host(&self, url: &Url) -> Result {
 
 #[implement(Service)]
 pub fn url_preview_allowed(&self, url: &Url) -> bool {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if ["http", "https"]
 		.iter()
 		.all(|&scheme| !scheme.eq_ignore_ascii_case(url.scheme()))
@@ -1024,20 +1058,16 @@ pub fn url_preview_allowed(&self, url: &Url) -> bool {
 		| Some(h) => h.to_owned(),
 	};
 
-	let allowlist_domain_contains = &self
-		.services
+	let allowlist_domain_contains = &services_root
 		.config
 		.url_preview_domain_contains_allowlist;
-	let allowlist_domain_explicit = &self
-		.services
+	let allowlist_domain_explicit = &services_root
 		.config
 		.url_preview_domain_explicit_allowlist;
-	let denylist_domain_explicit = &self
-		.services
+	let denylist_domain_explicit = &services_root
 		.config
 		.url_preview_domain_explicit_denylist;
-	let allowlist_url_contains = &self
-		.services
+	let allowlist_url_contains = &services_root
 		.config
 		.url_preview_url_contains_allowlist;
 
@@ -1086,7 +1116,7 @@ pub fn url_preview_allowed(&self, url: &Url) -> bool {
 		}
 
 		// check root domain if available and if user has root domain checks
-		if self.services.config.url_preview_check_root_domain {
+		if services_root.config.url_preview_check_root_domain {
 			debug!("Checking root domain");
 			match host.split_once('.') {
 				| None => return false,

@@ -14,7 +14,7 @@ use tuwunel_core::{
 	Result,
 	arrayvec::ArrayVec,
 	at, checked, err, implement, utils,
-	utils::{bytes, math::usize_from_f64, stream::IterStream},
+	utils::{bytes, math::usize_from_f64},
 };
 use tuwunel_database::{Map, Txn};
 
@@ -227,20 +227,17 @@ pub fn compress_state_events<'a, I>(
 where
 	I: Iterator<Item = (&'a ShortStateKey, &'a EventId)> + Clone + Debug + Send + 'a,
 {
-	let event_ids = state.clone().map(at!(1));
-
-	let short_event_ids = self
-		.services
-		.short
-		.multi_get_or_create_shorteventid(event_ids);
-
-	state
-		.stream()
-		.map(at!(0))
-		.zip(short_event_ids)
-		.map(|(shortstatekey, shorteventid)| {
-			Ok(compress_state_event(*shortstatekey, shorteventid?))
-		})
+	let services_guard = self.services.get();
+	async_stream::stream! {
+		let services_root = services_guard.as_ref();
+		let event_ids = state.clone().map(|(_, event_id)| event_id);
+		let short_event_ids = services_root.short.multi_get_or_create_shorteventid(event_ids);
+		futures::pin_mut!(short_event_ids);
+		for (shortstatekey, _) in state {
+			let Some(shorteventid) = short_event_ids.next().await else { break; };
+			yield shorteventid.map(|id| compress_state_event(*shortstatekey, id));
+		}
+	}
 }
 
 #[implement(Service)]
@@ -249,8 +246,10 @@ pub async fn compress_state_event(
 	shortstatekey: ShortStateKey,
 	event_id: &EventId,
 ) -> Result<CompressedStateEvent> {
-	let shorteventid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shorteventid = services_root
 		.short
 		.get_or_create_shorteventid(event_id)
 		.await?;
@@ -423,11 +422,13 @@ pub async fn save_state(
 	room_id: &RoomId,
 	new_state_ids_compressed: Arc<CompressedState>,
 ) -> Result<HashSetCompressStateEvent> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if new_state_ids_compressed.len() > bounds::MAX_STATE_EVENTS {
 		return Err(state_limit());
 	}
-	let previous_shortstatehash = self
-		.services
+	let previous_shortstatehash = services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -439,8 +440,7 @@ pub async fn save_state(
 			.map(|bytes| &bytes[..]),
 	);
 
-	let existing_shortstatehash = self
-		.services
+	let existing_shortstatehash = services_root
 		.short
 		.get_shortstatehash(&state_hash)
 		.await
@@ -483,7 +483,7 @@ pub async fn save_state(
 	let new_shortstatehash = if let Some(new_shortstatehash) = existing_shortstatehash {
 		new_shortstatehash
 	} else {
-		self.services
+		services_root
 			.short
 			.get_or_create_shortstatehash(&state_hash, |txn, shortstatehash| {
 				self.save_state_from_diff(

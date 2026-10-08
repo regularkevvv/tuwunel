@@ -22,8 +22,10 @@ pub async fn unban(
 	sender_user: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	let current_member_content = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let current_member_content = services_root
 		.state_accessor
 		.get_member(room_id, user_id)
 		.await
@@ -36,7 +38,7 @@ pub async fn unban(
 		)));
 	}
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {

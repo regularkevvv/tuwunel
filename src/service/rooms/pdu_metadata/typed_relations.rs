@@ -61,8 +61,10 @@ pub(super) async fn typed_children(
 	tag: Tag,
 	budget: &mut RelationReadBudget,
 ) -> Result<Vec<Pdu>> {
-	let parent_id: PduId = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let parent_id: PduId = match services_root
 		.timeline
 		.get_pdu_id(parent.event_id())
 		.await
@@ -111,7 +113,7 @@ pub(super) async fn typed_children(
 		}
 		.into();
 		let Some(child) = self.relation_pdu(&child_id, budget).await? else {
-			match self.services.timeline.get_pdu_id(&event_id).await {
+			match services_root.timeline.get_pdu_id(&event_id).await {
 				| Err(error) if error.kind() == ErrorKind::NotFound => continue,
 				| Err(error) => return Err(error),
 				| Ok(_) =>
@@ -149,10 +151,13 @@ async fn typed_child_event_id(
 	short: u64,
 	budget: &mut RelationReadBudget,
 ) -> Result<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if short == 0 {
 		return Err(Error::bad_database("Invalid zero typed child compact ID"));
 	}
-	let value = self.services.db["shorteventid_eventid"]
+	let value = services_root.db["shorteventid_eventid"]
 		.get(&short.to_be_bytes())
 		.await
 		.map_err(|error| {
@@ -167,7 +172,7 @@ async fn typed_child_event_id(
 		.map_err(|_| Error::bad_database("Invalid typed child event encoding"))?;
 	let event_id = EventId::parse(event_id)
 		.map_err(|_| Error::bad_database("Invalid typed child event ID"))?;
-	let forward = self.services.db["eventid_shorteventid"]
+	let forward = services_root.db["eventid_shorteventid"]
 		.get(&event_id)
 		.await
 		.map_err(|error| {
@@ -201,11 +206,14 @@ pub async fn add_typed_relation<E: Event>(
 	child: &E,
 	rel_type: RelationType,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(tag) = tag(&rel_type) else {
 		return Ok(());
 	};
 
-	let parent_id: PduId = match self.services.timeline.get_pdu_id(parent).await {
+	let parent_id: PduId = match services_root.timeline.get_pdu_id(parent).await {
 		| Ok(id) => id.into(),
 		| Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
 		| Err(error) => return Err(error),
@@ -219,8 +227,7 @@ pub async fn add_typed_relation<E: Event>(
 		return Ok(()); // backfilled relations are not indexed
 	};
 
-	let child_short = self
-		.services
+	let child_short = services_root
 		.short
 		.get_or_create_shorteventid(child.event_id())
 		.await?;
@@ -266,6 +273,9 @@ pub(super) fn key(
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "debug")]
 pub async fn delete_typed_relation(&self, child_id: &RawPduId, child: &CanonicalJsonObject) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(relates_to) = child
 		.get("content")
 		.and_then(CanonicalJsonValue::as_object)
@@ -303,8 +313,7 @@ pub async fn delete_typed_relation(&self, child_id: &RawPduId, child: &Canonical
 	let child_count = child_id.pdu_count();
 	let shortroomid = u64_from_u8(&child_id.shortroomid());
 
-	let Ok(parent_count) = self
-		.services
+	let Ok(parent_count) = services_root
 		.timeline
 		.get_pdu_count(&parent)
 		.await

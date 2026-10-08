@@ -29,23 +29,26 @@ pub fn room_state_type_pdus<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 	event_type: &'a StateEventType,
-) -> impl Stream<Item = Result<impl Event>> + Send + 'a {
-	self.services
-		.state
-		.get_room_shortstatehash(room_id)
-		.map_ok(move |shortstatehash| {
-			self.state_type_pdus_strict(shortstatehash, event_type)
-				.map(move |result| {
-					result.and_then(|pdu| {
-						(pdu.room_id() == room_id)
-							.then_some(pdu)
-							.ok_or_else(|| err!(Database("Mismatched room state event")))
+) -> impl Stream<Item = Result<impl Event + use<>>> + Send + 'a {
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state
+			.get_room_shortstatehash(room_id)
+			.map_ok(move |shortstatehash| {
+				self.state_type_pdus_strict(shortstatehash, event_type)
+					.map(move |result| {
+						result.and_then(|pdu| {
+							(pdu.room_id() == room_id)
+								.then_some(pdu)
+								.ok_or_else(|| err!(Database("Mismatched room state event")))
+						})
 					})
-				})
-		})
-		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
-		.try_flatten_stream()
-		.boxed()
+			})
+			.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
+			.try_flatten_stream()
+			.boxed()
+	})
 }
 
 /// Returns the full room state.
@@ -54,29 +57,32 @@ pub fn room_state_type_pdus<'a>(
 pub fn room_state_full<'a>(
 	&'a self,
 	room_id: &'a RoomId,
-) -> impl Stream<Item = Result<((StateEventType, StateKey), impl Event)>> + Send + 'a {
-	self.services
-		.state
-		.get_room_shortstatehash(room_id)
-		.map_ok(move |shortstatehash| {
-			self.state_full_pdus_strict(shortstatehash)
-				.map(move |result| {
-					result.and_then(|(state_key, pdu)| {
-						(pdu.room_id() == room_id)
-							.then_some((state_key, pdu))
-							.ok_or_else(|| err!(Database("Mismatched room state event")))
+) -> impl Stream<Item = Result<((StateEventType, StateKey), impl Event + use<>)>> + Send + 'a {
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state
+			.get_room_shortstatehash(room_id)
+			.map_ok(move |shortstatehash| {
+				self.state_full_pdus_strict(shortstatehash)
+					.map(move |result| {
+						result.and_then(|(state_key, pdu)| {
+							(pdu.room_id() == room_id)
+								.then_some((state_key, pdu))
+								.ok_or_else(|| err!(Database("Mismatched room state event")))
+						})
 					})
-				})
-		})
-		.map_err(move |error| {
-			if error.kind() == ErrorKind::NotFound {
-				err!(Database("Missing state for {room_id:?}"))
-			} else {
-				error
-			}
-		})
-		.try_flatten_stream()
-		.boxed()
+			})
+			.map_err(move |error| {
+				if error.kind() == ErrorKind::NotFound {
+					err!(Database("Missing state for {room_id:?}"))
+				} else {
+					error
+				}
+			})
+			.try_flatten_stream()
+			.boxed()
+	})
 }
 
 /// Returns the full room state pdus
@@ -85,23 +91,26 @@ pub fn room_state_full<'a>(
 pub fn room_state_full_pdus<'a>(
 	&'a self,
 	room_id: &'a RoomId,
-) -> impl Stream<Item = Result<impl Event>> + Send + 'a {
-	self.services
-		.state
-		.get_room_shortstatehash(room_id)
-		.map_ok(move |shortstatehash| {
-			self.state_full_pdus_strict(shortstatehash)
-				.map(move |result| {
-					result.and_then(|(_, pdu)| {
-						(pdu.room_id() == room_id)
-							.then_some(pdu)
-							.ok_or_else(|| err!(Database("Mismatched room state event")))
+) -> impl Stream<Item = Result<impl Event + use<>>> + Send + 'a {
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state
+			.get_room_shortstatehash(room_id)
+			.map_ok(move |shortstatehash| {
+				self.state_full_pdus_strict(shortstatehash)
+					.map(move |result| {
+						result.and_then(|(_, pdu)| {
+							(pdu.room_id() == room_id)
+								.then_some(pdu)
+								.ok_or_else(|| err!(Database("Mismatched room state event")))
+						})
 					})
-				})
-		})
-		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
-		.try_flatten_stream()
-		.boxed()
+			})
+			.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
+			.try_flatten_stream()
+			.boxed()
+	})
 }
 
 /// Returns a single EventId from `room_id` with key (`event_type`,
@@ -114,7 +123,10 @@ pub async fn room_state_get_id(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<OwnedEventId> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.and_then(|shortstatehash| self.state_get_id(shortstatehash, event_type, state_key))
@@ -130,13 +142,16 @@ pub fn room_state_keys_with_ids<'a>(
 	room_id: &'a RoomId,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = Result<(StateKey, OwnedEventId)>> + Send + 'a {
-	self.services
-		.state
-		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| self.state_keys_with_ids_strict(shortstatehash, event_type))
-		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
-		.try_flatten_stream()
-		.boxed()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state
+			.get_room_shortstatehash(room_id)
+			.map_ok(|shortstatehash| self.state_keys_with_ids_strict(shortstatehash, event_type))
+			.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
+			.try_flatten_stream()
+			.boxed()
+	})
 }
 
 /// Iterates the state_keys for an event_type in the state
@@ -147,13 +162,16 @@ pub fn room_state_keys<'a>(
 	room_id: &'a RoomId,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = Result<StateKey>> + Send + 'a {
-	self.services
-		.state
-		.get_room_shortstatehash(room_id)
-		.map_ok(|shortstatehash| self.state_keys_strict(shortstatehash, event_type))
-		.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
-		.try_flatten_stream()
-		.boxed()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state
+			.get_room_shortstatehash(room_id)
+			.map_ok(|shortstatehash| self.state_keys_strict(shortstatehash, event_type))
+			.map_err(move |e| err!(Database("Missing state for {room_id:?}: {e:?}")))
+			.try_flatten_stream()
+			.boxed()
+	})
 }
 
 /// Returns a single PDU from `room_id` with key (`event_type`,
@@ -166,7 +184,10 @@ pub async fn room_state_get(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<Pdu> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.and_then(|shortstatehash| self.state_get(shortstatehash, event_type, state_key))

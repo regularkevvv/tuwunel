@@ -65,6 +65,9 @@ impl Service {
 		)
 	)]
 	pub async fn typing_add(&self, user_id: &UserId, room_id: &RoomId, timeout: u64) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		debug_info!("typing started {user_id:?} in {room_id:?} timeout:{timeout:?}");
 
 		// update clients
@@ -72,7 +75,7 @@ impl Service {
 		let room = typing.entry(room_id.to_owned()).or_default();
 		room.users.insert(user_id.to_owned(), timeout);
 
-		let count = self.services.globals.next_count().await?;
+		let count = services_root.globals.next_count().await?;
 
 		room.update = *count;
 
@@ -91,8 +94,7 @@ impl Service {
 		let appservice_send = self.appservice_send(room_id);
 
 		// update federation
-		let federation_send = self
-			.services
+		let federation_send = services_root
 			.globals
 			.user_is_local(user_id)
 			.then_async(|| self.federation_send(room_id, user_id, true))
@@ -114,6 +116,9 @@ impl Service {
 		)
 	)]
 	pub async fn typing_remove(&self, user_id: &UserId, room_id: &RoomId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		debug_info!("typing stopped {user_id:?} in {room_id:?}");
 
 		// update clients
@@ -121,7 +126,7 @@ impl Service {
 		let room = typing.entry(room_id.to_owned()).or_default();
 		room.users.remove(user_id);
 
-		let count = self.services.globals.next_count().await?;
+		let count = services_root.globals.next_count().await?;
 
 		room.update = *count;
 
@@ -140,8 +145,7 @@ impl Service {
 		let appservice_send = self.appservice_send(room_id);
 
 		// update federation
-		let federation_send = self
-			.services
+		let federation_send = services_root
 			.globals
 			.user_is_local(user_id)
 			.then_async(|| self.federation_send(room_id, user_id, false))
@@ -163,6 +167,9 @@ impl Service {
 
 	/// Makes sure that typing events with old timestamps get removed.
 	async fn typings_maintain(&self, room_id: &RoomId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let current_timestamp = millis_since_unix_epoch();
 		let typing = self.typing.read().await;
 		let has_expired = typing.get(room_id).is_some_and(|room| {
@@ -198,7 +205,7 @@ impl Service {
 		}
 
 		// update clients
-		let count = self.services.globals.next_count().await?;
+		let count = services_root.globals.next_count().await?;
 
 		room.update = *count;
 
@@ -223,7 +230,7 @@ impl Service {
 		// update federation
 		let federation_sends = removable
 			.iter()
-			.filter(|user_id| self.services.globals.user_is_local(user_id))
+			.filter(|user_id| services_root.globals.user_is_local(user_id))
 			.try_stream()
 			.try_for_each(|user_id| self.federation_send(room_id, user_id, false));
 
@@ -260,9 +267,12 @@ impl Service {
 
 	/// Sends a typing EDU to all appservices interested in the room.
 	async fn appservice_send(&self, room_id: &RoomId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let content = self.typings_content(room_id).await;
 
-		self.services
+		services_root
 			.sending
 			.send_edu_room_appservices(room_id, |buf| {
 				let edu = EphemeralData::Typing(EphemeralRoomEvent {
@@ -337,12 +347,14 @@ impl Service {
 		user_ids: Vec<OwnedUserId>,
 		sender_user: &UserId,
 	) -> Vec<OwnedUserId> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if user_ids.is_empty() {
 			return user_ids;
 		}
 
-		let ignored: Option<IgnoredUserListEvent> = self
-			.services
+		let ignored: Option<IgnoredUserListEvent> = services_root
 			.account_data
 			.get_global(sender_user, GlobalAccountDataEventType::IgnoredUserList)
 			.await
@@ -362,8 +374,11 @@ impl Service {
 	}
 
 	async fn federation_send(&self, room_id: &RoomId, user_id: &UserId, typing: bool) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		debug_assert!(
-			self.services.globals.user_is_local(user_id),
+			services_root.globals.user_is_local(user_id),
 			"tried to broadcast typing status of remote user",
 		);
 
@@ -377,7 +392,7 @@ impl Service {
 		let mut buf = EduBuf::new();
 		serde_json::to_writer(&mut buf, &edu).expect("Serialized Edu::Typing");
 
-		self.services
+		services_root
 			.sending
 			.send_edu_room(room_id, buf)
 			.await?;

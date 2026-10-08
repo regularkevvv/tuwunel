@@ -115,14 +115,15 @@ async fn get_key(
 	key_id: &ServerSigningKeyId,
 	usage: KeyUse,
 ) -> Result<VerifyKey> {
-	let notary_first = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let notary_first = services_root
 		.server
 		.config
 		.query_trusted_key_servers_first;
 
-	let notary_only = self
-		.services
+	let notary_only = services_root
 		.server
 		.config
 		.only_query_trusted_key_servers;
@@ -170,7 +171,10 @@ async fn get_key_from_notaries(
 	key_id: &ServerSigningKeyId,
 	usage: KeyUse,
 ) -> Result<VerifyKey> {
-	for notary in &self.services.config.trusted_servers {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	for notary in &services_root.config.trusted_servers {
 		if let Ok(server_keys) = self.notary_request(notary, origin).await {
 			for server_key in server_keys {
 				self.add_signing_keys(server_key).await;

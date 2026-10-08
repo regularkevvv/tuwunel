@@ -16,16 +16,18 @@ impl Service {
 	/// Room state resolution remains subject to its own snapshot
 	/// implementation.
 	pub(super) async fn avatar_mxcs(&self) -> Result<HashSet<OwnedMxcUri>> {
-		let users = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let users = services_root
 			.users
 			.bounded_registered_users()
 			.await?;
-		let rooms = self.services.metadata.bounded_room_ids().await?;
+		let rooms = services_root.metadata.bounded_room_ids().await?;
 		let mut spared = HashSet::new();
 		let mut bytes = 128 * 1024_usize;
 		for user in users {
-			match self.services.profile.avatar_url(&user).await {
+			match services_root.profile.avatar_url(&user).await {
 				| Ok(avatar) => retain_avatar(&mut spared, &mut bytes, avatar)?,
 				| Err(error) if error.is_not_found() => {},
 				| Err(error) => return Err(error),
@@ -40,15 +42,16 @@ impl Service {
 	}
 
 	async fn room_avatar(&self, room: &RoomId) -> Result<Option<OwnedMxcUri>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// Only a complete state snapshot can prove an avatar absent. A missing
 		// room hash or referenced event must never become an empty spare-set.
-		let hash = self
-			.services
+		let hash = services_root
 			.state
 			.get_room_shortstatehash(room)
 			.await?;
-		let Some(event) = self
-			.services
+		let Some(event) = services_root
 			.state_accessor
 			.state_get_optional(hash, &StateEventType::RoomAvatar, "")
 			.await?

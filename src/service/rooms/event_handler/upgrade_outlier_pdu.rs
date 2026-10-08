@@ -77,9 +77,11 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	recursion_level: usize,
 	create_event_id: &EventId,
 ) -> Result<Option<(RawPduId, bool)>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Skip the PDU if we already have it as a timeline event
-	if let Ok(pdu_id) = self
-		.services
+	if let Ok(pdu_id) = services_root
 		.timeline
 		.get_pdu_id(incoming_pdu.event_id())
 		.await
@@ -125,7 +127,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	// 13. Use state resolution to find new room state
 	// We start looking at current room state now, so lets lock the room
 	trace!("Locking the room");
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let state_lock = services_root.state.mutex.lock(room_id).await;
 
 	// 14. Check if the event passes auth based on the current room state.
 	let soft_fail_current_state = !self
@@ -138,7 +140,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 		.compute_remaining_extremities(room_id, &incoming_pdu)
 		.await;
 
-	let config = &self.services.server.config;
+	let config = &services_root.server.config;
 	let max = config.forward_extremities_max;
 	let len = extremities
 		.len()
@@ -152,8 +154,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 			config.forward_extremities_prune_batch,
 		);
 
-		let summary = self
-			.services
+		let summary = services_root
 			.state
 			.prune_forward_extremities(room_id, &mut extremities, goal, Trigger::Receive)
 			.await;
@@ -162,8 +163,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	}
 
 	trace!("Compressing state...");
-	let state_ids_compressed: Arc<CompressedState> = self
-		.services
+	let state_ids_compressed: Arc<CompressedState> = services_root
 		.state_compressor
 		.compress_state_events(
 			state_at_incoming_event
@@ -207,8 +207,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 		.map(Borrow::borrow)
 		.chain(incoming_extremity);
 
-	let pdu_id = self
-		.services
+	let pdu_id = services_root
 		.timeline
 		.append_incoming_pdu(
 			&incoming_pdu,
@@ -226,7 +225,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	);
 
 	if soft_fail {
-		self.services
+		services_root
 			.pdu_metadata
 			.mark_event_soft_failed(incoming_pdu.event_id())
 			.await?;
@@ -249,7 +248,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	drop(state_lock);
 
 	if cleared {
-		self.services
+		services_root
 			.pdu_metadata
 			.clear_event_soft_failed(incoming_pdu.event_id())
 			.await?;
@@ -279,9 +278,11 @@ async fn current_state_auth_passes(
 	incoming_pdu: &PduEvent,
 	room_rules: &RoomVersionRules,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	trace!("Gathering current-state auth events.");
-	let auth_events = self
-		.services
+	let auth_events = services_root
 		.state
 		.get_auth_events(
 			room_id,
@@ -360,10 +361,12 @@ async fn soft_fail_standing(
 	room_rules: &RoomVersionRules,
 	pdu_json: &mut CanonicalJsonObject,
 ) -> Result<Standing> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = incoming_pdu.event_id();
 
-	if !self
-		.services
+	if !services_root
 		.pdu_metadata
 		.is_event_soft_failed(event_id)
 		.await
@@ -406,7 +409,10 @@ async fn soft_fail_standing(
 async fn rejected_prevs_replaced(&self, incoming_pdu: &PduEvent) -> Option<PduEvent> {
 	const REJECTED_WALK_LIMIT: usize = 64;
 
-	let timeline = &self.services.timeline;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let timeline = &services_root.timeline;
 	let mut replaced = false;
 	let mut walked = 0_usize;
 	let mut seen = HashSet::new();
@@ -449,6 +455,9 @@ async fn resolve_state_at_incoming_event(
 	recursion_level: usize,
 	create_event_id: &EventId,
 ) -> Result<(HashMap<u64, OwnedEventId>, ResolvedVia)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// 10. Fetch missing state and auth chain events by calling /state_ids at
 	//     backwards extremities doing all the checks in this list starting at 1.
 	//     These are not timeline events.
@@ -470,7 +479,7 @@ async fn resolve_state_at_incoming_event(
 		return Ok((state, ResolvedVia::Derived));
 	}
 
-	let config = &self.services.server.config;
+	let config = &services_root.server.config;
 	let enabled = config.resolve_state_locally && config.resolve_state_locally_max > 0;
 
 	if enabled {
@@ -544,14 +553,16 @@ async fn auth_check_outlier_pdu(
 	room_rules: &RoomVersionRules,
 	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Every event holding a `shorteventid_shortstatehash` row passed spec check 5
 	// (auth against the state at its own position) as a hard reject; soft failure
 	// (spec check 6) still writes the row, so soft-failed events are valid fold
 	// inputs while positionally rejected events never gain a row.
 
 	let state_fetch = async |k: StateEventType, s: StateKey| {
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_shortstatekey(&k, s.as_str())
 			.await?;
@@ -564,7 +575,7 @@ async fn auth_check_outlier_pdu(
 				)))
 			})?;
 
-		self.services
+		services_root
 			.timeline
 			.get_pdu(event_id)
 			.await
@@ -601,13 +612,15 @@ async fn compute_soft_fail(
 	room_rules: &RoomVersionRules,
 	pdu_json: &mut CanonicalJsonObject,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Soft fail check before doing state res
 	trace!("Performing soft-fail check");
 	let soft_fail_redact = match incoming_pdu.redacts_id(room_rules) {
 		| None => false,
 		| Some(redact_id) =>
-			!self
-				.services
+			!services_root
 				.state_accessor
 				.user_can_redact(&redact_id, incoming_pdu.sender(), incoming_pdu.room_id(), true)
 				.await?,
@@ -628,11 +641,13 @@ async fn compute_remaining_extremities(
 	room_id: &RoomId,
 	incoming_pdu: &PduEvent,
 ) -> Vec<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Now we calculate the set of extremities this room has after the incoming
 	// event has been applied. We start with the previous extremities (aka leaves)
 	trace!("Calculating extremities");
-	let extremities: Vec<_> = self
-		.services
+	let extremities: Vec<_> = services_root
 		.state
 		.get_forward_extremities(room_id)
 		.ready_filter(|&event_id| {
@@ -644,7 +659,7 @@ async fn compute_remaining_extremities(
 		.map(ToOwned::to_owned)
 		.broad_filter_map(|event_id| async move {
 			// Only keep those extremities were not referenced yet
-			self.services
+			services_root
 				.pdu_metadata
 				.is_event_referenced(room_id, &event_id)
 				.await
@@ -672,13 +687,15 @@ async fn resolve_and_force_state_after(
 	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// We also add state after incoming event to the fork states
 	let mut state_after = state_at_incoming_event.clone();
 	if let Some(state_key) = incoming_pdu.state_key() {
 		let event_id = incoming_pdu.event_id();
 		let event_type = incoming_pdu.kind();
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&event_type.to_string().into(), state_key)
 			.await?;
@@ -703,8 +720,7 @@ async fn resolve_and_force_state_after(
 
 	// Set the new room state to the resolved state
 	trace!("Saving resolved state.");
-	let HashSetCompressStateEvent { shortstatehash, added, removed } = self
-		.services
+	let HashSetCompressStateEvent { shortstatehash, added, removed } = services_root
 		.state_compressor
 		.save_state(room_id, new_room_state)
 		.await?;
@@ -715,7 +731,7 @@ async fn resolve_and_force_state_after(
 		removed = removed.len(),
 		"Forcing new room state."
 	);
-	self.services
+	services_root
 		.state
 		.force_state(room_id, shortstatehash, added, removed, state_lock)
 		.await?;

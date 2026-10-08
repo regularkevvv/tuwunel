@@ -43,20 +43,23 @@ impl Service {
 		presence_state: &PresenceState,
 		count: u64,
 	) -> Result {
-		if !(self.timeout_remote_users || self.services.globals.user_is_local(user_id))
-			|| user_id == self.services.globals.server_user
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !(self.timeout_remote_users || services_root.globals.user_is_local(user_id))
+			|| user_id == services_root.globals.server_user
 		{
 			return Ok(());
 		}
 
 		let timeout = match presence_state {
 			| PresenceState::Online =>
-				self.services
+				services_root
 					.server
 					.config
 					.presence_idle_timeout_s,
 			| _ =>
-				self.services
+				services_root
 					.server
 					.config
 					.presence_offline_timeout_s,
@@ -113,6 +116,9 @@ impl Service {
 		status_msg: StatusMsg,
 		refresh_window_ms: Option<u64>,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let now = tuwunel_core::utils::millis_since_unix_epoch();
 		let preserve_status = matches!(status_msg, StatusMsg::Unchanged);
 
@@ -204,7 +210,7 @@ impl Service {
 				"Presence went inactive; flushing suppressed pushes"
 			);
 
-			self.services
+			services_root
 				.sending
 				.schedule_resume_pushes_for_user(
 					user_id.to_owned(),
@@ -245,15 +251,18 @@ impl Service {
 	pub async fn maybe_ping_presence(&self, user_id: &UserId, args: Ping<'_>) -> Result {
 		const REFRESH_TIMEOUT: u64 = 30 * 1000;
 
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if args.appservice.is_some()
-			|| !self.services.server.config.allow_local_presence
-			|| self.services.db.is_read_only()
+			|| !services_root.server.config.allow_local_presence
+			|| services_root.db.is_read_only()
 		{
 			return Ok(());
 		}
 
 		let update_device_seen = args.device_id.map_async(|device_id| {
-			self.services
+			services_root
 				.users
 				.update_device_last_seen(user_id, device_id, args.client_ip, None)
 		});
@@ -328,6 +337,9 @@ impl Service {
 		last_active_ago: Option<UInt>,
 		status_msg: Option<String>,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let presence_state = match state.as_str() {
 			| "" => &PresenceState::Offline, // default an empty string to 'offline'
 			| &_ => state,
@@ -339,8 +351,8 @@ impl Service {
 			.await?;
 
 		if let Some(count) = count {
-			let is_local = self.services.globals.user_is_local(user_id);
-			let is_server_user = user_id == self.services.globals.server_user;
+			let is_local = services_root.globals.user_is_local(user_id);
+			let is_server_user = user_id == services_root.globals.server_user;
 			let allow_timeout = self.timeout_remote_users || is_local;
 
 			if allow_timeout && !is_server_user {
@@ -356,6 +368,9 @@ impl Service {
 		user_id: &OwnedUserId,
 		expected_count: u64,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let Ok((current_count, presence)) = self.db.get_presence_raw(user_id).await else {
 			return Ok(());
 		};
@@ -392,7 +407,7 @@ impl Service {
 
 			if let Some(new_state) = new_state {
 				if matches!(new_state, PresenceState::Unavailable | PresenceState::Offline) {
-					self.services
+					services_root
 						.sending
 						.schedule_resume_pushes_for_user(
 							user_id.to_owned(),
@@ -414,7 +429,7 @@ impl Service {
 		}
 
 		if matches!(aggregated.state, PresenceState::Unavailable | PresenceState::Offline) {
-			self.services
+			services_root
 				.sending
 				.schedule_resume_pushes_for_user(user_id.to_owned(), "presence->inactive");
 		}

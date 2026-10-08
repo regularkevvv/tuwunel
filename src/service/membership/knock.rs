@@ -48,12 +48,14 @@ pub async fn knock<'a>(
 	servers: &'a [OwnedServerName],
 	state_lock: &'a RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let servers =
-		get_servers_for_room(&self.services, sender_user, room_id, orig_server_name, servers)
+		get_servers_for_room(services_root, sender_user, room_id, orig_server_name, servers)
 			.await?;
 
-	if self
-		.services
+	if services_root
 		.state_cache
 		.is_invited(sender_user, room_id)
 		.await
@@ -64,8 +66,7 @@ pub async fn knock<'a>(
 		)));
 	}
 
-	if self
-		.services
+	if services_root
 		.state_cache
 		.is_joined(sender_user, room_id)
 		.await
@@ -74,16 +75,14 @@ pub async fn knock<'a>(
 		return Err!(Request(Forbidden("You cannot knock on a room you are already joined in.")));
 	}
 
-	let server_in_room = self
-		.services
+	let server_in_room = services_root
 		.state_cache
-		.server_in_room(self.services.globals.server_name(), room_id)
+		.server_in_room(services_root.globals.server_name(), room_id)
 		.await;
 
 	// Trust a local knock; re-drive a remote one in case we missed a kick.
 	if server_in_room
-		&& self
-			.services
+		&& services_root
 			.state_cache
 			.is_knocked(sender_user, room_id)
 			.await
@@ -92,8 +91,7 @@ pub async fn knock<'a>(
 		return Ok(());
 	}
 
-	if let Ok(membership) = self
-		.services
+	if let Ok(membership) = services_root
 		.state_accessor
 		.get_member(room_id, sender_user)
 		.await && membership.membership == MembershipState::Ban
@@ -104,7 +102,7 @@ pub async fn knock<'a>(
 
 	let local_knock = server_in_room
 		|| servers.is_empty()
-		|| (servers.len() == 1 && self.services.globals.server_is_ours(&servers[0]));
+		|| (servers.len() == 1 && services_root.globals.server_is_ours(&servers[0]));
 
 	if local_knock {
 		self.knock_room_helper_local(sender_user, room_id, reason, &servers, state_lock)
@@ -126,10 +124,12 @@ async fn knock_room_helper_local(
 	servers: &[OwnedServerName],
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_info!("We can knock locally");
 
-	let room_version_id = self
-		.services
+	let room_version_id = services_root
 		.state
 		.get_room_version(room_id)
 		.await?;
@@ -141,13 +141,12 @@ async fn knock_room_helper_local(
 		..RoomMemberEventContent::new(MembershipState::Knock)
 	};
 
-	self.services
+	services_root
 		.profile
 		.fill_profile_data(sender_user, &mut content)
 		.await;
 
-	let Err(error) = self
-		.services
+	let Err(error) = services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(sender_user.to_string(), &content),
@@ -161,7 +160,7 @@ async fn knock_room_helper_local(
 	};
 
 	if servers.is_empty()
-		|| (servers.len() == 1 && self.services.globals.server_is_ours(&servers[0]))
+		|| (servers.len() == 1 && services_root.globals.server_is_ours(&servers[0]))
 	{
 		return Err(error);
 	}
@@ -198,6 +197,9 @@ async fn knock_room_local_federation_fallback(
 	servers: &[OwnedServerName],
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let (make_knock_response, remote_server) = self
 		.make_knock_request(sender_user, room_id, servers)
 		.await?;
@@ -206,8 +208,7 @@ async fn knock_room_local_federation_fallback(
 
 	let room_version_id = make_knock_response.room_version.clone();
 
-	if !self
-		.services
+	if !services_root
 		.config
 		.supported_room_version(&room_version_id)
 	{
@@ -224,7 +225,7 @@ async fn knock_room_local_federation_fallback(
 		.execute_send_knock(&remote_server, room_id, &event_id, &knock_event, &room_version_id)
 		.await?;
 
-	self.services
+	services_root
 		.short
 		.get_or_create_shortroomid(room_id)
 		.await?;
@@ -250,12 +251,15 @@ async fn finalize_knock_membership(
 	send_knock_response: federation::membership::create_knock_event::v1::Response,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	info!("Parsing knock event");
 	let parsed_knock_pdu = PduEvent::from_object_and_eventid(event_id, knock_event.clone())
 		.map_err(|e| err!(BadServerResponse("Invalid knock event PDU: {e:?}")))?;
 
 	info!("Updating membership locally to knock state with provided stripped state events");
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 	let membership_event = parsed_knock_pdu
 		.get_content::<RoomMemberEventContent>()
 		.expect("we just created this");
@@ -266,7 +270,7 @@ async fn finalize_knock_membership(
 		.filter_map(|state| into_client_stripped(room_id, state))
 		.collect();
 
-	self.services
+	services_root
 		.state_cache
 		.update_membership(MembershipUpdate {
 			room_id,
@@ -281,7 +285,7 @@ async fn finalize_knock_membership(
 		.await?;
 
 	info!("Appending room knock event locally");
-	self.services
+	services_root
 		.timeline
 		.append_pdu(
 			&parsed_knock_pdu,
@@ -304,6 +308,9 @@ async fn knock_room_helper_remote(
 	servers: &[OwnedServerName],
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	info!("Knocking {room_id} over federation.");
 
 	let (make_knock_response, remote_server) = self
@@ -314,8 +321,7 @@ async fn knock_room_helper_remote(
 
 	let room_version_id = make_knock_response.room_version.clone();
 
-	if !self
-		.services
+	if !services_root
 		.config
 		.supported_room_version(&room_version_id)
 	{
@@ -332,7 +338,7 @@ async fn knock_room_helper_remote(
 		.execute_send_knock(&remote_server, room_id, &event_id, &knock_event, &room_version_id)
 		.await?;
 
-	self.services
+	services_root
 		.short
 		.get_or_create_shortroomid(room_id)
 		.await?;
@@ -348,14 +354,13 @@ async fn knock_room_helper_remote(
 	self.apply_send_knock_state(room_id, &state_map, state_lock)
 		.await?;
 
-	let statehash_after_knock = self
-		.services
+	let statehash_after_knock = services_root
 		.state
 		.append_to_state(&parsed_knock_pdu)
 		.await?;
 
 	info!("Updating membership locally to knock state with provided stripped state events");
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 	let membership_event = parsed_knock_pdu
 		.get_content::<RoomMemberEventContent>()
 		.expect("we just created this");
@@ -366,7 +371,7 @@ async fn knock_room_helper_remote(
 		.filter_map(|state| into_client_stripped(room_id, state))
 		.collect();
 
-	self.services
+	services_root
 		.state_cache
 		.update_membership(MembershipUpdate {
 			room_id,
@@ -383,7 +388,7 @@ async fn knock_room_helper_remote(
 	info!("Appending room knock event locally and setting final room state");
 	// The append makes the state after the knock current once the pdu is stored
 	// and before the pdu is published.
-	self.services
+	services_root
 		.timeline
 		.append_pdu(
 			&parsed_knock_pdu,
@@ -406,6 +411,9 @@ async fn build_knock_event(
 	make_knock_response: &federation::membership::prepare_knock_event::v1::Response,
 	room_version_id: &RoomVersionId,
 ) -> Result<(CanonicalJsonObject, OwnedEventId)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut knock_event_stub: CanonicalJsonObject =
 		serde_json::from_str(make_knock_response.event.get()).map_err(|e| {
 			err!(BadServerResponse("Invalid make_knock event json received from server: {e:?}"))
@@ -416,7 +424,7 @@ async fn build_knock_event(
 		..RoomMemberEventContent::new(MembershipState::Knock)
 	};
 
-	self.services
+	services_root
 		.profile
 		.fill_profile_data(sender_user, &mut content)
 		.await;
@@ -424,7 +432,7 @@ async fn build_knock_event(
 	knock_event_stub.insert(
 		"origin".into(),
 		CanonicalJsonValue::String(
-			self.services
+			services_root
 				.globals
 				.server_name()
 				.as_str()
@@ -457,7 +465,7 @@ async fn build_knock_event(
 
 	// In order to create a compatible ref hash (EventID) the `hashes` field needs
 	// to be present
-	self.services
+	services_root
 		.server_keys
 		.hash_and_sign_event(&mut knock_event_stub, room_version_id)?;
 
@@ -478,19 +486,20 @@ async fn execute_send_knock(
 	knock_event: &CanonicalJsonObject,
 	room_version_id: &RoomVersionId,
 ) -> Result<federation::membership::create_knock_event::v1::Response> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	info!("Asking {remote_server} for send_knock in room {room_id}");
 	let send_knock_request = federation::membership::create_knock_event::v1::Request {
 		room_id: room_id.to_owned(),
 		event_id: event_id.clone(),
-		pdu: self
-			.services
+		pdu: services_root
 			.federation
 			.format_pdu_into(knock_event.clone(), Some(room_version_id))
 			.await,
 	};
 
-	let response = self
-		.services
+	let response = services_root
 		.federation
 		.execute(remote_server, send_knock_request)
 		.await?;
@@ -511,14 +520,16 @@ async fn ingest_send_knock_state(
 	send_knock_response: &federation::membership::create_knock_event::v1::Response,
 	room_version_id: &RoomVersionId,
 ) -> Result<HashMap<u64, OwnedEventId>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	info!("Going through send_knock response knock state events");
 
 	let verdict = self
 		.validate_stripped_create(&send_knock_response.knock_room_state, room_id, room_version_id)
 		.await?;
 
-	let enforce = self
-		.services
+	let enforce = services_root
 		.config
 		.enforce_stripped_state_pdu_validation;
 
@@ -567,13 +578,12 @@ async fn ingest_send_knock_state(
 		}
 
 		let event_id = gen_event_id(&event, room_version_id)?;
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&event_type, &state_key)
 			.await?;
 
-		self.services
+		services_root
 			.timeline
 			.add_pdu_outlier(&event_id, &event)
 			.await?;
@@ -591,9 +601,11 @@ async fn apply_send_knock_state(
 	state_map: &HashMap<u64, OwnedEventId>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	info!("Compressing state from send_knock");
-	let compressed: CompressedState = self
-		.services
+	let compressed: CompressedState = services_root
 		.state_compressor
 		.compress_state_events(
 			state_map
@@ -608,14 +620,13 @@ async fn apply_send_knock_state(
 		shortstatehash: statehash_before_knock,
 		added,
 		removed,
-	} = self
-		.services
+	} = services_root
 		.state_compressor
 		.save_state(room_id, Arc::new(compressed))
 		.await?;
 
 	debug!("Forcing state for new room");
-	self.services
+	services_root
 		.state
 		.force_state(room_id, statehash_before_knock, added, removed, state_lock)
 		.await?;
@@ -630,14 +641,16 @@ async fn make_knock_request(
 	room_id: &RoomId,
 	servers: &[OwnedServerName],
 ) -> Result<(federation::membership::prepare_knock_event::v1::Response, OwnedServerName)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut make_knock_response_and_server =
 		Err!(BadServerResponse("No server available to assist in knocking."));
 
 	let mut make_knock_counter: usize = 0;
 
 	for remote_server in servers {
-		if self
-			.services
+		if services_root
 			.globals
 			.server_is_ours(remote_server)
 		{
@@ -646,14 +659,12 @@ async fn make_knock_request(
 
 		info!("Asking {remote_server} for make_knock ({make_knock_counter})");
 
-		let make_knock_response = self
-			.services
+		let make_knock_response = services_root
 			.federation
 			.execute(remote_server, federation::membership::prepare_knock_event::v1::Request {
 				room_id: room_id.to_owned(),
 				user_id: sender_user.to_owned(),
-				ver: self
-					.services
+				ver: services_root
 					.config
 					.supported_room_versions()
 					.map(at!(0))

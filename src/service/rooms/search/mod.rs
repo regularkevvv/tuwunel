@@ -115,31 +115,34 @@ pub async fn search_pdus<'a>(
 	&'a self,
 	query: &'a RoomQuery<'a>,
 ) -> Result<(usize, impl Stream<Item = impl Event + use<>> + Send + '_)> {
+	let services_guard = self.services.get();
 	let pdu_ids: Vec<_> = self.search_pdu_ids(query).await?.collect().await;
 
-	let filter = &query.criteria.filter;
 	let count = pdu_ids.len();
-	let pdus = pdu_ids
-		.into_iter()
-		.stream()
-		.wide_filter_map(async |result_pdu_id: RawPduId| {
-			self.services
-				.timeline
-				.get_pdu_from_id(&result_pdu_id)
-				.await
-				.ok()
-		})
-		.ready_filter(|pdu| !pdu.is_redacted())
-		.ready_filter(move |pdu| filter.matches(pdu))
-		.wide_filter_map(async |pdu| {
-			self.services
-				.state_accessor
-				.user_can_see_event(query.user_id?, pdu.room_id(), pdu.event_id())
-				.await
-				.then_some(pdu)
-		})
-		.skip(query.skip)
-		.take(query.limit);
+	let pdus = crate::once_services::services_stream!(services_guard, services_root, {
+		let filter = &query.criteria.filter;
+		pdu_ids
+			.into_iter()
+			.stream()
+			.wide_filter_map(async |result_pdu_id: RawPduId| {
+				services_root
+					.timeline
+					.get_pdu_from_id(&result_pdu_id)
+					.await
+					.ok()
+			})
+			.ready_filter(|pdu| !pdu.is_redacted())
+			.ready_filter(move |pdu| filter.matches(pdu))
+			.wide_filter_map(async |pdu| {
+				services_root
+					.state_accessor
+					.user_can_see_event(query.user_id?, pdu.room_id(), pdu.event_id())
+					.await
+					.then_some(pdu)
+			})
+			.skip(query.skip)
+			.take(query.limit)
+	});
 
 	Ok((count, pdus))
 }
@@ -151,8 +154,10 @@ pub async fn search_pdu_ids(
 	&self,
 	query: &RoomQuery<'_>,
 ) -> Result<impl Stream<Item = RawPduId> + Send + '_ + use<'_>> {
-	let shortroomid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid = services_root
 		.short
 		.get_shortroomid(query.room_id)
 		.await?;

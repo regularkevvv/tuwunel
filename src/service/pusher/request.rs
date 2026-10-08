@@ -23,6 +23,9 @@ where
 	for<'a> T::Authentication: AuthScheme<Input<'a> = ()>,
 	for<'a> T::PathBuilder: PathBuilder<Input<'a> = ()>,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let dest = if dest.contains(['?', '#']) {
 		let parsed = Url::parse(dest).ok();
 
@@ -39,8 +42,7 @@ where
 
 		dest
 	} else {
-		let push_path = self
-			.services
+		let push_path = services_root
 			.config
 			.notification_push_path
 			.trim_end_matches('/');
@@ -63,8 +65,7 @@ where
 
 	let reqwest_request = reqwest::Request::try_from(http_request)?;
 
-	if self
-		.services
+	if services_root
 		.client
 		.proxy
 		.resolver_alias(reqwest_request.url())
@@ -75,16 +76,14 @@ where
 	}
 
 	trace!("Checking request URL for IP");
-	if !self
-		.services
+	if !services_root
 		.client
 		.valid_cidr_range_url(reqwest_request.url())
 	{
 		return Err!(BadServerResponse("Not allowed to send requests to this IP"));
 	}
 
-	match self
-		.services
+	match services_root
 		.client
 		.pusher
 		.execute(reqwest_request)
@@ -100,13 +99,15 @@ async fn handle_ok<T>(&self, dest: &str, mut response: Response) -> Result<T::In
 where
 	T: OutgoingRequest,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	trace!("Checking response destination's IP");
 	if let Some(remote_addr) = response.remote_addr()
-		&& !self
-			.services
+		&& !services_root
 			.client
 			.valid_cidr_range_ip(remote_addr.ip())
-		&& !self.services.client.proxied(response.url())
+		&& !services_root.client.proxied(response.url())
 	{
 		return Err!(BadServerResponse("Not allowed to send requests to this IP"));
 	}
@@ -123,7 +124,7 @@ where
 			.expect("http::response::Builder is usable"),
 	);
 
-	let limit = self.services.config.max_response_size;
+	let limit = services_root.config.max_response_size;
 	let body = read_response_capped(response, limit).await?;
 
 	if !status.is_success() {

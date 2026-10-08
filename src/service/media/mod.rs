@@ -11,7 +11,7 @@ mod video;
 use std::{
 	collections::{HashMap, HashSet},
 	path::PathBuf,
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, OnceLock},
 	time::{Duration, Instant, SystemTime},
 };
 
@@ -101,6 +101,8 @@ struct MXCState {
 pub struct Service {
 	pub(super) db: Data,
 	services: Arc<crate::services::OnceServices>,
+	server: Arc<tuwunel_core::Server>,
+	storage: OnceLock<Arc<crate::storage::Service>>,
 	url_preview_mutex: MutexMap<String, ()>,
 	federation_mutex: MutexMap<String, ()>,
 	quota_mutex: MutexMap<String, ()>,
@@ -129,6 +131,8 @@ impl crate::Service for Service {
 		let service = Arc::new(Self {
 			db: Data::new(args.db),
 			services: args.services.clone(),
+			server: args.server.clone(),
+			storage: OnceLock::new(),
 			url_preview_mutex: MutexMap::new(),
 			federation_mutex: MutexMap::new(),
 			quota_mutex: MutexMap::new(),
@@ -154,8 +158,11 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		if self.services.globals.is_read_only()
-			|| self.services.server.config.media_remote_retention == 0
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if services_root.globals.is_read_only()
+			|| services_root.server.config.media_remote_retention == 0
 		{
 			return Ok(());
 		}
@@ -167,7 +174,7 @@ impl crate::Service for Service {
 				| Err(e) => warn!("Failed to remove remote media past its retention: {e}"),
 			}
 
-			let shutdown = self.services.server.until_shutdown();
+			let shutdown = services_root.server.until_shutdown();
 			if tokio::time::timeout(RETENTION_INTERVAL, shutdown)
 				.await
 				.is_ok()
@@ -189,7 +196,10 @@ impl Service {
 		user: &UserId,
 		unused_expires_at: u64,
 	) -> Result {
-		let config = &self.services.server.config;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let config = &services_root.server.config;
 
 		// Rate limiting (rc_media_create)
 		let rate = f64::from(config.media_rc_create_per_second);
@@ -380,12 +390,15 @@ impl Service {
 	/// Deletes a file in the database and from the media directory via an MXC
 	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete(&self, mxc: &Mxc<'_>) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// lazy URL-preview media has no file keys of its own; drop its reference
 		// and staged bytes whenever present so a delete can't re-mint the media
 		let had_lazy = self.db.search_lazy_media(mxc).await.is_ok();
 		if had_lazy {
 			let key = mxc.to_string();
-			let mut txn = self.services.db.txn();
+			let mut txn = services_root.db.txn();
 
 			self.db.remove_lazy_media(&mut txn, &key);
 			self.db.remove_lazy_content(&mut txn, &key);
@@ -491,12 +504,14 @@ impl Service {
 		skip(self),
 	)]
 	pub async fn get_or_fetch(&self, mxc: &Mxc<'_>, timeout_ms: Duration) -> Result<Media> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if let Ok(media) = self.get(mxc, Some(timeout_ms)).await {
 			return Ok(media);
 		}
 
-		if self
-			.services
+		if services_root
 			.globals
 			.server_is_ours(mxc.server_name)
 		{
@@ -601,6 +616,9 @@ impl Service {
 	/// at most once per item.
 	#[tracing::instrument(level = "debug", skip(self))]
 	async fn fetch_lazy_media(&self, mxc: &Mxc<'_>) -> Result<Media> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let key = mxc.to_string();
 
 		// bound outbound amplification to one in-flight fetch per mxc; requests
@@ -625,7 +643,7 @@ impl Service {
 					return Err!(Request(NotFound("Media not found.")));
 				};
 
-				let limit = self.services.config.url_preview_max_media_size;
+				let limit = services_root.config.url_preview_max_media_size;
 
 				self.location_request(Fetch::Preview(Agent::Media), &url, limit)
 					.await?
@@ -655,7 +673,7 @@ impl Service {
 			return Err(e);
 		}
 
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 
 		self.db.remove_lazy_media(&mut txn, &key);
 		self.db.remove_lazy_content(&mut txn, &key);
@@ -671,7 +689,10 @@ impl Service {
 	/// can presign (filesystem-only media).
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn redirect_url(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Option<Url>> {
-		if !self.services.config.media_allow_redirect {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !services_root.config.media_allow_redirect {
 			return Ok(None);
 		}
 
@@ -849,8 +870,11 @@ impl Service {
 	}
 
 	fn is_local(&self, mxc: &OwnedMxcUri) -> bool {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		mxc.server_name()
-			.is_ok_and(|server| self.services.globals.server_is_ours(server))
+			.is_ok_and(|server| services_root.globals.server_is_ours(server))
 	}
 
 	/// First storage provider's object metadata for the media stored under
@@ -877,10 +901,13 @@ impl Service {
 		newer_than: bool,
 		yes_i_want_to_delete_local_media: bool,
 	) -> Result<usize> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// Records are read in bounded batches from a cursor, each read closed
 		// before its media are deleted. Local media are skipped by resuming
 		// past their keys, unless they are to be deleted too.
-		let local = format!("mxc://{}/", self.services.globals.server_name());
+		let local = format!("mxc://{}/", services_root.globals.server_name());
 		let mut from: Option<Vec<u8>> = None;
 		let mut deletion_count: usize = 0;
 		loop {
@@ -926,7 +953,7 @@ impl Service {
 
 				trace!("Parsed MXC key to URL: {mxc_s}");
 				let mxc = OwnedMxcUri::from(mxc_s);
-				if (mxc.server_name() == Ok(self.services.globals.server_name())
+				if (mxc.server_name() == Ok(services_root.globals.server_name())
 					&& !yes_i_want_to_delete_local_media)
 					|| !mxc.is_valid()
 				{
@@ -1000,7 +1027,7 @@ impl Service {
 				}
 			}
 
-			if ended || !self.services.server.is_running() {
+			if ended || !services_root.server.is_running() {
 				return Ok(deletion_count);
 			}
 		}
@@ -1044,10 +1071,13 @@ impl Service {
 	}
 
 	async fn create_media_file(&self, key: &[u8], file: &[u8]) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		self.storage_providers()
 			.try_stream()
 			.ready_try_filter(|provider| {
-				let store_media_on_providers = &self.services.config.store_media_on_providers;
+				let store_media_on_providers = &services_root.config.store_media_on_providers;
 
 				store_media_on_providers.is_empty()
 					|| store_media_on_providers.contains(&provider.name)
@@ -1081,17 +1111,20 @@ impl Service {
 	}
 
 	fn storage_providers(&self) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
-		let explicit_providers = &self.services.config.media_storage_providers;
+		let storage = self
+			.storage
+			.get_or_init(|| self.services.get().storage.clone());
+		let explicit_providers = &self.server.config.media_storage_providers;
 
 		let or_all_providers = explicit_providers
 			.is_empty()
-			.then(|| self.services.storage.providers())
+			.then(|| storage.providers())
 			.into_iter()
 			.flatten();
 
 		explicit_providers
 			.iter()
-			.filter_map(|id| self.services.storage.provider(id).ok())
+			.filter_map(|id| storage.provider(id).ok())
 			.chain(or_all_providers)
 	}
 
@@ -1132,7 +1165,10 @@ impl Service {
 
 	#[must_use]
 	pub fn get_media_dir(&self) -> PathBuf {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.server
 			.config
 			.database_path

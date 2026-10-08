@@ -244,8 +244,10 @@ impl Service {
 	/// Rows are durable, coalesced, and recomputed at send time.
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn refresh_push_badge(&self, user_id: &UserId) -> Result {
-		let pushkeys: Vec<String> = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let pushkeys: Vec<String> = services_root
 			.pusher
 			.get_pushkeys(user_id)
 			.map(ToOwned::to_owned)
@@ -273,11 +275,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self, room_id, pdu_id), level = "debug")]
 	pub async fn send_pdu_room(&self, room_id: &RoomId, pdu_id: &RawPduId) -> Result {
-		let servers = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let servers = services_root
 			.state_cache
 			.room_servers(room_id)
-			.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name));
+			.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name));
 
 		self.send_pdu_servers(servers, pdu_id).await
 	}
@@ -318,11 +322,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self, room_id, serialized), level = "debug")]
 	pub async fn send_edu_room(&self, room_id: &RoomId, serialized: EduBuf) -> Result {
-		let servers = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let servers = services_root
 			.state_cache
 			.room_servers(room_id)
-			.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name));
+			.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name));
 
 		self.send_edu_servers(servers, serialized).await
 	}
@@ -353,8 +359,10 @@ impl Service {
 		F: Fn(&mut dyn Write) -> Result + Send + 'a,
 		&'a F: Send + Sync,
 	{
-		let appservice_ids = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let appservice_ids = services_root
 			.appservice
 			.read()
 			.await
@@ -369,13 +377,11 @@ impl Service {
 					return true;
 				}
 
-				let appservice_in_room = self
-					.services
+				let appservice_in_room = services_root
 					.state_cache
 					.appservice_in_room(room_id, appservice);
 
-				let matching_aliases = self
-					.services
+				let matching_aliases = services_root
 					.alias
 					.local_aliases_for_room(room_id)
 					.ready_any(|room_alias| appservice.aliases.is_match(room_alias.as_str()));
@@ -423,7 +429,10 @@ impl Service {
 	where
 		I: Iterator<Item = (&'a DeviceId, u64)> + Clone + Send,
 	{
-		let registrations = self.services.appservice.read().await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let registrations = services_root.appservice.read().await;
 		let _cork = self.db.db.cork();
 
 		let mut payloads: Option<EduVec> = None;
@@ -459,7 +468,10 @@ impl Service {
 		),
 	)]
 	pub async fn send_device_list_appservices(&self, user_id: &UserId, count: u64) -> Result {
-		let registrations = self.services.appservice.read().await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let registrations = services_root.appservice.read().await;
 
 		// Hot path: no bridge opted into transaction extensions.
 		if !registrations
@@ -497,23 +509,23 @@ impl Service {
 	/// joined room the appservice participates in that is encrypted, or any
 	/// such room when `device_key_update_encrypted_rooms_only` is off.
 	async fn shares_device_list_room(&self, user_id: &UserId, info: &RegistrationInfo) -> bool {
-		let update_all_rooms = !self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let update_all_rooms = !services_root
 			.config
 			.device_key_update_encrypted_rooms_only;
 
-		self.services
+		services_root
 			.state_cache
 			.rooms_joined(user_id)
 			.map(ToOwned::to_owned)
 			.any(async |room_id: OwnedRoomId| {
 				(update_all_rooms
-					|| self
-						.services
+					|| services_root
 						.state_accessor
 						.is_encrypted_room(&room_id)
-						.await) && self
-					.services
+						.await) && services_root
 					.state_cache
 					.appservice_in_room(&room_id, info)
 					.await
@@ -551,11 +563,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self, room_id), level = "debug")]
 	pub async fn flush_room(&self, room_id: &RoomId) -> Result {
-		let servers = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let servers = services_root
 			.state_cache
 			.room_servers(room_id)
-			.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name));
+			.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name));
 
 		self.flush_servers(servers).await
 	}
@@ -599,8 +613,10 @@ impl Service {
 		),
 	)]
 	pub async fn notify_peer_alive(&self, server: &ServerName) -> bool {
-		let sad = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let sad = services_root
 			.federation
 			.note_peer_alive(server)
 			.await;

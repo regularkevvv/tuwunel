@@ -137,6 +137,9 @@ pub(crate) async fn stage_notification_plan(
 	pdu: &Pdu,
 	state: Option<ShortStateHash>,
 ) -> Result<PreparedNotifications> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let admission = self
 		.notification_admission
 		.clone()
@@ -144,8 +147,7 @@ pub(crate) async fn stage_notification_plan(
 		.await;
 	let pending = self.notification_inventory().await?;
 	let mut targets = BTreeSet::new();
-	let members = self
-		.services
+	let members = services_root
 		.state_cache
 		.bounded_room_members(pdu.room_id())
 		.await?;
@@ -153,12 +155,10 @@ pub(crate) async fn stage_notification_plan(
 		.map_err(|_| Error::bad_database("Invalid notification member inventory count"))?;
 	for user in members {
 		if user != pdu.sender()
-			&& self
-				.services
+			&& services_root
 				.users
 				.notification_recipient_active(&user)
-				.await? && !self
-			.services
+				.await? && !services_root
 			.users
 			.user_is_ignored_checked(pdu.sender(), &user)
 			.await?
@@ -170,8 +170,7 @@ pub(crate) async fn stage_notification_plan(
 		&& let Some(target) = pdu.state_key()
 	{
 		let target = UserId::parse(target)?;
-		if self
-			.services
+		if services_root
 			.users
 			.notification_recipient_active(&target)
 			.await?
@@ -185,27 +184,24 @@ pub(crate) async fn stage_notification_plan(
 	let state = match state {
 		| Some(state) => state,
 		| None =>
-			self.services
+			services_root
 				.state
 				.get_room_shortstatehash(pdu.room_id())
 				.await?,
 	};
-	let power_levels = self
-		.services
+	let power_levels = services_root
 		.state_accessor
 		.get_power_levels_at(pdu.room_id(), state, Some(pdu))
 		.await?;
 	let related_events = self.related_events_checked(pdu).await?;
-	let thread = self
-		.services
+	let thread = services_root
 		.threads
 		.get_thread_id_checked(pdu)
 		.await?;
 	let serialized = pdu.to_format();
 	let mut recipients = Vec::new();
 	for user in targets {
-		let rules = match self
-			.services
+		let rules = match services_root
 			.account_data
 			.get_global::<PushRulesEvent>(&user, GlobalAccountDataEventType::PushRules)
 			.await
@@ -229,7 +225,7 @@ pub(crate) async fn stage_notification_plan(
 			.await?
 			.to_vec();
 		let (notify, highlight) = decisions(&actions);
-		if !notify && !highlight && !self.services.config.push_everything {
+		if !notify && !highlight && !services_root.config.push_everything {
 			continue;
 		}
 		let pushkeys = self.notification_pushkeys(&user).await?;
@@ -237,7 +233,7 @@ pub(crate) async fn stage_notification_plan(
 			user,
 			actions,
 			pushkeys,
-			push_everything: self.services.config.push_everything,
+			push_everything: services_root.config.push_everything,
 		});
 	}
 	if recipients.is_empty() {
@@ -302,9 +298,11 @@ async fn notification_inventory(&self) -> Result<Vec<Plan>> {
 
 #[implement(super::Service)]
 async fn validate_notification_source(&self, plan: &Plan) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let raw = RawPduId::from_bytes(&plan.raw_id)?;
-	let pdu = self
-		.services
+	let pdu = services_root
 		.timeline
 		.get_pdu_from_id(&raw)
 		.await
@@ -315,16 +313,14 @@ async fn validate_notification_source(&self, plan: &Plan) -> Result {
 				error
 			}
 		})?;
-	let binding = self
-		.services
+	let binding = services_root
 		.timeline
 		.get_pdu_id(&plan.event)
 		.await?;
 	if binding != raw
 		|| pdu.event_id() != plan.event
 		|| pdu.room_id() != plan.room
-		|| self
-			.services
+		|| services_root
 			.short
 			.get_shortroomid(&plan.room)
 			.await?
@@ -334,8 +330,7 @@ async fn validate_notification_source(&self, plan: &Plan) -> Result {
 		return Err(Error::bad_database("Notification source indexes disagree"));
 	}
 	for (index, recipient) in plan.recipients.iter().enumerate() {
-		if !self
-			.services
+		if !services_root
 			.globals
 			.user_is_local(&recipient.user)
 		{
@@ -367,12 +362,15 @@ async fn validate_notification_source(&self, plan: &Plan) -> Result {
 
 #[implement(super::Service)]
 pub(crate) async fn restore_notifications(&self) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let plans = self.notification_inventory().await?;
 	for plan in &plans {
 		self.validate_notification_source(plan).await?;
 	}
 	for plan in plans {
-		let state = self.services.state.mutex.lock(&plan.room).await;
+		let state = services_root.state.mutex.lock(&plan.room).await;
 		self.finish_notification_plan(&plan.raw_id, &state)
 			.await?;
 	}
@@ -394,6 +392,9 @@ pub(crate) async fn append_pdu(
 
 #[implement(super::Service)]
 async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _plan = self.notification_plans.lock(&key.to_vec()).await;
 	let mut validated = false;
 	loop {
@@ -412,8 +413,7 @@ async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) ->
 		let guard = self
 			.lock_notification(&recipient.user, &plan.room)
 			.await;
-		let canceled = !self
-			.services
+		let canceled = !services_root
 			.users
 			.notification_recipient_active(&recipient.user)
 			.await? || self
@@ -455,7 +455,7 @@ async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) ->
 				self.stage_notification_index(&mut txn, raw, &plan.room, &recipient.user)?;
 			}
 			for pushkey in &recipient.pushkeys {
-				wakes.push(self.services.sending.stage_frozen_push(
+				wakes.push(services_root.sending.stage_frozen_push(
 					&mut txn,
 					raw,
 					&recipient.user,
@@ -481,7 +481,7 @@ async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) ->
 		// already passed the event. Keep the change stamp's sequence permit
 		// through the same recipient commit; read cutoffs live separately.
 		let update = if !canceled && (notify || highlight) {
-			let update = self.services.globals.next_count().await?;
+			let update = services_root.globals.next_count().await?;
 			match &plan.thread {
 				| Some(thread) => txn.put(
 					&self.db.roomuserid_lastnotificationread,
@@ -505,13 +505,16 @@ async fn finish_notification_plan(&self, key: &[u8], _state: &RoomMutexGuard) ->
 		drop(update);
 		drop(guard);
 		for wake in wakes {
-			self.services.sending.wake_frozen_push(wake)?;
+			services_root.sending.wake_frozen_push(wake)?;
 		}
 	}
 }
 
 #[implement(super::Service)]
 pub(super) async fn notification_worker(self: Arc<Self>) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut interval = tokio::time::interval(Duration::from_secs(1));
 	interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 	loop {
@@ -536,7 +539,7 @@ pub(super) async fn notification_worker(self: Arc<Self>) -> Result {
 		for plan in plans {
 			let state = tokio::select! {
 				() = self.notification_stop.notified() => return Ok(()),
-				state = self.services.state.mutex.lock(&plan.room) => state,
+				state = services_root.state.mutex.lock(&plan.room) => state,
 			};
 			if let Err(error) = self
 				.finish_notification_plan(&plan.raw_id, &state)
@@ -555,6 +558,9 @@ pub(crate) async fn frozen_push_decision(
 	user: &UserId,
 	event: &Pdu,
 ) -> Result<(Vec<Action>, bool, bool)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let value = self
 		.db
 		.notificationreceiptid_record
@@ -572,8 +578,7 @@ pub(crate) async fn frozen_push_decision(
 		.lock_notification(user, event.room_id())
 		.await;
 	let canceled = receipt.canceled
-		|| !self
-			.services
+		|| !services_root
 			.users
 			.notification_recipient_active(user)
 			.await?
@@ -666,6 +671,9 @@ impl super::Service {
 	}
 
 	async fn wait_notification_commit_for_test(&self, raw: &RawPduId) {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let pause = {
 			let mut gate = self
 				.notification_commit_pause
@@ -681,7 +689,7 @@ impl super::Service {
 			pause.entered.send(*raw).ok();
 			tokio::select! {
 				() = pause.release.notified() => {},
-				() = self.services.server.until_shutdown() => {},
+				() = services_root.server.until_shutdown() => {},
 			}
 		}
 	}

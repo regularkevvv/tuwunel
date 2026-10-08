@@ -95,11 +95,13 @@ impl Data {
 		event: &ReceiptEvent,
 		_state: &RoomMutexGuard,
 	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let Some(event_id) = event.content.keys().next() else {
 			return Ok(false);
 		};
-		let guard = self
-			.services
+		let guard = services_root
 			.pusher
 			.lock_notification(user_id, room_id)
 			.await;
@@ -113,12 +115,12 @@ impl Data {
 		{
 			return Ok(false);
 		}
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 		for key in &superseded {
 			txn.del_raw(&self.readreceiptid_readreceipt, key);
 		}
 		check_receipt_mutation(&txn)?;
-		let count = self.services.globals.next_count().await?;
+		let count = services_root.globals.next_count().await?;
 		txn.put(
 			&self.readreceiptid_readreceipt,
 			(room_id, *count, user_id, thread_kind),
@@ -132,19 +134,18 @@ impl Data {
 			.and_then(|by_user| by_user.values().next())
 			.map(|receipt| &receipt.thread)
 			.ok_or_else(|| Error::bad_database("Receipt has no thread context"))?;
-		let local = self.services.globals.user_is_local(user_id);
+		let local = services_root.globals.user_is_local(user_id);
 		if local {
-			match self.services.timeline.get_pdu_id(event_id).await {
+			match services_root.timeline.get_pdu_id(event_id).await {
 				| Ok(raw) => {
-					let pdu = self
-						.services
+					let pdu = services_root
 						.timeline
 						.get_pdu_from_id(&raw)
 						.await?;
 					if pdu.room_id != room_id {
 						return Err(Error::bad_database("Receipt cutoff room mismatch"));
 					}
-					self.services
+					services_root
 						.pusher
 						.stage_notification_reset(
 							&mut txn,
@@ -154,7 +155,7 @@ impl Data {
 							Some(raw.pdu_count().into_normal().into_unsigned()),
 						)
 						.await?;
-					self.services
+					services_root
 						.pusher
 						.stage_notification_cutoff(
 							&mut txn,
@@ -171,7 +172,7 @@ impl Data {
 		check_receipt_mutation(&txn)?;
 		txn.execute().await?;
 		if local {
-			self.services
+			services_root
 				.pusher
 				.notification_reset_committed(&guard, thread);
 		}
@@ -231,13 +232,16 @@ impl Data {
 		current: Option<&EventId>,
 		incoming: &EventId,
 	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		match current {
 			| None => Ok(true),
 			| Some(current) if current == incoming => Ok(false),
 			| Some(current) => {
 				let (current, incoming) = join(
-					self.services.timeline.get_pdu_count(current),
-					self.services.timeline.get_pdu_count(incoming),
+					services_root.timeline.get_pdu_count(current),
+					services_root.timeline.get_pdu_count(incoming),
 				)
 				.await;
 				let position = |result: Result<PduCount>| match result {
@@ -307,7 +311,10 @@ impl Data {
 		read: PrivateRead<'_>,
 		state: &RoomMutexGuard,
 	) -> Result<bool> {
-		let mut txn = self.services.db.txn();
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let mut txn = services_root.db.txn();
 		let Some(prepared) = self
 			.stage_private_read(read, &mut txn, state)
 			.await?
@@ -315,7 +322,7 @@ impl Data {
 			return Ok(false);
 		};
 		txn.execute().await?;
-		prepared.committed(&self.services.pusher);
+		prepared.committed(&services_root.pusher);
 		Ok(true)
 	}
 
@@ -327,6 +334,9 @@ impl Data {
 		txn: &mut Txn,
 		_state: &RoomMutexGuard,
 	) -> Result<Option<PreparedPrivateRead>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let PrivateRead {
 			room_id,
 			user_id,
@@ -335,8 +345,7 @@ impl Data {
 			thread,
 			announce,
 		} = read;
-		let guard = self
-			.services
+		let guard = services_root
 			.pusher
 			.lock_notification(user_id, room_id)
 			.await;
@@ -374,7 +383,7 @@ impl Data {
 		}
 		// The permit outlives the combined marker/reset commit.
 		let next_count = if announce {
-			Some(self.services.globals.next_count().await?)
+			Some(services_root.globals.next_count().await?)
 		} else {
 			None
 		};
@@ -396,14 +405,14 @@ impl Data {
 				(count, ts),
 			),
 		}
-		let local = self.services.globals.user_is_local(user_id);
+		let local = services_root.globals.user_is_local(user_id);
 		if local {
 			let stamp = next_count.as_deref().copied().unwrap_or(count);
-			self.services
+			services_root
 				.pusher
 				.stage_notification_reset(txn, &guard, thread, Some(stamp), Some(count))
 				.await?;
-			self.services
+			services_root
 				.pusher
 				.stage_notification_cutoff(txn, &guard, thread, count)
 				.await?;

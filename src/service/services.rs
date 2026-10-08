@@ -144,7 +144,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		db,
 	});
 
-	Ok(services.set(res))
+	Ok(services.set(&res))
 }
 
 #[implement(Services)]
@@ -246,9 +246,12 @@ pub async fn stop(&self) {
 	info!("Shutting down services...");
 
 	self.interrupt().await;
-	if let Some(manager) = self.manager.lock().await.as_ref() {
+	let mut manager = self.manager.lock().await;
+	if let Some(manager) = manager.as_ref() {
 		manager.stop().await;
 	}
+	manager.take();
+	drop(manager);
 
 	// Stops the writer-lease renewal and releases the lease on the remote
 	// backend, so a successor need not wait out its expiry (ADR-0003). A

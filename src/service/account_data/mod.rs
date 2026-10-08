@@ -87,11 +87,14 @@ pub async fn update(
 	event_type: RoomAccountDataEventType,
 	data: &serde_json::Value,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if data.get("type").is_none() || data.get("content").is_none() {
 		return Err!(Request(InvalidParam("Account data doesn't have all required fields.")));
 	}
 
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 	let roomuserdataid = (room_id, user_id, *count, &event_type);
 	let key = (room_id, user_id, &event_type);
 	let prev = self
@@ -100,7 +103,7 @@ pub async fn update(
 		.qry(&key)
 		.await;
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.put(&self.db.roomuserdataid_accountdata, roomuserdataid, Json(data));
 	txn.put(&self.db.roomusertype_roomuserdataid, key, roomuserdataid);
@@ -241,8 +244,11 @@ pub fn changes_since_fallible<'a>(
 /// the namespace keys before removing them.
 #[implement(Service)]
 pub async fn erase_user(&self, user_id: &UserId, room_id: Option<&RoomId>) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let prefix = (room_id, user_id, Interfix);
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	self.db
 		.roomuserdataid_accountdata

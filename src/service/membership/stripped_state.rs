@@ -104,6 +104,9 @@ pub async fn validate_stripped_create(
 	room_id: &RoomId,
 	room_version_id: &RoomVersionId,
 ) -> Result<StrippedCreateVerdict> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let create = state.iter().find_map(|event| match event {
 		| RawStrippedState::Pdu(raw) => serde_json::from_str::<CanonicalJsonObject>(raw.get())
 			.ok()
@@ -145,8 +148,7 @@ pub async fn validate_stripped_create(
 		return Ok(StrippedCreateVerdict::WrongRoom);
 	}
 
-	if self
-		.services
+	if services_root
 		.server_keys
 		.verify_event(&create, Some(room_version_id))
 		.await

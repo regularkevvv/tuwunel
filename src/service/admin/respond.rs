@@ -64,22 +64,25 @@ pub(super) async fn handle_response(
 	output: CommandOutput,
 	reply_id: Option<&EventId>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(reply_id) = reply_id else {
 		return Ok(());
 	};
 
-	let Ok(pdu) = self.services.timeline.get_pdu(reply_id).await else {
+	let Ok(pdu) = services_root.timeline.get_pdu(reply_id).await else {
 		error!(?reply_id, "Missing admin command in_reply_to event");
 		return Ok(());
 	};
 
 	let response_sender = if self.is_admin_room(pdu.room_id()).await {
-		&self.services.globals.server_user
+		&services_root.globals.server_user
 	} else {
 		pdu.sender()
 	};
 
-	let threads = self.services.server.config.admin_output_threads;
+	let threads = services_root.server.config.admin_output_threads;
 	let mode = command_thread(&pdu)
 		.or_else(|| threads.then(|| reply_id.to_owned()))
 		.map_or_else(|| Mode::Reply(reply_id.to_owned()), Mode::Thread);
@@ -100,9 +103,11 @@ async fn respond(
 	sender: &UserId,
 	mode: &Mode,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let markdown = matches!(output, CommandOutput::Markdown(_));
-	let max_events = self
-		.services
+	let max_events = services_root
 		.server
 		.config
 		.admin_output_max_events;
@@ -152,9 +157,12 @@ async fn send_segments(
 	mode: &Mode,
 	markdown: bool,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	assert!(self.user_is_admin(sender).await, "sender is not admin");
 
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let state_lock = services_root.state.mutex.lock(room_id).await;
 
 	let result = segments
 		.iter()
@@ -163,7 +171,7 @@ async fn send_segments(
 			let mut content = notice(segment, markdown);
 			content.relates_to = Some(mode.relation(previous.as_deref()));
 
-			self.services
+			services_root
 				.timeline
 				.build_and_append_pdu(
 					PduBuilder::timeline(&content),
@@ -193,12 +201,14 @@ pub(super) async fn respond_to_room(
 	room_id: &RoomId,
 	user_id: &UserId,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	assert!(self.user_is_admin(user_id).await, "sender is not admin");
 
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let state_lock = services_root.state.mutex.lock(room_id).await;
 
-	if let Err(e) = self
-		.services
+	if let Err(e) = services_root
 		.timeline
 		.build_and_append_pdu(PduBuilder::timeline(&content), user_id, room_id, &state_lock)
 		.await
@@ -220,13 +230,16 @@ async fn handle_response_error(
 	user_id: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	error!(%e, "Failed to build and append admin room response PDU");
 	let content = RoomMessageEventContent::text_plain(format!(
 		"Failed to build and append admin room PDU: \"{e}\"\n\nThe original admin command may \
 		 have finished successfully, but we could not return the output."
 	));
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(PduBuilder::timeline(&content), user_id, room_id, state_lock)
 		.boxed()

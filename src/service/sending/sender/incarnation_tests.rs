@@ -363,8 +363,9 @@ fn promotion_bound_preserves_pending_and_reserves_one_identity() -> Result {
 pub(super) fn isolated(test: &str, exercise: impl Future<Output = Result>) -> Result {
 	const CHILD: &str = "TUWUNEL_INCARNATION_TEST_CHILD";
 	if std::env::var(CHILD).as_deref() != Ok(test) {
-		// The native OnceServices graph is process-lifetime. Give each added
-		// graph its own process so it releases RocksDB pools on exit.
+		// Isolate native fixtures so failed cases and global backend settings
+		// cannot contaminate another case. Lifecycle tests also verify release
+		// and database reopening inside their child process.
 		let mut child = Command::new(std::env::current_exe()?)
 			.args(["--exact", test, "--nocapture", "--test-threads=1"])
 			.env(CHILD, test)

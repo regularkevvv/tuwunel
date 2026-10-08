@@ -84,6 +84,9 @@ impl Service {
 	where
 		E: Event,
 	{
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let initial = match event.get_content::<ExtractThreadRelation>() {
 			| Ok(t) => Some(t.relates_to),
 			| Err(_) => self.relates_to_via_redaction_target(event).await,
@@ -96,8 +99,7 @@ impl Service {
 				return Some(relates_to.event_id);
 			}
 
-			relates_to = self
-				.services
+			relates_to = services_root
 				.timeline
 				.get_pdu(&relates_to.event_id)
 				.await
@@ -114,18 +116,20 @@ impl Service {
 		&self,
 		event: &E,
 	) -> Result<Option<OwnedEventId>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let mut relation = event
 			.get_content::<ExtractThreadRelation>()
 			.ok()
 			.map(|value| value.relates_to);
 		if relation.is_none() && *event.kind() == TimelineEventType::RoomRedaction {
-			let rules = self
-				.services
+			let rules = services_root
 				.state
 				.get_room_version_rules(event.room_id())
 				.await?;
 			if let Some(target) = event.redacts_id(&rules) {
-				match self.services.timeline.get_pdu(&target).await {
+				match services_root.timeline.get_pdu(&target).await {
 					| Ok(pdu) if pdu.room_id() == event.room_id() =>
 						relation = pdu
 							.get_content::<ExtractThreadRelation>()
@@ -141,8 +145,7 @@ impl Service {
 			return Ok(None);
 		};
 		for _ in 0..MAX_THREAD_HOPS {
-			let pdu = match self
-				.services
+			let pdu = match services_root
 				.timeline
 				.get_pdu(&relation.event_id)
 				.await
@@ -172,12 +175,14 @@ impl Service {
 	where
 		E: Event,
 	{
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if *event.kind() != TimelineEventType::RoomRedaction {
 			return None;
 		}
 
-		let room_rules = self
-			.services
+		let room_rules = services_root
 			.state
 			.get_room_version_rules(event.room_id())
 			.await
@@ -185,7 +190,7 @@ impl Service {
 
 		let target_id = event.redacts_id(&room_rules)?;
 
-		self.services
+		services_root
 			.timeline
 			.get_pdu(&target_id)
 			.await
@@ -198,8 +203,10 @@ impl Service {
 	/// `get_thread_id` for an event referenced by id; events missing
 	/// locally resolve to `None` (the main timeline).
 	pub async fn get_thread_id_for_event(&self, event_id: &EventId) -> Option<OwnedEventId> {
-		let pdu = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let pdu = services_root
 			.timeline
 			.get_pdu(event_id)
 			.await
@@ -217,8 +224,10 @@ impl Service {
 	where
 		E: Event,
 	{
-		let root_id = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let root_id = services_root
 			.timeline
 			.get_pdu_id(root_event_id)
 			.await
@@ -226,8 +235,7 @@ impl Service {
 				err!(Request(InvalidParam("Invalid event_id in thread message: {e:?}")))
 			})?;
 
-		let root_pdu = self
-			.services
+		let root_pdu = services_root
 			.timeline
 			.get_pdu_from_id(&root_id)
 			.await
@@ -237,8 +245,7 @@ impl Service {
 			return Err(err!(Request(InvalidParam("Thread root belongs to another room"))));
 		}
 
-		let mut root_pdu_json = self
-			.services
+		let mut root_pdu_json = services_root
 			.timeline
 			.get_pdu_json_from_id(&root_id)
 			.await
@@ -266,7 +273,7 @@ impl Service {
 
 		// Commit participants and activity before the bundle so concurrent MSC3816
 		// readers never observe stale participation.
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 
 		self.update_participants(&mut txn, &root_id, &users);
 
@@ -320,7 +327,7 @@ impl Service {
 				);
 			}
 
-			self.services
+			services_root
 				.timeline
 				.replace_pdu(&root_id, &root_pdu_json)
 				.await?;
@@ -336,46 +343,49 @@ impl Service {
 		count: PduCount,
 		include: &'a IncludeThreads,
 	) -> impl Stream<Item = Result<(PduCount, PduEvent)>> + Send {
-		let participated = matches!(include, IncludeThreads::Participated);
+		let services_guard = self.services.get();
+		crate::once_services::services_stream!(services_guard, services_root, {
+			let participated = matches!(include, IncludeThreads::Participated);
 
-		self.services
-			.short
-			.get_shortroomid(room_id)
-			.map_ok(move |shortroomid| PduId {
-				shortroomid,
-				count: count.saturating_sub(1),
-			})
-			.map_ok(Into::into)
-			.map_ok(move |current: RawPduId| {
-				let mut rows = 0_usize;
-				let mut bytes = 0_usize;
-				self.db
-					.threadactivityid_rootid
-					.rev_raw_stream_from(&current)
-					.ready_try_take_while(move |(key, _)| {
-						Ok(key.starts_with(&current.shortroomid()))
-					})
-					.map(move |row| {
-						let (key, value) = row?;
-						rows = rows.saturating_add(1);
-						bytes = bytes
-							.saturating_add(key.len())
-							.saturating_add(value.len());
-						if rows > MAX_THREAD_SCAN_ROWS || bytes > MAX_THREAD_SCAN_BYTES {
-							return Err(thread_read_limit());
-						}
-						let activity_id = RawPduId::from_bytes(key)?;
-						let root_id = RawPduId::from_bytes(value)?;
-						if activity_id.shortroomid() != root_id.shortroomid() {
-							return Err(Error::bad_database("Mismatched thread index room"));
-						}
-						Ok((activity_id, root_id))
-					})
-					.try_filter_map(move |(activity_id, root_id)| {
-						self.live_thread(user_id, room_id, participated, activity_id, root_id)
-					})
-			})
-			.try_flatten_stream()
+			services_root
+				.short
+				.get_shortroomid(room_id)
+				.map_ok(move |shortroomid| PduId {
+					shortroomid,
+					count: count.saturating_sub(1),
+				})
+				.map_ok(Into::into)
+				.map_ok(move |current: RawPduId| {
+					let mut rows = 0_usize;
+					let mut bytes = 0_usize;
+					self.db
+						.threadactivityid_rootid
+						.rev_raw_stream_from(&current)
+						.ready_try_take_while(move |(key, _)| {
+							Ok(key.starts_with(&current.shortroomid()))
+						})
+						.map(move |row| {
+							let (key, value) = row?;
+							rows = rows.saturating_add(1);
+							bytes = bytes
+								.saturating_add(key.len())
+								.saturating_add(value.len());
+							if rows > MAX_THREAD_SCAN_ROWS || bytes > MAX_THREAD_SCAN_BYTES {
+								return Err(thread_read_limit());
+							}
+							let activity_id = RawPduId::from_bytes(key)?;
+							let root_id = RawPduId::from_bytes(value)?;
+							if activity_id.shortroomid() != root_id.shortroomid() {
+								return Err(Error::bad_database("Mismatched thread index room"));
+							}
+							Ok((activity_id, root_id))
+						})
+						.try_filter_map(move |(activity_id, root_id)| {
+							self.live_thread(user_id, room_id, participated, activity_id, root_id)
+						})
+				})
+				.try_flatten_stream()
+		})
 	}
 
 	/// Resolve one activity row to its thread root, skipping and reaping rows
@@ -388,6 +398,9 @@ impl Service {
 		activity_id: RawPduId,
 		root_id: RawPduId,
 	) -> Result<Option<(PduCount, PduEvent)>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let count = activity_id.pdu_count();
 
 		let value = self
@@ -423,8 +436,7 @@ impl Service {
 			return Ok(None);
 		}
 
-		let mut pdu = self
-			.services
+		let mut pdu = services_root
 			.timeline
 			.get_pdu_from_id(&root_id)
 			.await
@@ -435,8 +447,7 @@ impl Service {
 					error
 				}
 			})?;
-		let canonical = self
-			.services
+		let canonical = services_root
 			.timeline
 			.get_pdu_id(pdu.event_id())
 			.await
@@ -512,8 +523,10 @@ impl Service {
 		root_event_id: &EventId,
 		user_id: &UserId,
 	) -> Result<bool> {
-		let root_id = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let root_id = services_root
 			.timeline
 			.get_pdu_id(root_event_id)
 			.await
@@ -546,10 +559,12 @@ impl Service {
 	}
 
 	async fn index_thread_activity(&self, root_id: RawPduId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let root: PduId = root_id.into();
 
-		let mut replies = self
-			.services
+		let mut replies = services_root
 			.pdu_metadata
 			.get_relations(root.shortroomid, root.count, None, Direction::Backward, None)
 			.await?
@@ -570,7 +585,7 @@ impl Service {
 		}
 		.into();
 
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 
 		txn.insert_raw(&self.db.threadactivityid_rootid, activity_id, root_id);
 		txn.insert_raw(&self.db.threadrootid_latestcount, root_id, latest.to_be_bytes());

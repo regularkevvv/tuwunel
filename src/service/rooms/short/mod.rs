@@ -75,12 +75,13 @@ impl crate::Service for Service {
 /// Output stays in input order, including duplicates; allocation follows
 /// demand.
 #[implement(Service)]
-pub fn multi_get_or_create_shorteventid<'a, I>(
-	&'a self,
+pub fn multi_get_or_create_shorteventid<'a, 's, I>(
+	&'s self,
 	event_ids: I,
-) -> impl Stream<Item = Result<ShortEventId>> + Send + 'a
+) -> impl Stream<Item = Result<ShortEventId>> + Send + 's
 where
-	I: Iterator<Item = &'a EventId> + Clone + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + Send + 's,
+	'a: 's,
 {
 	self.prepare_event_ids(event_ids)
 		.map_ok(Vec::into_iter)
@@ -195,12 +196,15 @@ async fn existing_event_id(&self, event_id: &EventId) -> Result<Option<ShortEven
 
 #[implement(Service)]
 async fn create_shorteventid(&self, event_id: &EventId) -> Result<ShortEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _lock = self.creating.shorteventid.lock(event_id).await;
 	if let Some(short) = self.existing_event_id(event_id).await? {
 		return Ok(short);
 	}
-	let short = self.services.globals.next_count().await?;
-	let mut txn = self.services.db.txn();
+	let short = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
 	txn.insert_raw(&self.db.shorteventid_eventid, (*short).to_be_bytes(), event_id);
 	txn.insert_raw(&self.db.eventid_shorteventid, event_id, (*short).to_be_bytes());
 	txn.execute().await?;
@@ -245,6 +249,9 @@ async fn create_shortstatekey(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<ShortStateKey> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let owned_key = (event_type.clone(), StateKey::from_str(state_key));
 	let _lock = self.creating.shortstatekey.lock(&owned_key).await;
 
@@ -256,8 +263,8 @@ async fn create_shortstatekey(
 	}
 
 	let key = (event_type, state_key);
-	let shortstatekey = self.services.globals.next_count().await?;
-	let mut txn = self.services.db.txn();
+	let shortstatekey = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
 
 	txn.put(&self.db.shortstatekey_statekey, *shortstatekey, key);
 	txn.put(&self.db.statekey_shortstatekey, key, *shortstatekey);
@@ -412,6 +419,9 @@ async fn create_shortstatehash<F>(
 where
 	F: FnOnce(&mut Txn, ShortStateHash) -> Result,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _lock = self
 		.creating
 		.shortstatehash
@@ -424,8 +434,8 @@ where
 		| Err(error) => return Err(error),
 	}
 
-	let shortstatehash = self.services.globals.next_count().await?;
-	let mut txn = self.services.db.txn();
+	let shortstatehash = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(
 		&self.db.statehash_shortstatehash,
@@ -453,7 +463,10 @@ pub async fn get_shortstatehash(&self, state_hash: &Digest) -> Result<ShortState
 
 #[implement(Service)]
 async fn existing_state_hash(&self, shortstatehash: ShortStateHash) -> Result {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state_compressor
 		.load_shortstatehash_info(shortstatehash)
 		.await
@@ -517,6 +530,9 @@ pub async fn get_or_create_shortroomid(&self, room_id: &RoomId) -> Result<ShortR
 async fn create_shortroomid(&self, room_id: &RoomId) -> Result<ShortRoomId> {
 	const BUFSIZE: usize = size_of::<ShortRoomId>();
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _lock = self.creating.shortroomid.lock(room_id).await;
 
 	match self.get_shortroomid(room_id).await {
@@ -525,7 +541,7 @@ async fn create_shortroomid(&self, room_id: &RoomId) -> Result<ShortRoomId> {
 		| Err(error) => return Err(error),
 	}
 
-	let short = self.services.globals.next_count().await?;
+	let short = services_root.globals.next_count().await?;
 
 	debug_assert!(size_of_val(&*short) == BUFSIZE, "buffer requirement changed");
 

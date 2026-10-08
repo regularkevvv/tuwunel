@@ -36,33 +36,35 @@ pub async fn full_register(
 		omit_displayname_suffix,
 	}: Register<'_>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let ref user_id = user_id
 		.map(ToOwned::to_owned)
 		.map(Ok)
 		.or_else(|| {
 			username.map(|username| {
-				UserId::parse_with_server_name(username, self.services.globals.server_name())
+				UserId::parse_with_server_name(username, services_root.globals.server_name())
 			})
 		})
 		.transpose()?
 		.expect("Caller failed to supply either user_id or username parameter");
 
-	if !self.services.globals.user_is_local(user_id) {
+	if !services_root.globals.user_is_local(user_id) {
 		return Err!("Cannot register remote user");
 	}
 
-	if self.services.users.exists(user_id).await {
+	if services_root.users.exists(user_id).await {
 		return Err!(Request(UserInUse("User ID is not available.")));
 	}
 
 	// Create user
-	self.services
+	services_root
 		.users
 		.create(user_id, password, origin)
 		.await?;
 
-	let displayname_suffix = self
-		.services
+	let displayname_suffix = services_root
 		.config
 		.new_user_displayname_suffix
 		.as_str();
@@ -75,13 +77,13 @@ pub async fn full_register(
 		displayname = &displayname_with_suffix;
 	}
 
-	self.services
+	services_root
 		.profile
 		.set_displayname(user_id, Some(displayname), Some(Propagation::None))
 		.await?;
 
 	// Initial account data
-	self.services
+	services_root
 		.account_data
 		.update(
 			None,
@@ -103,16 +105,15 @@ pub async fn full_register(
 	if !is_guest
 		&& !is_appservice
 		&& grant_first_user_admin
-		&& self.services.config.grant_admin_to_first_user
-		&& let Ok(admin_room) = self.services.admin.get_admin_room().await
-		&& self
-			.services
+		&& services_root.config.grant_admin_to_first_user
+		&& let Ok(admin_room) = services_root.admin.get_admin_room().await
+		&& services_root
 			.state_cache
 			.room_joined_count(&admin_room)
 			.await
 			.is_ok_and(is_equal_to!(1))
 	{
-		self.services
+		services_root
 			.admin
 			.make_user_admin(user_id)
 			.boxed()
@@ -120,9 +121,9 @@ pub async fn full_register(
 		warn!("Granting {user_id} admin privileges as the first user");
 	}
 
-	if !is_appservice && (self.services.config.allow_guests_auto_join_rooms || !is_guest) {
-		for room in &self.services.server.config.auto_join_rooms {
-			let Ok(room_id) = self.services.alias.maybe_resolve(room).await else {
+	if !is_appservice && (services_root.config.allow_guests_auto_join_rooms || !is_guest) {
+		for room in &services_root.server.config.auto_join_rooms {
+			let Ok(room_id) = services_root.alias.maybe_resolve(room).await else {
 				error!(
 					"Failed to resolve room alias to room ID when attempting to auto join \
 					 {room}, skipping"
@@ -130,10 +131,9 @@ pub async fn full_register(
 				continue;
 			};
 
-			if !self
-				.services
+			if !services_root
 				.state_cache
-				.server_in_room(self.services.globals.server_name(), &room_id)
+				.server_in_room(services_root.globals.server_name(), &room_id)
 				.await
 			{
 				warn!(
@@ -142,8 +142,7 @@ pub async fn full_register(
 				continue;
 			}
 
-			match self
-				.services
+			match services_root
 				.membership
 				.join(Join {
 					sender_user: user_id,

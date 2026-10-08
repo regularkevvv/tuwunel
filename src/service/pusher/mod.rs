@@ -226,6 +226,9 @@ async fn set_pusher_post(
 
 #[implement(Service)]
 fn check_http_pusher_url(&self, url: &Url) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if ["http", "https"]
 		.iter()
 		.all(|&scheme| !scheme.eq_ignore_ascii_case(url.scheme()))
@@ -235,13 +238,13 @@ fn check_http_pusher_url(&self, url: &Url) -> Result {
 		)));
 	}
 
-	if self.services.client.proxy.resolver_alias(url) {
+	if services_root.client.proxy.resolver_alias(url) {
 		return Err!(Request(InvalidParam(
 			warn!(%url, "HTTP pusher URL is a forbidden proxy endpoint")
 		)));
 	}
 
-	if !self.services.client.valid_cidr_range_url(url) {
+	if !services_root.client.valid_cidr_range_url(url) {
 		return Err!(Request(InvalidParam(
 			warn!(%url, "HTTP pusher URL is a forbidden remote address")
 		)));
@@ -252,6 +255,9 @@ fn check_http_pusher_url(&self, url: &Url) -> Result {
 
 #[implement(Service)]
 pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let key = (sender, pushkey);
 	self.db
 		.senderkey_pusher
@@ -265,7 +271,7 @@ pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
 		.expect("database write error");
 	self.forget_sent_badge(sender, pushkey);
 
-	self.services
+	services_root
 		.sending
 		.cleanup_events(None, Some(sender), Some(pushkey))
 		.await
@@ -375,8 +381,10 @@ pub async fn get_notifications(
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn get_actions<'a>(&self, evaluation: Evaluate<'a, '_>) -> Result<&'a [Action]> {
-	let count = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let count = services_root
 		.state_cache
 		.room_joined_count_uint(evaluation.room_id)
 		.await?;
@@ -400,7 +408,10 @@ pub(crate) async fn get_actions_with_count<'a>(
 	}: Evaluate<'a, '_>,
 	room_joined_count: UInt,
 ) -> Result<&'a [Action]> {
-	let user_display_name = self.services.profile.displayname(user).await;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let user_display_name = services_root.profile.displayname(user).await;
 	let user_display_name = match user_display_name {
 		| Ok(name) => Ok(name),
 		| Err(error) if error.is_not_found() => Ok(user.localpart().to_owned()),
@@ -456,7 +467,10 @@ pub(crate) async fn related_events_checked<E: Event>(
 	&self,
 	event: &E,
 ) -> Result<Option<Arc<RelatedEvents>>> {
-	let config = &self.services.server.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.server.config;
 
 	if !config.msc3664_related_event_match {
 		return Ok(None);
@@ -477,7 +491,7 @@ pub(crate) async fn related_events_checked<E: Event>(
 		.into_iter()
 		.chain(reply)
 	{
-		let pdu = match self.services.timeline.get_pdu(&event_id).await {
+		let pdu = match services_root.timeline.get_pdu(&event_id).await {
 			| Ok(pdu) => pdu,
 			| Err(error) if error.is_not_found() => continue,
 			| Err(error) => return Err(error),

@@ -22,14 +22,16 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		let unset = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let unset = services_root
 			.config
 			.emergency_password
 			.as_ref()
 			.is_none_or(String::is_empty);
 
-		if self.services.globals.is_read_only() {
+		if services_root.globals.is_read_only() {
 			if !unset {
 				debug_warn!("emergency password feature ignored in read_only mode.");
 			}
@@ -45,7 +47,7 @@ impl crate::Service for Service {
 				});
 		}
 
-		if self.services.config.ldap.enable {
+		if services_root.config.ldap.enable {
 			warn!("emergency password feature not available with LDAP enabled.");
 			return Ok(());
 		}
@@ -67,16 +69,17 @@ impl Service {
 	/// (docs/runbooks/break-glass.md). Nothing is written when there is nothing
 	/// to seal.
 	async fn seal_emergency_access(&self) -> Result {
-		let server_user = &self.services.globals.server_user;
-		let has_password = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let server_user = &services_root.globals.server_user;
+		let has_password = services_root
 			.users
 			.password_hash(server_user)
 			.await
 			.is_ok_and(|hash| !hash.is_empty());
 
-		let devices: Vec<OwnedDeviceId> = self
-			.services
+		let devices: Vec<OwnedDeviceId> = services_root
 			.users
 			.all_device_ids(server_user)
 			.map(ToOwned::to_owned)
@@ -88,13 +91,13 @@ impl Service {
 		}
 
 		warn!("The emergency password is unset: signing the server account out and clearing it.");
-		self.services
+		services_root
 			.users
 			.set_password(server_user, None)
 			.await?;
 
 		for device in &devices {
-			self.services
+			services_root
 				.users
 				.remove_device(server_user, device)
 				.await;
@@ -106,19 +109,22 @@ impl Service {
 	/// Sets the emergency password and push rules for the server user account
 	/// in case emergency password is set
 	async fn set_emergency_access(&self) -> Result {
-		let server_user = &self.services.globals.server_user;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
 
-		self.services
+		let server_user = &services_root.globals.server_user;
+
+		services_root
 			.users
-			.set_password(server_user, self.services.config.emergency_password.as_deref())
+			.set_password(server_user, services_root.config.emergency_password.as_deref())
 			.await?;
 
-		let (ruleset, pwd_set) = match self.services.config.emergency_password {
+		let (ruleset, pwd_set) = match services_root.config.emergency_password {
 			| Some(_) => (Ruleset::server_default(server_user), true),
 			| None => (Ruleset::new(), false),
 		};
 
-		self.services
+		services_root
 			.account_data
 			.update(
 				None,
@@ -142,7 +148,7 @@ impl Service {
 			Ok(())
 		} else {
 			// logs out any users still in the server service account and removes sessions
-			self.services
+			services_root
 				.users
 				.deactivate_account(server_user)
 				.await

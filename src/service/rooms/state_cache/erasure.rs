@@ -124,6 +124,9 @@ impl Service {
 		budget: &mut ErasureBudget,
 		txn: &mut Txn,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let prefix = (room, Interfix);
 		let encoded = serialize_key(prefix)?;
 		let keys = source.keys_prefix_raw_capped(&prefix, budget.cap());
@@ -135,7 +138,7 @@ impl Service {
 			let user: &UserId = name
 				.try_into()
 				.map_err(|_| Error::bad_database("Invalid membership erasure user key"))?;
-			if retain_local && self.services.globals.user_is_local(user) {
+			if retain_local && services_root.globals.user_is_local(user) {
 				continue;
 			}
 			txn.del(source, (room, user));

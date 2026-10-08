@@ -179,19 +179,21 @@ pub async fn spawn_history(
 	boundary: PduCount,
 	delete_local_events: bool,
 ) -> Result<TaskId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Room -> insertion -> journal; never wait for a room under the journal.
-	let Ok(state) = self.services.state.mutex.try_lock(&room) else {
+	let Ok(state) = services_root.state.mutex.try_lock(&room) else {
 		return super::data::limit();
 	};
-	let Ok(insert) = self
-		.services
+	let Ok(insert) = services_root
 		.timeline
 		.mutex_insert
 		.try_lock(&room)
 	else {
 		return super::data::limit();
 	};
-	let shortroomid = self.services.short.get_shortroomid(&room).await?;
+	let shortroomid = services_root.short.get_shortroomid(&room).await?;
 	let history = History {
 		executor: Executor::HistoryV1,
 		boundary: boundary.into_signed(),
@@ -202,7 +204,7 @@ pub async fn spawn_history(
 		current: None,
 		done: false,
 	};
-	let _originals = self.services.retention.lock_originals().await;
+	let _originals = services_root.retention.lock_originals().await;
 	let _journal = self.journal.lock().await;
 	let admission = self
 		.admit("purge_history", room.to_string(), serde_json::to_value(history)?)
@@ -224,6 +226,9 @@ pub async fn spawn_history(
 
 #[implement(Service)]
 fn hold_uncertain_history_room(&self, state: RoomMutexGuard, insert: RoomMutexGuard) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut handles = self.handles.lock().expect("locked");
 	let mut id = string_array::<{ super::TASK_ID_LEN }>();
 	while handles.contains_key(&id) {
@@ -233,7 +238,7 @@ fn hold_uncertain_history_room(&self, state: RoomMutexGuard, insert: RoomMutexGu
 	// abort_all joins it during shutdown before dropping database services.
 	handles.insert(
 		id,
-		self.services.server.runtime().spawn(async move {
+		services_root.server.runtime().spawn(async move {
 			let _state = state;
 			let _insert = insert;
 			pending::<()>().await;
@@ -249,15 +254,19 @@ fn launch_history(
 	state: RoomMutexGuard,
 	insert: RoomMutexGuard,
 ) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let this = self.clone();
-	let handle = self.services.server.runtime().spawn(async move {
+	let task_services = services_guard.clone();
+	let handle = services_root.server.runtime().spawn(async move {
 		let _state = state;
 		let _insert = insert;
 		if let Err(error) = this.run_history(&id, &room).await {
 			// A commit can have an ambiguous outcome. Keep canonical progress;
 			// never replace it with a speculative Failed/Complete transition.
 			error!(%id, %error, "History request stopped with durable progress; restart or repair required");
-			this.services.server.until_shutdown().await;
+			task_services.server.until_shutdown().await;
 		}
 		this.handles.lock().expect("locked").remove(&id);
 	});
@@ -269,6 +278,9 @@ fn launch_history(
 
 #[implement(Service)]
 async fn run_history(&self, id: &TaskId, room: &RoomId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.set_active(id).await?;
 	loop {
 		let mut task = {
@@ -284,9 +296,8 @@ async fn run_history(&self, id: &TaskId, room: &RoomId) -> Result {
 			.ok_or_else(|| Error::bad_database("History handler is missing"))?;
 		// Capture original bytes and their durable pin under the same exclusion
 		// used by retention. Subsequent expiry reads these canonical job pins.
-		let _originals = self.services.retention.lock_originals().await;
-		let (txn, next) = self
-			.services
+		let _originals = services_root.retention.lock_originals().await;
+		let (txn, next) = services_root
 			.timeline
 			.prepare_history_step(room, history)
 			.await?;
@@ -317,6 +328,9 @@ async fn run_history(&self, id: &TaskId, room: &RoomId) -> Result {
 /// storage. Notification completion must precede retained history room locks.
 #[implement(Service)]
 pub(crate) async fn preflight_interrupted(&self) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let tasks = {
 		let _journal = self.journal.lock().await;
 		self.db.load().await?
@@ -338,7 +352,7 @@ pub(crate) async fn preflight_interrupted(&self) -> Result {
 		}
 		if let Some(history) = History::decode(&task.parameters)? {
 			let room = OwnedRoomId::try_from(task.resource_id.as_str())?;
-			self.services
+			services_root
 				.timeline
 				.validate_history_progress(&room, &history)
 				.await?;
@@ -350,6 +364,9 @@ pub(crate) async fn preflight_interrupted(&self) -> Result {
 /// Restore room exclusion before workers/readiness, then resume in background.
 #[implement(Service)]
 pub(crate) async fn restore_interrupted(self: &Arc<Self>) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let tasks = {
 		let _journal = self.journal.lock().await;
 		self.db.load().await?
@@ -376,14 +393,13 @@ pub(crate) async fn restore_interrupted(self: &Arc<Self>) -> Result {
 			&& let Some(history) = History::decode(&task.parameters)?
 		{
 			let room = OwnedRoomId::try_from(task.resource_id.as_str())?;
-			let state = self.services.state.mutex.lock(&room).await;
-			let insert = self
-				.services
+			let state = services_root.state.mutex.lock(&room).await;
+			let insert = services_root
 				.timeline
 				.mutex_insert
 				.lock(&room)
 				.await;
-			self.services
+			services_root
 				.timeline
 				.validate_history_progress(&room, &history)
 				.await?;

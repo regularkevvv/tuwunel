@@ -81,16 +81,19 @@ pub(crate) async fn append_incoming_pdu<'a, Leafs>(
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// We append to state before appending the pdu, so we don't have a moment in
 	// time with the pdu without it's state. This is okay because append_pdu can't
 	// fail.
-	self.services
+	services_root
 		.state
 		.set_event_state(&pdu.event_id, &pdu.room_id, state_ids_compressed)
 		.await?;
 
 	if soft_fail {
-		self.services
+		services_root
 			.pdu_metadata
 			.mark_as_referenced(&pdu.room_id, pdu.prev_events.iter().map(AsRef::as_ref))
 			.await?;
@@ -98,7 +101,7 @@ where
 		// Keep the previous band rather than let a soft-failed event empty it; a
 		// later accepted event self-chains and heals it.
 		if let Some(new_room_leafs) = nonempty_band(new_room_leafs) {
-			self.services
+			services_root
 				.state
 				.set_forward_extremities(&pdu.room_id, new_room_leafs.into_iter(), state_lock)
 				.await;
@@ -178,11 +181,13 @@ pub async fn append_pdu_with_txnid<'a, Leafs>(
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Coalesce database writes for the remainder of this scope.
 	let _cork = self.db.db.cork_and_flush();
 
-	let shortroomid = self
-		.services
+	let shortroomid = services_root
 		.short
 		.get_shortroomid(pdu.room_id())
 		.await
@@ -196,12 +201,10 @@ where
 			.entry("unsigned".into())
 			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
 		{
-			if let Ok(shortstatehash) = self
-				.services
+			if let Ok(shortstatehash) = services_root
 				.state
 				.pdu_shortstatehash(pdu.event_id())
-				.await && let Ok(prev_state) = self
-				.services
+				.await && let Ok(prev_state) = services_root
 				.state_accessor
 				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
 				.await
@@ -233,7 +236,7 @@ where
 	}
 
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
-	let next_count = self.services.globals.next_count().await?;
+	let next_count = services_root.globals.next_count().await?;
 
 	let count = PduCount::Normal(*next_count);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
@@ -252,25 +255,23 @@ where
 	);
 
 	// We must keep track of all events that have been referenced.
-	self.services.pdu_metadata.mark_as_referenced_txn(
+	services_root.pdu_metadata.mark_as_referenced_txn(
 		&mut txn,
 		pdu.room_id(),
 		pdu.prev_events().map(AsRef::as_ref),
 	);
 
-	self.services
+	services_root
 		.state
 		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
 		.await;
 
-	let notifications = self
-		.services
+	let notifications = services_root
 		.pusher
 		.stage_notification_plan(&mut txn, pdu_id, pdu, room_state)
 		.await?;
 
-	let sender_read = self
-		.services
+	let sender_read = services_root
 		.read_receipt
 		.stage_private_read(
 			PrivateRead {
@@ -290,7 +291,7 @@ where
 	drop(notifications);
 
 	if let Some(sender_read) = sender_read {
-		sender_read.committed(&self.services.pusher);
+		sender_read.committed(&services_root.pusher);
 	}
 
 	drop(insert_lock);
@@ -300,15 +301,15 @@ where
 	let event_id = pdu.event_id();
 
 	// Only local senders can own pushers.
-	if self.services.globals.user_is_local(pdu.sender()) {
-		self.services
+	if services_root.globals.user_is_local(pdu.sender()) {
+		services_root
 			.sending
 			.refresh_push_badge(pdu.sender())
 			.await
 			.effect("push badge", event_id);
 	}
 
-	self.services
+	services_root
 		.pusher
 		.append_pdu(pdu_id, pdu, state_lock)
 		.await
@@ -319,7 +320,7 @@ where
 
 	// A recount that failed to commit, an earlier event's or this event's own,
 	// is retried here, before this event goes to the room's servers.
-	self.services
+	services_root
 		.state_cache
 		.repair_joined_count(pdu.room_id())
 		.await
@@ -327,7 +328,7 @@ where
 
 	drop(next_count);
 
-	self.services
+	services_root
 		.appservice
 		.append_pdu(pdu_id, pdu)
 		.await
@@ -348,6 +349,9 @@ async fn append_pdu_effects(
 	count: PduCount,
 	state_lock: &RoomMutexGuard,
 ) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = pdu.event_id();
 
 	match *pdu.kind() {
@@ -367,19 +371,18 @@ async fn append_pdu_effects(
 				.and_then(|content| content.body);
 
 			if let Some(body) = body {
-				self.services
+				services_root
 					.search
 					.index_pdu(shortroomid, &pdu_id, &body)
 					.await
 					.effect("search index", event_id);
 
-				if self
-					.services
+				if services_root
 					.admin
 					.is_admin_command(pdu, &body)
 					.await
 				{
-					self.services
+					services_root
 						.admin
 						.command(body, Some(event_id.into()))
 						.await
@@ -389,7 +392,7 @@ async fn append_pdu_effects(
 		},
 		| TimelineEventType::RoomTopic =>
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
-				self.services
+				services_root
 					.search
 					.index_pdu(shortroomid, &pdu_id, &topic)
 					.await
@@ -400,7 +403,7 @@ async fn append_pdu_effects(
 
 	// The cached hierarchy summary projects room state; evict on any state change.
 	if pdu.state_key().is_some() {
-		self.services
+		services_root
 			.spaces
 			.cache_evict(pdu.room_id())
 			.await
@@ -412,7 +415,7 @@ async fn append_pdu_effects(
 			.get_pdu_count(&content.relates_to.event_id)
 			.await
 	{
-		self.services
+		services_root
 			.pdu_metadata
 			.add_relation(count, related_pducount)
 			.await
@@ -425,7 +428,7 @@ async fn append_pdu_effects(
 				// We need to do it again here, because replies don't have
 				// event_id as a top level field
 				if let Ok(related_pducount) = self.get_pdu_count(&in_reply_to.event_id).await {
-					self.services
+					services_root
 						.pdu_metadata
 						.add_relation(count, related_pducount)
 						.await
@@ -433,14 +436,14 @@ async fn append_pdu_effects(
 				}
 			},
 			| Relation::Thread(thread) => {
-				self.services
+				services_root
 					.threads
 					.add_to_thread(&thread.event_id, pdu_id, pdu)
 					.await
 					.effect("thread", event_id);
 			},
 			| Relation::Replacement(replacement) => {
-				self.services
+				services_root
 					.pdu_metadata
 					.add_typed_relation(
 						shortroomid,
@@ -453,7 +456,7 @@ async fn append_pdu_effects(
 					.effect("typed relation", event_id);
 			},
 			| Relation::Reference(reference) => {
-				self.services
+				services_root
 					.pdu_metadata
 					.add_typed_relation(
 						shortroomid,
@@ -478,8 +481,10 @@ async fn append_redaction_effects(
 	shortroomid: ShortRoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	let room_version = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let room_version = services_root
 		.state
 		.get_room_version(pdu.room_id())
 		.await?;
@@ -489,8 +494,7 @@ async fn append_redaction_effects(
 	let redacts_id = pdu.redacts_id(&room_rules);
 
 	if let Some(redacts_id) = &redacts_id
-		&& self
-			.services
+		&& services_root
 			.state_accessor
 			.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
 			.await?
@@ -509,6 +513,9 @@ async fn append_redaction_effects(
 /// earlier event on record for auth.
 #[implement(super::Service)]
 async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(state_key) = pdu.state_key() else {
 		return Ok(());
 	};
@@ -522,8 +529,7 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 	let is_direct = content.is_direct;
 
 	let stripped_state = match content.membership {
-		| MembershipState::Invite | MembershipState::Knock => self
-			.services
+		| MembershipState::Invite | MembershipState::Knock => services_root
 			.state
 			.summary_stripped(pdu)
 			.await
@@ -531,7 +537,7 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 		| _ => None,
 	};
 
-	self.services
+	services_root
 		.state_cache
 		.update_membership(MembershipUpdate {
 			room_id: pdu.room_id(),
@@ -546,7 +552,7 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 		.await?;
 
 	if is_invite {
-		self.services
+		services_root
 			.membership
 			.auto_accept(pdu.room_id(), &user_id, pdu.sender(), is_direct);
 	}
@@ -572,6 +578,9 @@ pub fn append_pdu_txn(
 	txnid: Option<&[u8]>,
 	room_state: Option<(ShortStateHash, &RoomMutexGuard)>,
 ) -> Txn {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
 	let mut txn = self.db.db.txn();
@@ -590,7 +599,7 @@ pub fn append_pdu_txn(
 	}
 
 	if let Some((room_state, state_lock)) = room_state {
-		self.services
+		services_root
 			.state
 			.set_room_state_txn(&mut txn, pdu.room_id(), room_state, state_lock);
 	}

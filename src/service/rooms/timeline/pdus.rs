@@ -2,7 +2,7 @@ use futures::{
 	Stream, TryFutureExt, TryStreamExt,
 	future::Either::{Left, Right},
 };
-use ruma::{MilliSecondsSinceUnixEpoch, RoomId, UInt, UserId, api::Direction};
+use ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId, UInt, UserId, api::Direction};
 use tuwunel_core::{
 	Error, Result, at, err, implement,
 	matrix::pdu::{PduCount, PduEvent},
@@ -52,37 +52,38 @@ pub fn pdu_ids_near_ts(
 	ts: MilliSecondsSinceUnixEpoch,
 	dir: Direction,
 ) -> impl Stream<Item = Result<(MilliSecondsSinceUnixEpoch, PduId)>> + Send {
-	use Direction::{Backward, Forward};
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		use Direction::{Backward, Forward};
 
-	type KeyVal<'a> = ((&'a RoomId, UInt, u64), i64);
+		type KeyVal = ((OwnedRoomId, UInt, u64), i64);
 
-	let ts: u64 = ts.get().into();
+		let ts: u64 = ts.get().into();
 
-	self.services
-		.short
-		.get_shortroomid(room_id)
-		.map_err(|e| err!(Request(NotFound("Room not found: {e:?}"))))
-		.map_ok(move |shortroomid| {
-			match dir {
-				| Forward => Left(self.db.roomid_tscount_pducount.stream_from(&(
-					room_id,
-					ts,
-					u64::MIN,
-				))),
-				| Backward => Right(self.db.roomid_tscount_pducount.rev_stream_from(&(
-					room_id,
-					ts,
-					u64::MAX,
-				))),
-			}
-			.ready_try_take_while(
-				move |((room_id_, ..), _): &KeyVal<'_>| Ok(room_id == *room_id_),
-			)
-			.map_ok(move |((_, ts, _), count)| {
-				(MilliSecondsSinceUnixEpoch(ts), PduId { shortroomid, count: count.into() })
+		services_root
+			.short
+			.get_shortroomid(room_id)
+			.map_err(|e| err!(Request(NotFound("Room not found: {e:?}"))))
+			.map_ok(move |shortroomid| {
+				match dir {
+					| Forward => Left(self.db.roomid_tscount_pducount.stream_from(&(
+						room_id,
+						ts,
+						u64::MIN,
+					))),
+					| Backward => Right(self.db.roomid_tscount_pducount.rev_stream_from(&(
+						room_id,
+						ts,
+						u64::MAX,
+					))),
+				}
+				.ready_try_take_while(move |((room_id_, ..), _): &KeyVal| Ok(room_id == room_id_))
+				.map_ok(move |((_, ts, _), count)| {
+					(MilliSecondsSinceUnixEpoch(ts), PduId { shortroomid, count: count.into() })
+				})
 			})
-		})
-		.try_flatten_stream()
+			.try_flatten_stream()
+	})
 }
 
 /// Returns an iterator over all PDUs in a room. Unknown rooms produce no

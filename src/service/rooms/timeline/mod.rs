@@ -240,8 +240,10 @@ pub async fn prev_shortstatehash(
 	room_id: &RoomId,
 	before: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -256,7 +258,7 @@ pub async fn prev_shortstatehash(
 
 	let shorteventid = self.get_shorteventid_from_pdu_id(&prev).await?;
 
-	self.services
+	services_root
 		.state
 		.get_shortstatehash(shorteventid)
 		.await
@@ -272,8 +274,10 @@ pub async fn next_shortstatehash(
 	room_id: &RoomId,
 	after: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -288,7 +292,7 @@ pub async fn next_shortstatehash(
 
 	let shorteventid = self.get_shorteventid_from_pdu_id(&next).await?;
 
-	self.services
+	services_root
 		.state
 		.get_shortstatehash(shorteventid)
 		.await
@@ -302,8 +306,10 @@ pub async fn get_shortstatehash(
 	room_id: &RoomId,
 	count: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -313,7 +319,7 @@ pub async fn get_shortstatehash(
 
 	let shorteventid = self.get_shorteventid_from_pdu_id(&pdu_id).await?;
 
-	self.services
+	services_root
 		.state
 		.get_shortstatehash(shorteventid)
 		.await
@@ -448,8 +454,10 @@ async fn count_to_id(
 	count: PduCount,
 	dir: Direction,
 ) -> Result<RawPduId> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -473,8 +481,10 @@ fn pdu_count_to_id(shortroomid: ShortRoomId, count: PduCount, dir: Direction) ->
 /// Checks the `eventid_outlierpdu` Tree if not found in the timeline.
 #[implement(Service)]
 pub async fn get_pdu_from_shorteventid(&self, shorteventid: ShortEventId) -> Result<PduEvent> {
-	let event_id: OwnedEventId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let event_id: OwnedEventId = services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await?;
@@ -664,9 +674,12 @@ pub async fn get_pdu_count(&self, event_id: &EventId) -> Result<PduCount> {
 /// Returns the `shorteventid` from the `pdu_id`
 #[implement(Service)]
 pub async fn get_shorteventid_from_pdu_id(&self, pdu_id: &PduId) -> Result<ShortEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = self.get_event_id_from_pdu_id(pdu_id).await?;
 
-	self.services
+	services_root
 		.short
 		.get_shorteventid(&event_id)
 		.await
@@ -685,8 +698,10 @@ pub async fn get_event_id_from_pdu_id(&self, pdu_id: &PduId) -> Result<OwnedEven
 /// Returns the `pdu_id` from the `shorteventid`
 #[implement(Service)]
 pub async fn get_pdu_id_from_shorteventid(&self, shorteventid: ShortEventId) -> Result<RawPduId> {
-	let event_id: OwnedEventId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let event_id: OwnedEventId = services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await?;
@@ -711,8 +726,10 @@ pub async fn member_snapshot_boundary(
 	room_id: &RoomId,
 	count: PduCount,
 ) -> Result<(PduCount, PduEvent)> {
-	let shortroomid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await?;

@@ -96,7 +96,10 @@ impl crate::Service for Service {
 	fields(%event_id)
 )]
 async fn event_exists(&self, event_id: &EventId) -> bool {
-	self.services.timeline.pdu_exists(event_id).await
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root.timeline.pdu_exists(event_id).await
 }
 
 #[implement(Service)]
@@ -107,7 +110,10 @@ async fn event_exists(&self, event_id: &EventId) -> bool {
 	fields(%event_id)
 )]
 async fn event_fetch(&self, event_id: &EventId) -> Result<PduEvent> {
-	self.services.timeline.get_pdu(event_id).await
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root.timeline.get_pdu(event_id).await
 }
 
 /// Extract a room's version from the create event in a stripped-state list (as

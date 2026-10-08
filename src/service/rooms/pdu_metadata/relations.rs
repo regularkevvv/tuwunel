@@ -70,7 +70,10 @@ pub async fn event_has_relation(
 	rel_type: Option<&RelationType>,
 	key: Option<&str>,
 ) -> Result<bool> {
-	let pdu_id = match self.services.timeline.get_pdu_id(event_id).await {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let pdu_id = match services_root.timeline.get_pdu_id(event_id).await {
 		| Ok(pdu_id) => pdu_id,
 		| Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
 		| Err(error) => return Err(error),
@@ -241,7 +244,10 @@ pub(super) async fn relation_pdu(
 	id: &RawPduId,
 	budget: &mut RelationReadBudget,
 ) -> Result<Option<Pdu>> {
-	let value = match self.services.db["pduid_pdu"].get(id).await {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let value = match services_root.db["pduid_pdu"].get(id).await {
 		| Ok(value) => value,
 		| Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
 		| Err(error) => return Err(error),
@@ -249,8 +255,7 @@ pub(super) async fn relation_pdu(
 	budget.charge(0, value.len())?;
 	let pdu = serde_json::from_slice::<Pdu>(&value)
 		.map_err(|_| Error::bad_database("Invalid stored relation event"))?;
-	let canonical = self
-		.services
+	let canonical = services_root
 		.timeline
 		.get_pdu_id(pdu.event_id())
 		.await
@@ -261,8 +266,7 @@ pub(super) async fn relation_pdu(
 				error
 			}
 		})?;
-	let room = self
-		.services
+	let room = services_root
 		.short
 		.get_shortroomid(pdu.room_id())
 		.await

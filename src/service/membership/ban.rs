@@ -21,7 +21,10 @@ pub async fn ban(
 	sender_user: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {

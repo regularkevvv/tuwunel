@@ -56,10 +56,21 @@ PY
 }
 
 history_compatibility() {
-  cargo test --locked -p tuwunel --test admin_history_resume -- --ignored \
+  local case=older_journal_refuses_schema_and_record_changes_without_mutation
+  cargo test --locked -p tuwunel --test admin_history_resume "$case" -- --ignored --exact --color never \
     | tee "$test_root/history-compatibility.log"
-  grep -Fq 'test older_journal_refuses_schema_and_record_changes_without_mutation ... ok' "$test_root/history-compatibility.log"
-  grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$test_root/history-compatibility.log"
+  # Child logs may appear between the outer test name and its final status.
+  # Require the selected name and the last (outer) summary, not a child pass.
+  python3 - "$test_root/history-compatibility.log" "$case" <<'PY_HISTORY'
+import re, sys
+from pathlib import Path
+
+log = Path(sys.argv[1]).read_text()
+summaries = [line for line in log.splitlines() if line.startswith('test result: ')]
+summary = re.match(r'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;', summaries[-1]) if summaries else None
+if f'test {sys.argv[2]} ... ' not in log or summary is None or summary.groups() != ('ok', '1', '0', '0'):
+    sys.exit('Expected one passing outer predecessor compatibility test')
+PY_HISTORY
 }
 
 case "$mode" in

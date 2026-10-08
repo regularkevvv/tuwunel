@@ -24,7 +24,10 @@ struct Snapshot {
 
 #[implement(super::Service)]
 pub(crate) async fn validate_history_progress(&self, room: &RoomId, history: &History) -> Result {
-	if self.services.short.get_shortroomid(room).await? != history.shortroomid {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.short.get_shortroomid(room).await? != history.shortroomid {
 		return Err(Error::bad_database("History room binding changed"));
 	}
 	if let Some(target) = &history.current {
@@ -35,7 +38,7 @@ pub(crate) async fn validate_history_progress(&self, room: &RoomId, history: &Hi
 			&snapshot,
 			target,
 			history,
-			self.services
+			services_root
 				.globals
 				.user_is_local(&snapshot.pdu.sender),
 		)?;
@@ -49,6 +52,9 @@ pub(crate) async fn prepare_history_step(
 	room: &RoomId,
 	mut history: History,
 ) -> Result<(Txn, History)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut txn = self.db.db.txn();
 	let Some(mut target) = history.current.take() else {
 		let rows = self
@@ -74,8 +80,7 @@ pub(crate) async fn prepare_history_step(
 			.await?;
 		if snapshot.pdu.state_key.is_some()
 			|| (!history.delete_local_events
-				&& self
-					.services
+				&& services_root
 					.globals
 					.user_is_local(&snapshot.pdu.sender))
 		{
@@ -99,7 +104,7 @@ pub(crate) async fn prepare_history_step(
 		&snapshot,
 		&target,
 		&history,
-		self.services
+		services_root
 			.globals
 			.user_is_local(&snapshot.pdu.sender),
 	)?;
@@ -117,7 +122,7 @@ pub(crate) async fn prepare_history_step(
 				.transpose()?
 				.and_then(|body| body.body);
 			match body {
-				| Some(body) => self.services.search.append_deindex_page(
+				| Some(body) => services_root.search.append_deindex_page(
 					&mut txn,
 					history.shortroomid,
 					&raw,
@@ -128,7 +133,7 @@ pub(crate) async fn prepare_history_step(
 			}
 		},
 		| Phase::LegacyRelations | Phase::TypedRelations =>
-			self.services
+			services_root
 				.pdu_metadata
 				.append_history_relation_page(
 					&mut txn,
@@ -139,7 +144,7 @@ pub(crate) async fn prepare_history_step(
 				)
 				.await?,
 		| Phase::Notifications =>
-			self.services
+			services_root
 				.pusher
 				.stage_notification_erasure_page(&mut txn, &raw, room, target.after.as_deref())
 				.await?,
@@ -147,11 +152,11 @@ pub(crate) async fn prepare_history_step(
 			txn = self
 				.prepare_history_base(&raw, &snapshot.pdu)
 				.await?;
-			self.services
+			services_root
 				.pusher
 				.stage_notification_erasure(&mut txn, &raw, room)
 				.await?;
-			self.services
+			services_root
 				.pdu_metadata
 				.append_history_points(
 					&mut txn,
@@ -161,7 +166,7 @@ pub(crate) async fn prepare_history_step(
 					&target.event_id,
 				)
 				.await?;
-			self.services
+			services_root
 				.retention
 				.append_purge_original(&mut txn, &target.event_id);
 			history.purged = history
@@ -190,6 +195,9 @@ pub(crate) async fn prepare_history_step(
 
 #[implement(super::Service)]
 async fn history_snapshot(&self, room: &RoomId, short: u64, key: &[u8]) -> Result<Snapshot> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let raw = RawPduId::from_bytes(key)?;
 	if raw.shortroomid() != short.to_be_bytes() {
 		return Err(Error::bad_database("History PDU room key changed"));
@@ -213,8 +221,7 @@ async fn history_snapshot(&self, room: &RoomId, short: u64, key: &[u8]) -> Resul
 	// Validate the timestamp binding before any derived cleanup too.
 	let base = self.prepare_history_base(&raw, &pdu).await?;
 	drop(base);
-	let original = self
-		.services
+	let original = services_root
 		.retention
 		.original_snapshot(&pdu.event_id)
 		.await?;

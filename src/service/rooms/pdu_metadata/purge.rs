@@ -29,6 +29,9 @@ pub(crate) async fn append_purge_event_relations(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let target = parent.to_be_bytes();
 	self.append_relation_removals(txn, &self.db.tofrom_relation, &target, false)
 		.await?;
@@ -38,7 +41,7 @@ pub(crate) async fn append_purge_event_relations(
 	self.append_relation_removals(txn, &self.db.relatesto_typed, &prefix, true)
 		.await?;
 	txn.del(&self.db.referencedevents, (room_id, event_id));
-	txn.del_raw(&self.services.db["eventid_policysigstate"], event_id);
+	txn.del_raw(&services_root.db["eventid_policysigstate"], event_id);
 	txn.del_raw(&self.db.softfailedeventids, event_id);
 	crate::rooms::timeline::check_purge_batch(txn)
 }
@@ -73,9 +76,12 @@ async fn append_relation_removals(
 /// partial or stale index is replaced wholesale.
 #[implement(Service)]
 pub async fn rebuild_typed_relations(&self) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.db.relatesto_typed.clear().await?;
 
-	let pdus = self.services.db["pduid_pdu"].clone();
+	let pdus = services_root.db["pduid_pdu"].clone();
 
 	pdus.raw_stream()
 		.map(|row| {
@@ -173,6 +179,9 @@ pub(crate) async fn append_history_points(
 	room: &RoomId,
 	event: &EventId,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	for typed in [false, true] {
 		let mut prefix = Vec::new();
 		if typed {
@@ -194,6 +203,6 @@ pub(crate) async fn append_history_points(
 	}
 	txn.del(&self.db.referencedevents, (room, event));
 	txn.del_raw(&self.db.softfailedeventids, event);
-	txn.del_raw(&self.services.db["eventid_policysigstate"], event);
+	txn.del_raw(&services_root.db["eventid_policysigstate"], event);
 	Ok(())
 }

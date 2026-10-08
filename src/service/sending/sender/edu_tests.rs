@@ -29,9 +29,8 @@ pub(super) struct Fixture {
 
 impl Fixture {
 	pub(super) async fn new() -> Result<Self> {
-		// Match the main runtime's per-process descriptor setup. A service
-		// graph is process-lifetime (OnceServices has strong references), so
-		// the outer test runner owns scratch cleanup after this process exits.
+		// Match the main runtime's descriptor setup. The outer test runner
+		// owns scratch cleanup after this process exits.
 		sys::maximize_fd_limit()?;
 		let root =
 			std::env::temp_dir().join(format!("matrix-edu-reference-{}", rand::string(20)));

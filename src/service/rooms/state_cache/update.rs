@@ -95,6 +95,9 @@ pub async fn update_membership(
 		count,
 	}: MembershipUpdate<'_>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let membership = membership_event.membership;
 
 	self.ensure_remote_user(user_id).await?;
@@ -104,8 +107,7 @@ pub async fn update_membership(
 			self.handle_join(room_id, user_id, count).await?;
 		},
 		| MembershipState::Invite => {
-			if self
-				.services
+			if services_root
 				.users
 				.user_is_ignored(sender, user_id)
 				.await
@@ -120,8 +122,8 @@ pub async fn update_membership(
 			self.handle_leave(room_id, user_id, count).await?;
 
 			// A departure drops the room from the account-wide badge total.
-			if self.services.globals.user_is_local(user_id) {
-				self.services
+			if services_root.globals.user_is_local(user_id) {
+				services_root
 					.sending
 					.refresh_push_badge(user_id)
 					.await
@@ -173,6 +175,9 @@ pub(super) async fn update_joined_count_locked(
 	room_id: &RoomId,
 	_guard: &super::MembershipGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.ensure_recount_pending(room_id).await?;
 	// Refuse malformed reconciliation metadata before any aggregate mutation.
 	// A missing or prior-process stamp is normal and will be replaced below.
@@ -182,7 +187,7 @@ pub(super) async fn update_joined_count_locked(
 	let joinedcount = inventory.joined.to_be_bytes();
 	let invitedcount = inventory.invited.to_be_bytes();
 	let knockedcount = inventory.knocked.to_be_bytes();
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(&self.db.roomid_joinedcount, room_id, joinedcount);
 	txn.insert_raw(&self.db.roomid_invitedcount, room_id, invitedcount);
@@ -213,19 +218,22 @@ pub(super) async fn update_joined_count_locked(
 	}
 
 	txn.put_raw(
-		&self.services.db["global"],
+		&services_root.db["global"],
 		(super::recount::RECOUNT_GENERATION, room_id),
 		self.recount_generation.as_bytes(),
 	);
-	txn.del(&self.services.db["global"], (RECOUNT_PENDING, room_id));
+	txn.del(&services_root.db["global"], (RECOUNT_PENDING, room_id));
 	txn.execute().await
 }
 
 /// Also retain the obligation when an explicit recount of older data fails.
 #[implement(super::Service)]
 async fn ensure_recount_pending(&self, room_id: &RoomId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let key = (RECOUNT_PENDING, room_id);
-	let global = &self.services.db["global"];
+	let global = &services_root.db["global"];
 	match global.qry(&key).await {
 		| Ok(value) if value.is_empty() => Ok(()),
 		| Ok(_) => Err(Error::bad_database("Invalid membership recount marker")),
@@ -251,7 +259,10 @@ pub(super) async fn repair_joined_count_locked(
 	room_id: &RoomId,
 	guard: &super::MembershipGuard,
 ) -> Result {
-	match self.services.db["global"]
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	match services_root.db["global"]
 		.qry(&(RECOUNT_PENDING, room_id))
 		.await
 	{
@@ -286,9 +297,12 @@ pub(super) async fn commit_membership_locked(
 	mut txn: Txn,
 	guard: &super::MembershipGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Never publish membership without its repair obligation, including bulk
 	// updates that defer recounting and a kill before the first recount starts.
-	txn.put(&self.services.db["global"], (RECOUNT_PENDING, room_id), &[0_u8; 0][..]);
+	txn.put(&services_root.db["global"], (RECOUNT_PENDING, room_id), &[0_u8; 0][..]);
 	self.commit_membership_txn_locked(room_id, txn, guard)
 		.await
 }
@@ -302,8 +316,11 @@ pub(super) async fn commit_membership_erasure_locked(
 	mut txn: Txn,
 	guard: &super::MembershipGuard,
 ) -> Result {
-	txn.del(&self.services.db["global"], (RECOUNT_PENDING, room_id));
-	txn.del(&self.services.db["global"], (super::recount::RECOUNT_GENERATION, room_id));
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	txn.del(&services_root.db["global"], (RECOUNT_PENDING, room_id));
+	txn.del(&services_root.db["global"], (super::recount::RECOUNT_GENERATION, room_id));
 	self.commit_membership_txn_locked(room_id, txn, guard)
 		.await
 }
@@ -337,6 +354,9 @@ pub(crate) async fn mark_as_joined(
 	room_id: &RoomId,
 	count: PduCount,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -344,7 +364,7 @@ pub(crate) async fn mark_as_joined(
 	let roomuser_id = serialize_key(roomuser_id).expect("failed to serialize roomuser_id");
 
 	let count = count.into_unsigned().to_be_bytes();
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(&self.db.userroomid_joinedcount, &userroom_id, count);
 	txn.insert_raw(&self.db.roomuserid_joinedcount, &roomuser_id, count);
@@ -368,6 +388,9 @@ pub(crate) async fn mark_as_left(
 	room_id: &RoomId,
 	count: PduCount,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -378,7 +401,7 @@ pub(crate) async fn mark_as_left(
 		.expect("failed to serialize left state");
 
 	let count = count.into_unsigned().to_be_bytes();
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(&self.db.userroomid_leftstate, &userroom_id, leftstate);
 	txn.insert_raw(&self.db.roomuserid_leftcount, &roomuser_id, count);
@@ -403,6 +426,9 @@ pub(crate) async fn mark_as_knocked(
 	count: PduCount,
 	knocked_state: StrippedRoomState,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -413,7 +439,7 @@ pub(crate) async fn mark_as_knocked(
 		.expect("failed to serialize knocked state");
 
 	let count = count.into_unsigned().to_be_bytes();
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(&self.db.userroomid_knockedstate, &userroom_id, knocked_state);
 	txn.insert_raw(&self.db.roomuserid_knockedcount, &roomuser_id, count);
@@ -430,9 +456,12 @@ pub(crate) async fn mark_as_knocked(
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub async fn forget(&self, room_id: &RoomId, user_id: &UserId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userroom_id = (user_id, room_id);
 	let roomuser_id = (room_id, user_id);
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.del(&self.db.userroomid_leftstate, userroom_id);
 	txn.del(&self.db.roomuserid_leftcount, roomuser_id);
@@ -442,9 +471,12 @@ pub async fn forget(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 async fn mark_as_once_joined(&self, user_id: &UserId, room_id: &RoomId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let key = (user_id, room_id);
 	let key = serialize_key(key).expect("failed to serialize roomuseroncejoinedid");
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(&self.db.roomuseroncejoinedids, key, []);
 	txn.execute().await
@@ -460,6 +492,9 @@ pub(crate) async fn mark_as_invited(
 	last_state: StrippedRoomState,
 	invite_via: Option<Vec<OwnedServerName>>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
@@ -470,7 +505,7 @@ pub(crate) async fn mark_as_invited(
 		.expect("failed to serialize invite state");
 
 	let count = count.into_unsigned().to_be_bytes();
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.insert_raw(&self.db.userroomid_invitestate, &userroom_id, invite_state);
 	txn.insert_raw(&self.db.roomuserid_invitecount, &roomuser_id, count);
@@ -492,11 +527,14 @@ pub(crate) async fn mark_as_invited(
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 async fn ensure_remote_user(&self, user_id: &UserId) -> Result {
-	if self.services.globals.user_is_local(user_id) || self.services.users.exists(user_id).await {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.globals.user_is_local(user_id) || services_root.users.exists(user_id).await {
 		return Ok(());
 	}
 
-	self.services
+	services_root
 		.users
 		.create(user_id, None, None)
 		.await
@@ -518,8 +556,10 @@ async fn handle_join(&self, room_id: &RoomId, user_id: &UserId, count: PduCount)
 
 #[implement(super::Service)]
 async fn copy_predecessor_data(&self, room_id: &RoomId, user_id: &UserId) -> Result {
-	let predecessor = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let predecessor = services_root
 		.state_accessor
 		.room_state_get_content(room_id, &StateEventType::RoomCreate, "")
 		.await
@@ -539,8 +579,10 @@ async fn copy_predecessor_data(&self, room_id: &RoomId, user_id: &UserId) -> Res
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 async fn copy_predecessor_tags(&self, room_id: &RoomId, user_id: &UserId, predecessor: &RoomId) {
-	let Ok(tag_event) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(tag_event) = services_root
 		.account_data
 		.get_room(predecessor, user_id, RoomAccountDataEventType::Tag)
 		.await
@@ -548,7 +590,7 @@ async fn copy_predecessor_tags(&self, room_id: &RoomId, user_id: &UserId, predec
 		return;
 	};
 
-	self.services
+	services_root
 		.account_data
 		.update(Some(room_id), user_id, RoomAccountDataEventType::Tag, &tag_event)
 		.await
@@ -563,8 +605,10 @@ async fn copy_predecessor_direct(
 	user_id: &UserId,
 	predecessor: &RoomId,
 ) -> Result {
-	let Ok(mut direct_event) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(mut direct_event) = services_root
 		.account_data
 		.get_global::<DirectEvent>(user_id, GlobalAccountDataEventType::Direct)
 		.await
@@ -600,7 +644,7 @@ async fn copy_predecessor_direct(
 
 	let direct_event = serde_json::to_value(&direct_event).expect("to json always works");
 
-	self.services
+	services_root
 		.account_data
 		.update(None, user_id, event_type, &direct_event)
 		.await
@@ -609,12 +653,15 @@ async fn copy_predecessor_direct(
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.mark_as_left(user_id, room_id, count).await?;
 
-	if self.services.globals.user_is_local(user_id)
-		&& (self.services.config.forget_forced_upon_leave
-			|| self.services.metadata.is_banned(room_id).await
-			|| self.services.metadata.is_disabled(room_id).await)
+	if services_root.globals.user_is_local(user_id)
+		&& (services_root.config.forget_forced_upon_leave
+			|| services_root.metadata.is_banned(room_id).await
+			|| services_root.metadata.is_disabled(room_id).await)
 	{
 		self.forget(room_id, user_id).await?;
 	}

@@ -24,14 +24,16 @@ type Parsed = (OwnedRoomId, OwnedEventId, CanonicalJsonObject);
     )
 )]
 pub async fn parse_incoming_pdu(&self, pdu: &RawJsonValue) -> Result<Parsed> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let value: CanonicalJsonObject = serde_json::from_str(pdu.get()).map_err(|e| {
 		err!(BadServerResponse(debug_error!("Error parsing incoming event: {e} {pdu:#?}")))
 	})?;
 
 	let room_id = room_id_of(&value)?;
 
-	let room_version_id = match self
-		.services
+	let room_version_id = match services_root
 		.state
 		.get_room_version(&room_id)
 		.await
@@ -101,8 +103,10 @@ fn room_id_of(value: &CanonicalJsonObject) -> Result<OwnedRoomId> {
 /// invite). The create event in the stripped state carries the version.
 #[implement(super::Service)]
 async fn invited_room_version(&self, room_id: &RoomId) -> Result<Option<RoomVersionId>> {
-	let invited = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let invited = services_root
 		.state_cache
 		.bounded_invited_members(room_id)
 		.await?;
@@ -110,11 +114,10 @@ async fn invited_room_version(&self, room_id: &RoomId) -> Result<Option<RoomVers
 	let mut bytes = 256 * 1024_usize;
 	let mut version = None;
 	for user in invited {
-		if !self.services.globals.user_is_local(&user) {
+		if !services_root.globals.user_is_local(&user) {
 			continue;
 		}
-		let stripped = self
-			.services
+		let stripped = services_root
 			.state_cache
 			.bounded_invite_state(&user, room_id, events, bytes)
 			.await?;

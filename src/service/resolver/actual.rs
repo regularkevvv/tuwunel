@@ -146,6 +146,9 @@ async fn actual_dest(
 	cache: bool,
 	host: &mut DestString,
 ) -> Result<FedDest> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	match get_ip_with_port(dest.as_str()) {
 		| Some(host_port) => Self::actual_dest_1(host_port),
 		| None if let Some(pos) = dest.as_str().find(':') =>
@@ -153,7 +156,7 @@ async fn actual_dest(
 		| None => {
 			self.maybe_query_and_cache(dest.as_str(), 8448, true)
 				.await?;
-			self.services.server.check_running()?;
+			services_root.server.check_running()?;
 			match self.request_well_known(dest.as_str()).await? {
 				| Some(delegated) => self.actual_dest_3(host, cache, &delegated).await,
 				| _ => match self.query_srv_record(dest.as_str()).await? {
@@ -342,7 +345,10 @@ async fn query_and_cache_override(
 	hostname: &'_ str,
 	port: u16,
 ) -> Result {
-	self.services.server.check_running()?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root.server.check_running()?;
 
 	debug!("querying IP for {untername:?} ({hostname:?}:{port})");
 	match self
@@ -372,11 +378,14 @@ async fn query_and_cache_override(
 #[implement(super::Service)]
 #[tracing::instrument(name = "srv", level = "debug", skip(self))]
 async fn query_srv_record(&self, hostname: &'_ str) -> Result<Option<FedDest>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let hostnames =
 		[format!("_matrix-fed._tcp.{hostname}."), format!("_matrix._tcp.{hostname}.")];
 
 	for hostname in hostnames {
-		self.services.server.check_running()?;
+		services_root.server.check_running()?;
 
 		debug!("querying SRV for {hostname:?}");
 		let hostname = hostname.trim_end_matches('.');
@@ -444,9 +453,12 @@ fn validate_dest(&self, dest: &ServerName, allow_self: bool) -> Result {
 
 #[implement(super::Service)]
 fn validate_self_destination(&self, dest: &ServerName, allow_self: bool) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if !allow_self
-		&& dest == self.services.server.name
-		&& !self.services.server.config.federation_loopback
+		&& dest == services_root.server.name
+		&& !services_root.server.config.federation_loopback
 	{
 		return Err!("Won't send federation request to ourselves");
 	}
@@ -490,7 +502,10 @@ fn validate_dest_ip_literal(&self, dest: &ServerName) -> Result {
 
 #[implement(super::Service)]
 pub(crate) fn validate_ip(&self, ip: &IPAddress) -> Result {
-	if !self.services.client.valid_cidr_range(ip) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root.client.valid_cidr_range(ip) {
 		return Err!(BadServerResponse("Not allowed to send requests to this IP"));
 	}
 

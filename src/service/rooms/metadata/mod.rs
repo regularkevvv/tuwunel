@@ -42,7 +42,10 @@ impl crate::Service for Service {
 
 #[implement(Service)]
 pub async fn exists(&self, room_id: &RoomId) -> bool {
-	let Ok(prefix) = self.services.short.get_shortroomid(room_id).await else {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(prefix) = services_root.short.get_shortroomid(room_id).await else {
 		return false;
 	};
 
@@ -139,10 +142,12 @@ pub async fn bounded_room_ids(&self) -> Result<Vec<OwnedRoomId>> {
 
 #[implement(Service)]
 pub async fn is_public(&self, room_id: &RoomId) -> bool {
-	let listed_public = self.services.directory.is_public_room(room_id);
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	let join_rule_public = self
-		.services
+	let listed_public = services_root.directory.is_public_room(room_id);
+
+	let join_rule_public = services_root
 		.state_accessor
 		.get_join_rules(room_id)
 		.map(|rule| matches!(rule, JoinRule::Public));

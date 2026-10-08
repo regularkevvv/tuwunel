@@ -27,6 +27,9 @@ pub async fn watch<'a, Rooms>(
 where
 	Rooms: Stream<Item = &'a RoomId> + Send + 'a,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userid_prefix =
 		serialize_key((user_id, Interfix)).expect("failed to serialize watch prefix");
 
@@ -94,7 +97,7 @@ where
 	// advances; the rocksdb slice contract forbids stashing them.
 	pin_mut!(rooms);
 	while let Some(room_id) = rooms.next().await {
-		let Ok(short_roomid) = self.services.short.get_shortroomid(room_id).await else {
+		let Ok(short_roomid) = services_root.short.get_shortroomid(room_id).await else {
 			continue;
 		};
 
@@ -135,8 +138,7 @@ where
 		);
 		// Typing: subscribe synchronously so the receiver is registered before
 		// this fn returns; `wait_for_update` would defer until poll.
-		let mut typing_rx = self
-			.services
+		let mut typing_rx = services_root
 			.typing
 			.typing_update_sender
 			.subscribe();
@@ -155,10 +157,12 @@ where
 	}
 
 	// Server shutdown
-	futures.push(self.services.server.until_shutdown().boxed());
+	let server = services_root.server.clone();
+	let shutdown_server = server.clone();
+	futures.push(async move { shutdown_server.until_shutdown().await }.boxed());
 
 	async move {
-		if !self.services.server.is_running() {
+		if !server.is_running() {
 			return;
 		}
 

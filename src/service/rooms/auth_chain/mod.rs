@@ -71,23 +71,27 @@ impl crate::Service for Service {
 
 #[implement(Service)]
 /// Returns only complete chain reads; reverse-mapping errors remain errors.
-pub fn event_ids_iter<'a, I>(
-	&'a self,
-	room_id: &'a RoomId,
-	room_version: &'a RoomVersionId,
+pub fn event_ids_iter<'a, 's, I>(
+	&'s self,
+	room_id: &'s RoomId,
+	room_version: &'s RoomVersionId,
 	starting_events: I,
-) -> impl Stream<Item = Result<OwnedEventId>> + Send + 'a
+) -> impl Stream<Item = Result<OwnedEventId>> + Send + 's
 where
-	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 's,
+	'a: 's,
 {
-	self.get_auth_chain(room_id, room_version, starting_events)
-		.map_ok(|chain| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(chain.into_iter().stream())
-				.map_err(|_| Error::bad_database("Incomplete authentication chain mapping"))
-		})
-		.try_flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.get_auth_chain(room_id, room_version, starting_events)
+			.map_ok(|chain| {
+				services_root
+					.short
+					.multi_get_eventid_from_short(chain.into_iter().stream())
+					.map_err(|_| Error::bad_database("Incomplete authentication chain mapping"))
+			})
+			.try_flatten_stream()
+	})
 }
 
 /// Streams an auth chain and reports whether its observed inputs were complete.
@@ -96,29 +100,33 @@ where
 /// the stream. Cached chains leave it unchanged. Any polled reverse-mapping or
 /// ancestor-walk failure sets it to `false`.
 #[implement(Service)]
-pub fn event_ids_iter_strict<'a, I>(
-	&'a self,
-	room_id: &'a RoomId,
-	room_version: &'a RoomVersionId,
+pub fn event_ids_iter_strict<'a, 's, I>(
+	&'s self,
+	room_id: &'s RoomId,
+	room_version: &'s RoomVersionId,
 	starting_events: I,
-	complete: &'a AtomicBool,
-) -> impl Stream<Item = Result<OwnedEventId>> + Send + 'a
+	complete: &'s AtomicBool,
+) -> impl Stream<Item = Result<OwnedEventId>> + Send + 's
 where
-	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 's,
+	'a: 's,
 {
-	self.get_auth_chain_strict(room_id, room_version, starting_events, complete)
-		.map_ok(move |chain| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(chain.into_iter().stream())
-				.inspect(move |result| {
-					if result.is_err() {
-						complete.store(false, Ordering::Relaxed);
-					}
-				})
-				.ready_filter(Result::is_ok)
-		})
-		.try_flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.get_auth_chain_strict(room_id, room_version, starting_events, complete)
+			.map_ok(move |chain| {
+				services_root
+					.short
+					.multi_get_eventid_from_short(chain.into_iter().stream())
+					.inspect(move |result| {
+						if result.is_err() {
+							complete.store(false, Ordering::Relaxed);
+						}
+					})
+					.ready_filter(Result::is_ok)
+			})
+			.try_flatten_stream()
+	})
 }
 
 #[implement(Service)]
@@ -132,13 +140,13 @@ where
 	)
 )]
 pub async fn get_auth_chain<'a, I>(
-	&'a self,
+	&self,
 	room_id: &RoomId,
 	room_version: &RoomVersionId,
 	starting_events: I,
 ) -> Result<Vec<ShortEventId>>
 where
-	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send,
 {
 	let complete = AtomicBool::new(true);
 
@@ -162,14 +170,14 @@ where
 	)
 )]
 async fn get_auth_chain_strict<'a, I>(
-	&'a self,
+	&self,
 	room_id: &RoomId,
 	room_version: &RoomVersionId,
 	starting_events: I,
 	complete: &AtomicBool,
 ) -> Result<Vec<ShortEventId>>
 where
-	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send,
 {
 	self.get_auth_chain_inner(room_id, room_version, starting_events, complete)
 		.inspect_err(|_| complete.store(false, Ordering::Relaxed))
@@ -178,23 +186,25 @@ where
 
 #[implement(Service)]
 async fn get_auth_chain_inner<'a, I>(
-	&'a self,
+	&self,
 	room_id: &RoomId,
 	room_version: &RoomVersionId,
 	starting_events: I,
 	complete: &AtomicBool,
 ) -> Result<Vec<ShortEventId>>
 where
-	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
+	I: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send,
 {
 	const NUM_BUCKETS: usize = 50; //TODO: change possible w/o disrupting db?
 	const BUCKET: Bucket<'_> = BTreeSet::new();
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let started = Instant::now();
 	let room_rules = room_version::rules(room_version)?;
 	let starting_events_count = starting_events.len();
-	let starting_ids = self
-		.services
+	let starting_ids = services_root
 		.short
 		.multi_get_or_create_shorteventid(starting_events.clone())
 		.zip(starting_events.stream());
@@ -280,7 +290,7 @@ where
 
 #[implement(Service)]
 async fn build_chunk_auth_chain<'a, I>(
-	&'a self,
+	&self,
 	room_id: &'a RoomId,
 	started: &'a Instant,
 	starting_events: I,
@@ -369,13 +379,16 @@ fn get_event_auth_chain<'a>(
 	room_rules: &'a RoomVersionRules,
 	complete: &'a AtomicBool,
 ) -> impl Stream<Item = Result<ShortEventId>> + Send + 'a {
-	self.get_event_auth_chain_ids(room_id, event_id, room_rules, complete)
-		.broad_then(async move |auth_event| {
-			self.services
-				.short
-				.get_or_create_shorteventid(&auth_event)
-				.await
-		})
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.get_event_auth_chain_ids(room_id, event_id, room_rules, complete)
+			.broad_then(async move |auth_event| {
+				services_root
+					.short
+					.get_or_create_shorteventid(&auth_event)
+					.await
+			})
+	})
 }
 
 #[implement(Service)]
@@ -533,19 +546,21 @@ where
 	skip_all,
 	fields(%event_id)
 )]
-async fn get_event_auth_event_ids<'a>(
-	&'a self,
-	room_id: &'a RoomId,
+async fn get_event_auth_event_ids(
+	&self,
+	room_id: &RoomId,
 	event_id: OwnedEventId,
 ) -> Result<AuthEvents> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	#[derive(Deserialize)]
 	struct Pdu {
 		auth_events: AuthEvents,
 		room_id: OwnedRoomId,
 	}
 
-	let pdu: Pdu = self
-		.services
+	let pdu: Pdu = services_root
 		.timeline
 		.get(&event_id)
 		.inspect_err(|e| {

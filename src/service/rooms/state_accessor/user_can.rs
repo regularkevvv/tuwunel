@@ -32,7 +32,10 @@ pub async fn user_can_redact(
 	room_id: &RoomId,
 	federation: bool,
 ) -> Result<bool> {
-	let redacting_event = match self.services.timeline.get_pdu(redacts).await {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let redacting_event = match services_root.timeline.get_pdu(redacts).await {
 		| Ok(pdu) => Some(pdu),
 		| Err(error) if error.kind() == ErrorKind::NotFound => None,
 		| Err(error) => return Err(error),
@@ -87,8 +90,10 @@ pub async fn user_can_see_event(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> bool {
-	let shortstatehash = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortstatehash = match services_root
 		.state
 		.pdu_shortstatehash(event_id)
 		.await
@@ -149,7 +154,10 @@ async fn user_shared_history(
 	event_id: &EventId,
 	user_id: &UserId,
 ) -> bool {
-	let state_cache = &self.services.state_cache;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let state_cache = &services_root.state_cache;
 
 	if state_cache.is_joined(user_id, room_id).await
 		|| self
@@ -167,8 +175,7 @@ async fn user_shared_history(
 		return false;
 	};
 
-	let Ok(event_count) = self
-		.services
+	let Ok(event_count) = services_root
 		.timeline
 		.get_pdu_count(event_id)
 		.await
@@ -184,8 +191,10 @@ async fn user_shared_history(
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId) -> bool {
-	if self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root
 		.state_cache
 		.is_joined(user_id, room_id)
 		.await
@@ -193,8 +202,7 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 		return true;
 	}
 
-	let Ok(shortstatehash) = self
-		.services
+	let Ok(shortstatehash) = services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -213,13 +221,13 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 		| HistoryVisibility::WorldReadable => true,
 
 		| HistoryVisibility::Invited =>
-			self.services
+			services_root
 				.state_cache
 				.is_invited(user_id, room_id)
 				.await,
 
 		| HistoryVisibility::Shared =>
-			self.services
+			services_root
 				.state_cache
 				.once_joined(user_id, room_id)
 				.await,
@@ -236,12 +244,14 @@ pub async fn user_can_see_state_events_checked(
 	user_id: &UserId,
 	room_id: &RoomId,
 ) -> Result<bool> {
-	let cache = &self.services.state_cache;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let cache = &services_root.state_cache;
 	if cache.is_joined_checked(user_id, room_id).await? {
 		return Ok(true);
 	}
-	let shortstatehash = match self
-		.services
+	let shortstatehash = match services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -266,7 +276,10 @@ pub async fn user_can_see_state_events_checked(
 /// user's left-state, so a forgotten room is not visible.
 #[implement(super::Service)]
 pub async fn user_can_see_room(&self, user_id: &UserId, room_id: &RoomId) -> bool {
-	let state_cache = &self.services.state_cache;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let state_cache = &services_root.state_cache;
 	let joined = state_cache.is_joined(user_id, room_id);
 	let invited = state_cache.is_invited(user_id, room_id);
 	let left = state_cache.is_left(user_id, room_id);
@@ -288,7 +301,10 @@ pub async fn user_can_invite(
 	target_user: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> bool {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.timeline
 		.create_hash_and_sign_event(
 			PduBuilder::state(
@@ -310,8 +326,10 @@ pub async fn user_can_tombstone(
 	user_id: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> bool {
-	if !self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root
 		.state_cache
 		.is_joined(user_id, room_id)
 		.await
@@ -319,7 +337,7 @@ pub async fn user_can_tombstone(
 		return false;
 	}
 
-	self.services
+	services_root
 		.timeline
 		.create_hash_and_sign_event(
 			PduBuilder::state(StateKey::new(), &RoomTombstoneEventContent {

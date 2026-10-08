@@ -46,13 +46,16 @@ const ATTEMPTS: u32 = 5;
 /// call this while it holds the room's state mutex.
 #[implement(Service)]
 pub fn auto_accept(&self, room_id: &RoomId, user_id: &UserId, sender: &UserId, is_direct: bool) {
-	let config = &self.services.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.config;
 
 	let accepts = config.auto_accept_invites
 		&& (is_direct || !config.auto_accept_invites_direct_only)
-		&& self.services.globals.user_is_local(user_id)
+		&& services_root.globals.user_is_local(user_id)
 		&& (!config.auto_accept_invites_local_only
-			|| self.services.globals.user_is_local(sender));
+			|| services_root.globals.user_is_local(sender));
 
 	if !accepts {
 		return;
@@ -76,6 +79,9 @@ pub fn auto_accept(&self, room_id: &RoomId, user_id: &UserId, sender: &UserId, i
 /// the invite for its user to answer.
 #[implement(Service)]
 pub(super) async fn accept_worker(&self) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let accepting = self
 		.queue
 		.1
@@ -84,7 +90,7 @@ pub(super) async fn accept_worker(&self) {
 
 	tokio::select! {
 		() = accepting => {},
-		() = self.services.server.until_shutdown() => {},
+		() = services_root.server.until_shutdown() => {},
 	}
 }
 
@@ -99,6 +105,9 @@ pub(super) async fn accept_worker(&self) {
 	),
 )]
 async fn accept(&self, Pending { room_id, user_id, sender, is_direct }: Pending) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if !self.join_invited(&room_id, &user_id).await {
 		return;
 	}
@@ -106,7 +115,7 @@ async fn accept(&self, Pending { room_id, user_id, sender, is_direct }: Pending)
 	debug!("Accepted the invitation on the user's behalf.");
 
 	if is_direct {
-		self.services
+		services_root
 			.account_data
 			.mark_direct(&user_id, &sender, &room_id)
 			.await
@@ -168,8 +177,11 @@ async fn join_invited(&self, room_id: &RoomId, user_id: &UserId) -> bool {
 /// deserialization.
 #[implement(Service)]
 async fn acceptable(&self, room_id: &RoomId, user_id: &UserId) -> bool {
-	let state_cache = &self.services.state_cache;
-	let users = &self.services.users;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let state_cache = &services_root.state_cache;
+	let users = &services_root.users;
 
 	let invited = state_cache.is_invited(user_id, room_id);
 	let active = users.is_active_local(user_id);

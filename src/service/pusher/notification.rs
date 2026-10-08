@@ -224,10 +224,13 @@ pub async fn reset_notification_counts_for_thread(
 	room: &RoomId,
 	thread: &ReceiptThread,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let guard = self.lock_notification(user, room).await;
 	let mut txn = self.db.db.txn();
 	// The permit stays alive through execute so sync cannot pass this stamp.
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 	self.stage_notification_reset(&mut txn, &guard, thread, Some(*count), None)
 		.await?;
 	self.stage_notification_cutoff(&mut txn, &guard, thread, *count)
@@ -313,6 +316,9 @@ async fn notification_counts_after(
 	scope: &ReceiptThread,
 	position: u64,
 ) -> Result<NotificationState> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if position > i64::MAX.unsigned_abs() {
 		return Err(Error::bad_database("Invalid notification reset position"));
 	}
@@ -371,8 +377,7 @@ async fn notification_counts_after(
 			if RawPduId::from(id) != raw {
 				return Err(Error::bad_database("Notification metadata/index binding mismatch"));
 			}
-			let pdu = match self
-				.services
+			let pdu = match services_root
 				.timeline
 				.get_pdu_from_id(&id.into())
 				.await
@@ -387,11 +392,10 @@ async fn notification_counts_after(
 			if pdu.is_redacted() {
 				continue;
 			}
-			if self.services.short.get_shortroomid(room).await? != notified.sroomid {
+			if services_root.short.get_shortroomid(room).await? != notified.sroomid {
 				return Err(Error::bad_database("Notification reset room binding mismatch"));
 			}
-			let root = self
-				.services
+			let root = services_root
 				.threads
 				.get_thread_id_checked(&pdu)
 				.await?;
@@ -464,9 +468,12 @@ pub(crate) fn notification_reset_committed(
 	guard: &NotificationGuard,
 	_thread: &ReceiptThread,
 ) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Persisted event cutoffs determine cancellation at delivery. A main
 	// reset must never erase independent thread obligations.
-	self.services
+	services_root
 		.sending
 		.schedule_resume_pushes_for_user(guard.user.clone(), "read receipt committed");
 }
@@ -601,6 +608,9 @@ pub async fn highlight_count(&self, user: &UserId, room: &RoomId) -> Result<u64>
 /// changes.
 #[implement(super::Service)]
 pub async fn global_notification_count(&self, user: &UserId) -> Result<u64> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _guard = self.lock_notification_user(user).await;
 	let prefix = serialize_key((user, Interfix))?;
 	let mut after = None;
@@ -629,8 +639,7 @@ pub async fn global_notification_count(&self, user: &UserId) -> Result<u64> {
 				.await?;
 			budget.charge(key, &value)?;
 			let count = decode_count(&value)?;
-			if self
-				.services
+			if services_root
 				.state_cache
 				.is_joined_checked(user, &room)
 				.await?
@@ -711,11 +720,13 @@ pub async fn notification_is_read<E: Event>(
 	event: &E,
 	position: u64,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if position == 0 || position > i64::MAX.unsigned_abs() {
 		return Err(Error::bad_database("Invalid notification event position"));
 	}
-	let thread = self
-		.services
+	let thread = services_root
 		.threads
 		.get_thread_id_checked(event)
 		.await?;

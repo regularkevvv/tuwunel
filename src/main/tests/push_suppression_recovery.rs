@@ -13,6 +13,7 @@ use std::{
 	net::TcpListener,
 	path::{Path, PathBuf},
 	process::{Child, Command, id},
+	sync::Arc,
 	thread,
 	time::{Duration, Instant},
 };
@@ -184,7 +185,7 @@ fn child(path: &Path, phase: &str) -> Result {
 			let (gateway, rx) = gateway(m.gateway).await?;
 			(Some(gateway), rx)
 		};
-		let services = services.start().await?;
+		drop(services.start().await?);
 		_ = server
 			.services
 			.lock()
@@ -205,8 +206,23 @@ fn child(path: &Path, phase: &str) -> Result {
 			outcome.and(shutdown)
 		};
 		let (run, outcome) = tokio::join!(async_run(&server), exercise);
+		let stopped_services = Arc::downgrade(&services);
+		let stopped_database = Arc::downgrade(&services.db);
 		drop(services);
-		outcome.and(run).and(async_stop(&server).await)
+		let stopped = async_stop(&server).await;
+		if stopped.is_ok() {
+			assert_eq!(
+				stopped_services.strong_count(),
+				0,
+				"push recovery shutdown releases its service root"
+			);
+			assert_eq!(
+				stopped_database.strong_count(),
+				0,
+				"push recovery shutdown releases its database"
+			);
+		}
+		outcome.and(run).and(stopped)
 	});
 	drop(server);
 	drop(runtime);

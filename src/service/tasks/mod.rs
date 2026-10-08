@@ -87,15 +87,18 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		if self.services.server.config.maintenance {
-			self.services.server.until_shutdown().await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if services_root.server.config.maintenance {
+			services_root.server.until_shutdown().await;
 			return Ok(());
 		}
 		loop {
 			self.prune().await?;
 			tokio::select! {
 				() = sleep(GC_INTERVAL) => {},
-				() = self.services.server.until_shutdown() => return Ok(()),
+				() = services_root.server.until_shutdown() => return Ok(()),
 			}
 		}
 	}
@@ -119,6 +122,9 @@ pub async fn spawn<F>(
 where
 	F: Future<Output = Result<JsonValue>> + Send + 'static,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _guard = self.journal.lock().await;
 	if parameters.get("executor").is_some() {
 		return Err(err!("Typed admin requests require their registered handler"));
@@ -128,7 +134,7 @@ where
 		.await?;
 
 	let this = Arc::clone(self);
-	let handle = self.services.server.runtime().spawn(async move {
+	let handle = services_root.server.runtime().spawn(async move {
 		let result = async {
 			this.set_active(&id).await?;
 			let outcome = AssertUnwindSafe(work)
@@ -157,7 +163,10 @@ async fn admit(
 	resource_id: String,
 	parameters: JsonValue,
 ) -> Result<TaskId> {
-	if self.services.server.config.maintenance {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.server.config.maintenance {
 		return Err(err!("Admin tasks are unavailable in maintenance mode"));
 	}
 	data::action(action)?;

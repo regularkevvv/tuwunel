@@ -30,6 +30,9 @@ pub(super) async fn handle_outlier_pdu(
 	recursion_level: usize,
 	auth_events_known: bool,
 ) -> Result<(PduEvent, CanonicalJsonObject)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug!(?event_id, ?auth_events_known, %recursion_level, "handle outlier");
 
 	// 1. Remove unsigned field
@@ -39,8 +42,7 @@ pub(super) async fn handle_outlier_pdu(
 	// anywhere?: https://matrix.org/docs/spec/rooms/v6#canonical-json
 	// 2. Check signatures, otherwise drop
 	// 3. check content hash, redact if doesn't match
-	let pdu_json = match self
-		.services
+	let pdu_json = match services_root
 		.server_keys
 		.verify_event(&pdu_json, Some(room_version))
 		.await
@@ -61,7 +63,7 @@ pub(super) async fn handle_outlier_pdu(
 			};
 
 			// Skip the PDU if it is redacted and we already have it as an outlier event
-			if self.services.timeline.pdu_exists(event_id).await {
+			if services_root.timeline.pdu_exists(event_id).await {
 				return Err!(Request(InvalidParam(
 					"Event was redacted and we already knew about it"
 				)));
@@ -105,7 +107,7 @@ pub(super) async fn handle_outlier_pdu(
 		.auth_events()
 		.stream()
 		.any(async |auth_event_id| {
-			self.services
+			services_root
 				.timeline
 				.is_pdu_rejected(auth_event_id)
 				.await
@@ -113,7 +115,7 @@ pub(super) async fn handle_outlier_pdu(
 		.await;
 
 	if cites_rejected {
-		self.services
+		services_root
 			.timeline
 			.add_pdu_rejected(event.event_id(), &pdu_json)
 			.await?;
@@ -179,7 +181,7 @@ pub(super) async fn handle_outlier_pdu(
 	// its children, and rejects the events that cite it. A denial reached with
 	// an auth event missing may only reflect what we could not obtain.
 	if complete && matches!(outcome, AuthCheckOutcome::Deny(_)) {
-		self.services
+		services_root
 			.timeline
 			.add_pdu_rejected(event.event_id(), &pdu_json)
 			.await?;
@@ -189,7 +191,7 @@ pub(super) async fn handle_outlier_pdu(
 	trace!("Validation successful.");
 
 	// 7. Persist the event as an outlier.
-	self.services
+	services_root
 		.timeline
 		.add_pdu_outlier(event.event_id(), &pdu_json)
 		.await?;

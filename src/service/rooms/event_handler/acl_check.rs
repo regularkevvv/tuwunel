@@ -14,8 +14,10 @@ use tuwunel_core::{Err, Result, debug, implement, trace};
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "debug")]
 pub async fn acl_check(&self, server_name: &ServerName, room_id: &RoomId) -> Result {
-	let content = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let content = match services_root
 		.state_accessor
 		.room_state_get_content::<Value>(room_id, &StateEventType::RoomServerAcl, "")
 		.await

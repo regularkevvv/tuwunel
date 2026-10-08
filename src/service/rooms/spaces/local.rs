@@ -20,6 +20,9 @@ pub(super) async fn get_summary_and_children_local(
 ) -> Result<Accessibility> {
 	use Accessibility::{Accessible, Inaccessible};
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	match self.cache_get(current_room).await {
 		| Err(e) if !e.is_not_found() => {
 			error!(?current_room, "cache error: {e}");
@@ -33,8 +36,7 @@ pub(super) async fn get_summary_and_children_local(
 			{
 				return Ok(Inaccessible);
 			}
-			cached.summary.num_joined_members = self
-				.services
+			cached.summary.num_joined_members = services_root
 				.state_cache
 				.room_joined_count_uint(current_room)
 				.await?;
@@ -50,10 +52,9 @@ pub(super) async fn get_summary_and_children_local(
 		},
 	}
 
-	if !self
-		.services
+	if !services_root
 		.state_cache
-		.server_in_room(self.services.server.name.as_ref(), current_room)
+		.server_in_room(services_root.server.name.as_ref(), current_room)
 		.await
 	{
 		debug!(?current_room, "no local membership; defer to federation");
@@ -89,8 +90,10 @@ pub(super) async fn get_room_summary(
 	children_state: Vec<Raw<HierarchySpaceChildEvent>>,
 	sender: &Identifier<'_>,
 ) -> Result<Accessibility, Error> {
-	let join_rule = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let join_rule = services_root
 		.state_accessor
 		.get_join_rules(room_id)
 		.await;
@@ -103,56 +106,47 @@ pub(super) async fn get_room_summary(
 		return Ok(Accessibility::Inaccessible);
 	}
 
-	let name = self
-		.services
+	let name = services_root
 		.state_accessor
 		.get_name(room_id)
 		.ok();
 
-	let topic = self
-		.services
+	let topic = services_root
 		.state_accessor
 		.get_room_topic(room_id)
 		.ok();
 
-	let room_type = self
-		.services
+	let room_type = services_root
 		.state_accessor
 		.get_room_type(room_id)
 		.ok();
 
-	let world_readable = self
-		.services
+	let world_readable = services_root
 		.state_accessor
 		.is_world_readable(room_id);
 
-	let guest_can_join = self
-		.services
+	let guest_can_join = services_root
 		.state_accessor
 		.guest_can_join(room_id);
 
-	let num_joined_members = self
-		.services
+	let num_joined_members = services_root
 		.state_cache
 		.room_joined_count_uint(room_id);
 
-	let canonical_alias = self
-		.services
+	let canonical_alias = services_root
 		.state_accessor
 		.get_canonical_alias(room_id)
 		.ok();
 
-	let avatar_url = self
-		.services
+	let avatar_url = services_root
 		.state_accessor
 		.get_avatar(room_id)
 		.map_ok(|content| content.url)
 		.ok();
 
-	let room_version = self.services.state.get_room_version(room_id).ok();
+	let room_version = services_root.state.get_room_version(room_id).ok();
 
-	let encryption = self
-		.services
+	let encryption = services_root
 		.state_accessor
 		.get_room_encryption(room_id)
 		.ok();

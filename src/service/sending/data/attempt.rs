@@ -194,6 +194,9 @@ impl Data {
 		&self,
 		destination: &Destination,
 	) -> Result<Option<(Vec<u8>, Record)>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let ownership = match self.db["global"]
 			.get(&witness_key(destination))
 			.await
@@ -208,7 +211,7 @@ impl Data {
 			.await
 		{
 			| Ok(value) => {
-				let record = decode(&value, destination, self.services.globals.current_count())?;
+				let record = decode(&value, destination, services_root.globals.current_count())?;
 				if ownership.as_ref() != Some(&witness(&value)) {
 					return Err(Error::bad_database(
 						"Outgoing transaction ownership witness is missing or changed",
@@ -382,6 +385,9 @@ impl Data {
 		body: Vec<u8>,
 		recipient: Option<[u8; 32]>,
 	) -> Result<PreparedAttempt> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let _guard = self.active_write.lock().await;
 		self.require_active_schema().await?;
 		self.resume_cancellation(destination).await?;
@@ -445,7 +451,7 @@ impl Data {
 		};
 		// Check the largest possible encoded counter before consuming one.
 		encode(&record)?;
-		record.generation = *self.services.globals.next_count().await?;
+		record.generation = *services_root.globals.next_count().await?;
 		let value = encode(&record)?;
 		let mut txn = self.db.txn();
 		txn.insert_raw(&self.sendingtransaction_record, &prefix, &value);
@@ -481,6 +487,9 @@ impl Data {
 		acknowledgement: &ActiveAcknowledgement,
 		txn: &mut Txn,
 	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let current = self.read_attempt_header(destination).await?;
 		let Some(expected) = &acknowledgement.attempt else {
 			if current.is_some() {
@@ -490,7 +499,7 @@ impl Data {
 			}
 			return Ok(true);
 		};
-		decode(&expected.value, destination, self.services.globals.current_count())?;
+		decode(&expected.value, destination, services_root.globals.current_count())?;
 		let Some((value, record)) = current else { return Ok(true) };
 		if value != expected.value {
 			if record.generation > expected.generation {
@@ -515,6 +524,9 @@ impl Data {
 	}
 
 	pub(super) async fn cancel_attempt_and_requests(&self, destination: &Destination) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		self.require_active_schema().await?;
 		if AttemptKind::for_destination(destination).is_none() {
 			return self.delete_queue_pages(destination).await;
@@ -524,7 +536,7 @@ impl Data {
 		if prefix.len().saturating_add(17) > MAX_KEY_BYTES {
 			return Err(Error::bad_database("Outgoing cancellation owner exceeds key limit"));
 		}
-		let generation = *self.services.globals.next_count().await?;
+		let generation = *services_root.globals.next_count().await?;
 		let record = Record {
 			owner: prefix.clone().into(),
 			generation,

@@ -147,7 +147,10 @@ pub(crate) async fn stage_notification_index_erasure(
 	room: &RoomId,
 	limit: usize,
 ) -> Result<bool> {
-	let short = self.services.short.get_shortroomid(room).await?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let short = services_root.short.get_shortroomid(room).await?;
 	if raw.shortroomid() != short.to_be_bytes() {
 		return Err(Error::bad_database("Notification erasure room binding mismatch"));
 	}
@@ -198,7 +201,10 @@ pub(crate) async fn stage_room_notification_index_erasure(
 	txn: &mut Txn,
 	room: &RoomId,
 ) -> Result {
-	let short = self.services.short.get_shortroomid(room).await?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let short = services_root.short.get_shortroomid(room).await?;
 	let keys = self
 		.db
 		.notificationid_index

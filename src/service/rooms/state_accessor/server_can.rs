@@ -16,8 +16,10 @@ pub async fn server_can_see_event(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> bool {
-	let shortstatehash = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortstatehash = match services_root
 		.state
 		.pdu_shortstatehash(event_id)
 		.await
@@ -45,8 +47,7 @@ pub async fn server_can_see_event(
 		return false;
 	};
 
-	let current_server_members = self
-		.services
+	let current_server_members = services_root
 		.state_cache
 		.room_members(room_id)
 		.ready_filter(|member| member.server_name() == origin);
@@ -74,8 +75,10 @@ pub async fn server_can_see_event(
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 pub async fn server_joined_at_pdu(&self, origin: &ServerName, event_id: &EventId) -> bool {
-	let Ok(shortstatehash) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(shortstatehash) = services_root
 		.state
 		.pdu_shortstatehash(event_id)
 		.await

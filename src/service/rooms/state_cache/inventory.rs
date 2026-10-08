@@ -159,6 +159,9 @@ impl Service {
 		row_limit: usize,
 		byte_limit: usize,
 	) -> Result<RoomMemberInventoryCount> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let row_limit = row_limit.min(1024);
 		let byte_limit = byte_limit.min(128 * 1024);
 		let prefix = (room, Interfix);
@@ -183,7 +186,7 @@ impl Service {
 					http::StatusCode::TOO_MANY_REQUESTS,
 				));
 			}
-			if self.services.globals.user_is_local(user) {
+			if services_root.globals.user_is_local(user) {
 				count.local_members = count.local_members.saturating_add(1);
 			}
 		}

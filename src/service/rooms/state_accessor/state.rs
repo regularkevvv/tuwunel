@@ -78,6 +78,9 @@ pub async fn user_membership(
 /// targeting `user_id` overrides that lookup with its own content.
 #[implement(super::Service)]
 pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> MembershipState {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if pdu.kind() == &TimelineEventType::RoomMember
 		&& pdu.state_key() == Some(user_id.as_str())
 		&& let Ok(content) = pdu.get_content::<RoomMemberEventContent>()
@@ -85,8 +88,7 @@ pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> Membe
 		return content.membership;
 	}
 
-	let Ok(shortstatehash) = self
-		.services
+	let Ok(shortstatehash) = services_root
 		.state
 		.pdu_shortstatehash(pdu.event_id())
 		.await
@@ -121,8 +123,10 @@ pub async fn state_contains(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> bool {
-	let Ok(shortstatekey) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(shortstatekey) = services_root
 		.short
 		.get_shortstatekey(event_type, state_key)
 		.await
@@ -202,14 +206,15 @@ pub(crate) async fn state_get_optional_for_append(
 	state_key: &str,
 	pending: Option<&Pdu>,
 ) -> Result<Option<Pdu>> {
-	let direct_shortstatekey = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let direct_shortstatekey = match services_root
 		.short
 		.get_shortstatekey(event_type, state_key)
 		.await
 	{
-		| Ok(shortstatekey) => self
-			.services
+		| Ok(shortstatekey) => services_root
 			.short
 			.get_statekey_from_short(shortstatekey)
 			.await
@@ -255,8 +260,7 @@ pub(crate) async fn state_get_optional_for_append(
 			shorteventid
 		},
 	};
-	let event_id: OwnedEventId = self
-		.services
+	let event_id: OwnedEventId = services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await
@@ -284,6 +288,9 @@ async fn state_cell_from_snapshot(
 	state_key: &str,
 	pending: Option<&Pdu>,
 ) -> Result<Option<ShortEventId>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let entries = self
 		.state_full_shortids(shortstatehash)
 		.try_collect::<Vec<_>>()
@@ -292,8 +299,7 @@ async fn state_cell_from_snapshot(
 	let mut bytes = 0_usize;
 	let mut decoded = Vec::new();
 	for (shortstatekey, candidate_event) in entries {
-		let (candidate_type, candidate_key) = self
-			.services
+		let (candidate_type, candidate_key) = services_root
 			.short
 			.get_statekey_from_short(shortstatekey)
 			.await
@@ -304,8 +310,7 @@ async fn state_cell_from_snapshot(
 		if bytes > MAX_STATE_MAPPING_BYTES {
 			return Err(state_mapping_limit());
 		}
-		let event_id: OwnedEventId = self
-			.services
+		let event_id: OwnedEventId = services_root
 			.short
 			.get_eventid_from_short(candidate_event)
 			.await
@@ -351,10 +356,13 @@ async fn state_cell_from_snapshot(
 
 #[implement(super::Service)]
 async fn state_event_for_append(&self, event: &EventId, pending: Option<&Pdu>) -> Result<Pdu> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if let Some(pdu) = pending.filter(|pdu| pdu.event_id() == event) {
 		return Ok(pdu.clone());
 	}
-	self.services
+	services_root
 		.timeline
 		.get_pdu(event)
 		.await
@@ -396,7 +404,10 @@ pub async fn history_visibility_at(
 /// hash is absent.
 #[implement(super::Service)]
 pub async fn is_initial_room_create(&self, room_id: &RoomId, event_id: &EventId) -> bool {
-	let Ok(pdu) = self.services.timeline.get_pdu(event_id).await else {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(pdu) = services_root.timeline.get_pdu(event_id).await else {
 		return false;
 	};
 
@@ -428,8 +439,10 @@ pub async fn snapshotless_state(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> Option<ShortStateHash> {
-	let pdu = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let pdu = services_root
 		.timeline
 		.get_pdu(event_id)
 		.await
@@ -438,8 +451,7 @@ pub async fn snapshotless_state(
 		return None;
 	}
 
-	match self
-		.services
+	match services_root
 		.timeline
 		.get_pdu_count(event_id)
 		.await
@@ -449,7 +461,7 @@ pub async fn snapshotless_state(
 		| Ok(PduCount::Normal(_)) | Err(_) => return None,
 	}
 
-	self.services
+	services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -465,11 +477,14 @@ pub async fn state_get_id(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let shorteventid = self
 		.state_get_shortid(shortstatehash, event_type, state_key)
 		.await?;
 
-	self.services
+	services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await
@@ -499,14 +514,15 @@ pub async fn state_get_shortid_optional(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<Option<ShortEventId>> {
-	let direct_shortstatekey = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let direct_shortstatekey = match services_root
 		.short
 		.get_shortstatekey(event_type, state_key)
 		.await
 	{
-		| Ok(shortstatekey) => self
-			.services
+		| Ok(shortstatekey) => services_root
 			.short
 			.get_statekey_from_short(shortstatekey)
 			.await
@@ -536,8 +552,7 @@ pub async fn state_get_shortid_optional(
 	for compressed in full_state.iter().copied() {
 		let (candidate_shortstatekey, candidate_shorteventid) =
 			parse_compressed_state_event(compressed);
-		let (candidate_type, candidate_key) = self
-			.services
+		let (candidate_type, candidate_key) = services_root
 			.short
 			.get_statekey_from_short(candidate_shortstatekey)
 			.await
@@ -558,15 +573,18 @@ pub fn state_type_pdus<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = impl Event> + Send + 'a {
-	self.state_keys_with_ids(shortstatehash, event_type)
-		.map(at!(1))
-		.broad_filter_map(move |event_id: OwnedEventId| async move {
-			self.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-		})
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_keys_with_ids(shortstatehash, event_type)
+			.map(at!(1))
+			.broad_filter_map(move |event_id: OwnedEventId| async move {
+				services_root
+					.timeline
+					.get_pdu(&event_id)
+					.await
+					.ok()
+			})
+	})
 }
 
 /// Iterates every current-state PDU of an event type without treating a
@@ -591,16 +609,19 @@ pub fn state_keys_with_ids<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = (StateKey, OwnedEventId)> + Send + 'a {
-	self.state_keys_with_shortids(shortstatehash, event_type)
-		.unzip()
-		.map(|(state_keys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
-				.zip(state_keys.into_iter().stream())
-				.ready_filter_map(|(eid, sk)| eid.map(move |eid| (sk, eid)).ok())
-		})
-		.flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_keys_with_shortids(shortstatehash, event_type)
+			.unzip()
+			.map(|(state_keys, shorteventids): (Vec<_>, Vec<_>)| {
+				services_root
+					.short
+					.multi_get_eventid_from_short(shorteventids.into_iter().stream())
+					.zip(state_keys.into_iter().stream())
+					.ready_filter_map(|(eid, sk)| eid.map(move |eid| (sk, eid)).ok())
+			})
+			.flatten_stream()
+	})
 }
 
 /// Iterates current-state keys and IDs for an event type with complete
@@ -627,22 +648,25 @@ pub fn state_keys_with_shortids<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = (StateKey, ShortEventId)> + Send + 'a {
-	self.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.unzip()
-		.map(move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
-				.zip(shorteventids.into_iter().stream())
-				.ready_filter_map(|(res, id)| res.map(|res| (res, id)).ok())
-				.ready_filter_map(move |((event_type_, state_key), event_id)| {
-					event_type_
-						.eq(event_type)
-						.then_some((state_key, event_id))
-				})
-		})
-		.flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.unzip()
+			.map(move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
+				services_root
+					.short
+					.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
+					.zip(shorteventids.into_iter().stream())
+					.ready_filter_map(|(res, id)| res.map(|res| (res, id)).ok())
+					.ready_filter_map(move |((event_type_, state_key), event_id)| {
+						event_type_
+							.eq(event_type)
+							.then_some((state_key, event_id))
+					})
+			})
+			.flatten_stream()
+	})
 }
 
 /// Iterates the state_keys for an event_type in the state
@@ -652,18 +676,21 @@ pub fn state_keys<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = StateKey> + Send + 'a {
-	let short_ids = self
-		.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.map(at!(0));
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		let short_ids = self
+			.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.map(at!(0));
 
-	self.services
-		.short
-		.multi_get_statekey_from_short(short_ids)
-		.ready_filter_map(Result::ok)
-		.ready_filter_map(move |(event_type_, state_key)| {
-			event_type_.eq(event_type).then_some(state_key)
-		})
+		services_root
+			.short
+			.multi_get_statekey_from_short(short_ids)
+			.ready_filter_map(Result::ok)
+			.ready_filter_map(move |(event_type_, state_key)| {
+				event_type_.eq(event_type).then_some(state_key)
+			})
+	})
 }
 
 /// Iterates current-state keys for an event type with complete snapshot and
@@ -739,22 +766,25 @@ pub fn state_full_pdus(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = impl Event> + Send + '_ {
-	let short_ids = self
-		.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.map(at!(1));
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		let short_ids = self
+			.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.map(at!(1));
 
-	self.services
-		.short
-		.multi_get_eventid_from_short(short_ids)
-		.ready_filter_map(Result::ok)
-		.broad_filter_map(move |event_id: OwnedEventId| async move {
-			self.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-		})
+		services_root
+			.short
+			.multi_get_eventid_from_short(short_ids)
+			.ready_filter_map(Result::ok)
+			.broad_filter_map(move |event_id: OwnedEventId| async move {
+				services_root
+					.timeline
+					.get_pdu(&event_id)
+					.await
+					.ok()
+			})
+	})
 }
 
 /// Builds complete current-state entries from the snapshot. Both directions of
@@ -765,32 +795,29 @@ pub fn state_full_entries_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<((StateEventType, StateKey), OwnedEventId)>> + Send + '_ {
-	self.state_full_ids_strict(shortstatehash)
-		.try_collect::<Vec<_>>()
-		.and_then(async move |entries| {
-			let mut decoded = Vec::new();
-			let mut bytes = 0_usize;
-			for (shortstatekey, event_id) in entries {
-				let state_key = self
-					.services
-					.short
-					.get_statekey_from_short(shortstatekey)
-					.await
-					.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
-				bytes = bytes
-					.saturating_add(state_key.0.to_cow_str().len())
-					.saturating_add(state_key.1.as_str().len())
-					.saturating_add(event_id.as_str().len());
-				if bytes > MAX_STATE_MAPPING_BYTES {
-					return Err(state_mapping_limit());
-				}
-				decoded.push((state_key, event_id));
+	let services_guard = self.services.get();
+	async_stream::try_stream! {
+		let services_root = services_guard.as_ref();
+		let entries = self.state_full_ids_strict(shortstatehash).try_collect::<Vec<_>>().await?;
+		let mut decoded = Vec::new();
+		let mut bytes = 0_usize;
+		for (shortstatekey, event_id) in entries {
+			let state_key = services_root
+				.short
+				.get_statekey_from_short(shortstatekey)
+				.await
+				.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+			bytes = bytes
+				.saturating_add(state_key.0.to_cow_str().len())
+				.saturating_add(state_key.1.as_str().len())
+				.saturating_add(event_id.as_str().len());
+			if bytes > MAX_STATE_MAPPING_BYTES {
+				Err(state_mapping_limit())?;
 			}
-			Ok(decoded)
-		})
-		.map_ok(Vec::into_iter)
-		.map_ok(IterStream::try_stream)
-		.try_flatten_stream()
+			decoded.push((state_key, event_id));
+		}
+		for item in decoded { yield item; }
+	}
 }
 
 /// Iterates complete current-state PDUs. Every PDU must bind to its snapshot
@@ -800,28 +827,30 @@ pub fn state_full_pdus_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<((StateEventType, StateKey), Pdu)>> + Send + '_ {
-	self.state_full_entries_strict(shortstatehash)
-		.and_then(async |(state_key, event_id)| {
-			let pdu = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.map_err(|error| {
-					if error.kind() == ErrorKind::NotFound {
-						Error::bad_database("Incomplete state event")
-					} else {
-						error
-					}
-				})?;
-			if pdu.event_id() != event_id
-				|| pdu.event_type().to_cow_str() != state_key.0.to_cow_str()
-				|| pdu.state_key() != Some(state_key.1.as_str())
-			{
-				return Err(Error::bad_database("Mismatched state event"));
-			}
-			Ok((state_key, pdu))
-		})
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_full_entries_strict(shortstatehash)
+			.and_then(async |(state_key, event_id)| {
+				let pdu = services_root
+					.timeline
+					.get_pdu(&event_id)
+					.await
+					.map_err(|error| {
+						if error.kind() == ErrorKind::NotFound {
+							Error::bad_database("Incomplete state event")
+						} else {
+							error
+						}
+					})?;
+				if pdu.event_id() != event_id
+					|| pdu.event_type().to_cow_str() != state_key.0.to_cow_str()
+					|| pdu.state_key() != Some(state_key.1.as_str())
+				{
+					return Err(Error::bad_database("Mismatched state event"));
+				}
+				Ok((state_key, pdu))
+			})
+	})
 }
 
 /// Builds a StateMap by iterating over all keys that start
@@ -831,17 +860,20 @@ pub fn state_full_ids(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = (ShortStateKey, OwnedEventId)> + Send + '_ {
-	self.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.unzip()
-		.map(|(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
-				.zip(shortstatekeys.into_iter().stream())
-				.ready_filter_map(|(eid, ssk)| eid.ok().map(|eid| (ssk, eid)))
-		})
-		.flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.unzip()
+			.map(|(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
+				services_root
+					.short
+					.multi_get_eventid_from_short(shorteventids.into_iter().stream())
+					.zip(shortstatekeys.into_iter().stream())
+					.ready_filter_map(|(eid, ssk)| eid.ok().map(|eid| (ssk, eid)))
+			})
+			.flatten_stream()
+	})
 }
 
 /// Builds a complete StateMap for the given state hash.
@@ -853,29 +885,26 @@ pub fn state_full_ids_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<(ShortStateKey, OwnedEventId)>> + Send + '_ {
-	self.state_full_shortids(shortstatehash)
-		.try_collect::<Vec<_>>()
-		.and_then(async move |entries| {
-			let mut decoded = Vec::new();
-			let mut bytes = 0_usize;
-			for (shortstatekey, shorteventid) in entries {
-				let event_id = self
-					.services
-					.short
-					.get_eventid_from_short::<OwnedEventId>(shorteventid)
-					.await
-					.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
-				bytes = bytes.saturating_add(event_id.as_str().len());
-				if bytes > MAX_STATE_MAPPING_BYTES {
-					return Err(state_mapping_limit());
-				}
-				decoded.push((shortstatekey, event_id));
+	let services_guard = self.services.get();
+	async_stream::try_stream! {
+		let services_root = services_guard.as_ref();
+		let entries = self.state_full_shortids(shortstatehash).try_collect::<Vec<_>>().await?;
+		let mut decoded = Vec::new();
+		let mut bytes = 0_usize;
+		for (shortstatekey, shorteventid) in entries {
+			let event_id = services_root
+				.short
+				.get_eventid_from_short::<OwnedEventId>(shorteventid)
+				.await
+				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
+			bytes = bytes.saturating_add(event_id.as_str().len());
+			if bytes > MAX_STATE_MAPPING_BYTES {
+				Err(state_mapping_limit())?;
 			}
-			Ok(decoded)
-		})
-		.map_ok(Vec::into_iter)
-		.map_ok(IterStream::try_stream)
-		.try_flatten_stream()
+			decoded.push((shortstatekey, event_id));
+		}
+		for item in decoded { yield item; }
+	}
 }
 
 #[implement(super::Service)]
@@ -900,7 +929,10 @@ pub fn state_full_shortids(
 #[implement(super::Service)]
 #[tracing::instrument(name = "load", level = "debug", skip(self))]
 async fn load_full_state(&self, shortstatehash: ShortStateHash) -> Result<Arc<CompressedState>> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state_compressor
 		.load_shortstatehash_info(shortstatehash)
 		.map_err(|error| {

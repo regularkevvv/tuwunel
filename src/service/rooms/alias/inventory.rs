@@ -54,7 +54,10 @@ impl Service {
 		&self,
 		room: &RoomId,
 	) -> Result<(Txn, Vec<OwnedRoomAliasId>)> {
-		let mut txn = self.services.db.txn();
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let mut txn = services_root.db.txn();
 		let mut aliases = Vec::new();
 		for row in self.alias_rows(room).await? {
 			txn.del_raw(&self.db.aliasid_alias, row.key);
@@ -66,12 +69,15 @@ impl Service {
 			txn.del_raw(&self.db.alias_roomid, alias.alias());
 			txn.del_raw(&self.db.alias_userid, alias.alias());
 		}
-		txn.del_raw(&self.services.db["publicroomids"], room);
+		txn.del_raw(&services_root.db["publicroomids"], room);
 		check_mutation_budget(&txn, 0)?;
 		Ok((txn, aliases))
 	}
 
 	async fn alias_rows(&self, room: &RoomId) -> Result<Vec<AliasRow>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let prefix = (room, Interfix);
 		let encoded = serialize_key(prefix)?;
 		let rows = self
@@ -99,7 +105,7 @@ impl Service {
 				.map_err(|_| Error::bad_database("Invalid stored room alias"))?;
 			let alias = RoomAliasId::parse(text)
 				.map_err(|_| Error::bad_database("Invalid stored room alias"))?;
-			if !self.services.globals.alias_is_local(&alias)
+			if !services_root.globals.alias_is_local(&alias)
 				|| self.resolve_local_alias(&alias).await? != room
 			{
 				return Err(Error::bad_database("Room alias indexes disagree"));

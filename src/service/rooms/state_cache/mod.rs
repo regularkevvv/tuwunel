@@ -434,8 +434,11 @@ pub fn active_local_users_in_room<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &UserId> + Send + 'a {
-	self.local_users_in_room(room_id)
-		.filter(|user| self.services.users.is_active(user))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.local_users_in_room(room_id)
+			.filter(|user| services_root.users.is_active(user))
+	})
 }
 
 /// Returns an iterator of all our local users in the room, even if they're
@@ -446,8 +449,11 @@ pub fn local_users_in_room<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &UserId> + Send + 'a {
-	self.room_members(room_id)
-		.ready_filter(|user| self.services.globals.user_is_local(user))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.room_members(room_id)
+			.ready_filter(|user| services_root.globals.user_is_local(user))
+	})
 }
 
 /// Returns an iterator of only our users invited to this room.
@@ -457,8 +463,11 @@ pub fn local_users_invited_to_room<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &UserId> + Send + 'a {
-	self.room_members_invited(room_id)
-		.ready_filter(|user| self.services.globals.user_is_local(user))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.room_members_invited(room_id)
+			.ready_filter(|user| services_root.globals.user_is_local(user))
+	})
 }
 
 /// Returns an iterator over all User IDs who ever joined a room.
@@ -889,8 +898,11 @@ pub async fn is_left_checked(&self, user_id: &UserId, room_id: &RoomId) -> Resul
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let guard = self.membership_mutex.lock(room_id).await;
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 	self.stage_membership_erasure(room_id, force, &mut txn)
 		.await?;
 

@@ -60,8 +60,10 @@ pub(super) fn quota_owner<'a>(
 	uploader: Option<&'a UserId>,
 	original: bool,
 ) -> Option<Owner<'a>> {
-	if !self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root
 		.globals
 		.server_is_ours(mxc.server_name)
 	{
@@ -83,6 +85,9 @@ pub(super) fn quota_owner<'a>(
 /// lock the first attempt charged under.
 #[implement(super::Service)]
 pub(super) async fn admit(&self, owner: Owner<'_>, mxc: &Mxc<'_>, len: u64) -> Result<u64> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if matches!(owner, Owner::User(_))
 		&& self
 			.db
@@ -93,7 +98,7 @@ pub(super) async fn admit(&self, owner: Owner<'_>, mxc: &Mxc<'_>, len: u64) -> R
 	}
 
 	let next = self.usage_locked(owner).await.saturating_add(len);
-	let config = &self.services.server.config;
+	let config = &services_root.server.config;
 	let limit = match owner {
 		| Owner::User(_) => config.media_user_quota,
 		| Owner::Server(_) => config.media_remote_server_quota,
@@ -142,6 +147,9 @@ const BACKFILL_BATCH: usize = 256;
 /// is ever the size of a map. An owner that already has a counter keeps it.
 #[implement(super::Service)]
 pub async fn backfill_usage(&self) -> Result<usize> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut users: HashMap<OwnedUserId, u64> = HashMap::new();
 	let mut after: Option<Vec<u8>> = None;
 	loop {
@@ -179,7 +187,7 @@ pub async fn backfill_usage(&self) -> Result<usize> {
 		}
 	}
 
-	let local = format!("mxc://{}/", self.services.globals.server_name());
+	let local = format!("mxc://{}/", services_root.globals.server_name());
 	let mut servers: HashMap<OwnedServerName, u64> = HashMap::new();
 	let mut from: Option<Vec<u8>> = None;
 	loop {
@@ -202,7 +210,7 @@ pub async fn backfill_usage(&self) -> Result<usize> {
 				continue;
 			};
 
-			if self.services.globals.server_is_ours(&server)
+			if services_root.globals.server_is_ours(&server)
 				|| self
 					.db
 					.quota_usage(Owner::Server(&server))
@@ -273,7 +281,10 @@ pub(super) async fn object_len(&self, key: &[u8]) -> Option<u64> {
 /// retention keeps remote media until an admin deletes it.
 #[implement(super::Service)]
 pub async fn expire_remote_media(&self) -> Result<usize> {
-	let retention = self.services.server.config.media_remote_retention;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let retention = services_root.server.config.media_remote_retention;
 	if retention == 0 {
 		return Ok(0);
 	}

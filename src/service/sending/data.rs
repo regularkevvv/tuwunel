@@ -66,6 +66,9 @@ impl Data {
 	where
 		I: Iterator<Item = &'a QueueItem> + Send,
 	{
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let _guard = self.active_write.lock().await;
 		let events = events
 			.filter(|(key, _)| !key.is_empty())
@@ -125,7 +128,7 @@ impl Data {
 			} else {
 				// A key scopes its incarnation. All new members in this
 				// atomic promotion can share one persisted counter identity.
-				let identity = *self.services.globals.next_count().await?;
+				let identity = *services_root.globals.next_count().await?;
 				batch_identity = Some(identity);
 				identity
 			};
@@ -146,6 +149,9 @@ impl Data {
 		queued: &[EduBuf],
 		last_count: u64,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let _guard = self.active_write.lock().await;
 		self.require_active_schema().await?;
 		let prefix = Destination::Federation(server.to_owned()).get_prefix();
@@ -163,7 +169,7 @@ impl Data {
 			let mut key = prefix.clone();
 			// The permit retires at the end of this iteration, before the
 			// batch executes; EDU counts never gate reader visibility.
-			let count = self.services.globals.next_count().await?;
+			let count = services_root.globals.next_count().await?;
 			key.extend(&count.to_be_bytes());
 
 			if Arc::ptr_eq(map, &self.servercurrentevent_data) {
@@ -227,6 +233,9 @@ impl Data {
 	where
 		I: Iterator<Item = (&'a SendingEvent, &'a Destination)> + Clone + Debug + Send,
 	{
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let _guard = self.active_write.lock().await;
 		for (_, destination) in requests.clone() {
 			self.resume_cancellation(destination).await?;
@@ -237,7 +246,7 @@ impl Data {
 				| SendingEvent::Pdu(pdu_id) | SendingEvent::FrozenPush(pdu_id) =>
 					dest.event_key(pdu_id),
 				| _ => {
-					let count = self.services.globals.next_count().await?;
+					let count = services_root.globals.next_count().await?;
 					let count = count.to_be_bytes();
 					let mut key = dest.get_prefix_with_capacity(count.len());
 

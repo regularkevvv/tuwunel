@@ -31,8 +31,10 @@ pub async fn send_push_notice<E>(
 where
 	E: Event,
 {
-	let power_levels = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let power_levels = services_root
 		.state_accessor
 		.get_power_levels(event.room_id())
 		.map(Result::ok);
@@ -51,7 +53,7 @@ where
 		})
 		.await?;
 
-	self.send_push_actions(user_id, pusher, actions, self.services.config.push_everything, event)
+	self.send_push_actions(user_id, pusher, actions, services_root.config.push_everything, event)
 		.await
 }
 
@@ -172,6 +174,9 @@ async fn send_http_event_notice<Pdu: Event>(
 	tweaks: Vec<Tweak>,
 	event: &Pdu,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut device = self.prepare_http_pusher(pusher, http)?;
 
 	// TODO (timo): can pusher/devices have conflicting formats
@@ -210,11 +215,11 @@ async fn send_http_event_notice<Pdu: Event>(
 		}
 
 		let (display_name, room_name, room_alias) = join3(
-			self.services.profile.displayname(event.sender()),
-			self.services
+			services_root.profile.displayname(event.sender()),
+			services_root
 				.state_accessor
 				.get_name(event.room_id()),
-			self.services
+			services_root
 				.state_accessor
 				.get_canonical_alias(event.room_id()),
 		)

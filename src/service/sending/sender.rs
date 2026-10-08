@@ -411,6 +411,9 @@ impl Service {
 		stage: &mut QueueRecovery,
 		retries: &mut QueueRetries,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		match response {
 			| Ok(Delivery::Unprepared(dest, error) | Delivery::LocalFailure(dest, error)) => {
 				warn!(?dest, chain = %error_chain(&error), "Local delivery failed; accepted work retained");
@@ -441,15 +444,13 @@ impl Service {
 						// recorded against the destination, so the gate holds its queued
 						// events back. Arm a one-shot retry at its earliest-retry time,
 						// unless it has failed so long that delivery waits for its return.
-						if self
-							.services
+						if services_root
 							.federation
 							.sender_gave_up(&server)
 							.await
 						{
 							self.report_given_up(&server).await;
-						} else if let ShouldAttempt::No { earliest_retry } = self
-							.services
+						} else if let ShouldAttempt::No { earliest_retry } = services_root
 							.federation
 							.should_attempt(&server)
 							.await
@@ -794,6 +795,9 @@ impl Service {
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let status = statuses.get(&dest);
 
 		if matches!(
@@ -831,8 +835,7 @@ impl Service {
 			| Destination::Federation(server) => {
 				// A wake left for a peer since given up does nothing: its queue
 				// waits for the peer's return.
-				if self
-					.services
+				if services_root
 					.federation
 					.sender_gave_up(&server)
 					.await
@@ -840,8 +843,7 @@ impl Service {
 					return Ok(());
 				}
 
-				let should_attempt = self
-					.services
+				let should_attempt = services_root
 					.federation
 					.should_attempt(&server)
 					.await;
@@ -913,6 +915,9 @@ impl Service {
 		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if !self.server.config.startup_netburst {
 			return Ok(());
 		}
@@ -974,7 +979,7 @@ impl Service {
 			}
 		}
 
-		let retired = self.services.globals.current_count();
+		let retired = services_root.globals.current_count();
 		let mut after: Option<Vec<u8>> = None;
 		loop {
 			let (found, next) = self
@@ -1091,19 +1096,20 @@ impl Service {
 		statuses: &mut CurTransactionStatus,
 		retry_action: RetryAction,
 	) -> Result<(bool, bool)> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// peer_status gates federation only; appservice and push fall through.
 		// A peer given up is not attempted until its failure record clears; its
 		// events stay queued meanwhile.
 		if let Destination::Federation(server) = dest {
-			let should_attempt = self
-				.services
+			let should_attempt = services_root
 				.federation
 				.should_attempt(server)
 				.await;
 
 			if matches!(should_attempt, ShouldAttempt::No { .. })
-				|| self
-					.services
+				|| services_root
 					.federation
 					.sender_gave_up(server)
 					.await
@@ -1163,9 +1169,12 @@ impl Service {
 
 	#[tracing::instrument(name = "edus", level = "debug", skip_all)]
 	async fn select_edus(&self, server_name: &ServerName, budget_used: usize) -> Result<EduVec> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// selection window
 		let since = self.db.get_latest_educount(server_name).await?;
-		let since_upper = edu_window_end(since, self.services.globals.current_count())?;
+		let since_upper = edu_window_end(since, services_root.globals.current_count())?;
 
 		// Nothing new since the last window: skip the scan and the watermark.
 		if since == since_upper || budget_used >= EDU_LIMIT {
@@ -1225,7 +1234,7 @@ impl Service {
 		// Also continue empty windows: global counters include unrelated writes
 		// and queue identifiers. The persisted watermark reconstructs this wake
 		// at startup if the process stops before it can run.
-		if since_upper < self.services.globals.current_count() {
+		if since_upper < services_root.globals.current_count() {
 			self.dispatch(Msg {
 				dest: Destination::Federation(server_name.to_owned()),
 				event: SendingEvent::Flush,
@@ -1248,9 +1257,11 @@ impl Service {
 		since: (u64, u64),
 		events_len: &AtomicUsize,
 	) -> Result<Selected> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let mut selected = Selected::default();
-		let server_rooms = self
-			.services
+		let server_rooms = services_root
 			.state_cache
 			.server_rooms_fallible(server_name);
 
@@ -1258,7 +1269,7 @@ impl Service {
 		let mut device_list_changes = HashSet::<OwnedUserId>::new();
 		while let Some(room_id) = server_rooms.try_next().await? {
 			let keys_changed =
-				self.services
+				services_root
 					.users
 					.room_keys_changed_fallible(room_id, since.0, Some(since.1));
 
@@ -1266,7 +1277,7 @@ impl Service {
 			while let Some((user_id, count)) = keys_changed.try_next().await? {
 				debug_assert!(count <= since.1, "exceeds upper-bound");
 
-				if !self.services.globals.user_is_local(user_id) {
+				if !services_root.globals.user_is_local(user_id) {
 					continue;
 				}
 				if !device_list_changes.insert(user_id.into()) {
@@ -1329,10 +1340,12 @@ impl Service {
 		since: (u64, u64),
 		events_len: &AtomicUsize,
 	) -> Result<Selected> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let num = AtomicUsize::new(0);
 		let num = &num;
-		let by_room: RoomReceipts = self
-			.services
+		let by_room: RoomReceipts = services_root
 			.state_cache
 			.server_rooms_fallible(server_name)
 			.map_ok(ToOwned::to_owned)
@@ -1406,8 +1419,10 @@ impl Service {
 		since: (u64, u64),
 		num: &AtomicUsize,
 	) -> Result<RankedReceipts> {
-		let receipts = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let receipts = services_root
 			.read_receipt
 			.readreceipts_since_fallible(room_id, since.0, Some(since.1));
 
@@ -1416,7 +1431,7 @@ impl Service {
 		while let Some((user_id, count, read_receipt)) = receipts.try_next().await? {
 			debug_assert!(count <= since.1, "exceeds upper-bound");
 
-			if !self.services.globals.user_is_local(user_id) {
+			if !services_root.globals.user_is_local(user_id) {
 				continue;
 			}
 
@@ -1485,8 +1500,10 @@ impl Service {
 		server_name: &ServerName,
 		since: (u64, u64),
 	) -> Result<Option<EduBuf>> {
-		let presence_since = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let presence_since = services_root
 			.presence
 			.presence_since_fallible(since.0, Some(since.1));
 
@@ -1495,12 +1512,11 @@ impl Service {
 		while let Some((user_id, count, presence_bytes)) = presence_since.try_next().await? {
 			debug_assert!(count <= since.1, "exceeded upper-bound");
 
-			if !self.services.globals.user_is_local(user_id) {
+			if !services_root.globals.user_is_local(user_id) {
 				continue;
 			}
 
-			if !self
-				.services
+			if !services_root
 				.state_cache
 				.server_sees_user_fallible(server_name, user_id)
 				.await?
@@ -1508,8 +1524,7 @@ impl Service {
 				continue;
 			}
 
-			let presence_event = self
-				.services
+			let presence_event = services_root
 				.presence
 				.from_json_bytes_to_event(presence_bytes, user_id)
 				.await?;
@@ -1550,7 +1565,10 @@ impl Service {
 	}
 
 	fn send_events(&self, dest: Destination, events: Vec<SendingEvent>) -> SendingFuture {
-		let service = self.services.sending.clone();
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let service = services_root.sending.clone();
 		async move { service.deliver_events(dest, events).await }.boxed()
 	}
 
@@ -1617,8 +1635,10 @@ impl Service {
 		mut events: Vec<SendingEvent>,
 		mut rows: ActiveAcknowledgement,
 	) -> SendingResult {
-		let Some(info) = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let Some(info) = services_root
 			.appservice
 			.get_registration_info(&id)
 			.await
@@ -1651,6 +1671,9 @@ impl Service {
 		info: &crate::appservice::RegistrationInfo,
 		events: &[SendingEvent],
 	) -> Result<frozen::Body> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let msc3202 = info.registration.msc3202_transaction_extensions;
 
 		let (pdu_count, edu_count, to_device_count, device_list_count) = events.iter().fold(
@@ -1684,8 +1707,7 @@ impl Service {
 		for event in events {
 			match event {
 				| SendingEvent::Pdu(pdu_id) => {
-					let pdu = match self
-						.services
+					let pdu = match services_root
 						.timeline
 						.get_pdu_from_id(pdu_id)
 						.await
@@ -1808,9 +1830,12 @@ impl Service {
 		id: String,
 		attempt: PreparedAttempt,
 	) -> SendingResult {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// Retain registry ownership only for the read-only handoff and the
 		// bounded HTTP request, after composition/persistence have finished.
-		let registrations = self.services.appservice.read().await;
+		let registrations = services_root.appservice.read().await;
 		let Some(info) = registrations.get(&id) else {
 			return Ok(unprepared(
 				Destination::Appservice(id),
@@ -1830,6 +1855,9 @@ impl Service {
 		attempt: PreparedAttempt,
 		registration: &ruma::api::appservice::Registration,
 	) -> SendingResult {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let destination = Destination::Appservice(id.clone());
 		let owner = match super::data::appservice_owner(registration) {
 			| Ok(owner) => owner,
@@ -1849,8 +1877,7 @@ impl Service {
 			return Ok(unprepared(destination, error));
 		}
 		let request = PushEventsRequest::new(attempt.transaction_id().into(), Vec::new());
-		match self
-			.services
+		match services_root
 			.appservice
 			.send_request(registration.clone(), FrozenRequest::new(request, attempt.body))
 			.await
@@ -1868,11 +1895,14 @@ impl Service {
 		users: BTreeSet<OwnedUserId>,
 		recipients: BTreeSet<(OwnedUserId, OwnedDeviceId)>,
 	) -> (OtkCounts, FallbackTypes) {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let mut devices: Devices = users
 			.into_iter()
 			.stream()
 			.broad_then(async |user_id: OwnedUserId| {
-				self.services
+				services_root
 					.users
 					.all_device_ids(&user_id)
 					.map(|device_id| (user_id.clone(), device_id.to_owned()))
@@ -1891,13 +1921,11 @@ impl Service {
 			.into_iter()
 			.stream()
 			.broad_then(async |(user_id, device_id): (OwnedUserId, OwnedDeviceId)| {
-				let counts = self
-					.services
+				let counts = services_root
 					.users
 					.count_one_time_keys(&user_id, &device_id);
 
-				let fallbacks = self
-					.services
+				let fallbacks = services_root
 					.users
 					.unused_fallback_key_algorithms(&user_id, &device_id)
 					.collect();
@@ -1939,14 +1967,16 @@ impl Service {
 		pushkey: String,
 		events: Vec<SendingEvent>,
 	) -> SendingResult {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let has_pdu = events
 			.iter()
 			.any(|event| matches!(event, SendingEvent::Pdu(_)));
 
 		let destination = || Destination::Push(user_id.clone(), pushkey.clone());
 		let suppressed = self.pushing_suppressed(&user_id).map(Ok);
-		let pusher = self
-			.services
+		let pusher = services_root
 			.pusher
 			.get_pusher(&user_id, &pushkey)
 			.map(|result| match result {
@@ -1961,7 +1991,7 @@ impl Service {
 
 		let rules_for_user = has_pdu
 			.then_async(async || {
-				self.services
+				services_root
 					.account_data
 					.get_global::<PushRulesEvent>(&user_id, GlobalAccountDataEventType::PushRules)
 					.await
@@ -1989,8 +2019,7 @@ impl Service {
 
 		// Reconciliation, not an alert: a suppressed drop strands a stale badge.
 		if events.contains(&SendingEvent::BadgeRefresh) {
-			let result = self
-				.services
+			let result = services_root
 				.pusher
 				.send_badge_notice(&user_id, &pusher)
 				.await;
@@ -2061,10 +2090,13 @@ impl Service {
 		event: &SendingEvent,
 		rules: Option<&Ruleset>,
 	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let Some(raw) = event.pdu_id() else {
 			return Ok(());
 		};
-		let pdu = match self.services.timeline.get_pdu_from_id(raw).await {
+		let pdu = match services_root.timeline.get_pdu_from_id(raw).await {
 			| Ok(pdu) => pdu,
 			| Err(error) if error.is_not_found() => return Ok(()),
 			| Err(error) => return Err(error),
@@ -2074,13 +2106,12 @@ impl Service {
 		}
 		match event {
 			| SendingEvent::FrozenPush(_) =>
-				self.services
+				services_root
 					.pusher
 					.send_frozen_push_notice(user, pusher, raw, &pdu)
 					.await,
 			| SendingEvent::Pdu(_) => {
-				if self
-					.services
+				if services_root
 					.pusher
 					.notification_is_read(user, &pdu, raw.pdu_count().into_unsigned())
 					.await?
@@ -2089,7 +2120,7 @@ impl Service {
 				}
 				let rules = rules
 					.ok_or_else(|| Error::bad_database("Legacy push rules were not resolved"))?;
-				self.services
+				services_root
 					.pusher
 					.send_push_notice(user, pusher, rules, &pdu)
 					.await
@@ -2108,12 +2139,15 @@ impl Service {
 	// optional suppression: heuristic combining presence age and recent sync
 	// activity.
 	async fn pushing_suppressed(&self, user_id: &UserId) -> bool {
-		if !self.services.config.suppress_push_when_active {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !services_root.config.suppress_push_when_active {
 			debug!(?user_id, "push not suppressed: suppress_push_when_active disabled");
 			return false;
 		}
 
-		let Ok(presence) = self.services.presence.get_presence(user_id).await else {
+		let Ok(presence) = services_root.presence.get_presence(user_id).await else {
 			debug!(?user_id, "push not suppressed: presence unavailable");
 			return false;
 		};
@@ -2138,8 +2172,7 @@ impl Service {
 			return false;
 		}
 
-		let sync_gap_ms = self
-			.services
+		let sync_gap_ms = services_root
 			.presence
 			.last_sync_gap_ms(user_id)
 			.await;
@@ -2209,13 +2242,15 @@ impl Service {
 		server: &ServerName,
 		events: &[SendingEvent],
 	) -> Result<frozen::Body> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let pdus = events
 			.iter()
 			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
 			.stream()
 			.wide_then(|pdu_id| async move {
-				let pdu = match self
-					.services
+				let pdu = match services_root
 					.timeline
 					.get_pdu_json_from_id(pdu_id)
 					.await
@@ -2224,13 +2259,12 @@ impl Service {
 					| Err(error) if error.is_not_found() => return Ok(None),
 					| Err(error) => return Err(error),
 				};
-				let pdu = self
-					.services
+				let pdu = services_root
 					.state_accessor
 					.erased_for_server(server, pdu)
 					.await;
 				Ok::<_, Error>(Some(
-					self.services
+					services_root
 						.federation
 						.format_pdu_into(pdu, None)
 						.await,
@@ -2275,6 +2309,9 @@ impl Service {
 		server: OwnedServerName,
 		attempt: PreparedAttempt,
 	) -> SendingResult {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let txn_id = attempt.transaction_id();
 		let request = send_transaction_message::v1::Request {
 			transaction_id: txn_id.clone().into(),
@@ -2284,11 +2321,10 @@ impl Service {
 			edus: Vec::new(),
 		};
 
-		let result = self
-			.services
+		let result = services_root
 			.federation
 			.execute_transaction(
-				&self.services.client.sender,
+				&services_root.client.sender,
 				&server,
 				FrozenRequest::new(request, attempt.body),
 			)

@@ -57,8 +57,10 @@ impl Service {
 	/// `m.room.power_levels` state. Defaults require proven absence in a
 	/// complete snapshot; corruption and failed reads remain errors.
 	pub async fn get_power_levels(&self, room_id: &RoomId) -> Result<RoomPowerLevels> {
-		let snapshot = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let snapshot = services_root
 			.state
 			.get_room_shortstatehash(room_id)
 			.await

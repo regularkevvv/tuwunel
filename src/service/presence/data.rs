@@ -28,6 +28,9 @@ impl Data {
 
 	#[inline]
 	pub(super) async fn get_presence(&self, user_id: &UserId) -> Result<(u64, PresenceEvent)> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let count = self
 			.userid_presenceid
 			.get(user_id)
@@ -36,8 +39,7 @@ impl Data {
 
 		let key = presenceid_key(count, user_id);
 		let bytes = self.presenceid_presence.get(&key).await?;
-		let event = self
-			.services
+		let event = services_root
 			.presence
 			.from_json_bytes_to_event(&bytes, user_id)
 			.await?;
@@ -67,6 +69,9 @@ impl Data {
 		last_active_ago: Option<UInt>,
 		status_msg: Option<String>,
 	) -> Result<Option<u64>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let last_presence = self.get_presence(user_id).await;
 		let state_changed = match last_presence {
 			| Err(_) => true,
@@ -128,7 +133,7 @@ impl Data {
 			status_msg,
 		};
 
-		let count = self.services.globals.next_count().await?;
+		let count = services_root.globals.next_count().await?;
 		let key = presenceid_key(*count, user_id);
 
 		self.userid_presenceid

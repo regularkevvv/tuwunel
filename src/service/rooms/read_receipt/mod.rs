@@ -99,9 +99,12 @@ impl Service {
 		room_id: &RoomId,
 		event: &ReceiptEvent,
 	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let stored = {
-			let state = self.services.state.mutex.lock(room_id).await;
-			match self.services.short.get_shortroomid(room_id).await {
+			let state = services_root.state.mutex.lock(room_id).await;
+			match services_root.short.get_shortroomid(room_id).await {
 				| Ok(_) => {},
 				| Err(error) if error.is_not_found() => return Ok(false),
 				| Err(error) => return Err(error),
@@ -118,7 +121,7 @@ impl Service {
 		// other failed; one that fails is logged, and the receipt stays stored.
 		let event_id = event.content.keys().next();
 
-		self.services
+		services_root
 			.sending
 			.send_edu_room_appservices(room_id, |buf| {
 				let edu = EphemeralData::Receipt(ReceiptEvent {
@@ -137,8 +140,8 @@ impl Service {
 				);
 			});
 
-		if self.services.globals.user_is_local(user_id) {
-			self.services
+		if services_root.globals.user_is_local(user_id) {
+			services_root
 				.sending
 				.flush_room(room_id)
 				.await
@@ -159,8 +162,10 @@ impl Service {
 		room_id: &RoomId,
 		user_id: &UserId,
 	) -> Result<PrivateReadEvents> {
-		let shortroomid = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let shortroomid = services_root
 			.short
 			.get_shortroomid(room_id)
 			.await
@@ -210,6 +215,9 @@ impl Service {
 		user_id: &UserId,
 		update: u64,
 	) -> Result<PrivateReadEvents> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let snapshot = self
 			.db
 			.private_read_sync_update_fallible(user_id, room_id)
@@ -227,7 +235,7 @@ impl Service {
 		}
 
 		let shortroomid = async {
-			self.services
+			services_root
 				.short
 				.get_shortroomid(room_id)
 				.await
@@ -341,13 +349,15 @@ impl Service {
 		user_id: &UserId,
 		thread: ReceiptThread,
 	) -> Result<Raw<AnySyncEphemeralRoomEvent>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let pdu_id: RawPduId = PduId {
 			shortroomid,
 			count: PduCount::Normal(count),
 		}
 		.into();
-		let pdu = self
-			.services
+		let pdu = services_root
 			.timeline
 			.get_pdu_from_id(&pdu_id)
 			.await?;
@@ -405,8 +415,10 @@ impl Service {
 	/// position at or behind the stored one writes nothing.
 	#[tracing::instrument(skip(self), level = "debug", name = "set_private")]
 	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> Result<bool> {
-		let state = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let state = services_root
 			.state
 			.mutex
 			.lock(private_read.room_id)
@@ -425,7 +437,10 @@ impl Service {
 		read: PrivateRead<'_>,
 		state: &RoomMutexGuard,
 	) -> Result<bool> {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.short
 			.get_shortroomid(read.room_id)
 			.await?;

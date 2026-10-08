@@ -138,7 +138,10 @@ impl Service {
 	/// Returns true/false based on whether the recipient/receiving user has
 	/// blocked the sender
 	pub async fn user_is_ignored(&self, sender_user: &UserId, recipient_user: &UserId) -> bool {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.account_data
 			.get_global(recipient_user, GlobalAccountDataEventType::IgnoredUserList)
 			.await
@@ -156,8 +159,10 @@ impl Service {
 		sender: &UserId,
 		recipient: &UserId,
 	) -> Result<bool> {
-		match self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		match services_root
 			.account_data
 			.get_global::<IgnoredUserListEvent>(
 				recipient,
@@ -172,7 +177,10 @@ impl Service {
 	}
 
 	pub(crate) async fn notification_recipient_active(&self, user: &UserId) -> Result<bool> {
-		if !self.services.globals.user_is_local(user) || self.is_erased_checked(user).await? {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !services_root.globals.user_is_local(user) || self.is_erased_checked(user).await? {
 			return Ok(false);
 		}
 		match self.is_deactivated(user).await {
@@ -184,7 +192,10 @@ impl Service {
 
 	/// MSC4380: `m.invite_permission_config.default_action == "block"`.
 	pub async fn invites_blocked(&self, user_id: &UserId) -> bool {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.account_data
 			.get_global(user_id, GlobalAccountDataEventType::InvitePermissionConfig)
 			.await
@@ -215,9 +226,12 @@ impl Service {
 
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// Revoke and drop every stored upstream grant. The identity association
 		// stays, so the identity cannot provision a second account (ADR-0004).
-		self.services
+		services_root
 			.oauth
 			.clear_user_grants(user_id)
 			.await;
@@ -266,7 +280,10 @@ impl Service {
 
 	/// Check if account is active, infallible
 	pub async fn is_active_local(&self, user_id: &UserId) -> bool {
-		self.services.globals.user_is_local(user_id) && self.is_active(user_id).await
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root.globals.user_is_local(user_id) && self.is_active(user_id).await
 	}
 
 	/// Gate an LDAP-authenticated login into an existing local account.
@@ -390,12 +407,14 @@ impl Service {
 
 	/// MSC4025: mark the user erased, recording the current global count.
 	pub async fn set_erased(&self, user_id: &UserId) -> Result {
-		let _notifications = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let _notifications = services_root
 			.pusher
 			.lock_notification_user(user_id)
 			.await;
-		let count = self.services.globals.current_count();
+		let count = services_root.globals.current_count();
 
 		self.db
 			.userid_erased
@@ -406,8 +425,10 @@ impl Service {
 	/// MSC4025: erasure is reversible; clearing the marker restores the
 	/// unredacted view.
 	pub async fn clear_erased(&self, user_id: &UserId) -> Result {
-		let _notifications = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let _notifications = services_root
 			.pusher
 			.lock_notification_user(user_id)
 			.await;
@@ -516,8 +537,10 @@ impl Service {
 
 	/// Hash and set the user's password to the Argon2 hash
 	pub async fn set_password(&self, user_id: &UserId, password: Option<&str>) -> Result {
-		let _notifications = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let _notifications = services_root
 			.pusher
 			.lock_notification_user(user_id)
 			.await;
@@ -609,7 +632,10 @@ impl Service {
 	pub async fn create_openid_token(&self, user_id: &UserId, token: &str) -> Result<u64> {
 		use std::num::Saturating as Sat;
 
-		let expires_in = self.services.server.config.openid_token_ttl;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let expires_in = services_root.server.config.openid_token_ttl;
 		let expires_at = Sat(utils::millis_since_unix_epoch()) + Sat(expires_in) * Sat(1000);
 
 		let mut value = expires_at.0.to_be_bytes().to_vec();
@@ -663,7 +689,10 @@ impl Service {
 	pub async fn create_login_token(&self, user_id: &UserId, token: &str) -> u64 {
 		use std::num::Saturating as Sat;
 
-		let expires_in = self.services.server.config.login_token_ttl;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let expires_in = services_root.server.config.login_token_ttl;
 		let expires_at = Sat(utils::millis_since_unix_epoch()) + Sat(expires_in);
 
 		let value = (expires_at.0, user_id);
