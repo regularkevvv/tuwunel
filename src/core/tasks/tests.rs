@@ -31,12 +31,12 @@ async fn cancelled_join_retains_completion_and_owner() {
 async fn native_completion_retains_failure_across_cancelled_join() {
 	let tasks = Tasks::default();
 	let (release, completion) = futures::channel::oneshot::channel();
-	tasks.retain_native(async move {
-		completion
-			.await
-			.map_err(|error| crate::err!("native completion lost: {error}"))?
-	});
-	tasks.retain_native(async { Err(crate::err!("native cleanup failure")) });
+	tasks.retain_native(completion);
+	let (failure, failed) = futures::channel::oneshot::channel();
+	tasks.retain_native(failed);
+	failure
+		.send(Err(crate::err!("native cleanup failure")))
+		.expect("native failure retained");
 	let mut join = Box::pin(tasks.join());
 	assert!(poll!(join.as_mut()).is_pending());
 	drop(join);

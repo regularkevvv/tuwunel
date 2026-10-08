@@ -9,13 +9,12 @@ use std::{
 use rocksdb::{Cache, LruCacheOptions};
 use tuwunel_core::{
 	Result, Server, debug,
+	tasks::native::Executor,
 	utils::{math::usize_from_f64, result::LogErr},
 };
 
 use super::env::Env;
 use crate::pool::Pool;
-
-mod reaper;
 
 /// One block-cache pool, plus the column families participating in it.
 ///
@@ -35,7 +34,7 @@ pub(crate) struct ColCache {
 /// engine component a common owner for those resources.
 pub(crate) struct Context {
 	resources: Option<Box<Resources>>,
-	reaper: reaper::Sender,
+	reaper: Executor,
 }
 
 /// Transferred as one owner when the final context is released on its worker.
@@ -112,7 +111,7 @@ impl Context {
 		let env = acquire()?;
 		// Prepare the independent teardown executor before starting any worker.
 		// Context destruction must not require a new thread or a live Tokio runtime.
-		let reaper = reaper::acquire()?;
+		let reaper = Executor::prepare()?;
 
 		Ok(Arc::new(Self {
 			resources: Some(Box::new(Resources {
@@ -140,7 +139,12 @@ impl Drop for Context {
 			.take()
 			.expect("owned context resources");
 		if resources.pool.is_worker_thread() {
-			reaper::submit(&self.reaper, resources);
+			let server = resources.server.clone();
+			self.reaper.submit(&server.cleanup, move || {
+				let result = resources.close();
+				drop(resources);
+				result
+			});
 		} else {
 			resources
 				.close()

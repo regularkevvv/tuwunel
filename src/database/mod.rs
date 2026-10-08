@@ -160,13 +160,18 @@ impl Database {
 		}
 	}
 
-	/// Stops background lease renewal and releases the writer lease.
+	/// Drains accepted native reads or stops renewal and releases the remote
+	/// writer lease.
 	///
-	/// A no-op off the remote backend. Releasing is best effort: a successor
-	/// otherwise waits out the lease's natural expiry.
+	/// RocksDB waits for offloaded reads and seeks already submitted, including
+	/// commands whose requesting futures were cancelled. It keeps the pool open
+	/// for lazy queries retained by callers after the service graph stops.
+	/// Remote lease release is best effort: a successor otherwise waits out the
+	/// lease's natural expiry.
 	pub async fn close(&self) {
-		if let Inner::Remote(backend) = &self.inner {
-			backend.close().await;
+		match &self.inner {
+			| Inner::Rocks { engine, .. } => engine.pool.drain().await,
+			| Inner::Remote(backend) => backend.close().await,
 		}
 	}
 

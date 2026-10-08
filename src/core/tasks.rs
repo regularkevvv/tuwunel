@@ -1,5 +1,6 @@
 //! Retains shutdown task completions across cancelled and concurrent joiners.
 
+pub mod native;
 #[cfg(test)]
 mod tests;
 
@@ -9,7 +10,7 @@ use std::{
 	task::{Poll, Waker},
 };
 
-use futures::future::poll_fn;
+use futures::{channel::oneshot, future::poll_fn};
 use tokio::{
 	runtime::Handle,
 	sync::Mutex as AsyncMutex,
@@ -36,7 +37,7 @@ struct State {
 
 enum Completion {
 	Task(JoinHandle<()>),
-	Native(Pin<Box<dyn Future<Output = Result> + Send>>),
+	Native(oneshot::Receiver<Result>),
 }
 
 impl Future for Completion {
@@ -51,7 +52,14 @@ impl Future for Completion {
 					| Err(error) if error.is_cancelled() => Ok(()),
 					| Err(error) => Err(error.into()),
 				}),
-			| Self::Native(completion) => completion.as_mut().poll(context),
+			| Self::Native(completion) =>
+				Pin::new(completion)
+					.poll(context)
+					.map(|result| match result {
+						| Ok(result) => result,
+						| Err(error) =>
+							Err(crate::err!("Native cleanup completion lost: {error}")),
+					}),
 		}
 	}
 }
@@ -113,22 +121,16 @@ impl Tasks {
 		abort
 	}
 
-	/// Retains a completion receipt for work already running independently of
-	/// Tokio. The receipt must not own this registry or drive the cleanup
-	/// itself. It remains joinable even after the embedding runtime has shut
-	/// down.
-	pub fn retain_native<F>(&self, completion: F)
-	where
-		F: Future<Output = Result> + Send + 'static,
-	{
+	/// Retains a receipt for independently running native cleanup. The receiver
+	/// owns no cleanup resources and has no module-specific future to poll. It
+	/// remains joinable after the embedding runtime has shut down.
+	pub fn retain_native(&self, completion: oneshot::Receiver<Result>) {
 		let wake = {
 			let mut state = self
 				.state
 				.lock()
 				.unwrap_or_else(PoisonError::into_inner);
-			state
-				.pending
-				.push(Completion::Native(Box::pin(completion)));
+			state.pending.push(Completion::Native(completion));
 			state.waker.take()
 		};
 		if let Some(wake) = wake {

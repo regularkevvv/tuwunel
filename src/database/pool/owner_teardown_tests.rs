@@ -1,6 +1,8 @@
 //! Cancelled accepted reads must release the last map without joining their own
 //! worker.
 
+mod drain_tests;
+
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::{
@@ -31,6 +33,8 @@ pub(super) struct Audit {
 	before: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 	finished: AtomicUsize,
 	panics: AtomicUsize,
+	admissions: AtomicUsize,
+	commands_finished: AtomicUsize,
 }
 
 pub(super) struct WorkerAudit<'a>(pub(super) &'a Pool);
@@ -63,6 +67,20 @@ pub(super) fn before_command(pool: &Pool) {
 		if let Some(callback) = callback {
 			callback();
 		}
+	}
+}
+
+pub(super) fn after_admission(pool: &Pool) {
+	if let Some(audit) = pool.audit.lock().expect("worker audit").as_ref() {
+		audit.admissions.fetch_add(1, Ordering::Release);
+	}
+}
+
+pub(super) fn after_command(pool: &Pool) {
+	if let Some(audit) = pool.audit.lock().expect("worker audit").as_ref() {
+		audit
+			.commands_finished
+			.fetch_add(1, Ordering::Release);
 	}
 }
 
@@ -166,6 +184,8 @@ async fn last_owner(read: Read) -> Result {
 		}))),
 		finished: AtomicUsize::new(0),
 		panics: AtomicUsize::new(0),
+		admissions: AtomicUsize::new(0),
+		commands_finished: AtomicUsize::new(0),
 	});
 	*pool.audit.lock().expect("worker audit") = Some(audit.clone());
 	let mut request = match read {

@@ -59,7 +59,8 @@ impl Service {
 
 		let mut txn = services_root.db.txn();
 		let mut aliases = Vec::new();
-		for row in self.alias_rows(room).await? {
+		let rows = self.alias_rows(room).await?;
+		for row in rows {
 			txn.del_raw(&self.db.aliasid_alias, row.key);
 			aliases.push(row.alias);
 		}

@@ -77,7 +77,9 @@ impl Service {
 			let map = &services_root.db[name];
 			let keys = map.keys_prefix_raw_capped(&short, budget.cap());
 			pin_mut!(keys);
-			while let Some(key) = keys.try_next().await? {
+			loop {
+				let next = keys.try_next().await?;
+				let Some(key) = next else { break };
 				budget.key(key)?;
 				txn.del_raw(map, key);
 			}
@@ -96,7 +98,9 @@ impl Service {
 			let map = &services_root.db[name];
 			let keys = map.keys_prefix_raw_capped(&(room, Interfix), budget.cap());
 			pin_mut!(keys);
-			while let Some(key) = keys.try_next().await? {
+			loop {
+				let next = keys.try_next().await?;
+				let Some(key) = next else { break };
 				budget.key(key)?;
 				txn.del_raw(map, key);
 			}
