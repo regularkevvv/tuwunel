@@ -164,3 +164,41 @@ async fn cancelled_close_retains_dispatched_release_completion() -> Result {
 	);
 	Ok(())
 }
+
+#[tokio::test]
+async fn dropped_backend_retains_dispatched_close_for_shutdown_join() -> Result {
+	let fake = Fake::start().await?;
+	let server = remote_server(&fake.url, 2, 0)?;
+	let backend = Backend::open(&server).await?;
+	let root = Arc::downgrade(&backend);
+	let gate = fake.pause_release();
+	let mut entered = Box::pin(gate.entered.notified());
+	let mut close = Box::pin(backend.close());
+	timeout(Duration::from_secs(5), async {
+		loop {
+			assert!(futures::poll!(&mut close).is_pending(), "release response blocked");
+			if futures::poll!(&mut entered).is_ready() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("release dispatched");
+	drop(close);
+	drop(backend);
+	assert_eq!(root.strong_count(), 0, "cleanup does not retain backend");
+	let mut join = Box::pin(server.cleanup.join());
+	let premature = futures::poll!(&mut join).is_ready();
+	gate.release.notify_one();
+	if !premature {
+		timeout(Duration::from_secs(5), join)
+			.await
+			.expect("retained release joined")?;
+	}
+	assert!(!premature, "backend drop detached its dispatched close");
+	let successor = Backend::open(&server).await?;
+	assert!(successor.lease_status().held, "successor acquires released lease");
+	successor.close().await;
+	Ok(())
+}

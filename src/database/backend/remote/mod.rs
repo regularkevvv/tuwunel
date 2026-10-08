@@ -679,28 +679,48 @@ impl Backend {
 }
 
 impl Drop for Backend {
-	/// Best-effort close: renewals always stop, and the lease is released
-	/// when a runtime is still available to carry the call. A missed release
-	/// only makes a successor wait out the natural expiry.
+	/// Retain renewal and release completions for the server's shutdown join.
 	fn drop(&mut self) {
-		self.abort_renewals();
-
-		let Ok(handle) = tokio::runtime::Handle::try_current() else {
+		self.scans.close();
+		let renewals = self
+			.renewals
+			.get_mut()
+			.unwrap_or_else(PoisonError::into_inner)
+			.take();
+		if let Some(task) = &renewals {
+			task.abort();
+		}
+		let closing = match std::mem::replace(self.closing.get_mut(), CloseState::Closed) {
+			| CloseState::Closing(task) => Some(task),
+			| CloseState::Open | CloseState::Closed => None,
+		};
+		let identity = self.lease.releasable();
+		if renewals.is_none() && closing.is_none() && identity.is_none() {
+			return;
+		}
+		let Some(runtime) = self
+			.server
+			.runtime
+			.clone()
+			.or_else(|| tokio::runtime::Handle::try_current().ok())
+		else {
 			return;
 		};
-
-		let Some(lease) = self.lease.releasable() else {
-			return;
-		};
-
-		let client = self.client.clone();
-		handle.spawn(async move {
-			match client
-				.call(&Request::LeaseRelease { lease }, None)
-				.await
+		let lease = self.lease.clone();
+		self.server.cleanup.spawn(&runtime, async move {
+			if let Some(task) = renewals
+				&& let Err(error) = task.await
+				&& !error.is_cancelled()
 			{
-				| Ok(_) => debug!("released the writer lease"),
-				| Err(error) => warn!(%error, "lease release failed; it expires on its own"),
+				error!(%error, "Dropped backend renewal join failed");
+			}
+			if let Some(task) = closing
+				&& let Err(error) = task.await
+			{
+				error!(%error, "Dropped backend close join failed");
+			}
+			if let Some(identity) = identity {
+				lease.release_identity(identity).await;
 			}
 		});
 	}

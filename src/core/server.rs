@@ -54,6 +54,9 @@ pub struct Server {
 	/// Handle to the runtime
 	pub runtime: Option<runtime::Handle>,
 
+	/// Router and backend cleanup completions retained through cancellation.
+	pub cleanup: crate::tasks::Tasks,
+
 	/// Reload/shutdown signal
 	pub signal: broadcast::Sender<&'static str>,
 
@@ -88,6 +91,7 @@ impl Server {
 			restarting: AtomicBool::new(false),
 			backup_restored: AtomicBool::new(false),
 			runtime: runtime.cloned(),
+			cleanup: crate::tasks::Tasks::default(),
 			signal: broadcast::channel::<&'static str>(1).0,
 			log,
 			metrics,

@@ -46,6 +46,6 @@ pub fn fini(admin_service: &tuwunel_service::admin::Service) {
 	_ = admin_service
 		.command
 		.write()
-		.expect("locked for writing")
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
 		.take();
 }
