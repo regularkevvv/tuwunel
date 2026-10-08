@@ -1,7 +1,10 @@
 mod configure;
 #[cfg(test)]
+mod owner_teardown_tests;
+#[cfg(test)]
 #[path = "pool/startup_tests.rs"]
 pub(crate) mod startup_tests;
+mod worker;
 
 use std::{
 	mem::take,
@@ -37,6 +40,8 @@ pub(crate) struct Pool {
 	server: Arc<Server>,
 	queues: Vec<Sender<Cmd>>,
 	workers: Mutex<Vec<JoinHandle<()>>>,
+	#[cfg(test)]
+	audit: Mutex<Option<Arc<owner_teardown_tests::Audit>>>,
 	topology: Vec<usize>,
 	busy: AtomicUsize,
 	queued_max: AtomicUsize,
@@ -78,8 +83,10 @@ pub(crate) struct Get {
 /// to keep later cursor movements nonblocking. The worker returns the
 /// positioned iterator state through the response sender.
 pub(crate) struct Seek {
-	pub(crate) map: Arc<Map>,
+	// The iterator borrows the native database. Rust drops fields in declaration
+	// order, so release it before the map that can own the final engine reference.
 	pub(crate) state: stream::State<'static>,
+	pub(crate) map: Arc<Map>,
 	pub(crate) dir: Direction,
 	pub(crate) key: Option<KeyBuf>,
 	pub(crate) res: Option<ResultSender<stream::State<'static>>>,
@@ -131,6 +138,8 @@ pub(crate) fn new(server: &Arc<Server>) -> Result<Arc<Self>> {
 		server: server.clone(),
 		queues: senders,
 		workers: Vec::new().into(),
+		#[cfg(test)]
+		audit: Mutex::new(None),
 		topology,
 		busy: AtomicUsize::default(),
 		queued_max: AtomicUsize::default(),
@@ -340,6 +349,9 @@ async fn execute(&self, queue: &Sender<Cmd>, cmd: Cmd) -> Result {
 	),
 )]
 fn worker(self: Arc<Self>, id: usize, chan_id: usize, recv: &Receiver<Cmd>) {
+	let _worker = worker::Current::enter(&self);
+	#[cfg(test)]
+	let _audit = owner_teardown_tests::WorkerAudit(&self);
 	self.worker_init(id, chan_id);
 	self.worker_loop(recv);
 }
@@ -370,6 +382,8 @@ fn worker_loop(self: &Arc<Self>, recv: &Receiver<Cmd>) {
 	self.busy.fetch_add(1, Ordering::Relaxed);
 
 	while let Ok(cmd) = self.worker_wait(recv) {
+		#[cfg(test)]
+		owner_teardown_tests::before_command(self);
 		worker_handle(cmd);
 	}
 }

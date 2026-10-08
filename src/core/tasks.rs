@@ -28,10 +28,32 @@ pub struct Tasks {
 
 #[derive(Default)]
 struct State {
-	pending: Vec<JoinHandle<()>>,
+	pending: Vec<Completion>,
 	error: Option<Error>,
 	spawning: usize,
 	waker: Option<Waker>,
+}
+
+enum Completion {
+	Task(JoinHandle<()>),
+	Native(Pin<Box<dyn Future<Output = Result> + Send>>),
+}
+
+impl Future for Completion {
+	type Output = Result;
+
+	fn poll(mut self: Pin<&mut Self>, context: &mut std::task::Context<'_>) -> Poll<Result> {
+		match &mut *self {
+			| Self::Task(task) => Pin::new(task)
+				.poll(context)
+				.map(|result| match result {
+					| Ok(()) => Ok(()),
+					| Err(error) if error.is_cancelled() => Ok(()),
+					| Err(error) => Err(error.into()),
+				}),
+			| Self::Native(completion) => completion.as_mut().poll(context),
+		}
+	}
 }
 
 struct Registration<'a>(&'a Tasks);
@@ -86,9 +108,32 @@ impl Tasks {
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner)
 			.pending
-			.push(task);
+			.push(Completion::Task(task));
 		drop(registration);
 		abort
+	}
+
+	/// Retains a completion receipt for work already running independently of
+	/// Tokio. The receipt must not own this registry or drive the cleanup
+	/// itself. It remains joinable even after the embedding runtime has shut
+	/// down.
+	pub fn retain_native<F>(&self, completion: F)
+	where
+		F: Future<Output = Result> + Send + 'static,
+	{
+		let wake = {
+			let mut state = self
+				.state
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner);
+			state
+				.pending
+				.push(Completion::Native(Box::pin(completion)));
+			state.waker.take()
+		};
+		if let Some(wake) = wake {
+			wake.wake();
+		}
 	}
 
 	/// Joins all retained tasks, including cleanup they enqueue while
@@ -116,10 +161,9 @@ impl Tasks {
 				};
 				state.pending.pop();
 				if let Err(error) = result
-					&& !error.is_cancelled()
 					&& state.error.is_none()
 				{
-					state.error = Some(error.into());
+					state.error = Some(error);
 				}
 			}
 		})

@@ -28,6 +28,37 @@ async fn cancelled_join_retains_completion_and_owner() {
 }
 
 #[tokio::test]
+async fn native_completion_retains_failure_across_cancelled_join() {
+	let tasks = Tasks::default();
+	let (release, completion) = futures::channel::oneshot::channel();
+	tasks.retain_native(async move {
+		completion
+			.await
+			.map_err(|error| crate::err!("native completion lost: {error}"))?
+	});
+	tasks.retain_native(async { Err(crate::err!("native cleanup failure")) });
+	let mut join = Box::pin(tasks.join());
+	assert!(poll!(join.as_mut()).is_pending());
+	drop(join);
+	release
+		.send(Ok(()))
+		.expect("native completion retained");
+	let error = tasks
+		.join()
+		.await
+		.expect_err("native failure retained after cancellation");
+	assert!(
+		error
+			.to_string()
+			.contains("native cleanup failure")
+	);
+	tasks
+		.join()
+		.await
+		.expect("native completions drained");
+}
+
+#[tokio::test]
 async fn concurrent_joiners_both_wait_for_completion() {
 	let tasks = Arc::new(Tasks::default());
 	let (sender, receiver) = oneshot::channel();

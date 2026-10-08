@@ -1,6 +1,7 @@
 use std::{
 	collections::BTreeMap,
 	fs::remove_dir_all,
+	ops::Deref,
 	path::Path,
 	sync::{Arc, Mutex},
 };
@@ -13,6 +14,8 @@ use tuwunel_core::{
 
 use super::env::Env;
 use crate::pool::Pool;
+
+mod reaper;
 
 /// One block-cache pool, plus the column families participating in it.
 ///
@@ -31,6 +34,13 @@ pub(crate) struct ColCache {
 /// before the database opens. Keeping them in one shared context gives every
 /// engine component a common owner for those resources.
 pub(crate) struct Context {
+	resources: Option<Box<Resources>>,
+	reaper: reaper::Sender,
+}
+
+/// Transferred as one owner when the final context is released on its worker.
+/// The caches and environment remain alive until every pool worker has joined.
+pub(crate) struct Resources {
 	pub(crate) pool: Arc<Pool>,
 
 	/// Retained because rust-rocksdb's `Cache` binding lacks `get_capacity`.
@@ -45,12 +55,22 @@ pub(crate) struct Context {
 	pub(super) env: Arc<Env>,
 }
 
+impl Deref for Context {
+	type Target = Resources;
+
+	fn deref(&self) -> &Self::Target {
+		self.resources
+			.as_deref()
+			.expect("live context resources")
+	}
+}
+
 /// Map of block-cache pools keyed by pool name. The pool name is either
 /// `SHARED_POOL` or the first-arrival CF that created it.
 pub(crate) type ColCaches = BTreeMap<&'static str, ColCache>;
 
 /// Name under which the shared block cache (every CF with
-/// `CacheDisp::Shared`) is registered in [`Context::col_cache`].
+/// `CacheDisp::Shared`) is registered in [`Resources::col_cache`].
 pub(crate) const SHARED_POOL: &str = "Shared";
 
 impl Context {
@@ -90,14 +110,20 @@ impl Context {
 		// Finish fallible environment acquisition before starting workers.
 		// A refused environment must not leave a pool held alive by its threads.
 		let env = acquire()?;
+		// Prepare the independent teardown executor before starting any worker.
+		// Context destruction must not require a new thread or a live Tokio runtime.
+		let reaper = reaper::acquire()?;
 
 		Ok(Arc::new(Self {
-			pool: Pool::new(server)?,
-			row_cache_capacity: row_cache_capacity_bytes,
-			row_cache: row_cache.into(),
-			col_cache: col_cache.into(),
-			server: server.clone(),
-			env,
+			resources: Some(Box::new(Resources {
+				pool: Pool::new(server)?,
+				row_cache_capacity: row_cache_capacity_bytes,
+				row_cache: row_cache.into(),
+				col_cache: col_cache.into(),
+				server: server.clone(),
+				env,
+			})),
+			reaper,
 		}))
 	}
 }
@@ -109,11 +135,25 @@ mod startup_tests;
 impl Drop for Context {
 	#[cold]
 	fn drop(&mut self) {
+		let resources = self
+			.resources
+			.take()
+			.expect("owned context resources");
+		if resources.pool.is_worker_thread() {
+			reaper::submit(&self.reaper, resources);
+		} else {
+			resources
+				.close()
+				.expect("Failed to execute after_close handler");
+		}
+	}
+}
+
+impl Resources {
+	fn close(&self) -> Result {
 		debug!("Closing frontend pool");
 		self.pool.close();
-
 		after_close(self, &self.server.config.database_path)
-			.expect("Failed to execute after_close handler");
 	}
 }
 
@@ -131,7 +171,7 @@ pub(super) fn before_open(ctx: &Arc<Context>, path: &Path) -> Result {
 
 /// For unit and integration tests the 'cleanup' directive deletes after close
 /// to cleanup.
-fn after_close(ctx: &Context, path: &Path) -> Result {
+fn after_close(ctx: &Resources, path: &Path) -> Result {
 	if ctx.server.config.test.contains("cleanup") {
 		delete_database_for_testing(ctx, path)
 			.log_err()
@@ -145,7 +185,7 @@ fn after_close(ctx: &Context, path: &Path) -> Result {
 /// To prevent misuse, cfg!(test) must be true for a unit test or the
 /// integration test server is named localhost.
 #[tracing::instrument(level = "debug", skip_all)]
-fn delete_database_for_testing(ctx: &Context, path: &Path) -> Result {
+fn delete_database_for_testing(ctx: &Resources, path: &Path) -> Result {
 	let config = &ctx.server.config;
 	let localhost = config
 		.server_name
