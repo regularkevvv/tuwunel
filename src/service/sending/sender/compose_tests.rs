@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use tokio::time::timeout;
 use tuwunel_core::{
 	Result,

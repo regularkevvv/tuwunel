@@ -11,12 +11,10 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{
 	FutureExt, StreamExt, TryStreamExt,
 	future::{BoxFuture, join, join3, try_join3},
 	pin_mut,
-	stream::FuturesUnordered,
 };
 use ruma::{
 	MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedRoomId, OwnedServerName,
@@ -54,7 +52,7 @@ use tuwunel_core::{
 	smallvec::SmallVec,
 	trace,
 	utils::{
-		BoolExt, ReadyExt, calculate_hash, exponential_backoff_remaining_secs,
+		BoolExt, ReadyExt, exponential_backoff_remaining_secs,
 		rand::secs as rand_secs,
 		stream::{BroadbandExt, IterStream, WidebandExt},
 	},
@@ -62,10 +60,14 @@ use tuwunel_core::{
 };
 
 use super::{
-	Destination, EduBuf, EduVec, Msg, SendingEvent, Service, TAG_PREFIX_LEN,
-	data::{ActiveAcknowledgement, QueueItem},
+	Destination, EduBuf, EduVec, FrozenRequest, Msg, SendingEvent, Service, TAG_PREFIX_LEN,
+	data::{ActiveAcknowledgement, PreparedAttempt, QueueItem},
+	frozen,
 };
 use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
+
+mod deliveries;
+use deliveries::SendingFutures;
 
 #[cfg(test)]
 mod edu_tests;
@@ -78,6 +80,12 @@ mod ack_tests;
 
 #[cfg(test)]
 mod incarnation_tests;
+
+#[cfg(test)]
+mod attempt_tests;
+
+#[cfg(test)]
+mod retry_restart_tests;
 
 /// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
 /// in `peer_status` (federation only); appservice/push paths keep their own
@@ -97,6 +105,7 @@ enum RetryAction {
 }
 
 type SendingError = (Destination, Error);
+#[derive(Debug)]
 enum Delivery {
 	Acknowledged(Destination, ActiveAcknowledgement),
 	Deferred(Destination),
@@ -104,8 +113,7 @@ enum Delivery {
 }
 
 type SendingResult = Result<Delivery, SendingError>;
-type SendingFuture<'a> = BoxFuture<'a, SendingResult>;
-type SendingFutures<'a> = FuturesUnordered<SendingFuture<'a>>;
+type SendingFuture = BoxFuture<'static, SendingResult>;
 type CurTransactionStatus = HashMap<Destination, TransactionStatus>;
 type FailedPushIds = SmallVec<[RawPduId; 1]>;
 
@@ -277,7 +285,7 @@ impl Service {
 	#[tracing::instrument(skip(self), level = "debug")]
 	pub(super) async fn sender(self: Arc<Self>, id: usize) -> Result {
 		let mut statuses: CurTransactionStatus = CurTransactionStatus::new();
-		let mut futures: SendingFutures<'_> = FuturesUnordered::new();
+		let mut futures = SendingFutures::new();
 		let mut wakes: WakeQueue = WakeQueue::new();
 
 		loop {
@@ -301,16 +309,16 @@ impl Service {
 			}
 		}
 
-		self.work_loop(id, &mut futures, &mut statuses, &mut wakes)
-			.await?;
-
-		if !futures.is_empty() {
-			self.finish_responses(&mut futures)
-				.boxed()
-				.await?;
-		}
-
-		Ok(())
+		let outcome = self
+			.work_loop(id, &mut futures, &mut statuses, &mut wakes)
+			.await;
+		let finish = if outcome.is_ok() && !futures.is_empty() {
+			self.finish_responses(&mut futures).boxed().await
+		} else {
+			Ok(())
+		};
+		futures.cancel_and_join().await;
+		outcome.and(finish)
 	}
 
 	#[tracing::instrument(
@@ -322,10 +330,10 @@ impl Service {
 			statuses = %statuses.len(),
 		),
 	)]
-	async fn work_loop<'a>(
-		&'a self,
+	async fn work_loop(
+		&self,
 		id: usize,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
 	) -> Result {
@@ -381,10 +389,10 @@ impl Service {
 	}
 
 	#[tracing::instrument(name = "response", level = "debug", skip_all)]
-	async fn handle_response<'a>(
-		&'a self,
+	async fn handle_response(
+		&self,
 		response: SendingResult,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
 		stage: &mut QueueRecovery,
@@ -544,10 +552,10 @@ fn push_backoff_remaining(&self, status: Option<&TransactionStatus>) -> Option<D
 }
 
 impl Service {
-	async fn handle_force_retry<'a>(
-		&'a self,
+	async fn handle_force_retry(
+		&self,
 		dest: Destination,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
 		let Some(events) = self
@@ -590,11 +598,10 @@ impl Service {
 		retry_action
 	}
 
-	#[expect(clippy::needless_pass_by_ref_mut)]
-	async fn resume_queue<'a>(
-		&'a self,
+	async fn resume_queue(
+		&self,
 		dest: &Destination,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		stage: &mut QueueRecovery,
 	) -> Result {
@@ -614,6 +621,7 @@ impl Service {
 		if !active.is_empty() {
 			statuses.insert(dest.clone(), TransactionStatus::Running);
 			futures.push(
+				dest.clone(),
 				self.send_events(
 					dest.clone(),
 					active
@@ -621,6 +629,7 @@ impl Service {
 						.map(|(_, event)| event)
 						.collect(),
 				),
+				self.server.runtime(),
 			);
 			return Ok(());
 		}
@@ -658,14 +667,18 @@ impl Service {
 		} else {
 			statuses.insert(dest.clone(), TransactionStatus::Running);
 
-			futures.push(self.send_events(dest.clone(), events));
+			futures.push(
+				dest.clone(),
+				self.send_events(dest.clone(), events),
+				self.server.runtime(),
+			);
 		}
 		Ok(())
 	}
 
-	async fn retry_queue<'a>(
-		&'a self,
-		futures: &mut SendingFutures<'a>,
+	async fn retry_queue(
+		&self,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		retries: &mut QueueRetries,
 	) -> Result {
@@ -689,29 +702,25 @@ impl Service {
 		Ok(())
 	}
 
-	#[expect(
-		clippy::needless_pass_by_ref_mut,
-		reason = "mutable reference avoids requiring SendingFutures to be Sync"
-	)]
-	fn schedule_events<'a>(
-		&'a self,
+	fn schedule_events(
+		&self,
 		dest: Destination,
 		events: Vec<SendingEvent>,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) {
 		if events.is_empty() {
 			statuses.remove(&dest);
 		} else {
-			futures.push(self.send_events(dest, events));
+			futures.push(dest.clone(), self.send_events(dest, events), self.server.runtime());
 		}
 	}
 
 	#[tracing::instrument(name = "request", level = "debug", skip_all)]
-	async fn handle_request<'a>(
-		&'a self,
+	async fn handle_request(
+		&self,
 		msg: Msg,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
 		let synthetic_wake = msg.queue_id.is_empty()
@@ -743,9 +752,9 @@ impl Service {
 		Ok(())
 	}
 
-	async fn drain_due_wakes<'a>(
-		&'a self,
-		futures: &mut SendingFutures<'a>,
+	async fn drain_due_wakes(
+		&self,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
 		retries: &mut QueueRetries,
@@ -769,10 +778,10 @@ impl Service {
 		Ok(())
 	}
 
-	async fn handle_wake<'a>(
-		&'a self,
+	async fn handle_wake(
+		&self,
 		dest: Destination,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
 	) -> Result {
@@ -860,7 +869,7 @@ impl Service {
 		skip_all,
 		fields(futures = %futures.len()),
 	)]
-	async fn finish_responses<'a>(&'a self, futures: &mut SendingFutures<'a>) -> Result {
+	async fn finish_responses(&self, futures: &mut SendingFutures) -> Result {
 		use tokio::{
 			select,
 			time::{Instant, sleep_until},
@@ -889,10 +898,10 @@ impl Service {
 		skip_all,
 		fields(futures = %futures.len()),
 	)]
-	async fn startup_netburst<'a>(
-		&'a self,
+	async fn startup_netburst(
+		&self,
 		id: usize,
-		futures: &mut SendingFutures<'a>,
+		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 	) -> Result {
 		if !self.server.config.startup_netburst {
@@ -928,7 +937,11 @@ impl Service {
 		for (dest, events) in txns {
 			if !events.is_empty() {
 				statuses.insert(dest.clone(), TransactionStatus::Running);
-				futures.push(self.send_events(dest.clone(), events));
+				futures.push(
+					dest.clone(),
+					self.send_events(dest.clone(), events),
+					self.server.runtime(),
+				);
 			}
 		}
 
@@ -1529,39 +1542,62 @@ impl Service {
 		Ok(Some(buf))
 	}
 
-	fn send_events(&self, dest: Destination, events: Vec<SendingEvent>) -> SendingFuture<'_> {
+	fn send_events(&self, dest: Destination, events: Vec<SendingEvent>) -> SendingFuture {
+		let service = self.services.sending.clone();
+		async move { service.deliver_events(dest, events).await }.boxed()
+	}
+
+	async fn deliver_events(
+		&self,
+		dest: Destination,
+		events: Vec<SendingEvent>,
+	) -> SendingResult {
 		debug_assert!(!events.is_empty(), "sending empty transaction");
-		async move {
-			let rows = match self
-				.db
-				.selected_acknowledgement(&dest, &events)
-				.await
-			{
-				| Ok(rows) => rows,
-				| Err(error) => return Ok(unprepared(dest, error)),
-			};
-			let response = match dest {
-				| Destination::Federation(server) =>
-					self.send_events_dest_federation(server, events)
-						.await,
-				| Destination::Appservice(id) =>
-					self.send_events_dest_appservice(id, events).await,
-				| Destination::Push(user_id, pushkey) =>
-					self.send_events_dest_push(user_id, pushkey, events)
-						.await,
-			};
-			response.map(|response| match response {
-				| Delivery::Acknowledged(dest, _) => Delivery::Acknowledged(dest, rows),
-				| response => response,
-			})
+		match self.db.load_attempt(&dest).await {
+			| Ok(Some(attempt)) => {
+				return match dest {
+					| Destination::Appservice(id) =>
+						self.deliver_appservice_attempt(id, attempt).await,
+					| Destination::Federation(server) =>
+						self.deliver_federation_attempt(server, attempt)
+							.await,
+					| Destination::Push(..) => {
+						unreachable!("push has no transaction journal")
+					},
+				};
+			},
+			| Ok(None) => {},
+			| Err(error) => return Ok(unprepared(dest, error)),
 		}
-		.boxed()
+		let rows = match self
+			.db
+			.selected_acknowledgement(&dest, &events)
+			.await
+		{
+			| Ok(rows) => rows,
+			| Err(error) => return Ok(unprepared(dest, error)),
+		};
+		match dest {
+			| Destination::Federation(server) =>
+				self.send_events_dest_federation(server, events, rows)
+					.await,
+			| Destination::Appservice(id) =>
+				self.send_events_dest_appservice(id, events, rows)
+					.await,
+			| Destination::Push(user_id, pushkey) => self
+				.send_events_dest_push(user_id, pushkey, events)
+				.await
+				.map(|response| match response {
+					| Delivery::Acknowledged(dest, _) => Delivery::Acknowledged(dest, rows),
+					| response => response,
+				}),
+		}
 	}
 
 	#[tracing::instrument(
 		name = "appservice",
 		level = "debug",
-		skip(self, events),
+		skip(self, events, rows),
 		fields(
 			events = %events.len(),
 		),
@@ -1570,20 +1606,21 @@ impl Service {
 		&self,
 		id: String,
 		events: Vec<SendingEvent>,
+		rows: ActiveAcknowledgement,
 	) -> SendingResult {
+		// Composition owns a snapshot; persistence validates the selected row
+		// incarnation, and the final HTTP handoff validates this owner again.
 		let Some(info) = self
 			.services
 			.appservice
 			.get_registration_info(&id)
 			.await
 		else {
-			//TODO: appservice queue cleanup.
 			return Ok(unprepared(
 				Destination::Appservice(id),
 				Error::bad_database("Missing appservice registration"),
 			));
 		};
-
 		let msc3202 = info.registration.msc3202_transaction_extensions;
 
 		let (pdu_count, edu_count, to_device_count, device_list_count) = events.iter().fold(
@@ -1627,8 +1664,9 @@ impl Service {
 						// Canonical erasure can remove a queued PDU. Failed or
 						// corrupt reads must retain its delivery obligation.
 						| Err(error) if error.is_not_found() => continue,
-						| Err(error) =>
-							return Ok(unprepared(Destination::Appservice(id), error)),
+						| Err(error) => {
+							return Ok(unprepared(Destination::Appservice(id), error));
+						},
 					};
 					if msc3202 && info.is_user_match(pdu.sender()) {
 						otk_users.insert(pdu.sender().to_owned());
@@ -1641,18 +1679,20 @@ impl Service {
 					}
 					match serde_json::from_slice(edu).and_then(|edu| Raw::new(&edu)) {
 						| Ok(edu) => edu_jsons.push(edu),
-						| Err(_) =>
+						| Err(_) => {
 							return Ok(unprepared(
 								Destination::Appservice(id),
 								Error::bad_database("Invalid queued appservice EDU"),
-							)),
+							));
+						},
 					}
 				},
 				| SendingEvent::ToDevice(buf) => {
 					let (raw, recipient) = match queued_to_device(buf, msc3202) {
 						| Ok(prepared) => prepared,
-						| Err(error) =>
-							return Ok(unprepared(Destination::Appservice(id), error)),
+						| Err(error) => {
+							return Ok(unprepared(Destination::Appservice(id), error));
+						},
 					};
 					if let Some(recipient) = recipient {
 						otk_recipients.insert((recipient.to_user_id, recipient.to_device_id));
@@ -1675,25 +1715,15 @@ impl Service {
 					};
 					changed.push(user);
 				},
-				| SendingEvent::FrozenPush(_) =>
+				| SendingEvent::FrozenPush(_) => {
 					return Ok(unprepared(
 						Destination::Appservice(id),
 						Error::bad_database("Frozen push queued to appservice"),
-					)),
+					));
+				},
 				| SendingEvent::BadgeRefresh | SendingEvent::Flush => {},
 			}
 		}
-
-		let txn_hash = calculate_hash(events.iter().filter_map(|e| match e {
-			| SendingEvent::Edu(b)
-			| SendingEvent::ToDevice(b)
-			| SendingEvent::DeviceListChanged(b) => Some(b.as_ref()),
-			| SendingEvent::Pdu(b) => Some(b.as_ref()),
-			| SendingEvent::FrozenPush(_) | SendingEvent::BadgeRefresh | SendingEvent::Flush =>
-				None,
-		}));
-
-		let txn_id = &*URL_SAFE_NO_PAD.encode(txn_hash);
 
 		let (device_lists, device_one_time_keys_count, device_unused_fallback_key_types) =
 			if msc3202 {
@@ -1716,31 +1746,108 @@ impl Service {
 			&& device_one_time_keys_count.is_empty()
 			&& device_unused_fallback_key_types.is_empty()
 		{
-			return Ok(transport_acknowledged(Destination::Appservice(id)));
+			return Ok(Delivery::Acknowledged(Destination::Appservice(id), rows));
 		}
 
+		let body = frozen::body(PushEventsRequest {
+			txn_id: "unassigned".into(),
+			events: pdu_jsons,
+			ephemeral: edu_jsons,
+			to_device,
+			device_lists,
+			device_one_time_keys_count,
+			device_unused_fallback_key_types,
+		});
+		let body = match body {
+			| Ok(body) => body,
+			| Err(error) => return Ok(unprepared(Destination::Appservice(id), error)),
+		};
+		self.persist_appservice_attempt(id, rows, body, &info.registration)
+			.await
+	}
+
+	async fn persist_appservice_attempt(
+		&self,
+		id: String,
+		rows: ActiveAcknowledgement,
+		body: Vec<u8>,
+		registration: &ruma::api::appservice::Registration,
+	) -> SendingResult {
+		let recipient = match super::data::appservice_owner(registration) {
+			| Ok(owner) => Some(owner),
+			| Err(error) => return Ok(unprepared(Destination::Appservice(id), error)),
+		};
+		let attempt = match self
+			.db
+			.persist_attempt(&Destination::Appservice(id.clone()), rows, body, recipient)
+			.await
+		{
+			| Ok(attempt) => attempt,
+			| Err(error) => return Ok(unprepared(Destination::Appservice(id), error)),
+		};
+		self.deliver_appservice_attempt(id, attempt).await
+	}
+
+	async fn deliver_appservice_attempt(
+		&self,
+		id: String,
+		attempt: PreparedAttempt,
+	) -> SendingResult {
+		// Retain registry ownership only for the read-only handoff and the
+		// bounded HTTP request, after composition/persistence have finished.
+		let registrations = self.services.appservice.read().await;
+		let Some(info) = registrations.get(&id) else {
+			return Ok(unprepared(
+				Destination::Appservice(id),
+				Error::bad_database("Missing appservice registration"),
+			));
+		};
+		let outcome = self
+			.deliver_appservice_owned_attempt(id, attempt, &info.registration)
+			.await;
+		drop(registrations);
+		outcome
+	}
+
+	async fn deliver_appservice_owned_attempt(
+		&self,
+		id: String,
+		attempt: PreparedAttempt,
+		registration: &ruma::api::appservice::Registration,
+	) -> SendingResult {
+		let destination = Destination::Appservice(id.clone());
+		let owner = match super::data::appservice_owner(registration) {
+			| Ok(owner) => owner,
+			| Err(error) => return Ok(unprepared(destination, error)),
+		};
+		if attempt.recipient != Some(owner) {
+			return Ok(unprepared(
+				destination,
+				Error::bad_database("Outgoing appservice registration owner changed"),
+			));
+		}
+		if let Err(error) = self
+			.db
+			.require_current_attempt(&destination, &attempt)
+			.await
+		{
+			return Ok(unprepared(destination, error));
+		}
+		let request = PushEventsRequest::new(attempt.transaction_id().into(), Vec::new());
 		match self
 			.services
 			.appservice
-			.send_request(info.registration, PushEventsRequest {
-				txn_id: txn_id.into(),
-				events: pdu_jsons,
-				ephemeral: edu_jsons,
-				to_device,
-				device_lists,
-				device_one_time_keys_count,
-				device_unused_fallback_key_types,
-			})
+			.send_request(registration.clone(), FrozenRequest::new(request, attempt.body))
 			.await
 		{
-			| Ok(_) => Ok(transport_acknowledged(Destination::Appservice(id))),
-			| Err(e) => Err((Destination::Appservice(id), e)),
+			| Ok(_) => Ok(Delivery::Acknowledged(destination, attempt.acknowledgement)),
+			| Err(error) => Err((destination, error)),
 		}
 	}
 
 	/// MSC3202 one-time-key counts and unused fallback key types over every
-	/// device of `users` plus the specific `recipients`. Recomputed per build
-	/// rather than snapshotted, so a retry ships fresh counts.
+	/// device of `users` plus the specific `recipients`. Computed once when
+	/// preparing an immutable transaction; retries use its saved body.
 	async fn msc3202_key_counts(
 		&self,
 		users: BTreeSet<OwnedUserId>,
@@ -2047,6 +2154,7 @@ impl Service {
 		&self,
 		server: OwnedServerName,
 		events: Vec<SendingEvent>,
+		rows: ActiveAcknowledgement,
 	) -> SendingResult {
 		let pdus = events
 			.iter()
@@ -2102,28 +2210,54 @@ impl Service {
 		};
 
 		if pdus.is_empty() && edus.is_empty() {
-			return Ok(transport_acknowledged(Destination::Federation(server)));
+			return Ok(Delivery::Acknowledged(Destination::Federation(server), rows));
 		}
 
-		let preimage = pdus
-			.iter()
-			.map(|raw| raw.get().as_bytes())
-			.chain(edus.iter().map(|raw| raw.json().get().as_bytes()));
-
-		let txn_hash = calculate_hash(preimage);
-		let txn_id = &*URL_SAFE_NO_PAD.encode(txn_hash);
 		let request = send_transaction_message::v1::Request {
-			transaction_id: txn_id.into(),
+			transaction_id: "unassigned".into(),
 			origin: self.server.name.clone(),
 			origin_server_ts: MilliSecondsSinceUnixEpoch::now(),
 			pdus,
 			edus,
 		};
+		let body = match frozen::body(request) {
+			| Ok(body) => body,
+			| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
+		};
+		let attempt = match self
+			.db
+			.persist_attempt(&Destination::Federation(server.clone()), rows, body, None)
+			.await
+		{
+			| Ok(attempt) => attempt,
+			| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
+		};
+		self.deliver_federation_attempt(server, attempt)
+			.await
+	}
+
+	async fn deliver_federation_attempt(
+		&self,
+		server: OwnedServerName,
+		attempt: PreparedAttempt,
+	) -> SendingResult {
+		let txn_id = attempt.transaction_id();
+		let request = send_transaction_message::v1::Request {
+			transaction_id: txn_id.clone().into(),
+			origin: self.server.name.clone(),
+			origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+			pdus: Vec::new(),
+			edus: Vec::new(),
+		};
 
 		let result = self
 			.services
 			.federation
-			.execute_transaction(&self.services.client.sender, &server, request)
+			.execute_transaction(
+				&self.services.client.sender,
+				&server,
+				FrozenRequest::new(request, attempt.body),
+			)
 			.await;
 
 		for (event_id, result) in result.iter().flat_map(|resp| resp.pdus.iter()) {
@@ -2136,7 +2270,10 @@ impl Service {
 		}
 
 		match result {
-			| Ok(_) => Ok(transport_acknowledged(Destination::Federation(server))),
+			| Ok(_) => Ok(Delivery::Acknowledged(
+				Destination::Federation(server),
+				attempt.acknowledgement,
+			)),
 			| Err(error) => Err((Destination::Federation(server), error)),
 		}
 	}

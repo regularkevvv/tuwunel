@@ -6,12 +6,11 @@ use tuwunel_database::Row;
 
 use super::{Data, Destination, SendingEvent, active, parse_servercurrentevent, within_prefix};
 
-/// Exact durable row bytes selected before an attempt starts. This does not
-/// freeze wire payloads or assign persistent transaction generations. New
-/// active rows include their durable incarnation in these physical bytes.
+/// Exact active row bytes and, for HTTP transactions, persisted attempt owner.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::sending) struct ActiveAcknowledgement {
-	rows: Vec<Row>,
+	pub(super) rows: Vec<Row>,
+	pub(super) attempt: Option<super::attempt::AttemptRef>,
 }
 
 impl Data {
@@ -55,7 +54,7 @@ impl Data {
 		if expected.values().any(|count| *count != 0) {
 			return Err(Error::bad_database("Selected delivery has no durable active row"));
 		}
-		Ok(ActiveAcknowledgement { rows })
+		Ok(ActiveAcknowledgement { rows, attempt: None })
 	}
 
 	/// Validate every selected row before one atomic removal. Active writers
@@ -69,6 +68,12 @@ impl Data {
 		let _guard = self.active_write.lock().await;
 		self.require_active_schema().await?;
 		let mut txn = self.db.txn();
+		if !self
+			.stage_attempt_ack(destination, acknowledgement, &mut txn)
+			.await?
+		{
+			return Ok(());
+		}
 		for (key, expected) in &acknowledgement.rows {
 			let (owner, _) = parse_servercurrentevent(key, expected)?;
 			if &owner != destination {
@@ -100,7 +105,7 @@ impl Data {
 		txn.execute().await
 	}
 
-	fn validate_active_identity(&self, value: &[u8]) -> Result {
+	pub(super) fn validate_active_identity(&self, value: &[u8]) -> Result {
 		if active::identity(value)?
 			.is_some_and(|identity| identity > self.services.globals.current_count())
 		{

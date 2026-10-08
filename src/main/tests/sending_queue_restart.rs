@@ -170,14 +170,31 @@ fn command(directory: &Path, phase: &str) -> Result<Command> {
 }
 
 fn run_child(directory: &Path, phase: &str) -> Result {
-	assert!(
-		command(directory, phase)?.status()?.success(),
-		"queue restart child {phase} failed"
-	);
+	let mut child = OwnedChild(command(directory, phase)?.spawn()?);
+	let started = Instant::now();
+	loop {
+		if let Some(status) = child.0.try_wait()? {
+			assert!(status.success(), "queue restart child {phase} failed");
+			return Ok(());
+		}
+		if started.elapsed() >= Duration::from_secs(30) {
+			let progress = read(directory.join("phase-progress"))?;
+			panic!(
+				"queue restart child {phase} exceeded its deadline at {}",
+				String::from_utf8_lossy(&progress)
+			);
+		}
+		thread::sleep(Duration::from_millis(20));
+	}
+}
+
+fn checkpoint(directory: &Path, phase: &str, stage: &str) -> Result {
+	write(directory.join("phase-progress"), format!("{phase}: {stage}"))?;
 	Ok(())
 }
 
 fn child(directory: &Path, phase: &str) -> Result {
+	checkpoint(directory, phase, "creating runtime")?;
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 	let modes: &[&str] = if phase == "prepare" { &["fresh"] } else { &[] };
@@ -190,7 +207,9 @@ fn child(directory: &Path, phase: &str) -> Result {
 		format!("startup_netburst={}", !matches!(phase, "disabled" | "wake")),
 		"ip_range_denylist=[]".into(),
 		"suppress_push_when_active=false".into(),
-		"log=\"error\"".into(),
+		"log=\"error,tuwunel_service::services=trace,tuwunel_service::manager=trace,\
+		 tuwunel_router::run=debug\""
+			.into(),
 	]);
 	if directory.join("wake-case").exists() {
 		args.option
@@ -209,6 +228,7 @@ fn child(directory: &Path, phase: &str) -> Result {
 				sleep(Duration::from_secs(1)).await;
 			}
 		}
+		checkpoint(directory, phase, "building services")?;
 		let (services, mut stub) = if phase == "prepare" {
 			(async_start(&server).await?, None)
 		} else {
@@ -221,8 +241,11 @@ fn child(directory: &Path, phase: &str) -> Result {
 				txn.execute().await?;
 			}
 			let manifest = manifest(directory)?;
+			checkpoint(directory, phase, "preparing stub")?;
 			let stub = prepare_stub(&services, &manifest).await?;
+			checkpoint(directory, phase, "starting services")?;
 			let services = services.start().await?;
+			checkpoint(directory, phase, "services started")?;
 			*server.services.lock().await = Some(services.clone());
 			(services, Some(stub))
 		};
@@ -231,15 +254,18 @@ fn child(directory: &Path, phase: &str) -> Result {
 				| "prepare" =>
 					prepare(&services, &format!("http://127.0.0.1:{port}"), directory).await,
 				| "wake" => {
+					checkpoint(directory, phase, "dispatching appservice hints")?;
 					for appservice in [AS_FIRST, AS_LAST] {
 						services
 							.sending
 							.flush_appservice(appservice.into())?;
 					}
+					checkpoint(directory, phase, "scheduling pushes")?;
 					services.sending.schedule_resume_pushes_for_user(
 						manifest(directory)?.recipient,
 						"owned active fixture",
 					);
+					checkpoint(directory, phase, "verifying recovery")?;
 					verify(&services, stub.as_mut().expect("restart stub"), directory, "resume")
 						.await
 				},
@@ -248,10 +274,23 @@ fn child(directory: &Path, phase: &str) -> Result {
 						.await,
 				| _ => panic!("unexpected queue fixture phase"),
 			};
+			if let Err(error) = &outcome {
+				eprintln!("queue restart child {phase} exercise failed: {error}");
+			}
+			checkpoint(directory, phase, "requesting shutdown")?;
 			let shutdown = server.server.shutdown();
 			outcome.and(shutdown)
 		};
 		let (run, outcome) = tokio::join!(async_run(&server), exercise);
+		checkpoint(
+			directory,
+			phase,
+			if outcome.is_ok() && run.is_ok() {
+				"stopping runtime after successful exercise"
+			} else {
+				"stopping runtime after failed exercise"
+			},
+		)?;
 		drop(stub);
 		drop(services);
 		outcome.and(run).and(async_stop(&server).await)

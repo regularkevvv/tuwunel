@@ -3,7 +3,7 @@ use std::{fmt::Debug, sync::Arc};
 #[cfg(test)]
 mod tests;
 
-use futures::{Stream, StreamExt, TryStreamExt, stream::iter};
+use futures::{Stream, StreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
 use tokio::sync::Mutex;
 use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
@@ -11,7 +11,9 @@ use tuwunel_database::{Database, Deserialized, Get, Map, Row, Txn, deserialize_f
 
 mod ack;
 mod active;
+mod attempt;
 pub(super) use ack::ActiveAcknowledgement;
+pub(super) use attempt::{PreparedAttempt, appservice_owner};
 
 use super::{
 	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED,
@@ -28,6 +30,7 @@ pub struct Data {
 	servercurrentevent_data: Arc<Map>,
 	servernameevent_data: Arc<Map>,
 	servername_educount: Arc<Map>,
+	sendingtransaction_record: Arc<Map>,
 	pub(super) db: Arc<Database>,
 	services: Arc<crate::services::OnceServices>,
 	active_write: Mutex<()>,
@@ -40,6 +43,7 @@ impl Data {
 			servercurrentevent_data: db["servercurrentevent_data"].clone(),
 			servernameevent_data: db["servernameevent_data"].clone(),
 			servername_educount: db["servername_educount"].clone(),
+			sendingtransaction_record: db["sendingtransaction_record"].clone(),
 			db: args.db.clone(),
 			services: args.services.clone(),
 			active_write: Mutex::new(()),
@@ -54,15 +58,7 @@ impl Data {
 
 	pub(super) async fn delete_all_requests_for(&self, destination: &Destination) -> Result {
 		let _guard = self.active_write.lock().await;
-		let prefix = destination.get_prefix();
-		self.servercurrentevent_data
-			.raw_keys_prefix(&prefix)
-			.try_for_each(|key| async move { self.servercurrentevent_data.remove(key).await })
-			.await?;
-
-		self.servernameevent_data
-			.raw_keys_prefix(&prefix)
-			.try_for_each(|key| async move { self.servernameevent_data.remove(key).await })
+		self.cancel_attempt_and_requests(destination)
 			.await
 	}
 
@@ -110,6 +106,19 @@ impl Data {
 				},
 				| Err(error) if error.is_not_found() => {},
 				| Err(error) => return Err(error),
+			}
+			// Dispatch hints can outlive a completed destination cancellation.
+			// Only a matching durable pending admission may become active.
+			let pending = match self.servernameevent_data.get(key).await {
+				| Ok(value) => value.as_ref().to_vec(),
+				| Err(error) if error.is_not_found() => continue,
+				| Err(error) => return Err(error),
+			};
+			let (_, admitted, _) = decode_queued(Ok((key.as_slice(), &pending)))?;
+			if &admitted != event {
+				return Err(Error::bad_database(
+					"Dispatch hint differs from its durable admission",
+				));
 			}
 			let identity = if let Some(identity) = batch_identity {
 				identity
@@ -218,6 +227,10 @@ impl Data {
 	where
 		I: Iterator<Item = (&'a SendingEvent, &'a Destination)> + Clone + Debug + Send,
 	{
+		let _guard = self.active_write.lock().await;
+		for (_, destination) in requests.clone() {
+			self.resume_cancellation(destination).await?;
+		}
 		let mut keys: Vec<Vec<u8>> = Vec::new();
 		for (event, dest) in requests.clone() {
 			keys.push(match event {
@@ -479,8 +492,9 @@ pub(crate) fn parse_servercurrentevent(
 			| [] => SendingEvent::Pdu(super::RawPduId::from_bytes(event)?),
 			| [TAG_TO_DEVICE, ..] => SendingEvent::ToDevice(value.into()),
 			| [TAG_DEVICE_LIST_CHANGED, ..] => SendingEvent::DeviceListChanged(value.into()),
-			| [TAG_FROZEN_PUSH, ..] =>
-				return Err(Error::bad_database("Frozen push has a non-push destination")),
+			| [TAG_FROZEN_PUSH, ..] => {
+				return Err(Error::bad_database("Frozen push has a non-push destination"));
+			},
 			| _ => SendingEvent::Edu(value.into()),
 		};
 
@@ -510,8 +524,9 @@ pub(crate) fn parse_servercurrentevent(
 			| [] => SendingEvent::Pdu(super::RawPduId::from_bytes(event)?),
 			| [tag] if *tag == TAG_BADGE_REFRESH => SendingEvent::BadgeRefresh,
 			| [TAG_FROZEN_PUSH] => SendingEvent::FrozenPush(super::RawPduId::from_bytes(event)?),
-			| [TAG_FROZEN_PUSH, ..] =>
-				return Err(Error::bad_database("Invalid frozen push queue tag")),
+			| [TAG_FROZEN_PUSH, ..] => {
+				return Err(Error::bad_database("Invalid frozen push queue tag"));
+			},
 			| _ => SendingEvent::Edu(value.into()),
 		})
 	} else {

@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use futures::{FutureExt, StreamExt, TryStreamExt, future::ready};
+use futures::{FutureExt, TryStreamExt, future::ready};
 use serde_json::{Value, json};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -217,7 +217,7 @@ async fn verify(mode: Mode) -> Result {
 	assert!(queued.contains_key(&pending.0));
 	let mut stage = QueueRecovery::ResumePending;
 	if matches!(mode, Mode::Shutdown) {
-		futures.push(ready(response).boxed());
+		futures.push(destination.clone(), ready(response).boxed(), services.server.runtime());
 		services
 			.sending
 			.finish_responses(&mut futures)

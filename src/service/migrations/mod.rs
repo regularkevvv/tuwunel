@@ -79,7 +79,9 @@ mod tests;
 // Version 21 gives active deliveries persistent counter identities. Older
 // senders must not interpret their envelopes as EDUs or acknowledge
 // replacements.
-pub(crate) const DATABASE_VERSION: u64 = 21;
+// Version 22 persists immutable outgoing transaction bodies and membership.
+// Older senders must refuse before recomposing an already attempted delivery.
+pub(crate) const DATABASE_VERSION: u64 = 22;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 

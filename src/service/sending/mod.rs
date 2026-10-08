@@ -1,5 +1,6 @@
 mod data;
 mod dest;
+mod frozen;
 mod sender;
 #[cfg(test)]
 mod tests;
@@ -30,13 +31,13 @@ use tuwunel_core::{
 	warn,
 };
 
-pub(crate) use self::data::parse_servercurrentevent;
 use self::wakes::PushWakes;
 pub use self::{
 	data::Data,
 	dest::Destination,
 	sender::{EDU_LIMIT, PDU_LIMIT},
 };
+pub(crate) use self::{data::parse_servercurrentevent, frozen::FrozenRequest};
 use crate::{appservice::RegistrationInfo, rooms::timeline::RawPduId};
 
 pub struct Service {

@@ -480,6 +480,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "sendingtransaction_record",
+		..descriptor::RANDOM
+	},
+	Descriptor {
 		name: "servername_destination",
 		cache_disp: CacheDisp::SharedWith("servername_override"), // one resolve writes both
 		key_size_hint: Some(48),

@@ -360,7 +360,7 @@ fn promotion_bound_preserves_pending_and_reserves_one_identity() -> Result {
 	isolated("sending::sender::incarnation_tests::promotion_bound_preserves_pending_and_reserves_one_identity", verify_promotion_bound_preserves_pending_and_reserves_one_identity())
 }
 
-fn isolated(test: &str, exercise: impl Future<Output = Result>) -> Result {
+pub(super) fn isolated(test: &str, exercise: impl Future<Output = Result>) -> Result {
 	const CHILD: &str = "TUWUNEL_INCARNATION_TEST_CHILD";
 	if std::env::var(CHILD).as_deref() != Ok(test) {
 		// The native OnceServices graph is process-lifetime. Give each added

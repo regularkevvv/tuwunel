@@ -116,12 +116,17 @@ where
 /// at once would be refused again. The sender's backoff and give-up pace the
 /// retries instead.
 #[implement(super::Service)]
-pub async fn execute_transaction(
+pub async fn execute_transaction<T>(
 	&self,
 	client: &Client,
 	dest: &ServerName,
-	request: send_transaction_message::v1::Request,
-) -> Result<send_transaction_message::v1::Response> {
+	request: T,
+) -> Result<send_transaction_message::v1::Response>
+where
+	T: OutgoingRequest<IncomingResponse = send_transaction_message::v1::Response> + Send,
+	T::Authentication: FedAuth,
+	T::PathBuilder: FedPath,
+{
 	let result = self
 		.execute_uncounted(client, dest, request)
 		.await;
