@@ -7,7 +7,7 @@ use futures::{FutureExt, TryStreamExt, future::ready};
 use serde_json::{Value, json};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
-	net::TcpListener,
+	net::{TcpListener, TcpStream},
 	task::JoinHandle,
 	time::timeout,
 };
@@ -40,49 +40,83 @@ impl Drop for Endpoint {
 	fn drop(&mut self) { self.task.abort(); }
 }
 impl Endpoint {
-	async fn new() -> Result<Self> {
+	async fn new() -> Result<Self> { Self::new_requests(1).await }
+
+	async fn new_requests(count: usize) -> Result<Self> {
+		assert!((1..=2).contains(&count), "owned peer request bound");
 		let listener = TcpListener::bind("127.0.0.1:0").await?;
 		let address = format!("http://{}", listener.local_addr()?);
 		let task = tokio::spawn(async move {
-			let (mut socket, _) = listener.accept().await?;
-			let mut bytes = Vec::new();
-			let mut buffer = [0_u8; 1024];
-			let body = loop {
-				let size = socket.read(&mut buffer).await?;
-				assert!(size != 0, "request must finish");
-				bytes.extend_from_slice(&buffer[..size]);
-				assert!(bytes.len() <= 8192, "owned request bound");
-				if let Some(start) = bytes
-					.windows(4)
-					.position(|part| part == b"\r\n\r\n")
-				{
-					let headers = std::str::from_utf8(&bytes[..start]).expect("HTTP headers");
-					let length = headers
-						.lines()
-						.find_map(|line| {
-							let (key, value) = line.split_once(':')?;
-							key.eq_ignore_ascii_case("content-length")
-								.then(|| {
-									value
-										.trim()
-										.parse::<usize>()
-										.expect("content length")
-								})
-						})
-						.expect("request body length");
-					let start = start.checked_add(4).expect("bounded header");
-					let end = start
-						.checked_add(length)
-						.expect("bounded content length");
-					if bytes.len() >= end {
-						break serde_json::from_slice(&bytes[start..end])?;
-					}
-				}
-			};
-			socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await?;
-			Ok(body)
+			let mut captured = Vec::new();
+			for _ in 0..count {
+				let (mut socket, _) = listener.accept().await?;
+				let (path, wire_body, body) = capture_request(&mut socket).await?;
+				socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await?;
+				captured.push(if count == 1 {
+					body
+				} else {
+					json!({"path": path, "wire_body": wire_body, "body": body})
+				});
+			}
+			Ok(if count == 1 {
+				captured.pop().expect("owned request")
+			} else {
+				Value::Array(captured)
+			})
 		});
 		Ok(Self { address, task })
+	}
+}
+
+async fn capture_request(socket: &mut TcpStream) -> Result<(String, Vec<u8>, Value)> {
+	let mut bytes = Vec::new();
+	let mut buffer = [0_u8; 1024];
+	loop {
+		let size = socket.read(&mut buffer).await?;
+		assert!(size != 0, "request must finish");
+		bytes.extend_from_slice(&buffer[..size]);
+		assert!(bytes.len() <= 8192, "owned request bound");
+		if let Some(start) = bytes
+			.windows(4)
+			.position(|part| part == b"\r\n\r\n")
+		{
+			let headers = std::str::from_utf8(&bytes[..start]).expect("HTTP headers");
+			let path = headers
+				.lines()
+				.next()
+				.expect("request line")
+				.split_whitespace()
+				.nth(1)
+				.expect("request URI")
+				.split('?')
+				.next()
+				.expect("request path")
+				.to_owned();
+			let length = headers
+				.lines()
+				.find_map(|line| {
+					let (key, value) = line.split_once(':')?;
+					key.eq_ignore_ascii_case("content-length")
+						.then(|| {
+							value
+								.trim()
+								.parse::<usize>()
+								.expect("content length")
+						})
+				})
+				.expect("request body length");
+			let start = start.checked_add(4).expect("bounded header");
+			let end = start
+				.checked_add(length)
+				.expect("bounded content length");
+			if bytes.len() >= end {
+				return Ok((
+					path,
+					bytes[start..end].to_vec(),
+					serde_json::from_slice(&bytes[start..end])?,
+				));
+			}
+		}
 	}
 }
 
@@ -149,6 +183,184 @@ pub(super) async fn enqueue(
 		.queue_requests(std::iter::once((&event, destination)))
 		.await?;
 	Ok((keys.into_iter().next().expect("one durable row"), event))
+}
+
+#[test]
+fn failed_task_preserves_attempt_and_recovers_without_new_hint() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::failed_task_preserves_attempt_and_recovers_without_new_hint",
+		async {
+			let fixture = Fixture::new().await?;
+			let services = &fixture.services;
+			let data = &services.sending.db;
+			let mut endpoint = Endpoint::new_requests(2).await?;
+			let destination = register(services, &endpoint).await?;
+			let selected = enqueue(services, &destination, 0).await?;
+			data.mark_as_active(std::iter::once(&selected))
+				.await?;
+			let acknowledgement = data
+				.selected_acknowledgement(&destination, &[selected.1])
+				.await?;
+			let registration = services
+				.appservice
+				.get_registration("ack-membership")
+				.await
+				.expect("owned registration");
+			let body = json!({"events": [], "ephemeral": [{"type": "m.typing", "room_id": "!ack:localhost", "content": {"user_ids": ["@ack-0:localhost"]}}]});
+			let attempt = data
+				.persist_attempt(
+					&destination,
+					acknowledgement,
+					serde_json::to_vec(&body)?,
+					Some(super::super::data::appservice_owner(&registration)?),
+				)
+				.await?;
+			// Independently admitted active/pending successors are outside the
+			// persisted attempt, even when a local task loses its completion.
+			let tail = enqueue(services, &destination, 1).await?;
+			data.mark_as_active(std::iter::once(&tail))
+				.await?;
+			enqueue(services, &destination, 2).await?;
+			let before = task_failure_snapshot(services).await?;
+			let mut futures = SendingFutures::new();
+			let mut statuses = CurTransactionStatus::new();
+			let mut wakes = WakeQueue::new();
+			let mut retries = QueueRetries::new();
+			let mut stage = QueueRecovery::ResumePending;
+			for after_http in [false, true] {
+				statuses.insert(destination.clone(), super::TransactionStatus::Running);
+				let failed = if after_http {
+					services
+						.sending
+						.send_events(destination.clone(), vec![SendingEvent::Flush])
+						.then(|outcome| async move {
+							assert!(
+								matches!(outcome, Ok(Delivery::Acknowledged(..))),
+								"owned peer accepted before task failure"
+							);
+							futures::future::poll_fn(
+								|_| -> std::task::Poll<super::SendingResult> {
+									panic!("owned task lost completion after HTTP success")
+								},
+							)
+							.await
+						})
+						.boxed()
+				} else {
+					futures::future::poll_fn(|_| -> std::task::Poll<super::SendingResult> {
+						panic!("owned delivery task failure")
+					})
+					.boxed()
+				};
+				futures.push(destination.clone(), failed, services.server.runtime());
+				let response = timeout(Duration::from_secs(2), futures.next())
+					.await
+					.expect("bounded failed task completion")
+					.expect("owned task outcome");
+				services
+					.sending
+					.handle_response(
+						response,
+						&mut futures,
+						&mut statuses,
+						&mut wakes,
+						&mut stage,
+						&mut retries,
+					)
+					.await?;
+				assert_eq!(
+					task_failure_snapshot(services).await?,
+					before,
+					"a local task failure cannot retire or rewrite accepted work"
+				);
+				assert_eq!(
+					retries.len(),
+					1,
+					"task failure must arm one local retry without a new dispatch hint"
+				);
+				assert_eq!(retries[&destination].1, QueueRecovery::ResumePending);
+				assert!(!statuses.contains_key(&destination), "no remote failure/backoff status");
+				assert!(wakes.is_empty(), "no remote retry timer");
+			}
+			retries
+				.get_mut(&destination)
+				.expect("owned local retry")
+				.0 = tokio::time::Instant::now();
+			services
+				.sending
+				.retry_queue(&mut futures, &mut statuses, &mut retries)
+				.await?;
+			let response = timeout(Duration::from_secs(5), futures.next())
+				.await
+				.expect("local timer recovers delivery")
+				.expect("owned replay outcome");
+			let Ok(Delivery::Acknowledged(owner, acknowledged)) = response else {
+				panic!("local retry must reach the actual HTTP peer");
+			};
+			assert_eq!(owner, destination);
+			assert_eq!(
+				acknowledged, attempt.acknowledgement,
+				"retry retains the original generation and membership"
+			);
+			let received = timeout(Duration::from_secs(2), &mut endpoint.task)
+				.await
+				.expect("owned HTTP capture")
+				.expect("owned peer finished")?;
+			assert_task_replay(&received, &body, &attempt.transaction_id());
+			data.acknowledge_active(&destination, &acknowledged)
+				.await?;
+			let active = rows(services, "servercurrentevent_data").await?;
+			assert_eq!(active.len(), 1, "unattempted active successor remains owed");
+			assert_eq!(active.get(&tail.0), before["servercurrentevent_data"].get(&tail.0));
+			assert_eq!(
+				rows(services, "servernameevent_data").await?,
+				before["servernameevent_data"]
+			);
+			assert!(
+				data.load_attempt(&destination).await?.is_none(),
+				"only the acknowledged journal retires"
+			);
+			futures.cancel_and_join().await;
+			fixture.finish().await;
+			Ok(())
+		},
+	)
+}
+
+fn assert_task_replay(received: &Value, body: &Value, transaction_id: &str) {
+	let captured = received
+		.as_array()
+		.expect("two actual HTTP deliveries");
+	assert_eq!(captured.len(), 2);
+	assert_eq!(
+		captured[0]["path"], captured[1]["path"],
+		"retry retains transaction ID after lost task completion"
+	);
+	assert!(
+		captured[0]["path"]
+			.as_str()
+			.expect("actual path")
+			.ends_with(&format!("/transactions/{transaction_id}"))
+	);
+	assert_eq!(
+		captured[0]["wire_body"], captured[1]["wire_body"],
+		"retry retains exact wire bytes after HTTP success"
+	);
+	assert_eq!(&captured[1]["body"], body, "retry excludes successors");
+}
+
+async fn task_failure_snapshot(services: &Services) -> Result<BTreeMap<&'static str, Rows>> {
+	let mut snapshot = BTreeMap::new();
+	for map in [
+		"global",
+		"servercurrentevent_data",
+		"servernameevent_data",
+		"sendingtransaction_record",
+		"servername_status",
+	] {
+		snapshot.insert(map, rows(services, map).await?);
+	}
+	Ok(snapshot)
 }
 
 async fn verify(mode: Mode) -> Result {

@@ -110,6 +110,9 @@ enum Delivery {
 	Acknowledged(Destination, ActiveAcknowledgement),
 	Deferred(Destination),
 	Unprepared(Destination, Box<Error>),
+	// A task failure can lose a transport outcome after HTTP started. Its
+	// durable attempt still owns recovery; it is not a peer failure.
+	LocalFailure(Destination, Box<Error>),
 }
 
 type SendingResult = Result<Delivery, SendingError>;
@@ -359,7 +362,7 @@ impl Service {
 			tokio::select! {
 				Some(response) = futures.next() => {
 					let (dest, mut stage) = match &response {
-						Ok(Delivery::Acknowledged(dest, _) | Delivery::Deferred(dest) | Delivery::Unprepared(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
+						Ok(Delivery::Acknowledged(dest, _) | Delivery::Deferred(dest) | Delivery::Unprepared(dest, _) | Delivery::LocalFailure(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
 					};
 					if let Err(error) = self.handle_response(response, futures, statuses, wakes, &mut stage, &mut retries).await {
 						defer_queue_error(&mut retries, dest, stage, error)?;
@@ -399,8 +402,8 @@ impl Service {
 		retries: &mut QueueRetries,
 	) -> Result {
 		match response {
-			| Ok(Delivery::Unprepared(dest, error)) => {
-				warn!(?dest, chain = %error_chain(&error), "Local delivery preparation failed; accepted work retained");
+			| Ok(Delivery::Unprepared(dest, error) | Delivery::LocalFailure(dest, error)) => {
+				warn!(?dest, chain = %error_chain(&error), "Local delivery failed; accepted work retained");
 				statuses.remove(&dest);
 				let (deadline, _) = wake_deadline(Duration::from_secs(1));
 				retries.insert(dest, (deadline, QueueRecovery::ResumePending));

@@ -9,7 +9,7 @@ use tokio::{
 };
 use tuwunel_core::Error;
 
-use super::{Destination, SendingFuture, SendingResult};
+use super::{Delivery, Destination, SendingFuture, SendingResult};
 
 #[derive(Default)]
 pub(super) struct SendingFutures {
@@ -52,7 +52,7 @@ impl SendingFutures {
 					.owners
 					.remove(&error.id())
 					.expect("owned delivery task");
-				Some(Err((owner, Error::from(error))))
+				Some(Ok(Delivery::LocalFailure(owner, Box::new(Error::from(error)))))
 			},
 		}
 	}
@@ -150,5 +150,54 @@ mod tests {
 		assert!(lock.try_lock().is_ok(), "no task retains its guard after exit");
 		assert!(deliveries.is_empty());
 		assert!(deliveries.next().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn panicked_task_is_a_local_failure_with_its_destination() {
+		let destination =
+			Destination::Federation(ruma::server_name!("task-failure.example").to_owned());
+		let mut deliveries = SendingFutures::new();
+		deliveries.push(
+			destination.clone(),
+			futures::future::poll_fn(|_| -> std::task::Poll<super::SendingResult> {
+				panic!("owned fixture task panic")
+			})
+			.boxed(),
+			&Handle::current(),
+		);
+		let outcome = tokio::time::timeout(Duration::from_secs(1), deliveries.next())
+			.await
+			.expect("bounded panic completion");
+		assert!(
+			matches!(outcome, Some(Ok(Delivery::LocalFailure(owner, error)))
+			if owner == destination && matches!(error.as_ref(), super::Error::JoinError(join) if join.is_panic())),
+			"a local task panic is not a remote transport failure"
+		);
+		assert!(deliveries.is_empty());
+		assert!(deliveries.owners.is_empty());
+	}
+
+	#[tokio::test]
+	async fn cancelled_task_is_a_local_failure_with_its_destination() {
+		let destination = Destination::Appservice("task-cancel".into());
+		let mut deliveries = SendingFutures::new();
+		deliveries.push(destination.clone(), std::future::pending().boxed(), &Handle::current());
+		let pending = {
+			let completion = deliveries.next();
+			futures::pin_mut!(completion);
+			poll!(&mut completion).is_pending()
+		};
+		assert!(pending);
+		deliveries.tasks.abort_all();
+		let outcome = tokio::time::timeout(Duration::from_secs(1), deliveries.next())
+			.await
+			.expect("bounded cancelled-task completion");
+		assert!(
+			matches!(outcome, Some(Ok(Delivery::LocalFailure(owner, error)))
+			if owner == destination && matches!(error.as_ref(), super::Error::JoinError(join) if join.is_cancelled())),
+			"a locally cancelled task is not a remote transport failure"
+		);
+		assert!(deliveries.is_empty());
+		assert!(deliveries.owners.is_empty());
 	}
 }
