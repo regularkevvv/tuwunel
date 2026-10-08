@@ -45,13 +45,25 @@ pub async fn async_exec(server: &Arc<Server>) -> Result {
 		.runtime()
 		.spawn(signals::enable(server.clone()));
 
-	async_start(server).await?;
-	async_run(server).await?;
-	async_stop(server).await?;
-	signals.await?;
+	let execution = async {
+		async_start(server).await?;
+		async_run(server).await
+	}
+	.await;
+	// Teardown is required even when initialization or the run loop fails.
+	// Preserve that original failure after stopping services and joining the
+	// signal handler; `?` here would skip those owned completions.
+	server.server.shutdown().ok();
+	let stopped = async_stop(server).await;
+	signals.abort();
+	let signals: Result = match signals.await {
+		| Ok(()) => Ok(()),
+		| Err(error) if error.is_cancelled() => Ok(()),
+		| Err(error) => Err(error.into()),
+	};
 
 	debug_info!("Exit runtime");
-	Ok(())
+	execution.and(stopped).and(signals)
 }
 
 #[cfg(any(not(tuwunel_mods), not(feature = "tuwunel_mods")))]
@@ -100,16 +112,10 @@ pub async fn async_run(server: &Arc<Server>) -> Result {
 pub async fn async_stop(server: &Arc<Server>) -> Result {
 	extern crate tuwunel_router as router;
 
-	if let Err(error) = router::stop(
-		server
-			.services
-			.lock()
-			.await
-			.take()
-			.expect("services initialized"),
-	)
-	.await
-	{
+	let Some(services) = server.services.lock().await.take() else {
+		return Ok(());
+	};
+	if let Err(error) = router::stop(services).await {
 		error!("Critical error stopping server: {error}");
 		return Err(error);
 	}

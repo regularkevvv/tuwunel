@@ -107,22 +107,34 @@ impl Manager {
 	async fn worker(self: &Arc<Self>) -> Result {
 		loop {
 			let mut workers = self.workers.lock().await;
-			tokio::select! {
-				result = workers.join_next() => match result {
-					Some(Ok(result)) => self.handle_result(&mut workers, result).await?,
-					Some(Err(error)) => self.handle_abort(&mut workers, &Error::from(error))?,
-					None => break,
+			let result = match workers.join_next().await {
+				| Some(Ok(result)) => self.handle_result(&mut workers, result).await,
+				| Some(Err(error)) => Err(Error::from(error)),
+				| None => break,
+			};
+			if let Err(error) = result {
+				// The first failure stays authoritative. Notify the listener and
+				// other workers before joining them; returning early would leave
+				// their manager/root references alive in this JoinSet.
+				self.server.shutdown().ok();
+				self.services.interrupt().await;
+				while let Some(result) = workers.join_next().await {
+					match result {
+						| Ok((service, Err(error))) => {
+							error!(name = service.name(), %error, "Service worker failed during fatal shutdown");
+						},
+						| Err(error) if !error.is_cancelled() => {
+							error!(%error, "Service worker task failed during fatal shutdown");
+						},
+						| _ => {},
+					}
 				}
+				return Err(error);
 			}
 		}
 
 		debug!("Worker manager finished");
 		Ok(())
-	}
-
-	fn handle_abort(&self, _workers: &mut WorkersLocked<'_>, error: &Error) -> Result {
-		// not supported until service can be associated with abort
-		unimplemented!("unexpected worker task abort {error:?}");
 	}
 
 	async fn handle_result(
@@ -292,3 +304,6 @@ mod tests {
 		Ok(())
 	}
 }
+
+#[cfg(test)]
+mod failure_tests;

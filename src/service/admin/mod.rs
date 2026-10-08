@@ -103,6 +103,12 @@ impl crate::Service for Service {
 			.write()
 			.expect("locked for writing")
 			.insert(sender);
+		// Shutdown may precede this worker's first poll, so the earlier
+		// interruption may have found no channel. Close the newly installed
+		// sender as well; the receiver can drain and exit without a lost signal.
+		if services_root.server.is_stopping() {
+			self.interrupt().await;
+		}
 
 		self.console_auto_start().await;
 
@@ -140,6 +146,14 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	#[cfg(test)]
+	pub(crate) fn worker_ready(&self) -> bool {
+		self.channel
+			.read()
+			.expect("locked for reading")
+			.is_some()
+	}
+
 	/// Posts a command to the command processor queue and returns. Processing
 	/// will take place on the service worker's task asynchronously. Errors if
 	/// the queue is full.

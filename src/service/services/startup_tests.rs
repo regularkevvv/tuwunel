@@ -22,7 +22,7 @@ use tuwunel_core::{
 
 use super::Services;
 
-fn isolated(name: &str, exercise: impl AsyncFnOnce(&Path) -> Result) -> Result {
+pub(crate) fn isolated(name: &str, exercise: impl AsyncFnOnce(&Path) -> Result) -> Result {
 	const CHILD: &str = "TUWUNEL_STARTUP_LIFECYCLE_CHILD";
 	const DIRECTORY: &str = "TUWUNEL_STARTUP_LIFECYCLE_DIRECTORY";
 	if std::env::var(CHILD).as_deref() == Ok(name) {
@@ -62,7 +62,7 @@ fn isolated(name: &str, exercise: impl AsyncFnOnce(&Path) -> Result) -> Result {
 	Ok(())
 }
 
-async fn services(root: &Path) -> Result<Arc<Services>> {
+pub(crate) async fn services(root: &Path) -> Result<Arc<Services>> {
 	sys::maximize_fd_limit()?;
 	let raw = Figment::new()
 		.merge(("server_name", "localhost"))
@@ -92,7 +92,7 @@ async fn services(root: &Path) -> Result<Arc<Services>> {
 	Ok(services)
 }
 
-async fn released(root: &Weak<Services>, database: &Weak<tuwunel_database::Database>) {
+pub(crate) async fn released(root: &Weak<Services>, database: &Weak<tuwunel_database::Database>) {
 	let result = timeout(Duration::from_secs(5), async {
 		while root.strong_count() != 0 || database.strong_count() != 0 {
 			yield_now().await;
@@ -105,6 +105,16 @@ async fn released(root: &Weak<Services>, database: &Weak<tuwunel_database::Datab
 		root.strong_count(),
 		database.strong_count()
 	);
+}
+
+pub(crate) async fn installed_manager(graph: &Services) -> Arc<crate::manager::Manager> {
+	graph
+		.manager
+		.lock()
+		.await
+		.as_ref()
+		.expect("started graph has a manager")
+		.clone()
 }
 
 #[test]

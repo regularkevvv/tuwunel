@@ -54,7 +54,9 @@ pub(crate) async fn run(services: Arc<Services>) -> Result {
 			res.0.unwrap_or(res.1.unwrap_or(Ok(())))
 		},
 		res = services.poll() => {
-			server.until_shutdown().await;
+			// A manager join failure may not have notified lifecycle watchers.
+			// Request shutdown before awaiting the listener that needs it.
+			server.shutdown().ok();
 			handle_services_finish(server, res, listener.await)
 		},
 	};

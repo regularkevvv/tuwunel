@@ -353,4 +353,4 @@ pub async fn memory_usage(&self) -> Result<String> {
 }
 
 #[cfg(test)]
-mod startup_tests;
+pub(crate) mod startup_tests;
