@@ -125,6 +125,16 @@ fn transport_acknowledged(destination: Destination) -> Delivery {
 	Delivery::Acknowledged(destination, ActiveAcknowledgement::default())
 }
 
+fn shrink_batch(events: &mut Vec<SendingEvent>, rows: &mut ActiveAcknowledgement) -> Result {
+	if events.len() <= 1 {
+		return Err(Error::bad_database("Outgoing transaction cannot fit one accepted delivery"));
+	}
+	let count = events.len().div_ceil(2);
+	rows.retain_prefix(count)?;
+	events.truncate(count);
+	Ok(())
+}
+
 fn unprepared(destination: Destination, error: Error) -> Delivery {
 	Delivery::Unprepared(destination, Box::new(error))
 }
@@ -1604,11 +1614,9 @@ impl Service {
 	async fn send_events_dest_appservice(
 		&self,
 		id: String,
-		events: Vec<SendingEvent>,
-		rows: ActiveAcknowledgement,
+		mut events: Vec<SendingEvent>,
+		mut rows: ActiveAcknowledgement,
 	) -> SendingResult {
-		// Composition owns a snapshot; persistence validates the selected row
-		// incarnation, and the final HTTP handoff validates this owner again.
 		let Some(info) = self
 			.services
 			.appservice
@@ -1620,6 +1628,29 @@ impl Service {
 				Error::bad_database("Missing appservice registration"),
 			));
 		};
+		loop {
+			match self.compose_appservice(&info, &events).await {
+				| Ok(frozen::Body::Empty) =>
+					return Ok(Delivery::Acknowledged(Destination::Appservice(id), rows)),
+				| Ok(frozen::Body::Ready(body)) =>
+					return self
+						.persist_appservice_attempt(id, rows, body, &info.registration)
+						.await,
+				| Ok(frozen::Body::TooLarge) => {
+					if let Err(error) = shrink_batch(&mut events, &mut rows) {
+						return Ok(unprepared(Destination::Appservice(id), error));
+					}
+				},
+				| Err(error) => return Ok(unprepared(Destination::Appservice(id), error)),
+			}
+		}
+	}
+
+	async fn compose_appservice(
+		&self,
+		info: &crate::appservice::RegistrationInfo,
+		events: &[SendingEvent],
+	) -> Result<frozen::Body> {
 		let msc3202 = info.registration.msc3202_transaction_extensions;
 
 		let (pdu_count, edu_count, to_device_count, device_list_count) = events.iter().fold(
@@ -1650,7 +1681,7 @@ impl Service {
 			otk_users.insert(info.sender.clone());
 		}
 
-		for event in &events {
+		for event in events {
 			match event {
 				| SendingEvent::Pdu(pdu_id) => {
 					let pdu = match self
@@ -1664,7 +1695,7 @@ impl Service {
 						// corrupt reads must retain its delivery obligation.
 						| Err(error) if error.is_not_found() => continue,
 						| Err(error) => {
-							return Ok(unprepared(Destination::Appservice(id), error));
+							return Err(error);
 						},
 					};
 					if msc3202 && info.is_user_match(pdu.sender()) {
@@ -1679,10 +1710,7 @@ impl Service {
 					match serde_json::from_slice(edu).and_then(|edu| Raw::new(&edu)) {
 						| Ok(edu) => edu_jsons.push(edu),
 						| Err(_) => {
-							return Ok(unprepared(
-								Destination::Appservice(id),
-								Error::bad_database("Invalid queued appservice EDU"),
-							));
+							return Err(Error::bad_database("Invalid queued appservice EDU"));
 						},
 					}
 				},
@@ -1690,7 +1718,7 @@ impl Service {
 					let (raw, recipient) = match queued_to_device(buf, msc3202) {
 						| Ok(prepared) => prepared,
 						| Err(error) => {
-							return Ok(unprepared(Destination::Appservice(id), error));
+							return Err(error);
 						},
 					};
 					if let Some(recipient) = recipient {
@@ -1707,18 +1735,12 @@ impl Service {
 						.and_then(|bytes| from_utf8(bytes).ok())
 						.and_then(|user| UserId::parse(user).ok());
 					let Some(user) = user else {
-						return Ok(unprepared(
-							Destination::Appservice(id),
-							Error::bad_database("Invalid queued device-list user"),
-						));
+						return Err(Error::bad_database("Invalid queued device-list user"));
 					};
 					changed.push(user);
 				},
 				| SendingEvent::FrozenPush(_) => {
-					return Ok(unprepared(
-						Destination::Appservice(id),
-						Error::bad_database("Frozen push queued to appservice"),
-					));
+					return Err(Error::bad_database("Frozen push queued to appservice"));
 				},
 				| SendingEvent::BadgeRefresh | SendingEvent::Flush => {},
 			}
@@ -1745,10 +1767,10 @@ impl Service {
 			&& device_one_time_keys_count.is_empty()
 			&& device_unused_fallback_key_types.is_empty()
 		{
-			return Ok(Delivery::Acknowledged(Destination::Appservice(id), rows));
+			return Ok(frozen::Body::Empty);
 		}
 
-		let body = frozen::body(PushEventsRequest {
+		frozen::bounded_body(PushEventsRequest {
 			txn_id: "unassigned".into(),
 			events: pdu_jsons,
 			ephemeral: edu_jsons,
@@ -1756,13 +1778,7 @@ impl Service {
 			device_lists,
 			device_one_time_keys_count,
 			device_unused_fallback_key_types,
-		});
-		let body = match body {
-			| Ok(body) => body,
-			| Err(error) => return Ok(unprepared(Destination::Appservice(id), error)),
-		};
-		self.persist_appservice_attempt(id, rows, body, &info.registration)
-			.await
+		})
 	}
 
 	async fn persist_appservice_attempt(
@@ -2152,45 +2168,80 @@ impl Service {
 	async fn send_events_dest_federation(
 		&self,
 		server: OwnedServerName,
-		events: Vec<SendingEvent>,
-		rows: ActiveAcknowledgement,
+		mut events: Vec<SendingEvent>,
+		mut rows: ActiveAcknowledgement,
 	) -> SendingResult {
+		loop {
+			match self.compose_federation(&server, &events).await {
+				| Ok(frozen::Body::Empty) =>
+					return Ok(Delivery::Acknowledged(Destination::Federation(server), rows)),
+				| Ok(frozen::Body::Ready(body)) => {
+					let attempt = match self
+						.db
+						.persist_attempt(
+							&Destination::Federation(server.clone()),
+							rows,
+							body,
+							None,
+						)
+						.await
+					{
+						| Ok(attempt) => attempt,
+						| Err(error) =>
+							return Ok(unprepared(Destination::Federation(server), error)),
+					};
+					return self
+						.deliver_federation_attempt(server, attempt)
+						.await;
+				},
+				| Ok(frozen::Body::TooLarge) => {
+					if let Err(error) = shrink_batch(&mut events, &mut rows) {
+						return Ok(unprepared(Destination::Federation(server), error));
+					}
+				},
+				| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
+			}
+		}
+	}
+
+	async fn compose_federation(
+		&self,
+		server: &ServerName,
+		events: &[SendingEvent],
+	) -> Result<frozen::Body> {
 		let pdus = events
 			.iter()
 			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
 			.stream()
-			.wide_then(|pdu_id| {
-				let server = &server;
-				async move {
-					let pdu = match self
-						.services
-						.timeline
-						.get_pdu_json_from_id(pdu_id)
-						.await
-					{
-						| Ok(pdu) => pdu,
-						| Err(error) if error.is_not_found() => return Ok(None),
-						| Err(error) => return Err(error),
-					};
-					let pdu = self
-						.services
-						.state_accessor
-						.erased_for_server(server, pdu)
-						.await;
-					Ok::<_, Error>(Some(
-						self.services
-							.federation
-							.format_pdu_into(pdu, None)
-							.await,
-					))
-				}
+			.wide_then(|pdu_id| async move {
+				let pdu = match self
+					.services
+					.timeline
+					.get_pdu_json_from_id(pdu_id)
+					.await
+				{
+					| Ok(pdu) => pdu,
+					| Err(error) if error.is_not_found() => return Ok(None),
+					| Err(error) => return Err(error),
+				};
+				let pdu = self
+					.services
+					.state_accessor
+					.erased_for_server(server, pdu)
+					.await;
+				Ok::<_, Error>(Some(
+					self.services
+						.federation
+						.format_pdu_into(pdu, None)
+						.await,
+				))
 			})
 			.try_filter_map(|pdu| async move { Ok(pdu) })
 			.try_collect::<Vec<_>>()
 			.await;
 		let pdus = match pdus {
 			| Ok(pdus) => pdus,
-			| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
+			| Err(error) => return Err(error),
 		};
 
 		let edus = events
@@ -2202,14 +2253,11 @@ impl Service {
 			.map(serde_json::from_slice)
 			.collect::<std::result::Result<Vec<Raw<Edu>>, _>>();
 		let Ok(edus) = edus else {
-			return Ok(unprepared(
-				Destination::Federation(server),
-				Error::bad_database("Invalid queued federation EDU"),
-			));
+			return Err(Error::bad_database("Invalid queued federation EDU"));
 		};
 
 		if pdus.is_empty() && edus.is_empty() {
-			return Ok(Delivery::Acknowledged(Destination::Federation(server), rows));
+			return Ok(frozen::Body::Empty);
 		}
 
 		let request = send_transaction_message::v1::Request {
@@ -2219,20 +2267,7 @@ impl Service {
 			pdus,
 			edus,
 		};
-		let body = match frozen::body(request) {
-			| Ok(body) => body,
-			| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
-		};
-		let attempt = match self
-			.db
-			.persist_attempt(&Destination::Federation(server.clone()), rows, body, None)
-			.await
-		{
-			| Ok(attempt) => attempt,
-			| Err(error) => return Ok(unprepared(Destination::Federation(server), error)),
-		};
-		self.deliver_federation_attempt(server, attempt)
-			.await
+		frozen::bounded_body(request)
 	}
 
 	async fn deliver_federation_attempt(

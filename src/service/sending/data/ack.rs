@@ -17,6 +17,18 @@ pub(in crate::sending) struct ActiveAcknowledgement {
 	pub(super) attempt: Option<super::attempt::AttemptRef>,
 }
 
+impl ActiveAcknowledgement {
+	pub(in crate::sending) fn retain_prefix(&mut self, count: usize) -> Result {
+		if self.attempt.is_some() || count == 0 || count > self.rows.len() {
+			return Err(Error::bad_database(
+				"Cannot split persisted or invalid transaction membership",
+			));
+		}
+		self.rows.truncate(count);
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 impl ActiveAcknowledgement {
 	pub(in crate::sending) fn selected_rows(&self) -> &[Row] { &self.rows }

@@ -13,7 +13,7 @@ mod ack;
 mod active;
 mod attempt;
 pub(super) use ack::ActiveAcknowledgement;
-pub(super) use attempt::{PreparedAttempt, appservice_owner};
+pub(super) use attempt::{BODY_LIMIT, PreparedAttempt, appservice_owner};
 
 use super::{
 	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED,

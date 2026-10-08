@@ -54,8 +54,10 @@ impl Endpoint {
 				socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await?;
 				captured.push(if count == 1 {
 					body
+				} else if wire_body.len() <= 64 * 1024 {
+					json!({"path": path, "wire_body": wire_body, "wire_len": wire_body.len(), "body": body})
 				} else {
-					json!({"path": path, "wire_body": wire_body, "body": body})
+					json!({"path": path, "wire_hash": tuwunel_core::utils::hash::sha256::hash(&wire_body), "wire_len": wire_body.len(), "body": body})
 				});
 			}
 			Ok(if count == 1 {
@@ -75,7 +77,7 @@ async fn capture_request(socket: &mut TcpStream) -> Result<(String, Vec<u8>, Val
 		let size = socket.read(&mut buffer).await?;
 		assert!(size != 0, "request must finish");
 		bytes.extend_from_slice(&buffer[..size]);
-		assert!(bytes.len() <= 64 * 1024, "owned request bound");
+		assert!(bytes.len() <= 4 * 1024 * 1024, "owned request bound");
 		if let Some(start) = bytes
 			.windows(4)
 			.position(|part| part == b"\r\n\r\n")
@@ -183,6 +185,96 @@ pub(super) async fn enqueue(
 		.queue_requests(std::iter::once((&event, destination)))
 		.await?;
 	Ok((keys.into_iter().next().expect("one durable row"), event))
+}
+
+#[test]
+fn splitting_membership_refuses_existing_journal_without_mutation() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::splitting_membership_refuses_existing_journal_without_mutation",
+		async {
+			let fixture = Fixture::new().await?;
+			let services = &fixture.services;
+			let data = &services.sending.db;
+			let endpoint = Endpoint::new().await?;
+			let destination = register(services, &endpoint).await?;
+			for n in 0..2 {
+				let item = enqueue(services, &destination, n).await?;
+				data.mark_as_active(std::iter::once(&item)).await?;
+			}
+			let (_, rows) = data.active_batch(&destination).await?;
+			let registration = services.appservice.get_registration("ack-membership").await.expect("owned registration");
+			let attempt = data.persist_attempt(&destination, rows, serde_json::to_vec(&json!({"events":[]}))?, Some(super::super::data::appservice_owner(&registration)?)).await?;
+			let before = task_failure_snapshot(services).await?;
+			let mut selected = attempt.acknowledgement.clone();
+			selected.retain_prefix(1).expect_err("persisted transaction may not split");
+			assert_eq!(selected, attempt.acknowledgement);
+			assert_eq!(task_failure_snapshot(services).await?, before);
+			fixture.finish().await;
+			Ok(())
+		},
+	)
+}
+
+#[test]
+fn valid_active_values_split_when_the_http_envelope_exceeds_the_wire_limit() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::valid_active_values_split_when_the_http_envelope_exceeds_the_wire_limit",
+		async {
+			let fixture = Fixture::new().await?;
+			let services = &fixture.services;
+			let data = &services.sending.db;
+			let mut endpoint = Endpoint::new_requests(2).await?;
+			let destination = register(services, &endpoint).await?;
+			let mut value = json!({"type":"example.large", "content":{"value":""}});
+			let empty_len = serde_json::to_vec(&value)?.len();
+			value["content"]["value"] = Value::String("x".repeat(1_572_854_usize.checked_sub(empty_len).expect("valid fixture width")));
+			let event = SendingEvent::Edu(EduBuf::from_slice(&serde_json::to_vec(&value)?));
+			for _ in 0..2 {
+				let keys = data.queue_requests(std::iter::once((&event, &destination))).await?;
+				data.mark_as_active(std::iter::once(&(keys[0].clone(), event.clone()))).await?;
+			}
+			let mut owed = rows(services, "servercurrentevent_data").await?;
+			assert_eq!(owed.values().map(Vec::len).sum::<usize>(), 3 * 1024 * 1024, "both individually valid stored values fit the active budget exactly");
+			let (events, selected) = data.active_batch(&destination).await?;
+			assert_eq!(events.len(), 2);
+			assert_eq!(selected.selected_rows().len(), 2);
+			let mut futures = SendingFutures::new();
+			let mut statuses = CurTransactionStatus::new();
+			let mut wakes = WakeQueue::new();
+			let mut retries = QueueRetries::new();
+			let mut stage = QueueRecovery::ResumePending;
+			services.sending.resume_queue(&destination, &mut futures, &mut statuses, &mut stage).await?;
+			for _ in 0..2 {
+				let response = timeout(Duration::from_secs(10), futures.next()).await.expect("bounded actual large HTTP delivery").expect("next accepted attempt");
+				let Ok(Delivery::Acknowledged(owner, selected)) = &response else {
+					panic!("valid accepted rows must reach the peer after splitting the envelope: {response:?}");
+				};
+				assert_eq!(owner, &destination);
+				assert_eq!(selected.selected_rows().len(), 1, "each fitting attempt owns one physical admission");
+				let (key, value) = &selected.selected_rows()[0];
+				let original = owed.remove(key).expect("selected accepted key");
+				assert_eq!(tuwunel_core::utils::hash::sha256::hash(value), tuwunel_core::utils::hash::sha256::hash(&original));
+				services.sending.handle_response(response, &mut futures, &mut statuses, &mut wakes, &mut stage, &mut retries).await?;
+				let retained = rows(services, "servercurrentevent_data").await?;
+				assert_eq!(retained.keys().collect::<Vec<_>>(), owed.keys().collect::<Vec<_>>(), "unsent admission stays accepted");
+				assert!(retries.is_empty());
+			}
+			assert!(futures.is_empty());
+			assert!(data.load_attempt(&destination).await?.is_none());
+			let received = timeout(Duration::from_secs(2), &mut endpoint.task).await.expect("owned peer capture").expect("owned peer finished")?;
+			let received = received.as_array().expect("two actual large deliveries");
+			assert_eq!(received.len(), 2);
+			assert_ne!(received[0]["path"], received[1]["path"], "distinct durable transaction IDs");
+			for request in received {
+				assert!(request["wire_len"].as_u64().expect("actual body bytes") <= 3 * 1024 * 1024);
+				assert_eq!(request["body"]["ephemeral"].as_array().expect("EDUs").len(), 1);
+				assert_eq!(request["body"]["ephemeral"][0]["content"]["value"].as_str().expect("preserved value").len(), 1_572_854_usize.checked_sub(empty_len).expect("valid width"));
+			}
+			futures.cancel_and_join().await;
+			fixture.finish().await;
+			Ok(())
+		},
+	)
 }
 
 #[test]

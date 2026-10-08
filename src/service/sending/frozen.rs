@@ -1,12 +1,18 @@
 //! Substitute persisted transaction bytes before Ruma adds authentication.
 
-use std::sync::Arc;
+use std::{
+	io::{self, Write},
+	sync::Arc,
+};
 
+#[cfg(test)]
+use ruma::api::OutgoingBody;
 use ruma::api::{
-	BytesBody, Metadata, OutgoingBody, OutgoingRequest,
+	BytesBody, Metadata, OutgoingRequest,
 	error::IntoHttpError,
 	path_builder::{PathBuilder, SinglePath},
 };
+use serde::Serialize;
 use tuwunel_core::{Error, Result};
 
 #[derive(Clone, Debug)]
@@ -47,6 +53,67 @@ impl<T: OutgoingRequest> OutgoingRequest for FrozenRequest<T> {
 	}
 }
 
+#[derive(Debug)]
+pub(super) enum Body {
+	Empty,
+	Ready(Vec<u8>),
+	TooLarge,
+}
+
+pub(super) fn bounded_body<T>(request: T) -> Result<Body>
+where
+	T: OutgoingRequest<PathBuilder = SinglePath>,
+	T::Body: Serialize,
+{
+	let body = request
+		.try_into_http_request_inner("http://localhost", ())
+		.map_err(|_| Error::bad_database("Cannot prepare outgoing transaction body"))?
+		.into_body();
+	bounded_json(&body, super::data::BODY_LIMIT)
+}
+
+fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Body> {
+	let mut writer = BudgetWriter {
+		bytes: Vec::new(),
+		limit,
+		exceeded: false,
+	};
+	match serde_json::to_writer(&mut writer, value) {
+		| Ok(()) => Ok(Body::Ready(writer.bytes)),
+		| Err(_) if writer.exceeded => Ok(Body::TooLarge),
+		| Err(_) => Err(Error::bad_database("Cannot serialize outgoing transaction body")),
+	}
+}
+
+struct BudgetWriter {
+	bytes: Vec<u8>,
+	limit: usize,
+	exceeded: bool,
+}
+
+impl Write for BudgetWriter {
+	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+		let length = self.bytes.len().saturating_add(bytes.len());
+		if length > self.limit {
+			self.exceeded = true;
+			return Err(io::Error::from(io::ErrorKind::FileTooLarge));
+		}
+		if length > self.bytes.capacity() {
+			let capacity = length
+				.max(self.bytes.capacity().saturating_mul(2))
+				.min(self.limit);
+			self.bytes
+				.try_reserve_exact(capacity.saturating_sub(self.bytes.len()))
+				.map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+		}
+		self.bytes.extend_from_slice(bytes);
+		Ok(bytes.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+#[cfg(test)]
 pub(super) fn body<T: OutgoingRequest<PathBuilder = SinglePath>>(request: T) -> Result<Vec<u8>> {
 	request
 		.try_into_http_request_inner("http://localhost", ())
@@ -71,7 +138,61 @@ mod tests {
 		uint,
 	};
 
-	use super::{FrozenRequest, body};
+	use super::{Body, FrozenRequest, body, bounded_body, bounded_json};
+
+	#[test]
+	fn bounded_json_accepts_exact_size_and_refuses_the_next_byte() {
+		let value = "escaped \u{0} and é";
+		let expected = serde_json::to_vec(value).expect("fixture JSON");
+		let Body::Ready(actual) = bounded_json(&value, expected.len()).expect("exact budget")
+		else {
+			panic!("exact serialized boundary must fit");
+		};
+		assert_eq!(actual, expected);
+		assert!(matches!(
+			bounded_json(
+				&value,
+				expected
+					.len()
+					.checked_sub(1)
+					.expect("nonempty JSON")
+			)
+			.expect("size classification"),
+			Body::TooLarge
+		));
+	}
+
+	#[test]
+	fn serialization_failure_is_not_a_batch_size_signal() {
+		struct Invalid;
+		impl serde::Serialize for Invalid {
+			fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+				Err(serde::ser::Error::custom("owned serializer failure"))
+			}
+		}
+		bounded_json(&Invalid, 8).expect_err("malformed serialization must remain an error");
+	}
+
+	#[test]
+	fn bounded_appservice_body_matches_pinned_ruma_encoding() {
+		let mut request = ruma::api::appservice::event::push_events::v1::Request::new(
+			"owned-encoding".into(),
+			Vec::new(),
+		);
+		request
+			.ephemeral
+			.push(ruma::serde::Raw::from_json(
+				serde_json::value::to_raw_value(
+					&serde_json::json!({"type":"example.encoding", "content":{"value":"escaped \u{0} and é"}}),
+				)
+				.expect("fixture raw JSON"),
+			));
+		let expected = body(request.clone()).expect("Ruma body");
+		let Body::Ready(actual) = bounded_body(request).expect("bounded Ruma body") else {
+			panic!("small request must fit");
+		};
+		assert_eq!(actual, expected);
+	}
 
 	#[test]
 	fn federation_authentication_signs_the_saved_body() {
@@ -87,7 +208,12 @@ mod tests {
 			pdus: Vec::new(),
 			edus: Vec::new(),
 		};
-		let saved = body(request.clone()).expect("serialized transaction");
+		let expected = body(request.clone()).expect("Ruma serialized transaction");
+		let Body::Ready(saved) = bounded_body(request.clone()).expect("bounded transaction")
+		else {
+			panic!("small federation body must fit");
+		};
+		assert_eq!(saved, expected, "bounded serialization preserves Ruma bytes before signing");
 		let original = request
 			.clone()
 			.try_into_http_request::<Vec<u8>>("https://remote.example", auth.clone(), ())
