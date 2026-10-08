@@ -43,7 +43,7 @@ impl Endpoint {
 	async fn new() -> Result<Self> { Self::new_requests(1).await }
 
 	async fn new_requests(count: usize) -> Result<Self> {
-		assert!((1..=2).contains(&count), "owned peer request bound");
+		assert!((1..=11).contains(&count), "owned peer request bound");
 		let listener = TcpListener::bind("127.0.0.1:0").await?;
 		let address = format!("http://{}", listener.local_addr()?);
 		let task = tokio::spawn(async move {
@@ -75,7 +75,7 @@ async fn capture_request(socket: &mut TcpStream) -> Result<(String, Vec<u8>, Val
 		let size = socket.read(&mut buffer).await?;
 		assert!(size != 0, "request must finish");
 		bytes.extend_from_slice(&buffer[..size]);
-		assert!(bytes.len() <= 8192, "owned request bound");
+		assert!(bytes.len() <= 64 * 1024, "owned request bound");
 		if let Some(start) = bytes
 			.windows(4)
 			.position(|part| part == b"\r\n\r\n")
@@ -183,6 +183,249 @@ pub(super) async fn enqueue(
 		.queue_requests(std::iter::once((&event, destination)))
 		.await?;
 	Ok((keys.into_iter().next().expect("one durable row"), event))
+}
+
+#[test]
+fn active_backlog_drains_in_bounded_transactions_without_new_hint() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::active_backlog_drains_in_bounded_transactions_without_new_hint",
+		verify_bounded_backlog(97),
+	)
+}
+
+#[test]
+fn active_backlog_larger_than_journal_limit_keeps_progress() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::active_backlog_larger_than_journal_limit_keeps_progress",
+		verify_bounded_backlog(513),
+	)
+}
+
+async fn verify_bounded_backlog(count: usize) -> Result {
+	let fixture = Fixture::new().await?;
+	let services = &fixture.services;
+	let data = &services.sending.db;
+	let mut endpoint = Endpoint::new_requests(count.div_ceil(48)).await?;
+	let destination = register(services, &endpoint).await?;
+	// Equal logical events have distinct physical admissions. A bounded
+	// transaction must retain every independently admitted duplicate.
+	for _ in 0..count {
+		let item = enqueue(services, &destination, 0).await?;
+		data.mark_as_active(std::iter::once(&item))
+			.await?;
+	}
+	let mut owed = rows(services, "servercurrentevent_data").await?;
+	assert_eq!(owed.len(), count);
+	let mut futures = SendingFutures::new();
+	let mut statuses = CurTransactionStatus::new();
+	let mut wakes = WakeQueue::new();
+	let mut retries = QueueRetries::new();
+	let mut stage = QueueRecovery::ResumePending;
+	services
+		.sending
+		.resume_queue(&destination, &mut futures, &mut statuses, &mut stage)
+		.await?;
+	let counts = (0..count)
+		.step_by(48)
+		.map(|offset| {
+			count
+				.checked_sub(offset)
+				.expect("batch offset within accepted count")
+				.min(48)
+		})
+		.collect::<Vec<_>>();
+	for &expected_count in &counts {
+		let response = timeout(Duration::from_secs(5), futures.next())
+			.await
+			.expect("bounded actual HTTP delivery")
+			.expect("next accepted batch");
+		let Ok(Delivery::Acknowledged(owner, selected)) = &response else {
+			panic!("accepted active backlog must reach the owned HTTP peer: {response:?}");
+		};
+		assert_eq!(owner, &destination);
+		assert!(
+			selected.selected_rows().len() <= 48,
+			"active backlog exceeds the transaction member budget: {}",
+			selected.selected_rows().len()
+		);
+		assert_eq!(selected.selected_rows().len(), expected_count);
+		let expected = owed
+			.iter()
+			.take(expected_count)
+			.map(|(k, v)| (k.clone(), v.clone()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			selected.selected_rows(),
+			expected,
+			"ACK owns exact ordered physical rows, including duplicate values"
+		);
+		for (key, value) in selected.selected_rows() {
+			assert_eq!(owed.remove(key).as_ref(), Some(value));
+		}
+		services
+			.sending
+			.handle_response(
+				response,
+				&mut futures,
+				&mut statuses,
+				&mut wakes,
+				&mut stage,
+				&mut retries,
+			)
+			.await?;
+		assert_eq!(
+			rows(services, "servercurrentevent_data").await?,
+			owed,
+			"unsent physical successors remain accepted"
+		);
+		assert!(
+			rows(services, "servernameevent_data")
+				.await?
+				.is_empty()
+		);
+		assert!(retries.is_empty());
+	}
+	assert!(futures.is_empty());
+	assert!(statuses.is_empty());
+	assert!(data.load_attempt(&destination).await?.is_none());
+	let captured = timeout(Duration::from_secs(2), &mut endpoint.task)
+		.await
+		.expect("owned peer capture")
+		.expect("owned peer task")?;
+	let captured = captured.as_array().expect("actual transactions");
+	assert_eq!(
+		captured
+			.iter()
+			.map(|request| request["body"]["ephemeral"]
+				.as_array()
+				.expect("EDUs")
+				.len())
+			.collect::<Vec<_>>(),
+		counts
+	);
+	let paths = captured
+		.iter()
+		.map(|request| {
+			request["path"]
+				.as_str()
+				.expect("transaction path")
+		})
+		.collect::<std::collections::BTreeSet<_>>();
+	assert_eq!(
+		paths.len(),
+		count.div_ceil(48),
+		"each batch owns a distinct durable transaction ID"
+	);
+	futures.cancel_and_join().await;
+	fixture.finish().await;
+	Ok(())
+}
+
+#[test]
+fn active_batch_byte_budget_retains_large_successors() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::active_batch_byte_budget_retains_large_successors",
+		async {
+			let fixture = Fixture::new().await?;
+			let services = &fixture.services;
+			let destination = Destination::Appservice("large-active-values".into());
+			let event = SendingEvent::Edu(EduBuf::from_slice(&serde_json::to_vec(
+				&json!({"type":"example.large", "content":{"value":"x".repeat(1_600_000)}}),
+			)?));
+			for _ in 0..2 {
+				let keys = services
+					.sending
+					.db
+					.queue_requests(std::iter::once((&event, &destination)))
+					.await?;
+				services
+					.sending
+					.db
+					.mark_as_active(std::iter::once(&(keys[0].clone(), event.clone())))
+					.await?;
+			}
+			let before = rows(services, "servercurrentevent_data").await?;
+			let (events, selected) = services
+				.sending
+				.db
+				.active_batch(&destination)
+				.await?;
+			assert_eq!(events, [event]);
+			assert_eq!(
+				selected.selected_rows().len(),
+				1,
+				"a valid individual large row is selected while its successor exceeds the \
+				 shared byte budget"
+			);
+			assert_eq!(
+				rows(services, "servercurrentevent_data").await?,
+				before,
+				"selection does not mutate accepted work"
+			);
+			services
+				.sending
+				.db
+				.acknowledge_active(&destination, &selected)
+				.await?;
+			let remaining = rows(services, "servercurrentevent_data").await?;
+			assert_eq!(remaining.len(), 1);
+			let (_, next) = services
+				.sending
+				.db
+				.active_batch(&destination)
+				.await?;
+			assert_eq!(next.selected_rows(), &remaining.into_iter().collect::<Vec<_>>());
+			fixture.finish().await;
+			Ok(())
+		},
+	)
+}
+
+#[test]
+fn active_batch_key_budget_retains_long_key_successors() -> Result {
+	super::incarnation_tests::isolated(
+		"sending::sender::ack_tests::active_batch_key_budget_retains_long_key_successors",
+		async {
+			let fixture = Fixture::new().await?;
+			let services = &fixture.services;
+			let destination = Destination::Appservice("x".repeat(14 * 1024));
+			for _ in 0..10 {
+				let item = enqueue(services, &destination, 0).await?;
+				services
+					.sending
+					.db
+					.mark_as_active(std::iter::once(&item))
+					.await?;
+			}
+			let before = rows(services, "servercurrentevent_data").await?;
+			let (_, selected) = services
+				.sending
+				.db
+				.active_batch(&destination)
+				.await?;
+			assert_eq!(
+				selected.selected_rows().len(),
+				9,
+				"valid long keys stay within the header byte budget"
+			);
+			assert_eq!(rows(services, "servercurrentevent_data").await?, before);
+			services
+				.sending
+				.db
+				.acknowledge_active(&destination, &selected)
+				.await?;
+			let remaining = rows(services, "servercurrentevent_data").await?;
+			assert_eq!(remaining.len(), 1);
+			let (_, next) = services
+				.sending
+				.db
+				.active_batch(&destination)
+				.await?;
+			assert_eq!(next.selected_rows(), &remaining.into_iter().collect::<Vec<_>>());
+			fixture.finish().await;
+			Ok(())
+		},
+	)
 }
 
 #[test]

@@ -14,7 +14,7 @@ use super::{ActiveAcknowledgement, Data, Destination, active, parse_servercurren
 
 const MAGIC: &[u8] = b"MSTX\x02";
 const HEADER_LIMIT: usize = 256 * 1024;
-const BODY_LIMIT: usize = 3 * 1024 * 1024;
+pub(super) const BODY_LIMIT: usize = 3 * 1024 * 1024;
 const CHUNK_SIZE: usize = 128 * 1024;
 const MEMBER_LIMIT: usize = 512;
 const CANCEL_PAGE: usize = 64;

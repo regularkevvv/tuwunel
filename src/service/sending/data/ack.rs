@@ -1,10 +1,14 @@
+#[cfg(test)]
 use std::collections::HashMap;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tuwunel_core::{Error, Result, utils::ReadyExt};
 use tuwunel_database::Row;
 
-use super::{Data, Destination, SendingEvent, active, parse_servercurrentevent, within_prefix};
+use super::{
+	ACTIVE_PROMOTION_LIMIT, Data, Destination, SendingEvent, active, parse_servercurrentevent,
+	within_prefix,
+};
 
 /// Exact active row bytes and, for HTTP transactions, persisted attempt owner.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -13,7 +17,63 @@ pub(in crate::sending) struct ActiveAcknowledgement {
 	pub(super) attempt: Option<super::attempt::AttemptRef>,
 }
 
+#[cfg(test)]
+impl ActiveAcknowledgement {
+	pub(in crate::sending) fn selected_rows(&self) -> &[Row] { &self.rows }
+}
+
 impl Data {
+	/// Snapshot a bounded prefix of physical admissions. Duplicate logical
+	/// events retain distinct keys/identities; later active rows stay owed.
+	pub(in crate::sending) async fn active_batch(
+		&self,
+		destination: &Destination,
+	) -> Result<(Vec<SendingEvent>, ActiveAcknowledgement)> {
+		const VALUE_BYTES: usize = super::attempt::BODY_LIMIT;
+		const KEY_BYTES: usize = 128 * 1024;
+		let _guard = self.active_write.lock().await;
+		self.require_active_schema().await?;
+		let prefix = destination.get_prefix();
+		let mut active = self
+			.servercurrentevent_data
+			.raw_stream_from(&prefix)
+			.ready_take_while(move |row| within_prefix(row, &prefix))
+			.take(ACTIVE_PROMOTION_LIMIT)
+			.boxed();
+		let mut rows = Vec::new();
+		let mut events = Vec::new();
+		let mut key_bytes = 0_usize;
+		let mut value_bytes = 0_usize;
+		while let Some((key, value)) = active.try_next().await? {
+			if key.len() > tuwunel_bridge::MAX_KEY_BYTES {
+				return Err(Error::bad_database("Outgoing active key exceeds storage limit"));
+			}
+			let next_keys = key_bytes.saturating_add(key.len());
+			let next_values = value_bytes.saturating_add(value.len());
+			if next_keys > KEY_BYTES || next_values > VALUE_BYTES {
+				if rows.is_empty() {
+					return Err(Error::bad_database(
+						"Outgoing active row exceeds batch byte budget",
+					));
+				}
+				break;
+			}
+			self.validate_active_identity(value)?;
+			let (owner, event) = parse_servercurrentevent(key, value)?;
+			if &owner != destination {
+				return Err(Error::bad_database("Outgoing active batch destination mismatch"));
+			}
+			rows.push((key.to_vec(), value.to_vec()));
+			events.push(event);
+			key_bytes = next_keys;
+			value_bytes = next_values;
+		}
+		Ok((events, ActiveAcknowledgement { rows, attempt: None }))
+	}
+
+	// Small fixture preparation helper. Production snapshots select physical
+	// rows through active_batch rather than matching the entire backlog.
+	#[cfg(test)]
 	pub(in crate::sending) async fn selected_acknowledgement(
 		&self,
 		destination: &Destination,

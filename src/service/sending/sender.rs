@@ -619,19 +619,15 @@ impl Service {
 		let active = self
 			.db
 			.active_requests_for(dest)
-			.try_collect::<Vec<_>>()
-			.await?;
-		if !active.is_empty() {
+			.boxed()
+			.next()
+			.await
+			.transpose()?;
+		if active.is_some() {
 			statuses.insert(dest.clone(), TransactionStatus::Running);
 			futures.push(
 				dest.clone(),
-				self.send_events(
-					dest.clone(),
-					active
-						.into_iter()
-						.map(|(_, event)| event)
-						.collect(),
-				),
+				self.send_events(dest.clone(), vec![SendingEvent::Flush]),
 				self.server.runtime(),
 			);
 			return Ok(());
@@ -913,7 +909,7 @@ impl Service {
 
 		// Close each bounded page before reading the next. Active rows remain
 		// canonical delivery obligations until their send is acknowledged.
-		let mut txns = HashMap::<Destination, Vec<SendingEvent>>::new();
+		let mut txns = HashSet::<Destination>::new();
 		let mut after: Option<Vec<u8>> = None;
 		loop {
 			let (active, next) = self
@@ -921,14 +917,14 @@ impl Service {
 				.active_requests_after(after.as_deref(), NETBURST_BATCH)
 				.await?;
 
-			for (_, event, dest) in active {
+			for (_, _, dest) in active {
 				if self.shard_id(&dest) != id {
 					continue;
 				}
 
 				// These rows are accepted delivery obligations. Startup settings
 				// must not acknowledge or discard any of them.
-				txns.entry(dest).or_default().push(event);
+				txns.insert(dest);
 			}
 
 			match next {
@@ -937,15 +933,13 @@ impl Service {
 			}
 		}
 
-		for (dest, events) in txns {
-			if !events.is_empty() {
-				statuses.insert(dest.clone(), TransactionStatus::Running);
-				futures.push(
-					dest.clone(),
-					self.send_events(dest.clone(), events),
-					self.server.runtime(),
-				);
-			}
+		for dest in txns {
+			statuses.insert(dest.clone(), TransactionStatus::Running);
+			futures.push(
+				dest.clone(),
+				self.send_events(dest, vec![SendingEvent::Flush]),
+				self.server.runtime(),
+			);
 		}
 
 		// Active transaction generations must own their queued successors before
@@ -1046,12 +1040,12 @@ impl Service {
 		let active = self
 			.db
 			.active_requests_for(dest)
-			.try_collect::<Vec<_>>()
-			.await?;
-		if !active.is_empty() {
-			events.extend(active.into_iter().map(|(_, event)| event));
-
-			return Ok(Some(events));
+			.boxed()
+			.next()
+			.await
+			.transpose()?;
+		if active.is_some() {
+			return Ok(Some(vec![SendingEvent::Flush]));
 		}
 
 		// Compose the next transaction
@@ -1572,14 +1566,16 @@ impl Service {
 			| Ok(None) => {},
 			| Err(error) => return Ok(unprepared(dest, error)),
 		}
-		let rows = match self
-			.db
-			.selected_acknowledgement(&dest, &events)
-			.await
-		{
-			| Ok(rows) => rows,
+		// Hints do not own membership. Snapshot physical active rows only after
+		// checking for an immutable attempt, so recovery never splits a retry.
+		drop(events);
+		let (events, rows) = match self.db.active_batch(&dest).await {
+			| Ok(batch) => batch,
 			| Err(error) => return Ok(unprepared(dest, error)),
 		};
+		if events.is_empty() {
+			return Ok(Delivery::Acknowledged(dest, rows));
+		}
 		match dest {
 			| Destination::Federation(server) =>
 				self.send_events_dest_federation(server, events, rows)
