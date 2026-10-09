@@ -32,6 +32,34 @@ type PrevSplit = SmallVec<[OwnedEventId; MAX_PREV_EVENTS]>;
 
 type Handled = Option<(RawPduId, bool)>;
 
+/// Ordinary federation transactions do not rebroadcast their received events.
+#[implement(super::Service)]
+pub async fn handle_incoming_pdu<'a>(
+	&'a self,
+	origin: &'a ServerName,
+	room: &'a RoomId,
+	event: &'a EventId,
+	pdu: CanonicalJsonObject,
+	timeline: bool,
+) -> Result<Handled> {
+	self.handle_incoming_pdu_with_delivery(origin, room, event, pdu, timeline, false)
+		.await
+}
+
+/// Membership handshake roles accept the event and its complete delivery
+/// obligation together. A queue fault after acceptance cannot lose the fanout.
+#[implement(super::Service)]
+pub async fn handle_incoming_pdu_and_federate<'a>(
+	&'a self,
+	origin: &'a ServerName,
+	room: &'a RoomId,
+	event: &'a EventId,
+	pdu: CanonicalJsonObject,
+) -> Result<Handled> {
+	self.handle_incoming_pdu_with_delivery(origin, room, event, pdu, true, true)
+		.await
+}
+
 /// When receiving an event one needs to:
 /// 0. Check the server is in the room
 /// 1. Skip the PDU if we already know about it
@@ -68,13 +96,14 @@ type Handled = Option<(RawPduId, bool)>;
 	fields(%room_id, %event_id),
 	ret(level = "debug"),
 )]
-pub async fn handle_incoming_pdu<'a>(
+async fn handle_incoming_pdu_with_delivery<'a>(
 	&'a self,
 	origin: &'a ServerName,
 	room_id: &'a RoomId,
 	event_id: &'a EventId,
 	pdu: CanonicalJsonObject,
 	is_timeline_event: bool,
+	federate: bool,
 ) -> Result<Handled> {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
@@ -241,6 +270,7 @@ pub async fn handle_incoming_pdu<'a>(
 		&room_version,
 		recursion_level,
 		create_event.event_id(),
+		federate,
 	)
 	.boxed()
 	.await

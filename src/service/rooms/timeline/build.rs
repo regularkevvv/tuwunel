@@ -1,8 +1,8 @@
-use std::{collections::HashSet, iter::once};
+use std::iter::once;
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	OwnedEventId, OwnedServerName, RoomId, UserId,
+	OwnedEventId, RoomId, UserId,
 	events::{
 		TimelineEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
@@ -11,15 +11,11 @@ use ruma::{
 use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{
-		event::Event,
-		pdu::{PduBuilder, PduEvent, RawPduId},
-		room_version,
-	},
-	utils::{IterStream, ReadyExt},
+	matrix::{event::Event, pdu::PduBuilder, room_version},
+	utils::ReadyExt,
 };
 
-use super::{Effect, RoomMutexGuard};
+use super::RoomMutexGuard;
 
 /// Creates a new persisted data unit and adds it to a room. This function
 /// takes a roomid_mutex_state, meaning that only this function is able to
@@ -128,65 +124,21 @@ pub async fn build_and_append_pdu_with_txnid(
 	// The append stores the pdu and makes `statehashid` the room's current state
 	// in one commit, before its count retires, so a sync never delivers the pdu
 	// without the state it produced.
-	let pdu_id = self
-		.append_pdu_with_txnid(
-			&pdu,
-			pdu_json,
-			// Since this PDU references all pdu_leaves we can update the leaves
-			// of the room
-			once(pdu.event_id()),
-			txnid,
-			Some(statehashid),
-			state_lock,
-		)
-		.boxed()
-		.await?;
-
-	// The append returns once the pdu is durable, whatever its effects did, so
-	// the pdu goes to the room's servers even when one of them failed.
-	self.federate_local_pdu(&pdu, &pdu_id).await;
+	self.append_pdu_with_delivery(
+		&pdu,
+		pdu_json,
+		// Since this PDU references all pdu_leaves we can update the leaves
+		// of the room
+		once(pdu.event_id()),
+		txnid,
+		Some(statehashid),
+		true,
+		state_lock,
+	)
+	.boxed()
+	.await?;
 
 	Ok(pdu.event_id().to_owned())
-}
-
-/// Queues a durable local pdu for the room's other servers.
-///
-/// It follows the append, so the pdu's count has retired and the room's
-/// servers reflect any recount the append repaired. A failure is logged like
-/// any effect of a durable pdu, not returned: the pdu is sent, and its sender
-/// has to hear so (`Effect`).
-#[implement(super::Service)]
-async fn federate_local_pdu(&self, pdu: &PduEvent, pdu_id: &RawPduId) {
-	let services_guard = self.services.get();
-	let services_root = services_guard.as_ref();
-
-	let mut servers: HashSet<OwnedServerName> = services_root
-		.state_cache
-		.room_servers(pdu.room_id())
-		.map(ToOwned::to_owned)
-		.collect()
-		.await;
-
-	// In case we are kicking or banning a user, we need to inform their server of
-	// the change
-	if *pdu.kind() == TimelineEventType::RoomMember
-		&& let Some(state_key_uid) = &pdu
-			.state_key
-			.as_ref()
-			.and_then(|state_key| UserId::parse(state_key.as_str()).ok())
-	{
-		servers.insert(state_key_uid.server_name().to_owned());
-	}
-
-	// Remove our server from the server list since it will be added to it by
-	// room_servers() and/or the if statement above
-	servers.remove(services_root.globals.server_name());
-
-	services_root
-		.sending
-		.send_pdu_servers(servers.iter().map(AsRef::as_ref).stream(), pdu_id)
-		.await
-		.effect("federation", pdu.event_id());
 }
 
 #[implement(super::Service)]

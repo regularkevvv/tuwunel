@@ -575,6 +575,8 @@ impl Data {
 			return Ok(());
 		}
 		self.require_active_schema().await?;
+		self.cancel_federation_sources(destination)
+			.await?;
 		self.delete_queue_pages(destination).await?;
 		let mut txn = self.db.txn();
 		txn.del_raw(&self.sendingtransaction_record, destination.get_prefix());

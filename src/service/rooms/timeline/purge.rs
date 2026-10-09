@@ -78,6 +78,11 @@ pub async fn purge_history(
 		if pdu.state_key.is_none()
 			&& (delete_local_events || !services_root.globals.user_is_local(&pdu.sender))
 		{
+			let _federation = services_root
+				.sending
+				.db
+				.lock_federation_sources()
+				.await;
 			let txn = self
 				.prepare_history_erasure(short, &raw, &pdu)
 				.await?;
@@ -103,6 +108,11 @@ async fn prepare_history_erasure(
 	let services_root = services_guard.as_ref();
 
 	let mut txn = self.prepare_history_base(raw, pdu).await?;
+	services_root
+		.sending
+		.db
+		.stage_federation_erasure(&mut txn, raw)
+		.await?;
 	services_root
 		.pusher
 		.stage_notification_erasure(&mut txn, raw, &pdu.room_id)
@@ -183,6 +193,7 @@ fn purge_limit() -> Error {
 #[implement(super::Service)]
 pub(super) async fn prepare_history_base(&self, raw: &RawPduId, pdu: &PduEvent) -> Result<Txn> {
 	let mut txn = self.db.db.txn();
+
 	txn.del_raw(&self.db.pduid_pdu, raw);
 	txn.del_raw(&self.db.eventid_pduid, &pdu.event_id);
 	txn.del_raw(&self.db.eventid_outlierpdu, &pdu.event_id);

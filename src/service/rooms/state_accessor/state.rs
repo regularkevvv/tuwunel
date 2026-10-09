@@ -1,10 +1,10 @@
-use std::{ops::Deref, sync::Arc};
+use std::{collections::BTreeSet, ops::Deref, sync::Arc};
 
 use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
 };
 use ruma::{
-	EventId, OwnedEventId, OwnedRoomId, RoomId, UserId,
+	EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, UserId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 	events::{
 		StateEventType, TimelineEventType,
@@ -32,6 +32,85 @@ use crate::rooms::{
 };
 
 const MAX_STATE_MAPPING_BYTES: usize = 512 * 1024;
+
+/// Freeze recipients from complete authoritative state, including the event
+/// being admitted. Membership caches may lag a commit or a restart.
+#[implement(super::Service)]
+pub(crate) async fn federation_servers_for_append(
+	&self,
+	state: ShortStateHash,
+	pending: &tuwunel_core::PduEvent,
+) -> Result<Vec<OwnedServerName>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let mut servers = BTreeSet::new();
+	let entries = self.state_full_shortids(state);
+	let mut bytes = 0_usize;
+	pin_mut!(entries);
+	while let Some((shortkey, shortevent)) = entries.try_next().await? {
+		let (kind, key) = services_root
+			.short
+			.get_statekey_from_short(shortkey)
+			.await?;
+		let event = services_root
+			.short
+			.get_eventid_from_short::<OwnedEventId>(shortevent)
+			.await?;
+		bytes = bytes
+			.saturating_add(kind.to_cow_str().len())
+			.saturating_add(key.as_str().len())
+			.saturating_add(event.as_str().len());
+		if bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		if services_root
+			.short
+			.get_shortstatekey(&kind, key.as_str())
+			.await? != shortkey
+			|| services_root
+				.short
+				.get_shorteventid(&event)
+				.await? != shortevent
+		{
+			return Err(Error::bad_database("Federation state dictionaries disagree"));
+		}
+		if kind != StateEventType::RoomMember {
+			continue;
+		}
+		let pdu = self
+			.state_event_for_append(&event, Some(pending))
+			.await?;
+		if pdu.event_id() != event
+			|| pdu.room_id() != pending.room_id
+			|| pdu.event_type().to_cow_str() != kind.to_cow_str()
+			|| pdu.state_key() != Some(key.as_str())
+		{
+			return Err(Error::bad_database("Federation membership binding is invalid"));
+		}
+		let user = UserId::parse(key.as_str())?;
+		let member: RoomMemberEventContent = pdu.get_content()?;
+		if member.membership == MembershipState::Join
+			&& !services_root
+				.globals
+				.server_is_ours(user.server_name())
+		{
+			servers.insert(user.server_name().to_owned());
+		}
+	}
+	// Departed, banned and invited targets still need the membership event.
+	if pending.kind == TimelineEventType::RoomMember {
+		let user = UserId::parse(pending.state_key.as_deref().ok_or_else(|| {
+			Error::bad_database("Federation membership event lacks its state key")
+		})?)?;
+		if !services_root
+			.globals
+			.server_is_ours(user.server_name())
+		{
+			servers.insert(user.server_name().to_owned());
+		}
+	}
+	Ok(servers.into_iter().collect())
+}
 
 fn state_mapping_limit() -> Error {
 	Error::Request(

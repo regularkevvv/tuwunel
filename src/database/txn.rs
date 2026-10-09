@@ -386,6 +386,19 @@ where
 /// is dropped unapplied or, on a flush failure, applied but unnotified only
 /// after the backend has already accepted it durably into its write path.
 #[implement(Txn)]
+pub async fn execute(self) -> Result { self.execute_with_flush(false).await }
+
+/// Commit and flush the native WAL to the OS before returning or notifying,
+/// even inside an enclosing cork. Use for durable ownership transfers before
+/// acknowledgement or external delivery. This protects against process crash;
+/// it does not fsync for power-loss durability. Model and remote commits keep
+/// their existing atomic/fenced acknowledgement semantics. Empty batches are
+/// still no-ops, and an uncertain write/flush failure is returned to the
+/// caller.
+#[implement(Txn)]
+pub async fn execute_flushed(self) -> Result { self.execute_with_flush(true).await }
+
+#[implement(Txn)]
 #[tracing::instrument(
 	level = "trace",
 	skip_all,
@@ -394,7 +407,7 @@ where
 		bytes = self.size_in_bytes(),
 	)
 )]
-pub async fn execute(self) -> Result {
+async fn execute_with_flush(self, force_wal_flush: bool) -> Result {
 	if self.is_empty() {
 		return Ok(());
 	}
@@ -422,7 +435,7 @@ pub async fn execute(self) -> Result {
 				.write_opt(&batch, &engine.write_options)
 				.or_else(or_else)?;
 
-			if !engine.corked() {
+			if force_wal_flush || !engine.corked() {
 				engine.flush()?;
 			}
 		},

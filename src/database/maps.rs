@@ -484,6 +484,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM
 	},
 	Descriptor {
+		name: "pduid_federationplan",
+		..descriptor::RANDOM
+	},
+	Descriptor {
 		name: "servername_destination",
 		cache_disp: CacheDisp::SharedWith("servername_override"), // one resolve writes both
 		key_size_hint: Some(48),

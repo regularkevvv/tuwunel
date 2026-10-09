@@ -28,10 +28,10 @@ use super::{
 	state_local_build::WalkMode,
 };
 use crate::rooms::{
-	state::{RoomMutexGuard, Trigger, prune_goal},
+	state::{Trigger, prune_goal},
 	state_compressor::{CompressedState, HashSetCompressStateEvent},
 	state_res::{AuthCheckOutcome, auth_check},
-	timeline::RawPduId,
+	timeline::{Effect, RawPduId},
 };
 
 #[cfg(test)]
@@ -76,6 +76,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	room_version: &RoomVersionId,
 	recursion_level: usize,
 	create_event_id: &EventId,
+	federate: bool,
 ) -> Result<Option<(RawPduId, bool)>> {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
@@ -183,29 +184,26 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 
 	// A soft-failed event is not a forward extremity, so it never drives the
 	// room's current state; only an accepted state event resolves forward.
-	if incoming_pdu.state_key().is_some() && !soft_fail {
-		self.resolve_and_force_state_after(
+	let resolved = self
+		.resolve_state_after(
 			room_id,
 			room_version,
 			&incoming_pdu,
 			&state_at_incoming_event,
-			&state_lock,
+			soft_fail,
 		)
 		.boxed()
 		.await?;
-	}
 
 	// We use the `state_at_event` instead of `state_after` so we accurately
 	// represent the state for this event.
 	trace!("Appending pdu to timeline");
 
 	// Incoming event will be referenced in prev_events unless soft-failed.
-	let incoming_extremity = once(incoming_pdu.event_id()).filter(|_| !soft_fail);
-
 	let extremities = extremities
 		.iter()
 		.map(Borrow::borrow)
-		.chain(incoming_extremity);
+		.chain(once(incoming_pdu.event_id()).filter(|_| !soft_fail));
 
 	let pdu_id = services_root
 		.timeline
@@ -215,9 +213,18 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 			extremities,
 			state_ids_compressed,
 			soft_fail,
+			resolved
+				.as_ref()
+				.map(|state| state.shortstatehash),
+			federate,
 			&state_lock,
 		)
 		.await?;
+
+	if let Some(resolved) = resolved.filter(|_| pdu_id.is_some()) {
+		self.finish_resolved_membership(room_id, &incoming_pdu, resolved, &state_lock)
+			.await;
+	}
 
 	debug_assert!(
 		pdu_id.is_some() || soft_fail,
@@ -679,14 +686,17 @@ async fn compute_remaining_extremities(
 }
 
 #[implement(super::Service)]
-async fn resolve_and_force_state_after(
+async fn resolve_state_after(
 	&self,
 	room_id: &RoomId,
 	room_version: &RoomVersionId,
 	incoming_pdu: &PduEvent,
 	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
-	state_lock: &RoomMutexGuard,
-) -> Result {
+	soft_fail: bool,
+) -> Result<Option<HashSetCompressStateEvent>> {
+	if soft_fail || incoming_pdu.state_key().is_none() {
+		return Ok(None);
+	}
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
@@ -720,21 +730,28 @@ async fn resolve_and_force_state_after(
 
 	// Set the new room state to the resolved state
 	trace!("Saving resolved state.");
-	let HashSetCompressStateEvent { shortstatehash, added, removed } = services_root
+	services_root
 		.state_compressor
 		.save_state(room_id, new_room_state)
-		.await?;
+		.await
+		.map(Some)
+}
 
-	debug!(
-		?shortstatehash,
-		added = added.len(),
-		removed = removed.len(),
-		"Forcing new room state."
-	);
-	services_root
+/// Current state was already published by the canonical commit. Derived
+/// membership must not change before that acceptance boundary.
+#[implement(super::Service)]
+async fn finish_resolved_membership(
+	&self,
+	room: &RoomId,
+	pdu: &PduEvent,
+	resolved: HashSetCompressStateEvent,
+	lock: &crate::rooms::state::RoomMutexGuard,
+) {
+	self.services
+		.get()
+		.as_ref()
 		.state
-		.force_state(room_id, shortstatehash, added, removed, state_lock)
-		.await?;
-
-	Ok(())
+		.force_state(room, resolved.shortstatehash, resolved.added, resolved.removed, lock)
+		.await
+		.effect("resolved membership", pdu.event_id());
 }

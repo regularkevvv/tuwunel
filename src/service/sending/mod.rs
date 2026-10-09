@@ -12,7 +12,10 @@ use std::{
 	io::Write,
 	iter::{once, repeat_with},
 	pin::pin,
-	sync::{Arc, Mutex as StdMutex},
+	sync::{
+		Arc, Mutex as StdMutex,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use async_trait::async_trait;
@@ -49,6 +52,8 @@ pub struct Service {
 	// Hints only; a single owned worker scans one page per user turn.
 	push_wakes: StdMutex<PushWakes>,
 	push_wake_signal: Notify,
+	pub(super) federation_source_signal: Notify,
+	pub(super) federation_source_stopped: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +142,8 @@ impl crate::Service for Service {
 				.collect(),
 			push_wakes: PushWakes::default().into(),
 			push_wake_signal: Notify::new(),
+			federation_source_signal: Notify::new(),
+			federation_source_stopped: AtomicBool::new(false),
 		}))
 	}
 
@@ -162,6 +169,11 @@ impl crate::Service for Service {
 		let sending = self.clone();
 		let _wake_worker = senders
 			.spawn_on(async move { sending.push_wake_worker().await }, self.server.runtime());
+		let sending = self.clone();
+		let _source_worker = senders.spawn_on(
+			async move { sending.federation_source_worker().await },
+			self.server.runtime(),
+		);
 
 		while let Some(ret) = senders.join_next_with_id().await {
 			match ret {
@@ -181,6 +193,9 @@ impl crate::Service for Service {
 	async fn interrupt(&self) {
 		self.push_wakes.lock().expect("locked").stop();
 		self.push_wake_signal.notify_one();
+		self.federation_source_stopped
+			.store(true, Ordering::Release);
+		self.federation_source_signal.notify_one();
 
 		for (sender, _) in &self.channels {
 			if !sender.is_closed() {

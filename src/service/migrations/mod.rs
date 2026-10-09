@@ -81,7 +81,9 @@ mod tests;
 // replacements.
 // Version 22 persists immutable outgoing transaction bodies and membership.
 // Older senders must refuse before recomposing an already attempted delivery.
-pub(crate) const DATABASE_VERSION: u64 = 22;
+// Version 23 commits canonical federation obligations with their source PDU.
+// Older writers cannot resume these plans and must refuse the database.
+pub(crate) const DATABASE_VERSION: u64 = 23;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 

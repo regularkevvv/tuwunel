@@ -75,7 +75,7 @@ impl Fixture {
 			prepared
 				.globals
 				.db
-				.bump_database_version(22)
+				.bump_database_version(23)
 				.await?;
 			prepared.db["global"]
 				.insert(b"cancel-preservation", b"durable")

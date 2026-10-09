@@ -153,6 +153,11 @@ pub(crate) async fn prepare_history_step(
 				.prepare_history_base(&raw, &snapshot.pdu)
 				.await?;
 			services_root
+				.sending
+				.db
+				.stage_federation_erasure(&mut txn, &raw)
+				.await?;
+			services_root
 				.pusher
 				.stage_notification_erasure(&mut txn, &raw, room)
 				.await?;

@@ -39,13 +39,13 @@ type Band<'a> = SmallVec<[&'a EventId; 1]>;
 ///
 /// A pdu's effects follow the commit that stores it, each on its own: push
 /// counts, notification rows and pushes, membership, the search index,
-/// relations and threads, appservice delivery, and, for a local pdu, the queue
-/// to the room's other servers. One that fails is logged at error level under
-/// its name, with the pdu's event id and never its content, and the rest still
-/// run. The pdu stays sent: its sender is told so, and a retry of the sender's
-/// transaction finds the record and runs nothing again.
+/// relations and threads, and appservice delivery. One that fails is logged at
+/// error level under its name, with the pdu's event id and never its content,
+/// and the rest still run. The pdu stays sent: its sender is told so, and a
+/// retry of the sender's transaction finds the record and runs nothing again.
 ///
-/// So each effect runs at most once per live process. Nothing records an
+/// Federation and notifications have separate durable plans. The other
+/// effects run at most once per live process. Nothing records an
 /// effect as owed, so one that failed, or one a crash cut short, is not
 /// replayed.
 pub(crate) trait Effect {
@@ -63,6 +63,7 @@ impl Effect for Result {
 /// Append the incoming event setting the state snapshot to the state from
 /// the server that sent the event.
 #[implement(super::Service)]
+#[expect(clippy::too_many_arguments)]
 #[tracing::instrument(
 	name = "append_incoming",
 	level = "debug",
@@ -76,6 +77,8 @@ pub(crate) async fn append_incoming_pdu<'a, Leafs>(
 	new_room_leafs: Leafs,
 	state_ids_compressed: Arc<CompressedState>,
 	soft_fail: bool,
+	room_state: Option<ShortStateHash>,
+	federate: bool,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<Option<RawPduId>>
 where
@@ -84,9 +87,8 @@ where
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
-	// We append to state before appending the pdu, so we don't have a moment in
-	// time with the pdu without it's state. This is okay because append_pdu can't
-	// fail.
+	// Save the immutable event-before snapshot. It does not publish current
+	// room state; that pointer changes only in the canonical event commit.
 	services_root
 		.state
 		.set_event_state(&pdu.event_id, &pdu.room_id, state_ids_compressed)
@@ -110,9 +112,18 @@ where
 		return Ok(None);
 	}
 
-	// The event handler made the resolved state current before this call.
+	// Publish resolved current state and any required federation obligation
+	// together with the canonical event.
 	let pdu_id = self
-		.append_pdu(pdu, pdu_json, new_room_leafs, None, state_lock)
+		.append_pdu_with_delivery(
+			pdu,
+			pdu_json,
+			new_room_leafs,
+			None,
+			room_state,
+			federate,
+			state_lock,
+		)
 		.await?;
 
 	Ok(Some(pdu_id))
@@ -168,14 +179,33 @@ where
 /// `txnid` is a `userdevicetxnid_response` key from
 /// [`crate::transaction_ids::key`], written with the event id as its value.
 #[implement(super::Service)]
-#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
 pub async fn append_pdu_with_txnid<'a, Leafs>(
+	&'a self,
+	pdu: &'a PduEvent,
+	pdu_json: CanonicalJsonObject,
+	leafs: Leafs,
+	txnid: Option<&'a [u8]>,
+	room_state: Option<ShortStateHash>,
+	state_lock: &'a RoomMutexGuard,
+) -> Result<RawPduId>
+where
+	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
+{
+	self.append_pdu_with_delivery(pdu, pdu_json, leafs, txnid, room_state, false, state_lock)
+		.await
+}
+
+#[implement(super::Service)]
+#[expect(clippy::too_many_arguments)]
+#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
+pub(crate) async fn append_pdu_with_delivery<'a, Leafs>(
 	&'a self,
 	pdu: &'a PduEvent,
 	mut pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
 	txnid: Option<&'a [u8]>,
 	room_state: Option<ShortStateHash>,
+	federate: bool,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<RawPduId>
 where
@@ -287,7 +317,30 @@ where
 		)
 		.await?;
 
-	txn.execute().await?;
+	let federation = if federate {
+		let state = match room_state {
+			| Some(state) => state,
+			| None =>
+				services_root
+					.state
+					.get_room_shortstatehash(pdu.room_id())
+					.await?,
+		};
+		Some(
+			services_root
+				.sending
+				.db
+				.stage_federation_plan(&mut txn, pdu_id, pdu, state)
+				.await?,
+		)
+	} else {
+		None
+	};
+	// This is one indivisible admission, including metadata, deletions, client
+	// transaction identity, state and both notification/federation plans.
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await?;
+	drop(federation);
 	drop(notifications);
 
 	if let Some(sender_read) = sender_read {
@@ -327,6 +380,15 @@ where
 		.effect("joined count repair", event_id);
 
 	drop(next_count);
+
+	if federate {
+		services_root
+			.sending
+			.resume_federation_source(pdu_id)
+			.await
+			.effect("federation page", event_id);
+		services_root.sending.wake_federation_sources();
+	}
 
 	services_root
 		.appservice

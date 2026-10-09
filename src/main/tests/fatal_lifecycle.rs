@@ -47,12 +47,12 @@ fn startup_command_error_releases_database_before_runtime_exit() -> Result {
 	let server = Server::new(Some(&args), Some(&runtime))?;
 	let result = runtime.block_on(async {
 		// Seed a native fixture without starting workers or changing the core
-		// stopping flag. Schema 22 is the source-pinned reader in this test.
+		// stopping flag. Schema 23 is the source-pinned reader in this test.
 		let prepared = Services::build(server.server.clone()).await?;
 		prepared
 			.globals
 			.db
-			.bump_database_version(22)
+			.bump_database_version(23)
 			.await?;
 		prepared.db["global"]
 			.insert(b"fatal-run-preservation", b"durable")

@@ -154,19 +154,14 @@ async fn remote_invite(
 		err!(Request(BadJson(warn!("Origin field in event is not a valid server name: {e}"))))
 	})?;
 
-	let pdu_id = services_root
+	let _accepted = services_root
 		.event_handler
-		.handle_incoming_pdu(&origin, room_id, &event_id, value, true)
+		.handle_incoming_pdu_and_federate(&origin, room_id, &event_id, value)
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| {
 			err!(Request(InvalidParam("Could not accept incoming PDU as timeline event.")))
 		})?;
-
-	services_root
-		.sending
-		.send_pdu_room(room_id, &pdu_id)
-		.await?;
 
 	Ok(())
 }

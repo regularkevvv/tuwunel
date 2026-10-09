@@ -16,6 +16,7 @@ mod active;
 mod attempt;
 mod backoff;
 mod discovery;
+mod source;
 pub(super) use ack::ActiveAcknowledgement;
 pub(super) use attempt::{BODY_LIMIT, PreparedAttempt, appservice_owner};
 pub(super) use backoff::PushBackoff;
@@ -39,7 +40,7 @@ pub struct Data {
 	sendingtransaction_record: Arc<Map>,
 	pub(super) db: Arc<Database>,
 	services: Arc<crate::services::OnceServices>,
-	active_write: Mutex<()>,
+	active_write: Arc<Mutex<()>>,
 }
 
 impl Data {
@@ -52,7 +53,7 @@ impl Data {
 			sendingtransaction_record: db["sendingtransaction_record"].clone(),
 			db: args.db.clone(),
 			services: args.services.clone(),
-			active_write: Mutex::new(()),
+			active_write: Arc::new(Mutex::new(())),
 		}
 	}
 

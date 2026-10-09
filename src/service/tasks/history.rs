@@ -297,6 +297,11 @@ async fn run_history(&self, id: &TaskId, room: &RoomId) -> Result {
 		// Capture original bytes and their durable pin under the same exclusion
 		// used by retention. Subsequent expiry reads these canonical job pins.
 		let _originals = services_root.retention.lock_originals().await;
+		let _federation = services_root
+			.sending
+			.db
+			.lock_federation_sources()
+			.await;
 		let (txn, next) = services_root
 			.timeline
 			.prepare_history_step(room, history)

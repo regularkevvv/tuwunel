@@ -73,6 +73,7 @@ pub(super) async fn handle_prev_pdu(
 		room_version,
 		recursion_level,
 		create_event_id,
+		false,
 	)
 	.boxed()
 	.await
