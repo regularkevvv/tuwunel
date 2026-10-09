@@ -678,6 +678,72 @@ async fn rig(scan_page: u32, cache_mb: u32) -> Result<(Fake, Arc<Server>, Arc<Ba
 /// The map every case here writes through; `pduid_pdu` is a plain preset.
 const MAP: &str = "pduid_pdu";
 
+#[tokio::test]
+async fn put_admission_uses_current_writer_and_preserves_exact_commit_boundary() -> Result {
+	let (fake, _server, backend) = rig(4, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let value = vec![0; bridge::MAX_VALUE_BYTES];
+	let mut prefix = map.put_batch_budget()?;
+	prefix.try_put(1, &value).expect("first put");
+	prefix.try_put(1, &value).expect("second put");
+	let mut initial = prefix;
+	initial
+		.try_put(4, &vec![0; 65_536])
+		.expect("initial tail");
+	let tail_len = 65_536 + bridge::request::MAX_BYTES - initial.encoded_size().expect("size");
+	let tail = vec![0; tail_len];
+	let before = prefix.encoded_size().expect("prefix size");
+	prefix
+		.try_put(4, &vec![0; tail_len + 1])
+		.expect_err("one byte over");
+	assert_eq!(prefix.operations(), 2);
+	assert_eq!(prefix.encoded_size().expect("unchanged size"), before);
+	assert_eq!(fake.applied(), 0);
+	prefix
+		.try_put(4, &tail)
+		.expect("exact supported limit after refusal");
+	assert_eq!(prefix.encoded_size().expect("exact size"), bridge::request::MAX_BYTES);
+	let ops = vec![
+		Mutation::Put {
+			map: map_id(),
+			key: vec![0].into(),
+			val: value.clone().into(),
+		},
+		Mutation::Put {
+			map: map_id(),
+			key: vec![1].into(),
+			val: value.into(),
+		},
+		Mutation::Put {
+			map: map_id(),
+			key: vec![2; 4].into(),
+			val: tail.into(),
+		},
+	];
+	let request = Request::Commit {
+		request_id: vec![0; bridge::REQUEST_ID_LEN].into(),
+		lease: backend.writable_lease()?,
+		digest: bridge::digest(&ops).to_vec().into(),
+		ops: ops.clone(),
+	};
+	assert_eq!(
+		bridge::request::encode(&request)
+			.expect("actual lease wire")
+			.len(),
+		bridge::request::MAX_BYTES
+	);
+	backend.commit(ops).await?;
+	assert_eq!(fake.applied(), 1);
+	let rows = map
+		.raw_keys()
+		.try_fold(0_usize, |count, _| async move { Ok(count.saturating_add(1)) })
+		.await?;
+	assert_eq!(rows, 3);
+	backend.close().await;
+	assert!(map.put_batch_budget().is_err(), "released lease admitted a producer batch");
+	Ok(())
+}
+
 /// The `u64` prefix the `del_prefix` case deletes under.
 const DOOMED: u64 = 7;
 

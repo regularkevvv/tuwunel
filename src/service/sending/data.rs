@@ -221,6 +221,36 @@ impl Data {
 		txn.insert_raw(&self.servernameevent_data, key, event.value_bytes());
 	}
 
+	/// Bound fanout while destinations are still borrowed and share one event.
+	/// The first refusal stops the source before collecting the rest of it.
+	pub(super) async fn federation_destinations<'a, S>(
+		&self,
+		servers: S,
+		event: &SendingEvent,
+	) -> Result<Vec<Destination>>
+	where
+		S: Stream<Item = &'a ServerName> + Send + 'a,
+	{
+		let mut servers = std::pin::pin!(servers);
+		let mut next = servers.next().await;
+		if next.is_none() {
+			return Ok(Vec::new());
+		}
+		active::validate_payload(event.value_bytes())?;
+		let mut budget = self.servernameevent_data.put_batch_budget()?;
+		let mut destinations = Vec::new();
+		while let Some(server) = next {
+			let prefix_len = server.as_bytes().len().saturating_add(1);
+			let key_len = queue_key_len(event, prefix_len, false)?;
+			budget
+				.try_put(key_len, event.value_bytes())
+				.map_err(|error| admission_error(&error))?;
+			destinations.push(Destination::Federation(server.to_owned()));
+			next = servers.next().await;
+		}
+		Ok(destinations)
+	}
+
 	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>
 	where
 		I: Iterator<Item = (&'a SendingEvent, &'a Destination)> + Clone + Debug + Send,
@@ -229,26 +259,20 @@ impl Data {
 		let services_root = services_guard.as_ref();
 
 		let _guard = self.active_write.lock().await;
+		if requests.clone().next().is_none() {
+			return Ok(Vec::new());
+		}
+		let mut budget = self.servernameevent_data.put_batch_budget()?;
 		for (event, destination) in requests.clone() {
 			active::validate_payload(event.value_bytes())?;
-			let suffix = match event {
-				| SendingEvent::Pdu(id) | SendingEvent::FrozenPush(id) => id.as_ref().len(),
-				| _ => size_of::<u64>(),
-			};
-			let required_suffix = if matches!(destination, Destination::Push(..)) {
-				suffix
-			} else {
-				suffix.max(17)
-			};
-			if destination
-				.prefix_len()
-				.saturating_add(required_suffix)
-				> tuwunel_bridge::MAX_KEY_BYTES
-			{
-				return Err(err!(Request(TooLarge(
-					"Outgoing destination exceeds storage key width"
-				))));
-			}
+			let key_len = queue_key_len(
+				event,
+				destination.prefix_len(),
+				matches!(destination, Destination::Push(..)),
+			)?;
+			budget
+				.try_put(key_len, event.value_bytes())
+				.map_err(|error| admission_error(&error))?;
 		}
 		for (_, destination) in requests.clone() {
 			self.resume_cancellation(destination).await?;
@@ -501,6 +525,23 @@ fn decode_queued(row: Result<(&[u8], &[u8])>) -> Result<OutgoingItem> {
 		return Err(Error::bad_database("Active identity envelope in the pending queue"));
 	}
 	decode_outgoing(Ok((key, value)))
+}
+
+fn queue_key_len(event: &SendingEvent, prefix_len: usize, push: bool) -> Result<usize> {
+	let suffix = match event {
+		| SendingEvent::Pdu(id) | SendingEvent::FrozenPush(id) => id.as_ref().len(),
+		| _ => size_of::<u64>(),
+	};
+	// Non-push destinations also need room for the cancellation marker.
+	let required_suffix = if push { suffix } else { suffix.max(17) };
+	if prefix_len.saturating_add(required_suffix) > tuwunel_bridge::MAX_KEY_BYTES {
+		return Err(err!(Request(TooLarge("Outgoing destination exceeds storage key width"))));
+	}
+	Ok(prefix_len.saturating_add(suffix))
+}
+
+fn admission_error(error: &tuwunel_bridge::Error) -> Error {
+	err!(Request(TooLarge("Outgoing atomic batch: {error}")))
 }
 
 fn retain_existing(item: QueueItem, exists: Result) -> Option<Result<QueueItem>> {

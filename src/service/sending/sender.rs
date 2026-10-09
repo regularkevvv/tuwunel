@@ -98,6 +98,9 @@ mod inventory_tests;
 #[cfg(test)]
 mod allocation_tests;
 
+#[cfg(test)]
+mod admission_tests;
+
 /// Bookkeeping for admitted tasks and exact cleanup/persistence retries.
 /// Cross-attempt backoff lives in durable peer or push records.
 #[derive(Debug)]

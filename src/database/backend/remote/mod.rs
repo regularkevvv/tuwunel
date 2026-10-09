@@ -629,7 +629,7 @@ impl Backend {
 	}
 
 	/// The lease identity to fence a commit with, or the fail-fast error.
-	fn writable_lease(&self) -> Result<bridge::Lease> {
+	pub(crate) fn writable_lease(&self) -> Result<bridge::Lease> {
 		if !self.lease.writable() {
 			let status = self.lease.status();
 			return Err!(Database(

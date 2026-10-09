@@ -294,24 +294,8 @@ impl Service {
 	where
 		S: Stream<Item = &'a ServerName> + Send + 'a,
 	{
-		let requests = servers
-			.map(|server| {
-				(Destination::Federation(server.into()), SendingEvent::Pdu(pdu_id.to_owned()))
-			})
-			.collect::<Vec<_>>()
-			.await;
-
-		let _cork = self.db.db.cork();
-		let keys = self
-			.db
-			.queue_requests(requests.iter().map(|(o, e)| (e, o)))
-			.await?;
-
-		for ((dest, event), queue_id) in requests.into_iter().zip(keys) {
-			self.dispatch(Msg { dest, event, queue_id })?;
-		}
-
-		Ok(())
+		self.queue_federation(servers, SendingEvent::Pdu(*pdu_id))
+			.await
 	}
 
 	#[tracing::instrument(skip(self, server, serialized), level = "debug")]
@@ -541,24 +525,36 @@ impl Service {
 	where
 		S: Stream<Item = &'a ServerName> + Send + 'a,
 	{
-		let requests = servers
-			.map(|server| {
-				(
-					Destination::Federation(server.to_owned()),
-					SendingEvent::Edu(serialized.clone()),
-				)
-			})
-			.collect::<Vec<_>>()
-			.await;
+		self.queue_federation(servers, SendingEvent::Edu(serialized))
+			.await
+	}
+
+	async fn queue_federation<'a, S>(&self, servers: S, event: SendingEvent) -> Result
+	where
+		S: Stream<Item = &'a ServerName> + Send + 'a,
+	{
+		let destinations = self
+			.db
+			.federation_destinations(servers, &event)
+			.await?;
 
 		let _cork = self.db.db.cork();
 		let keys = self
 			.db
-			.queue_requests(requests.iter().map(|(o, e)| (e, o)))
+			.queue_requests(
+				destinations
+					.iter()
+					.map(|destination| (&event, destination)),
+			)
 			.await?;
+		drop(event);
 
-		for ((dest, event), queue_id) in requests.into_iter().zip(keys) {
-			self.dispatch(Msg { dest, event, queue_id })?;
+		for (dest, queue_id) in destinations.into_iter().zip(keys) {
+			self.dispatch(Msg {
+				dest,
+				event: SendingEvent::BadgeRefresh,
+				queue_id,
+			})?;
 		}
 
 		Ok(())

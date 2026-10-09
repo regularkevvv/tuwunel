@@ -235,6 +235,27 @@ impl Map {
 	#[inline]
 	pub fn name(&self) -> &str { self.name }
 
+	/// Starts allocation-free admission for one catalog-map put batch.
+	///
+	/// Remote storage counts the current writer's exact commit envelope and
+	/// refuses a non-writable lease. Native/model storage use the minimum wire
+	/// envelope, with no holder and epoch zero, to enforce protocol operation,
+	/// key/value and request-byte limits without inventing a remote identity.
+	/// Execution still checks the remote fence; this budget is not a
+	/// reservation or acknowledgement that a later commit will succeed.
+	pub fn put_batch_budget(&self) -> Result<tuwunel_bridge::request::PutBatchBudget> {
+		let map = self
+			.id
+			.ok_or_else(|| err!(Database("Put admission requires a catalog map")))?;
+		let lease = match self.sink() {
+			| Sink::Remote(backend) => backend.writable_lease()?,
+			| Sink::Rocks(_) | Sink::Mem(_) =>
+				tuwunel_bridge::Lease { holder: String::new(), epoch: 0 },
+		};
+		tuwunel_bridge::request::PutBatchBudget::new(map.0, &lease)
+			.map_err(|error| err!(Database("Put admission: {error}")))
+	}
+
 	/// Returns this map's stable numeric identity, if it is a catalog map.
 	///
 	/// Foreign migration column families have none and are invisible to
