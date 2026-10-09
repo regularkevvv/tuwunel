@@ -14,9 +14,11 @@ use tuwunel_database::{Row, deserialize_from_slice};
 mod ack;
 mod active;
 mod attempt;
+mod backoff;
 mod discovery;
 pub(super) use ack::ActiveAcknowledgement;
 pub(super) use attempt::{BODY_LIMIT, PreparedAttempt, appservice_owner};
+pub(super) use backoff::PushBackoff;
 pub(super) use discovery::{DISCOVERY_PAGE_LIMIT, RecoverySource};
 
 use super::{

@@ -8,7 +8,7 @@ use std::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
 	},
-	time::{Duration, Instant, SystemTime},
+	time::{Duration, SystemTime},
 };
 
 use futures::{
@@ -52,7 +52,7 @@ use tuwunel_core::{
 	smallvec::SmallVec,
 	trace,
 	utils::{
-		BoolExt, ReadyExt, exponential_backoff_remaining_secs,
+		BoolExt, ReadyExt,
 		rand::secs as rand_secs,
 		stream::{BroadbandExt, IterStream, WidebandExt},
 	},
@@ -61,7 +61,7 @@ use tuwunel_core::{
 
 use super::{
 	Destination, EduBuf, EduVec, FrozenRequest, Msg, SendingEvent, Service, TAG_PREFIX_LEN,
-	data::{ActiveAcknowledgement, PreparedAttempt, QueueItem},
+	data::{ActiveAcknowledgement, PreparedAttempt, PushBackoff, QueueItem},
 	frozen,
 };
 use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
@@ -92,16 +92,16 @@ mod retry_restart_tests;
 #[cfg(test)]
 mod resources_tests;
 
-/// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
-/// in `peer_status` (federation only); appservice/push paths keep their own
-/// status because they are not server-keyed.
+#[cfg(test)]
+mod inventory_tests;
+
+/// Bookkeeping for admitted tasks and exact cleanup/persistence retries.
+/// Cross-attempt backoff lives in durable peer or push records.
 #[derive(Debug)]
 enum TransactionStatus {
 	Running,
 	RunningForceRetry,
-	Failed(u32, Instant), // push backoff: tries, last failure
-	Retrying(u32),        // number of times failed
-	Deferred,             // user active; durable active rows remain owed
+	Retrying(u32), // push failure streak retained while a retry is in flight
 }
 
 enum RetryAction {
@@ -114,6 +114,7 @@ type SendingError = (Destination, Error);
 enum Delivery {
 	Acknowledged(Destination, ActiveAcknowledgement),
 	Deferred(Destination),
+	PushFailed(Destination, ActiveAcknowledgement, Box<Error>),
 	Unprepared(Destination, Box<Error>),
 	// A task failure can lose a transport outcome after HTTP started. Its
 	// durable attempt still owns recovery; it is not a peer failure.
@@ -157,13 +158,10 @@ type FallbackTypes = BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, Vec<OneTimeKe
 /// sender's plus matched PDU senders' devices and the to-device recipients.
 type Devices = SmallVec<[(OwnedUserId, OwnedDeviceId); 1]>;
 
-/// Per-worker retry timer keyed by earliest-retry deadline and destination.
-///
-/// Every recorded federation or push failure arms an entry. Stale entries are
-/// consumed by the destination's in-flight or newer failure generation. The
-/// heap is bounded by concurrently failing destinations, transient federation
-/// re-arms, and stale push entries.
+/// Bounded, coalesced timer hints. Durable rows and failure records recover
+/// hints dropped at capacity, including across process restart.
 type WakeQueue = BinaryHeap<Reverse<(TokioInstant, Destination)>>;
+const WAKE_HINT_LIMIT: usize = 128;
 
 /// Local database backpressure is not a remote delivery failure. In particular,
 /// once ACK cleanup completes, a retry must never clean up the unsent
@@ -171,6 +169,7 @@ type WakeQueue = BinaryHeap<Reverse<(TokioInstant, Destination)>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueRecovery {
 	CleanupAcknowledged(ActiveAcknowledgement),
+	PersistPushFailure(PushBackoff, ActiveAcknowledgement),
 	ResumePending,
 }
 
@@ -303,6 +302,7 @@ impl Service {
 		let mut statuses: CurTransactionStatus = CurTransactionStatus::new();
 		let mut futures = SendingFutures::new();
 		let mut wakes: WakeQueue = WakeQueue::new();
+		let mut retries = QueueRetries::new();
 
 		loop {
 			match self
@@ -326,10 +326,12 @@ impl Service {
 		}
 
 		let outcome = self
-			.work_loop(id, &mut futures, &mut statuses, &mut wakes)
+			.work_loop(id, &mut futures, &mut statuses, &mut wakes, &mut retries)
 			.await;
-		let finish = if outcome.is_ok() && !futures.is_empty() {
-			self.finish_responses(&mut futures).boxed().await
+		let finish = if outcome.is_ok() && (!futures.is_empty() || !retries.is_empty()) {
+			self.finish_responses(&mut futures, &mut statuses, &mut retries)
+				.boxed()
+				.await
 		} else {
 			Ok(())
 		};
@@ -352,6 +354,7 @@ impl Service {
 		futures: &mut SendingFutures,
 		statuses: &mut CurTransactionStatus,
 		wakes: &mut WakeQueue,
+		retries: &mut QueueRetries,
 	) -> Result {
 		use tokio::time::{Instant, sleep_until};
 
@@ -360,11 +363,13 @@ impl Service {
 			.get(id)
 			.map(|(_, receiver)| receiver.clone())
 			.expect("Missing channel for sender worker");
-		let mut retries = QueueRetries::new();
 		let mut discovery = Discovery::default();
 		let mut discovery_due = Instant::now();
 
 		while !receiver.is_closed() {
+			// Only an exact ACK or an uncommitted failure record owns a slot.
+			// Ordinary retries are recoverable from the canonical queue.
+			release_advisory_retries(retries, futures, statuses, wakes);
 			let capacity = futures.len().saturating_add(retries.len()) < DELIVERY_LIMIT;
 			let next_due = wakes
 				.peek()
@@ -378,8 +383,9 @@ impl Service {
 			tokio::select! {
 				Some(response) = futures.next() => {
 					let (dest, mut stage) = match &response {
-						Ok(Delivery::Acknowledged(dest, _) | Delivery::Deferred(dest) | Delivery::Unprepared(dest, _) | Delivery::LocalFailure(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
+						Ok(Delivery::Acknowledged(dest, _) | Delivery::Deferred(dest) | Delivery::PushFailed(dest, _, _) | Delivery::Unprepared(dest, _) | Delivery::LocalFailure(dest, _)) | Err((dest, _)) => (dest.clone(), QueueRecovery::ResumePending),
 					};
+					let acknowledged = matches!(&response, Ok(Delivery::Acknowledged(..)));
 					let result = match response {
 						Ok(Delivery::Acknowledged(owner, rows)) => {
 							// Release this batch's slot before discovering successors.
@@ -391,12 +397,14 @@ impl Service {
 							}
 							result
 						},
-						response => self.handle_response(response, futures, statuses, wakes, &mut stage, &mut retries).await,
+						response => self.handle_response(response, futures, statuses, wakes, &mut stage, retries).await,
 					};
 					if let Err(error) = result {
-						defer_queue_error(&mut retries, dest, stage, error)?;
+						defer_queue_error(retries, dest, stage, error)?;
 					}
-					discovery_due = Instant::now();
+					if acknowledged {
+						discovery_due = Instant::now();
+					}
 				},
 				request = receiver.recv_async() => match request {
 					Ok(request) => {
@@ -405,19 +413,19 @@ impl Service {
 						// wakes). The retry owns this destination until it dispatches.
 						if (capacity || futures.contains_destination(&dest)) && !retries.contains_key(&dest)
 							&& let Err(error) = self.handle_request(request, futures, statuses).await {
-							defer_queue_error(&mut retries, dest, QueueRecovery::ResumePending, error)?;
+							defer_queue_error(retries, dest, QueueRecovery::ResumePending, error)?;
 						}
 					},
 					Err(_) => return Ok(()),
 				},
 				() = sleep_until(next_due), if capacity && !wakes.is_empty() => {
-					self.drain_due_wakes(futures, statuses, wakes, &mut retries).await?;
+					self.drain_due_wakes(futures, statuses, wakes, retries).await?;
 				},
 				() = sleep_until(retry_due), if !retries.is_empty() => {
-					self.retry_queue(futures, statuses, &mut retries).await?;
+					self.retry_queue(futures, statuses, retries).await?;
 				},
 				() = sleep_until(discovery_due), if capacity => {
-					let result = self.discover_page(id, futures, statuses, Some(&mut retries), &mut discovery).await;
+					let result = self.discover_page(id, futures, statuses, Some(&mut *retries), &mut discovery).await;
 					if let Err(error) = result {
 						if error.status_code() != http::StatusCode::TOO_MANY_REQUESTS {
 							return Err(error);
@@ -455,11 +463,35 @@ impl Service {
 			| Ok(Delivery::Deferred(dest)) => {
 				let prompt =
 					matches!(statuses.get(&dest), Some(TransactionStatus::RunningForceRetry));
-				statuses.insert(dest.clone(), TransactionStatus::Deferred);
+				statuses.remove(&dest);
 				// Presence/read wakes may precede an existing timer. Keep one
 				// deferral wake per destination rather than accumulating copies.
 				wakes.retain(|Reverse((_, armed))| armed != &dest);
 				arm_wake_in(wakes, dest, Duration::from_secs(if prompt { 1 } else { 5 }));
+			},
+			| Ok(Delivery::PushFailed(dest, rows, error)) => {
+				let tries = match statuses.get(&dest) {
+					| Some(TransactionStatus::Retrying(tries)) => tries.saturating_add(1),
+					| _ => 1,
+				};
+				let backoff = PushBackoff::failed(tries)?;
+				// Keep exact membership until the failure record commits. Database
+				// backpressure may defer this stage, never bypass the retry hold.
+				*stage = QueueRecovery::PersistPushFailure(backoff, rows);
+				let persisted = self
+					.persist_push_failure(&dest, statuses, stage)
+					.await?;
+				if persisted {
+					let delay = backoff
+						.remaining(
+							self.server.config.sender_timeout,
+							self.server.config.sender_retry_backoff_limit,
+						)?
+						.unwrap_or_default();
+					let (deadline, retry_in) = wake_deadline(delay);
+					Self::record_push_failure(&dest, &error, tries, retry_in);
+					arm_wake_at(wakes, dest, deadline);
+				}
 			},
 			| Ok(Delivery::Acknowledged(dest, rows)) => {
 				*stage = QueueRecovery::CleanupAcknowledged(rows);
@@ -471,6 +503,7 @@ impl Service {
 
 				match dest {
 					| Destination::Federation(server) => {
+						statuses.remove(&Destination::Federation(server.clone()));
 						// Every failed transaction, a JSON 4xx refusal included, is
 						// recorded against the destination, so the gate holds its queued
 						// events back. Arm a one-shot retry at its earliest-retry time,
@@ -490,25 +523,18 @@ impl Service {
 						}
 					},
 					| dest @ Destination::Push(..) => {
-						let Some(status @ TransactionStatus::Failed(tries, _)) =
-							statuses.get(&dest)
-						else {
-							return Ok(());
-						};
-
-						let tries = *tries;
-						let delay = self
-							.push_backoff_remaining(Some(status))
-							.unwrap_or_default();
-						let (deadline, retry_in) = wake_deadline(delay);
-
-						Self::record_push_failure(&dest, &e, tries, retry_in);
-						wakes.push(Reverse((deadline, dest)));
+						// Production push failures carry physical membership above.
+						// An unowned error cannot create backoff for re-admitted work.
+						warn!(?dest, "Push failure lacks physical delivery ownership");
+						statuses.remove(&dest);
+						arm_wake_in(wakes, dest, Duration::from_secs(1));
 					},
 					| dest if matches!(retry_action, RetryAction::Force) =>
 						self.handle_force_retry(dest, futures, statuses)
 							.await?,
-					| _ => {},
+					| dest => {
+						statuses.remove(&dest);
+					},
 				}
 			},
 		}
@@ -516,9 +542,34 @@ impl Service {
 	}
 }
 
+fn release_advisory_retries(
+	retries: &mut QueueRetries,
+	futures: &SendingFutures,
+	statuses: &mut CurTransactionStatus,
+	wakes: &mut WakeQueue,
+) {
+	retries.retain(|destination, (deadline, stage)| {
+		if !matches!(stage, QueueRecovery::ResumePending) {
+			return true;
+		}
+		if !futures.contains_destination(destination) {
+			statuses.remove(destination);
+			arm_wake_at(wakes, destination.clone(), *deadline);
+		}
+		false
+	});
+}
+
+fn arm_wake_at(wakes: &mut WakeQueue, dest: Destination, deadline: TokioInstant) {
+	wakes.retain(|Reverse((_, armed))| armed != &dest);
+	if wakes.len() < WAKE_HINT_LIMIT {
+		wakes.push(Reverse((deadline, dest)));
+	}
+}
+
 fn arm_wake_in(wakes: &mut WakeQueue, dest: Destination, delay: Duration) {
 	let (deadline, _) = wake_deadline(delay);
-	wakes.push(Reverse((deadline, dest)));
+	arm_wake_at(wakes, dest, deadline);
 }
 
 fn wake_deadline(delay: Duration) -> (TokioInstant, Duration) {
@@ -581,21 +632,6 @@ async fn report_given_up(&self, server: &ServerName) {
 	);
 }
 
-#[implement(Service)]
-#[inline]
-fn push_backoff_remaining(&self, status: Option<&TransactionStatus>) -> Option<Duration> {
-	let Some(TransactionStatus::Failed(tries, time)) = status else {
-		return None;
-	};
-
-	exponential_backoff_remaining_secs(
-		self.server.config.sender_timeout,
-		self.server.config.sender_retry_backoff_limit,
-		time.elapsed(),
-		*tries,
-	)
-}
-
 impl Service {
 	async fn handle_force_retry(
 		&self,
@@ -623,27 +659,39 @@ impl Service {
 		e: &Error,
 	) -> RetryAction {
 		debug!(?dest, "{e:?}");
-		// Push backs off locally; federation defers to peer_status, appservice retries.
-		let push = matches!(dest, Destination::Push(..));
+		// Only in-flight bookkeeping changes here; durable records own backoff.
 
 		let Some(status) = statuses.get_mut(dest) else {
 			return RetryAction::None;
 		};
 
 		let (tries, retry_action) = match status {
-			| TransactionStatus::Running | TransactionStatus::Deferred => (1, RetryAction::None),
+			| TransactionStatus::Running => (1, RetryAction::None),
 			| TransactionStatus::RunningForceRetry => (1, RetryAction::Force),
-			| TransactionStatus::Failed(n, _) | TransactionStatus::Retrying(n) =>
-				(n.saturating_add(1), RetryAction::None),
+			| TransactionStatus::Retrying(n) => (n.saturating_add(1), RetryAction::None),
 		};
 
-		*status = if push {
-			TransactionStatus::Failed(tries, Instant::now())
-		} else {
-			TransactionStatus::Retrying(tries)
-		};
+		*status = TransactionStatus::Retrying(tries);
 
 		retry_action
+	}
+
+	async fn persist_push_failure(
+		&self,
+		destination: &Destination,
+		statuses: &mut CurTransactionStatus,
+		stage: &mut QueueRecovery,
+	) -> Result<bool> {
+		let QueueRecovery::PersistPushFailure(backoff, rows) = stage else {
+			return Err(Error::bad_database("Missing push failure recovery stage"));
+		};
+		let persisted = self
+			.db
+			.persist_push_backoff(destination, rows, *backoff)
+			.await?;
+		statuses.remove(destination);
+		*stage = QueueRecovery::ResumePending;
+		Ok(persisted)
 	}
 
 	async fn resume_queue(
@@ -741,10 +789,15 @@ impl Service {
 		let (_, mut stage) = retries
 			.remove(&dest)
 			.expect("selected queue retry");
-		if let Err(error) = self
-			.resume_queue(&dest, futures, statuses, &mut stage)
-			.await
-		{
+		let result = if matches!(stage, QueueRecovery::PersistPushFailure(..)) {
+			self.persist_push_failure(&dest, statuses, &mut stage)
+				.await
+				.map(|_| ())
+		} else {
+			self.resume_queue(&dest, futures, statuses, &mut stage)
+				.await
+		};
+		if let Err(error) = result {
 			defer_queue_error(retries, dest, stage, error)?;
 		}
 		Ok(())
@@ -863,22 +916,6 @@ impl Service {
 			return Ok(());
 		}
 
-		if let (Destination::Push(..), Some(remaining)) =
-			(&dest, self.push_backoff_remaining(status))
-		{
-			if wakes
-				.iter()
-				.any(|Reverse((_, armed_dest))| armed_dest == &dest)
-			{
-				trace!(?dest, "Dropping stale push wake");
-			} else {
-				trace!(?dest, ?remaining, "Re-arming early push wake");
-				arm_wake_in(wakes, dest, remaining);
-			}
-
-			return Ok(());
-		}
-
 		match dest {
 			| Destination::Federation(server) => {
 				// A wake left for a peer since given up does nothing: its queue
@@ -917,7 +954,18 @@ impl Service {
 				self.handle_force_retry(dest, futures, statuses)
 					.await?;
 			},
-			| Destination::Appservice(_) => {},
+			| dest @ Destination::Appservice(_) => {
+				self.handle_request(
+					Msg {
+						dest,
+						event: SendingEvent::BadgeRefresh,
+						queue_id: Vec::new(),
+					},
+					futures,
+					statuses,
+				)
+				.await?;
+			},
 		}
 		Ok(())
 	}
@@ -928,27 +976,89 @@ impl Service {
 		skip_all,
 		fields(futures = %futures.len()),
 	)]
-	async fn finish_responses(&self, futures: &mut SendingFutures) -> Result {
+	async fn finish_responses(
+		&self,
+		futures: &mut SendingFutures,
+		statuses: &mut CurTransactionStatus,
+		retries: &mut QueueRetries,
+	) -> Result {
 		use tokio::{
 			select,
 			time::{Instant, sleep_until},
 		};
 
-		let timeout = self.server.config.sender_shutdown_timeout;
-		let timeout = Duration::from_secs(timeout);
+		let timeout = Duration::from_secs(self.server.config.sender_shutdown_timeout);
 		let now = Instant::now();
 		let deadline = now.checked_add(timeout).unwrap_or(now);
 		loop {
-			trace!("Waiting for {} requests to complete...", futures.len());
+			// Shutdown completes only existing outcomes; it never dispatches a
+			// successor. Exact ACK/failure stages survive database backpressure.
+			retries.retain(|_, (_, stage)| !matches!(stage, QueueRecovery::ResumePending));
+			if futures.is_empty() && retries.is_empty() {
+				return Ok(());
+			}
+			let retry_due = retries
+				.values()
+				.map(|(due, _)| *due)
+				.min()
+				.unwrap_or_else(Instant::now);
+			trace!(
+				"Waiting for {} requests and {} durable completions...",
+				futures.len(),
+				retries.len()
+			);
 			select! {
 				() = sleep_until(deadline) => return Ok(()),
-				response = futures.next() => match response {
-					Some(Ok(Delivery::Acknowledged(dest, rows))) => self.db.acknowledge_active(&dest, &rows).await?,
-					Some(_) => {},
-					None => return Ok(()),
+				response = futures.next(), if !futures.is_empty() => {
+					let Some(response) = response else { continue; };
+					let (dest, mut stage) = match response {
+						Ok(Delivery::Acknowledged(dest, rows)) => (dest, QueueRecovery::CleanupAcknowledged(rows)),
+						Ok(Delivery::PushFailed(dest, rows, _)) => {
+							let tries = match statuses.get(&dest) {
+								Some(TransactionStatus::Retrying(tries)) => tries.saturating_add(1),
+								_ => 1,
+							};
+							(dest, QueueRecovery::PersistPushFailure(PushBackoff::failed(tries)?, rows))
+						},
+						_ => continue,
+					};
+					let Ok(result) = tokio::time::timeout_at(deadline, self.finish_recovery(&dest, statuses, &mut stage)).await else { return Ok(()); };
+					if let Err(error) = result {
+						defer_queue_error(retries, dest, stage, error)?;
+					}
+				},
+				() = sleep_until(retry_due), if !retries.is_empty() => {
+					let dest = retries.iter().find(|(_, (due, _))| *due <= Instant::now()).map(|(dest, _)| dest.clone()).expect("due shutdown retry");
+					let (_, mut stage) = retries.remove(&dest).expect("selected shutdown retry");
+					let Ok(result) = tokio::time::timeout_at(deadline, self.finish_recovery(&dest, statuses, &mut stage)).await else { return Ok(()); };
+					if let Err(error) = result {
+						defer_queue_error(retries, dest, stage, error)?;
+					}
 				},
 			}
 		}
+	}
+
+	async fn finish_recovery(
+		&self,
+		destination: &Destination,
+		statuses: &mut CurTransactionStatus,
+		stage: &mut QueueRecovery,
+	) -> Result {
+		if matches!(stage, QueueRecovery::PersistPushFailure(..)) {
+			self.persist_push_failure(destination, statuses, stage)
+				.await?;
+		} else {
+			stage
+				.clean_acknowledged(async |rows| {
+					self.db
+						.acknowledge_active(destination, rows)
+						.await
+				})
+				.await?;
+			statuses.remove(destination);
+		}
+		Ok(())
 	}
 
 	#[tracing::instrument(
@@ -1084,6 +1194,23 @@ impl Service {
 			}
 		}
 
+		if matches!(dest, Destination::Push(..))
+			&& !statuses.contains_key(dest)
+			&& let Some(backoff) = self.db.push_backoff(dest).await?
+		{
+			if backoff
+				.remaining(
+					self.server.config.sender_timeout,
+					self.server.config.sender_retry_backoff_limit,
+				)?
+				.is_some()
+			{
+				return Ok((false, false));
+			}
+			statuses.insert(dest.clone(), TransactionStatus::Retrying(backoff.tries));
+			return Ok((true, true));
+		}
+
 		let (mut allow, mut retry) = (true, false);
 		statuses
 			.entry(dest.clone())
@@ -1092,31 +1219,6 @@ impl Service {
 					allow = false; // already running
 					if matches!(retry_action, RetryAction::Force) {
 						*e = TransactionStatus::RunningForceRetry;
-					}
-				},
-				| TransactionStatus::Deferred => {
-					retry = true;
-					*e = TransactionStatus::Retrying(0);
-				},
-				| TransactionStatus::Failed(tries, time) => {
-					// Push backoff: hold off until the exponential window elapses.
-					let min = self.server.config.sender_timeout;
-					let max = self.server.config.sender_retry_backoff_limit;
-					let remaining =
-						exponential_backoff_remaining_secs(min, max, time.elapsed(), *tries);
-
-					trace!(
-						?dest,
-						tries = *tries,
-						?remaining,
-						"Push destination remains in backoff",
-					);
-
-					if remaining.is_some() {
-						allow = false;
-					} else {
-						retry = true;
-						*e = TransactionStatus::Retrying(*tries);
 					}
 				},
 				| TransactionStatus::Retrying(_) if matches!(dest, Destination::Push(..)) => {
@@ -1577,13 +1679,14 @@ impl Service {
 			| Destination::Appservice(id) =>
 				self.send_events_dest_appservice(id, events, rows)
 					.await,
-			| Destination::Push(user_id, pushkey) => self
+			| Destination::Push(user_id, pushkey) => match self
 				.send_events_dest_push(user_id, pushkey, events)
 				.await
-				.map(|response| match response {
-					| Delivery::Acknowledged(dest, _) => Delivery::Acknowledged(dest, rows),
-					| response => response,
-				}),
+			{
+				| Ok(Delivery::Acknowledged(dest, _)) => Ok(Delivery::Acknowledged(dest, rows)),
+				| Ok(response) => Ok(response),
+				| Err((dest, error)) => Ok(Delivery::PushFailed(dest, rows, Box::new(error))),
+			},
 		}
 	}
 

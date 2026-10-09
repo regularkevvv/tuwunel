@@ -146,14 +146,18 @@ impl Data {
 		{
 			return Ok(());
 		}
+		let mut matched = false;
+		let mut replaced = false;
 		for (key, expected) in &acknowledgement.rows {
 			let (owner, _) = parse_servercurrentevent(key, expected)?;
 			if &owner != destination {
 				return Err(Error::bad_database("Acknowledgement destination mismatch"));
 			}
 			match self.servercurrentevent_data.get(key).await {
-				| Ok(value) if value.as_ref() == expected.as_slice() =>
-					txn.del_raw(&self.servercurrentevent_data, key),
+				| Ok(value) if value.as_ref() == expected.as_slice() => {
+					matched = true;
+					txn.del_raw(&self.servercurrentevent_data, key);
+				},
 				| Ok(value) => {
 					self.validate_active_identity(&value)?;
 					let previous = active::identity(expected)?;
@@ -163,6 +167,7 @@ impl Data {
 					{
 						// Cancellation/re-admission owns a newer identity, even
 						// if key and logical event bytes were reused exactly.
+						replaced = true;
 						continue;
 					}
 					return Err(Error::bad_database(
@@ -173,6 +178,9 @@ impl Data {
 				| Err(error) if error.is_not_found() => {},
 				| Err(error) => return Err(error),
 			}
+		}
+		if matched && !replaced {
+			self.stage_clear_push_backoff(&mut txn, destination)?;
 		}
 		txn.execute().await
 	}

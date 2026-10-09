@@ -828,7 +828,7 @@ async fn verify(mode: Mode) -> Result {
 		futures.push(destination.clone(), ready(response).boxed(), services.server.runtime());
 		services
 			.sending
-			.finish_responses(&mut futures)
+			.finish_responses(&mut futures, &mut statuses, &mut QueueRetries::new())
 			.await?;
 	} else {
 		let result = services

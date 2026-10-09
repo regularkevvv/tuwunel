@@ -529,7 +529,8 @@ impl Data {
 
 		self.require_active_schema().await?;
 		if AttemptKind::for_destination(destination).is_none() {
-			return self.delete_queue_pages(destination).await;
+			self.delete_queue_pages(destination).await?;
+			return self.clear_push_backoff(destination).await;
 		}
 		let previous = self.read_attempt_header(destination).await?;
 		let prefix = destination.get_prefix();
