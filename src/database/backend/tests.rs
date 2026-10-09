@@ -29,6 +29,137 @@ const MAPS: &[&str] = &["alias_roomid", "pduid_pdu", "global"];
 /// Rows per remote scan page while the suite runs.
 const SCAN_PAGE: u32 = 3;
 
+#[tokio::test]
+async fn contract_mixed_commit_admission_counts_all_maps_and_deletions_before_mutation() -> Result
+{
+	let rig = rig("contract-mixed-admission").await?;
+	for (index, name) in BACKENDS.into_iter().enumerate() {
+		let make = |count: usize| {
+			let mut txn = match index {
+				| 0 => rig.rocks_db.txn(),
+				| 1 => Txn::new_with_sink(Sink::Mem(rig.store.clone())),
+				| _ => Txn::new_with_sink(Sink::Remote(rig.backend.clone())),
+			};
+			for at in 0..count {
+				let key = format!("mixed-admission-{at:04}");
+				let map = rig.trios[at % 3].all()[index];
+				if at % 3 == 2 {
+					txn.del_raw(map, &key);
+				} else {
+					txn.insert_raw(map, &key, b"value");
+				}
+			}
+			txn
+		};
+		let refused = make(tuwunel_bridge::MAX_COMMIT_OPS + 1);
+		refused
+			.check_bridge_admission()
+			.expect_err("901 mutations must refuse");
+		let accepted = make(tuwunel_bridge::MAX_COMMIT_OPS);
+		assert!(accepted.check_bridge_admission()? > 0);
+		for at in 0..=tuwunel_bridge::MAX_COMMIT_OPS {
+			let key = format!("mixed-admission-{at:04}");
+			assert!(
+				rig.trios[at % 3].all()[index]
+					.get(&key)
+					.await
+					.unwrap_err()
+					.is_not_found(),
+				"{name}: admission changed storage"
+			);
+		}
+		accepted.execute().await?;
+		for at in 0..tuwunel_bridge::MAX_COMMIT_OPS {
+			let key = format!("mixed-admission-{at:04}");
+			let row = rig.trios[at % 3].all()[index].get(&key).await;
+			if at % 3 == 2 {
+				assert!(row.unwrap_err().is_not_found(), "{name}: delete was applied as a put");
+			} else {
+				assert_eq!(row?.as_ref(), b"value", "{name}: missing accepted put");
+			}
+		}
+	}
+	rig.backend.close().await;
+	let empty = Txn::new_with_sink(Sink::Remote(rig.backend.clone()));
+	assert_eq!(empty.check_bridge_admission()?, 0, "empty closed backend is a no-op");
+	let mut closed = Txn::new_with_sink(Sink::Remote(rig.backend.clone()));
+	closed.insert_raw(&rig.trios[0].remote, b"closed", b"");
+	closed
+		.check_bridge_admission()
+		.expect_err("closed writer has no admissible lease");
+	Ok(())
+}
+
+#[tokio::test]
+async fn contract_mixed_commit_admission_keeps_each_writers_exact_byte_boundary() -> Result {
+	let rig = rig("contract-mixed-admission-bytes").await?;
+	let value = vec![0; tuwunel_bridge::MAX_VALUE_BYTES];
+	for (index, name) in BACKENDS.into_iter().enumerate() {
+		let make = |tail: usize| {
+			let mut txn = match index {
+				| 0 => rig.rocks_db.txn(),
+				| 1 => Txn::new_with_sink(Sink::Mem(rig.store.clone())),
+				| _ => Txn::new_with_sink(Sink::Remote(rig.backend.clone())),
+			};
+			txn.insert_raw(rig.trios[0].all()[index], b"a", &value);
+			txn.insert_raw(rig.trios[1].all()[index], b"b", &value);
+			txn.del_raw(rig.trios[2].all()[index], b"obsolete");
+			txn.insert_raw(rig.trios[2].all()[index], b"tail", vec![0; tail]);
+			txn
+		};
+		let initial = make(65_536);
+		let tail =
+			65_536 + tuwunel_bridge::request::MAX_BYTES - initial.check_bridge_admission()?;
+		let oversized = make(tail + 1);
+		oversized
+			.check_bridge_admission()
+			.expect_err("one byte over complete mixed commit");
+		let accepted = make(tail);
+		assert_eq!(
+			accepted.check_bridge_admission()?,
+			tuwunel_bridge::request::MAX_BYTES,
+			"{name}"
+		);
+		for (trio, key) in rig
+			.trios
+			.iter()
+			.zip([b"a".as_slice(), b"b", b"tail"])
+		{
+			assert!(
+				trio.all()[index]
+					.get(&key)
+					.await
+					.unwrap_err()
+					.is_not_found(),
+				"{name}: preflight applied an oversized commit"
+			);
+		}
+		accepted.execute().await?;
+		assert_eq!(
+			rig.trios[0].all()[index]
+				.get(&b"a".as_slice())
+				.await?
+				.len(),
+			value.len()
+		);
+		assert_eq!(
+			rig.trios[1].all()[index]
+				.get(&b"b".as_slice())
+				.await?
+				.len(),
+			value.len()
+		);
+		assert_eq!(
+			rig.trios[2].all()[index]
+				.get(&b"tail".as_slice())
+				.await?
+				.len(),
+			tail
+		);
+	}
+	Ok(())
+}
+
 /// One map opened on every backend, mutated and queried in lockstep.
 struct Trio {
 	rocks: Arc<Map>,

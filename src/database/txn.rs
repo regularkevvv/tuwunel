@@ -13,7 +13,7 @@ use rocksdb::WriteBatch;
 use serde::Serialize;
 use serde_bytes::ByteBuf;
 use tuwunel_bridge::Mutation;
-use tuwunel_core::{Result, implement};
+use tuwunel_core::{Result, err, implement};
 
 use crate::{
 	Engine, Map,
@@ -52,6 +52,41 @@ pub fn new(engine: &Arc<Engine>) -> Self {
 		ops: Vec::new(),
 		sink: Sink::Rocks(engine.clone()),
 	}
+}
+
+/// Checks this entire mixed-map transaction against the bridge's count,
+/// key/value and encoded-request limits without copying its queued inputs.
+///
+/// Remote checks use the current writable lease. Native/model checks use the
+/// minimum envelope, matching direct put admission; they do not claim byte
+/// parity with an arbitrary provider identity. An empty transaction is a no-op.
+/// This opt-in check neither executes nor splits the transaction. Execution
+/// still validates the remote fence and can fail after admission.
+#[implement(Txn)]
+pub fn check_bridge_admission(&self) -> Result<usize> {
+	if self.is_empty() {
+		return Ok(0);
+	}
+	let lease = match &self.sink {
+		| Sink::Remote(backend) => backend.writable_lease()?,
+		| Sink::Rocks(_) | Sink::Mem(_) =>
+			tuwunel_bridge::Lease { holder: String::new(), epoch: 0 },
+	};
+	let mut budget = tuwunel_bridge::request::CommitBudget::new(&lease)
+		.map_err(|error| err!(Database("Commit admission: {error}")))?;
+	for (map, operation) in &self.ops {
+		let map = map
+			.id()
+			.ok_or_else(|| err!(Database("Commit admission requires catalog maps")))?;
+		match operation {
+			| Op::Put { key, val } => budget.try_put(map.0, key, val),
+			| Op::Delete { key } => budget.try_delete(map.0, key),
+		}
+		.map_err(|error| err!(Database("Commit admission: {error}")))?;
+	}
+	budget
+		.encoded_size()
+		.map_err(|error| err!(Database("Commit admission: {error}")))
 }
 
 /// Creates an empty transaction addressed to an explicit backend sink.
