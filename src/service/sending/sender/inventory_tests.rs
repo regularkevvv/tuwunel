@@ -148,7 +148,7 @@ async fn failed_push_backoff_survives_sender_reconstruction() -> Result {
 	Ok(())
 }
 
-async fn healthy(services: &Services) -> Result<Destination> {
+pub(super) async fn healthy(services: &Services) -> Result<Destination> {
 	let registration: Registration = RegistrationInit {
 		id: "z-healthy-localretry".into(),
 		url: None,
@@ -167,7 +167,7 @@ async fn healthy(services: &Services) -> Result<Destination> {
 	Ok(Destination::Appservice("z-healthy-localretry".into()))
 }
 
-async fn wait_empty(services: &Services, destination: &Destination) -> Result {
+pub(super) async fn wait_empty(services: &Services, destination: &Destination) -> Result {
 	loop {
 		let pending = services
 			.sending

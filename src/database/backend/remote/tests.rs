@@ -1771,6 +1771,51 @@ async fn capped_batches_read_no_more_than_their_cap_and_resume_after_their_curso
 }
 
 #[tokio::test]
+async fn maximum_width_page_cursor_resumes_without_widening_the_bridge_request() -> Result {
+	let (fake, _server, backend) = rig(4, 0).await?;
+	let map = Map::open_remote(&backend, MAP);
+	let first = vec![b'x'; bridge::MAX_KEY_BYTES];
+	let mut next = first.clone();
+	*next.last_mut().expect("nonempty cursor") = b'y';
+	fake.fill(map_id(), [
+		(first.clone(), b"first".to_vec()),
+		(next.clone(), b"next".to_vec()),
+		(b"z".to_vec(), b"last".to_vec()),
+	]);
+	assert_eq!(map.raw_keys_after(None, 1).await?, vec![first.clone()]);
+	let before = fake.served();
+	assert_eq!(map.raw_keys_after(Some(&first), 1).await?, vec![next.clone()]);
+	assert!(fake.served().saturating_sub(before) <= 2);
+	assert_eq!(map.raw_rows_after(Some(&first), 1).await?, vec![(
+		next.clone(),
+		b"next".to_vec()
+	)]);
+	assert_eq!(
+		map.raw_keys_prefix_after(b"x", Some(&first), 1)
+			.await?,
+		vec![next.clone()]
+	);
+	assert_eq!(
+		map.raw_rows_prefix_after(b"x", Some(&first), 1)
+			.await?,
+		vec![(next.clone(), b"next".to_vec())]
+	);
+	// An absent cursor must not skip the next row; an empty page reads none.
+	map.remove(&first).await?;
+	assert_eq!(map.raw_keys_after(Some(&first), 1).await?, vec![next]);
+	let before = fake.served();
+	assert!(
+		map.raw_keys_after(Some(&first), 0)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(fake.served(), before);
+	assert_eq!(backend.scans().len(), 0, "owned pages close their scans");
+	backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
 async fn del_prefix_and_clear_past_the_drain_budget_remove_every_row() -> Result {
 	let (fake, _server, backend) = rig(256, 0).await?;
 	let map = Map::open_remote(&backend, MAP);

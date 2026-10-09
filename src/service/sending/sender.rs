@@ -95,6 +95,9 @@ mod resources_tests;
 #[cfg(test)]
 mod inventory_tests;
 
+#[cfg(test)]
+mod allocation_tests;
+
 /// Bookkeeping for admitted tasks and exact cleanup/persistence retries.
 /// Cross-attempt backoff lives in durable peer or push records.
 #[derive(Debug)]
@@ -279,7 +282,6 @@ const SELECT_DEVICE_CHANGE_LIMIT: usize = 256;
 /// cursor.
 const EDU_WINDOW_COUNTS: u64 = 128;
 const EDU_ROOM_READ_CONCURRENCY: usize = 8;
-const DEQUEUE_LIMIT: usize = super::data::ACTIVE_PROMOTION_LIMIT;
 const PUSH_FAILURE_STREAK: u32 = 4;
 const WAKE_OVERFLOW_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
 const WAKE_OVERFLOW_DELAY: Duration = Duration::from_secs(WAKE_OVERFLOW_DELAY_SECS);
@@ -643,7 +645,7 @@ impl Service {
 			return Ok(());
 		}
 		let Some(events) = self
-			.select_events(&dest, Vec::new(), statuses)
+			.select_or_refuse(&dest, Vec::new(), futures, statuses)
 			.await?
 		else {
 			return Ok(());
@@ -731,12 +733,14 @@ impl Service {
 		}
 
 		// Find events that have been added since starting the last request
-		let new_events = self
-			.db
-			.queued_requests(dest)
-			.take(DEQUEUE_LIMIT)
-			.try_collect::<Vec<_>>()
-			.await?;
+		let new_events = match self.db.queued_batch(dest).await {
+			| Ok(events) => events,
+			| Err(error) if error.status_code() == http::StatusCode::PAYLOAD_TOO_LARGE => {
+				self.schedule_refusal(dest, error, futures, statuses);
+				return Ok(());
+			},
+			| Err(error) => return Err(error),
+		};
 
 		if !new_events.is_empty() {
 			self.db.mark_as_active(new_events.iter()).await?;
@@ -837,15 +841,9 @@ impl Service {
 			&& matches!(&msg.event, SendingEvent::BadgeRefresh | SendingEvent::Flush);
 		let flush_wake = msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::Flush);
 
-		let mut new_events = match (synthetic_wake, statuses.contains_key(&msg.dest)) {
-			| (false, _) => vec![(msg.queue_id, msg.event)],
-			| (true, true) => Vec::new(),
-			| (true, false) =>
-				self.db
-					.queued_requests(&msg.dest)
-					.take(DEQUEUE_LIMIT)
-					.try_collect()
-					.await?,
+		let mut new_events = match synthetic_wake {
+			| false => vec![(msg.queue_id, msg.event)],
+			| true => Vec::new(),
 		};
 		// Preserve explicit appservice retry requests without persisting a
 		// synthetic row or sending a fabricated badge/PDU.
@@ -854,12 +852,46 @@ impl Service {
 		}
 
 		if let Some(events) = self
-			.select_events(&msg.dest, new_events, statuses)
+			.select_or_refuse(&msg.dest, new_events, futures, statuses)
 			.await?
 		{
 			self.schedule_events(msg.dest, events, futures, statuses);
 		}
 		Ok(())
+	}
+
+	fn schedule_refusal(
+		&self,
+		dest: &Destination,
+		error: Error,
+		futures: &mut SendingFutures,
+		statuses: &mut CurTransactionStatus,
+	) {
+		statuses.remove(dest);
+		futures.push(
+			dest.clone(),
+			futures::future::ready(Ok(unprepared(dest.clone(), error))).boxed(),
+			self.server.runtime(),
+		);
+	}
+
+	async fn select_or_refuse(
+		&self,
+		dest: &Destination,
+		new_events: Vec<QueueItem>,
+		futures: &mut SendingFutures,
+		statuses: &mut CurTransactionStatus,
+	) -> Result<Option<Vec<SendingEvent>>> {
+		match self
+			.select_events(dest, new_events, statuses)
+			.await
+		{
+			| Err(error) if error.status_code() == http::StatusCode::PAYLOAD_TOO_LARGE => {
+				self.schedule_refusal(dest, error, futures, statuses);
+				Ok(None)
+			},
+			| result => result,
+		}
 	}
 
 	async fn drain_due_wakes(
@@ -1138,6 +1170,16 @@ impl Service {
 		if active.is_some() {
 			return Ok(Some(vec![SendingEvent::Flush]));
 		}
+		// A synthetic wake does not own a payload. Select from physical pending
+		// rows only after giving an existing active transaction priority.
+		let new_events = if new_events
+			.iter()
+			.all(|(key, event)| key.is_empty() && matches!(event, SendingEvent::Flush))
+		{
+			self.db.queued_batch(dest).await?
+		} else {
+			new_events
+		};
 
 		// Compose the next transaction
 		let _cork = self.db.db.cork();

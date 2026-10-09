@@ -2,15 +2,25 @@
 //! cancellation. Queue keys and event payloads may be reused; this identity
 //! must not be.
 
-use tuwunel_core::{Error, Result};
+use tuwunel_core::{Error, Result, err};
 
 use super::SendingEvent;
 
 const TAG: u8 = 0x05;
 const VERSION: u8 = 1;
-const HEADER: usize = 2 + size_of::<u64>();
+pub(super) const HEADER: usize = 2 + size_of::<u64>();
+
+pub(super) fn validate_payload(value: &[u8]) -> Result {
+	if value.len().saturating_add(HEADER) > tuwunel_bridge::MAX_VALUE_BYTES {
+		return Err(err!(Request(TooLarge(
+			"Outgoing value leaves no room for its active identity"
+		))));
+	}
+	Ok(())
+}
 
 pub(super) fn encode(event: &SendingEvent, identity: u64) -> Result<Vec<u8>> {
+	validate_payload(event.value_bytes())?;
 	if identity == 0 || event.value_bytes().first() == Some(&TAG) {
 		return Err(Error::bad_database("Invalid active delivery identity payload"));
 	}

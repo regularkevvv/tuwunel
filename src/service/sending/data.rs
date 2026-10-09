@@ -3,10 +3,10 @@ use std::{fmt::Debug, sync::Arc};
 #[cfg(test)]
 mod tests;
 
-use futures::{Stream, StreamExt, stream::iter};
+use futures::{Stream, StreamExt, TryStreamExt, stream::iter};
 use ruma::{OwnedServerName, ServerName, UserId};
 use tokio::sync::Mutex;
-use tuwunel_core::{Error, Result, at, utils, utils::ReadyExt};
+use tuwunel_core::{Error, Result, at, err, utils, utils::ReadyExt};
 use tuwunel_database::{Database, Deserialized, Get, Map, Txn};
 #[cfg(test)]
 use tuwunel_database::{Row, deserialize_from_slice};
@@ -85,6 +85,14 @@ impl Data {
 		}
 		if events.len() > ACTIVE_PROMOTION_LIMIT {
 			return Err(Error::bad_database("Active promotion exceeds the batch limit"));
+		}
+		// Validate the entire proposed promotion before consuming an identity or
+		// staging a mutation. Native storage must share the provider's limits.
+		for (key, event) in &events {
+			if key.len() > tuwunel_bridge::MAX_KEY_BYTES {
+				return Err(Error::bad_database("Outgoing promotion key exceeds storage limit"));
+			}
+			active::validate_payload(event.value_bytes())?;
 		}
 		self.require_active_schema().await?;
 		let existing = iter(events.iter().map(|(key, _)| key.as_slice()))
@@ -221,6 +229,27 @@ impl Data {
 		let services_root = services_guard.as_ref();
 
 		let _guard = self.active_write.lock().await;
+		for (event, destination) in requests.clone() {
+			active::validate_payload(event.value_bytes())?;
+			let suffix = match event {
+				| SendingEvent::Pdu(id) | SendingEvent::FrozenPush(id) => id.as_ref().len(),
+				| _ => size_of::<u64>(),
+			};
+			let required_suffix = if matches!(destination, Destination::Push(..)) {
+				suffix
+			} else {
+				suffix.max(17)
+			};
+			if destination
+				.prefix_len()
+				.saturating_add(required_suffix)
+				> tuwunel_bridge::MAX_KEY_BYTES
+			{
+				return Err(err!(Request(TooLarge(
+					"Outgoing destination exceeds storage key width"
+				))));
+			}
+		}
 		for (_, destination) in requests.clone() {
 			self.resume_cancellation(destination).await?;
 		}
@@ -286,6 +315,54 @@ impl Data {
 			.raw_stream_from(&prefix)
 			.ready_take_while(move |row| within_prefix(row, &prefix))
 			.map(decode_sending)
+	}
+
+	/// Copy only a promotable prefix, reserving active-envelope bytes before
+	/// decoding payloads. The borrowed scan closes before promotion may write.
+	pub(super) async fn queued_batch(&self, destination: &Destination) -> Result<Vec<QueueItem>> {
+		const KEY_BYTES: usize = 128 * 1024;
+		if destination.prefix_len() > tuwunel_bridge::MAX_KEY_BYTES {
+			return Err(Error::bad_database("Outgoing queue prefix exceeds storage limit"));
+		}
+		let prefix = destination.get_prefix();
+		let mut queued = self
+			.servernameevent_data
+			.raw_stream_from(&prefix)
+			.ready_take_while(move |row| within_prefix(row, &prefix))
+			.take(ACTIVE_PROMOTION_LIMIT)
+			.boxed();
+		let mut items = Vec::new();
+		let mut key_bytes = 0_usize;
+		let mut value_bytes = 0_usize;
+		while let Some((key, value)) = queued.try_next().await? {
+			if key.len() > tuwunel_bridge::MAX_KEY_BYTES {
+				return Err(Error::bad_database("Outgoing queued key exceeds storage limit"));
+			}
+			if active::identity(value)?.is_some() {
+				return Err(Error::bad_database("Active identity envelope in the pending queue"));
+			}
+			if let Err(error) = active::validate_payload(value) {
+				if items.is_empty() {
+					return Err(error);
+				}
+				break;
+			}
+			let next_keys = key_bytes.saturating_add(key.len());
+			let next_values = value_bytes
+				.saturating_add(value.len())
+				.saturating_add(active::HEADER);
+			if next_keys > KEY_BYTES || next_values > BODY_LIMIT {
+				break;
+			}
+			let (owned_key, event, owner) = decode_queued(Ok((key, value)))?;
+			if &owner != destination {
+				return Err(Error::bad_database("Outgoing queued destination mismatch"));
+			}
+			items.push((owned_key, event));
+			key_bytes = next_keys;
+			value_bytes = next_values;
+		}
+		Ok(items)
 	}
 
 	/// A bounded, checked page of a user's owed push destinations. This only
