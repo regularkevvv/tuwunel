@@ -69,6 +69,10 @@ with open(os.environ["TEST_CARGO_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\\n")
 if os.environ.get("TEST_CARGO_FAIL") == "1":
     sys.exit(1)
+if "de_record_" in sys.argv:
+    print("test result: ok. 0 passed; 0 failed; 0 ignored;")
+    print("test result: ok. 7 passed; 0 failed; 0 ignored;")
+    sys.exit(0)
 for case in json.loads(os.environ["TEST_REQUIRED"]):
     print(f"test {case} ... ok")
 print("test result: ok. 42 passed; 0 failed; 0 ignored;")
@@ -83,8 +87,8 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
                     "TUWUNEL_LIFECYCLE_REPORT": str(self.base / "receipt.json"),
                     "TUWUNEL_QUEUE_RESTART_SCENARIO": "corrupt-pdu"}
 
-    def run_gate(self):
-        return subprocess.run(["bash", "ci/native-gate.sh", "container-lifecycle"], cwd=self.root,
+    def run_gate(self, mode="container-lifecycle"):
+        return subprocess.run(["bash", "ci/native-gate.sh", mode], cwd=self.root,
                               env=self.env, text=True, capture_output=True)
 
     def test_linux_amd64_driver_uses_declared_release_features(self):
@@ -102,6 +106,17 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
         receipt = json.loads((self.base / "receipt.json").read_text())
         self.assertEqual(receipt["required_case_count"], len(GATE.REQUIRED))
         self.assertEqual(receipt["cargo_profile"], "release")
+
+    def test_record_decoding_reuses_the_container_release_feature_closure(self):
+        result = self.run_gate("release")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = [json.loads(line) for line in (self.base / "cargo.jsonl").read_text().splitlines()]
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        for argument in ("--release", "--no-default-features", "tuwunel", "tuwunel_database", "de_record_"):
+            self.assertIn(argument, command)
+        features = command[command.index("--features") + 1].replace("tuwunel/", "").split(",")
+        self.assertEqual(features, GATE.feature_contract().split(","))
 
     def test_darwin_refuses_before_cargo(self):
         self.env["TEST_OS"] = "Darwin"

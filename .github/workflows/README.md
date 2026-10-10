@@ -13,7 +13,9 @@ refuses other platforms or feature drift. It runs the main/core/database/service
 router library suites and the real-process cancellation, fatal startup and
 SIGKILL/recovery integrations, requiring 42 named lifecycle controls. The Unix
 restart control executes the actual `exec` path in a disposable child process.
-The same job and Cargo target directory are reused; no second runner or provider
-credentials are required. The small receipt records source, scope and required
+The same job, release dependency feature closure and Cargo target directory are
+reused for lifecycle and record decoding; no second runner or provider credentials
+are required. Cargo test enables the existing dev-dependency refusal/recovery hooks;
+these are recorded in the receipt and are absent from the release image. The small receipt records source, scope and required
 cases. This gate qualifies local RocksDB and loopback bridge behavior, and does
 not claim a real-provider or staging result.

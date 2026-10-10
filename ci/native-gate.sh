@@ -151,7 +151,12 @@ case "$mode" in
       "${TUWUNEL_LIFECYCLE_REPORT:-$test_root/container-lifecycle.json}"
     ;;
   release)
-    cargo test --locked --release -p tuwunel_database --lib de_record_ -- --nocapture \
+    # Reuse the release dependency closure already built by container-lifecycle,
+    # rather than rebuilding native dependencies with a different feature set.
+    features=$(python3 ci/check-container-lifecycle.py --features)
+    workspace_features="tuwunel/${features//,/,tuwunel/}"
+    cargo test --locked --release --no-default-features --features "$workspace_features" \
+      -p tuwunel -p tuwunel_database --lib de_record_ -- --nocapture \
       | tee "$test_root/codec.log"
     grep -Fq 'test result: ok. 7 passed; 0 failed;' "$test_root/codec.log"
     ;;

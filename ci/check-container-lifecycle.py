@@ -99,6 +99,7 @@ def main():
         "schema": 1, "status": "passed", "source_commit": commit, "source_dirty": dirty,
         "os": platform.system(), "architecture": platform.machine(), "cargo_profile": "release",
         "default_features": False, "features": features.split(","),
+        "test_dev_dependency_features": ["tuwunel_database/commit_refusals", "tuwunel_service/notification_recovery_tests"],
         "required_cases": sorted(REQUIRED), "required_case_count": len(REQUIRED),
         "scope": "Linux/amd64 release-feature lifecycle; local RocksDB and loopback remote controls",
         "excludes": ["real D1/R2", "staging deployment", "hot modules", "io_uring", "systemd"],
