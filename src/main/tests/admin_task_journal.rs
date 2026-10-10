@@ -131,7 +131,10 @@ fn child(directory: &Path, phase: &str) -> Result {
 	let port = listener.local_addr()?.port();
 	let modes: &[&str] = if phase == "prepare" { &["fresh"] } else { &[] };
 	let mut args = Args::default_test(modes);
-	args.maintenance = matches!(phase, "inspect" | "repair");
+	// Corruption is seeded offline for the next startup refusal. A live task
+	// worker's initial prune could otherwise observe the newly corrupt rows
+	// and correctly shut down this seeding process before its own cleanup.
+	args.maintenance = matches!(phase, "inspect" | "corrupt" | "repair");
 	args.option.extend([
 		format!("database_path={:?}", directory.join("database")),
 		"address=[\"127.0.0.1\"]".into(),
