@@ -60,6 +60,31 @@ pub async fn handle_incoming_pdu_and_federate<'a>(
 		.await
 }
 
+#[implement(super::Service)]
+pub(super) async fn known_timeline_pdu(
+	&self,
+	room: &RoomId,
+	event: &EventId,
+	federate: bool,
+	state_lock: Option<&crate::rooms::state::RoomMutexGuard>,
+) -> Result<Option<RawPduId>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let raw = match services_root.timeline.get_pdu_id(event).await {
+		| Ok(raw) => raw,
+		| Err(error) if error.is_not_found() => return Ok(None),
+		| Err(error) => return Err(error),
+	};
+	if federate {
+		services_root
+			.timeline
+			.federate_existing_pdu(raw, room, event, state_lock)
+			.await?;
+	}
+	debug!(?raw, "Exists.");
+	Ok(Some(raw))
+}
+
 /// When receiving an event one needs to:
 /// 0. Check the server is in the room
 /// 1. Skip the PDU if we already know about it
@@ -109,8 +134,10 @@ async fn handle_incoming_pdu_with_delivery<'a>(
 	let services_root = services_guard.as_ref();
 
 	// 1. Skip the PDU if we already have it as a timeline event
-	if let Ok(pdu_id) = services_root.timeline.get_pdu_id(event_id).await {
-		debug!(?pdu_id, "Exists.");
+	if let Some(pdu_id) = self
+		.known_timeline_pdu(room_id, event_id, federate, None)
+		.await?
+	{
 		return Ok(Some((pdu_id, false)));
 	}
 

@@ -81,14 +81,11 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
-	// Skip the PDU if we already have it as a timeline event
-	if let Ok(pdu_id) = services_root
-		.timeline
-		.get_pdu_id(incoming_pdu.event_id())
-		.await
+	if let Some(raw) = self
+		.known_timeline_pdu(room_id, incoming_pdu.event_id(), federate, None)
+		.await?
 	{
-		debug!(?pdu_id, "Exists.");
-		return Ok(Some((pdu_id, false)));
+		return Ok(Some((raw, false)));
 	}
 
 	trace!("Upgrading to timeline pdu");
@@ -129,6 +126,14 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	// We start looking at current room state now, so lets lock the room
 	trace!("Locking the room");
 	let state_lock = services_root.state.mutex.lock(room_id).await;
+	// Another delivery may have accepted this event while authentication and
+	// state reconstruction ran. Recheck inside the canonical room exclusion.
+	if let Some(raw) = self
+		.known_timeline_pdu(room_id, incoming_pdu.event_id(), federate, Some(&state_lock))
+		.await?
+	{
+		return Ok(Some((raw, false)));
+	}
 
 	// 14. Check if the event passes auth based on the current room state.
 	let soft_fail_current_state = !self
@@ -255,13 +260,8 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	drop(state_lock);
 
 	if cleared {
-		services_root
-			.pdu_metadata
-			.clear_event_soft_failed(incoming_pdu.event_id())
+		self.clear_accepted_soft_fail(incoming_pdu.event_id())
 			.await?;
-
-		self.record_success(Context::Upgrade, incoming_pdu.event_id())
-			.await;
 	}
 
 	debug_info!(
@@ -270,6 +270,18 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	);
 
 	Ok(pdu_id.zip(Some(true)))
+}
+
+#[implement(super::Service)]
+async fn clear_accepted_soft_fail(&self, event: &EventId) -> Result {
+	self.services
+		.get()
+		.as_ref()
+		.pdu_metadata
+		.clear_event_soft_failed(event)
+		.await?;
+	self.record_success(Context::Upgrade, event).await;
+	Ok(())
 }
 
 #[implement(super::Service)]
@@ -744,14 +756,16 @@ async fn finish_resolved_membership(
 	&self,
 	room: &RoomId,
 	pdu: &PduEvent,
-	resolved: HashSetCompressStateEvent,
-	lock: &crate::rooms::state::RoomMutexGuard,
+	_resolved: HashSetCompressStateEvent,
+	_lock: &crate::rooms::state::RoomMutexGuard,
 ) {
+	// Canonical admission already retained and attempted all membership
+	// projections, including resolved changes to users other than the PDU target.
 	self.services
 		.get()
 		.as_ref()
-		.state
-		.force_state(room, resolved.shortstatehash, resolved.added, resolved.removed, lock)
+		.spaces
+		.cache_evict(room)
 		.await
-		.effect("resolved membership", pdu.event_id());
+		.effect("resolved hierarchy", pdu.event_id());
 }

@@ -28,7 +28,13 @@ impl Service {
 				.exists_checked(room)
 				.await?
 			{
-				return Err(Error::bad_database("Pending recount refers to an unknown room"));
+				// A remote join/knock can publish room state before any local
+				// timeline PDU. Both durable identifiers must already exist.
+				services_root.short.get_shortroomid(room).await?;
+				services_root
+					.state
+					.get_room_shortstatehash(room)
+					.await?;
 			}
 			let marker = services_root.db["global"]
 				.qry(&(RECOUNT_PENDING, room))
@@ -38,6 +44,9 @@ impl Service {
 			}
 			self.recount_is_current(room).await?;
 		}
+		// Projection completion can rebuild counts and retire their markers.
+		// Validate every existing recount marker before allowing that first write.
+		self.restore_membership_projections().await?;
 		for room in rooms {
 			let _state_lock = services_root.state.mutex.lock(&room).await;
 			self.repair_joined_count(&room).await?;

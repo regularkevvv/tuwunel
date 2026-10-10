@@ -266,13 +266,34 @@ async fn per_user_failures(services: &Services, alice: &UserId) -> Result {
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
 	metadata.clear().await?;
-	device(services, alice, serde_json::json!({"device_id":"x".repeat(32 * 1024 + 1)})).await?;
+	let oversized = "x".repeat(32 * 1024 + 1);
+	device(services, alice, serde_json::json!({"device_id":oversized})).await?;
 	assert_eq!(
 		services
 			.users
 			.bounded_device_ids(alice)
 			.await
 			.expect_err("device IDs have a separate retained-byte budget")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	// This deliberately invalid native key exceeds the bridge storage width.
+	// Remove it directly before any paged cleanup of the fixture's map.
+	metadata.del((alice, &oversized)).await?;
+	for index in 0..3 {
+		device(
+			services,
+			alice,
+			serde_json::json!({"device_id":format!("{index}{}", "x".repeat(12 * 1024))}),
+		)
+		.await?;
+	}
+	assert_eq!(
+		services
+			.users
+			.bounded_device_ids(alice)
+			.await
+			.expect_err("valid individual keys must still respect the aggregate ID byte budget")
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);

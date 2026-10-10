@@ -726,8 +726,8 @@ async fn room_erasure_controls(services: &Services, base: &str, bob: &OwnedUserI
 async fn assert_completed(db: &Database) -> Result {
 	assert_eq!(
 		db["global"].get(b"version").await?.as_ref(),
-		20_u64.to_be_bytes(),
-		"only the completed upgrade stamps schema 20"
+		24_u64.to_be_bytes(),
+		"only the completed startup stamps the current schema 24"
 	);
 	assert!(db["global"].get(DONE).await?.is_empty(), "completed migration marker is empty");
 	assert!(

@@ -38,7 +38,17 @@ impl Data {
 			.deserialized::<u64>()?;
 
 		let key = presenceid_key(count, user_id);
-		let bytes = self.presenceid_presence.get(&key).await?;
+		let bytes = self
+			.presenceid_presence
+			.get(&key)
+			.await
+			.map_err(|error| {
+				if error.is_not_found() {
+					Error::bad_database("Presence pointer references a missing body")
+				} else {
+					error
+				}
+			})?;
 		let event = services_root
 			.presence
 			.from_json_bytes_to_event(&bytes, user_id)
@@ -72,7 +82,10 @@ impl Data {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
-		let last_presence = self.get_presence(user_id).await;
+		let last_presence = match self.get_presence(user_id).await {
+			| Err(error) if !error.is_not_found() => return Err(error),
+			| result => result,
+		};
 		let state_changed = match last_presence {
 			| Err(_) => true,
 			| Ok(ref presence) => presence.1.content.presence != *presence_state,
@@ -136,17 +149,16 @@ impl Data {
 		let count = services_root.globals.next_count().await?;
 		let key = presenceid_key(*count, user_id);
 
-		self.userid_presenceid
-			.raw_put(user_id, *count)
-			.await?;
-		self.presenceid_presence
-			.raw_put(key, Json(presence))
-			.await?;
+		let mut txn = services_root.db.txn();
+		txn.raw_put(&self.userid_presenceid, user_id, *count);
+		txn.raw_put(&self.presenceid_presence, key, Json(presence));
 
 		if let Ok((last_count, _)) = last_presence {
 			let key = presenceid_key(last_count, user_id);
-			self.presenceid_presence.remove(&key).await?;
+			txn.del_raw(&self.presenceid_presence, key);
 		}
+		txn.check_bridge_admission()?;
+		txn.execute().await?;
 
 		Ok(Some(*count))
 	}

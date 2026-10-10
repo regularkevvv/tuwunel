@@ -19,11 +19,9 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Error, Event, PduEvent, Result,
-	error::inspect_debug_log,
-	implement,
+	Error, Event, PduEvent, Result, implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
-	result::{AndThenRef, FlatOk},
+	result::AndThenRef,
 	smallvec::SmallVec,
 	utils::{
 		IterStream, MutexMap, MutexMapGuard, calculate_hash,
@@ -37,8 +35,7 @@ use tuwunel_database::{Ignore, Interfix, Map, Txn, serialize_key};
 use crate::{
 	rooms::{
 		short::{ShortEventId, ShortStateHash},
-		state_cache::MembershipUpdate,
-		state_compressor::{CompressedState, parse_compressed_state_event},
+		state_compressor::CompressedState,
 		state_res::{StateMap, auth_types_for_event},
 	},
 	services::OnceServices,
@@ -104,73 +101,37 @@ pub async fn force_state(
 	&self,
 	room_id: &RoomId,
 	shortstatehash: u64,
-	statediffnew: Arc<CompressedState>,
+	_statediffnew: Arc<CompressedState>,
 	_statediffremoved: Arc<CompressedState>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
-	statediffnew
-		.iter()
-		.stream()
-		.map(|&new| parse_compressed_state_event(new).1)
-		.wide_filter_map(async |shorteventid| {
-			let event_id: OwnedEventId = services_root
-				.short
-				.get_eventid_from_short(shorteventid)
-				.inspect_err(inspect_debug_log)
-				.await
-				.ok()?;
-
-			services_root
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-		})
-		.map(Ok)
-		.try_for_each(async move |pdu| match pdu.kind {
-			| TimelineEventType::RoomMember => {
-				let Some(user_id) = pdu
-					.state_key
-					.as_ref()
-					.map(UserId::parse)
-					.flat_ok()
-				else {
-					return Ok(());
-				};
-
-				let Ok(membership_event) = pdu.get_content() else {
-					return Ok(());
-				};
-
-				let count = services_root.globals.next_count().await?;
-				services_root
-					.state_cache
-					.update_membership(MembershipUpdate {
-						room_id,
-						user_id: &user_id,
-						membership_event,
-						sender: &pdu.sender,
-						last_state: None,
-						invite_via: None,
-						update_joined_count: false,
-						count: PduCount::Normal(*count),
-					})
-					.await
-			},
-			| _ => Ok(()),
-		})
-		.boxed()
-		.await?;
-
 	services_root
 		.state_cache
-		.update_joined_count(room_id)
+		.resume_membership_projection(room_id, state_lock)
 		.await?;
-
-	self.set_room_state(room_id, shortstatehash, state_lock)
+	let count = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
+	let projection = services_root
+		.state_cache
+		.stage_membership_projection(
+			&mut txn,
+			room_id,
+			Some(shortstatehash),
+			None,
+			PduCount::Normal(*count),
+			state_lock,
+		)
+		.await?;
+	self.set_room_state_txn(&mut txn, room_id, shortstatehash, state_lock);
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await?;
+	drop(projection);
+	services_root
+		.state_cache
+		.resume_membership_projection(room_id, state_lock)
 		.await?;
 
 	// Forced state may change this room's cached hierarchy summary.

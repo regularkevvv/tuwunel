@@ -12,7 +12,7 @@ use tuwunel_core::{
 	utils::{hash::sha256, rand::string_array},
 };
 
-use super::{MAX_RUNNING, Service, Status, TaskId, matches_nonterminal};
+use super::{MAX_RUNNING, Service, Status, Task, TaskId, matches_nonterminal};
 use crate::rooms::timeline::RoomMutexGuard;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -53,6 +53,8 @@ pub(crate) enum Phase {
 	LegacyRelations,
 	TypedRelations,
 	Notifications,
+	OutgoingPending,
+	OutgoingActive,
 	Final,
 }
 
@@ -128,6 +130,8 @@ impl History {
 								.and_then(|user| ruma::UserId::parse(user).ok())
 								.is_some()
 					},
+					| Phase::OutgoingPending | Phase::OutgoingActive =>
+						!after.is_empty() && after.len() <= tuwunel_bridge::MAX_KEY_BYTES,
 					| Phase::Final => false,
 				};
 				if !valid {
@@ -328,6 +332,18 @@ async fn run_history(&self, id: &TaskId, room: &RoomId) -> Result {
 	}
 }
 
+/// Old generic executors admitted different destructive actions on one room.
+/// Both become explicit interruption failures rather than being replayed, so
+/// their cross-action overlap cannot conflict with a restored executor. Keep
+/// refusing duplicate actions and every overlap involving resumable progress.
+pub(super) fn conflicts_on_restore(task: &Task, other: &Task) -> bool {
+	!task.status.is_terminal()
+		&& matches_nonterminal(other, task.action, &task.resource_id)
+		&& (task.action == other.action
+			|| task.parameters.get("executor").is_some()
+			|| other.parameters.get("executor").is_some())
+}
+
 /// Validate the complete journal and frozen targets before changing any task.
 /// Preflight every interrupted job before another startup recovery mutates
 /// storage. Notification completion must precede retained history room locks.
@@ -351,7 +367,7 @@ pub(crate) async fn preflight_interrupted(&self) -> Result {
 		if pending
 			.iter()
 			.skip(index.saturating_add(1))
-			.any(|other| matches_nonterminal(other, task.action, &task.resource_id))
+			.any(|other| conflicts_on_restore(task, other))
 		{
 			return Err(Error::bad_database("Conflicting interrupted admin requests"));
 		}
@@ -387,7 +403,7 @@ pub(crate) async fn restore_interrupted(self: &Arc<Self>) -> Result {
 		if pending
 			.iter()
 			.skip(i.saturating_add(1))
-			.any(|(_, other)| matches_nonterminal(other, task.action, &task.resource_id))
+			.any(|(_, other)| conflicts_on_restore(task, other))
 		{
 			return Err(Error::bad_database("Conflicting interrupted admin requests"));
 		}

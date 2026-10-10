@@ -493,6 +493,12 @@ async fn prepend_backfill_pdu(
 	json: &CanonicalJsonObject,
 ) -> Result {
 	let mut txn = self.db.db.txn();
+	self.services
+		.get()
+		.as_ref()
+		.sending
+		.db
+		.stage_federation_role(&mut txn, pdu_id, room_id, event_id, false);
 
 	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
 	txn.insert_raw(&self.db.eventid_pduid, event_id, pdu_id);
@@ -502,5 +508,6 @@ async fn prepend_backfill_pdu(
 	let key = (room_id, origin_server_ts, count_key);
 	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
 
-	txn.execute().await
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await
 }

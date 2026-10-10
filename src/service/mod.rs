@@ -1,5 +1,9 @@
 #![expect(refining_impl_trait)]
 
+#[cfg(test)]
+#[path = "../database/backend/remote/fixture.rs"]
+pub mod bridge_fixture;
+
 mod manager;
 pub(crate) mod migrations;
 mod once_services;

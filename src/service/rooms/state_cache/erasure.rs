@@ -149,8 +149,8 @@ impl Service {
 }
 
 fn check_storage_batch(txn: &Txn) -> Result {
-	// commit_membership_erasure_locked adds the two recount metadata deletes.
-	if txn.len().saturating_add(2) > tuwunel_bridge::MAX_COMMIT_OPS
+	// Erasure also retires both recount records and all three projection records.
+	if txn.len().saturating_add(5) > tuwunel_bridge::MAX_COMMIT_OPS
 		|| txn.size_in_bytes().saturating_add(1024) > 512 * 1024
 	{
 		return Err(Error::Request(

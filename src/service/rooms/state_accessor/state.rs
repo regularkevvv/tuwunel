@@ -4,7 +4,7 @@ use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
 };
 use ruma::{
-	EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, UserId,
+	EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, UserId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 	events::{
 		StateEventType, TimelineEventType,
@@ -44,52 +44,10 @@ pub(crate) async fn federation_servers_for_append(
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 	let mut servers = BTreeSet::new();
-	let entries = self.state_full_shortids(state);
-	let mut bytes = 0_usize;
-	pin_mut!(entries);
-	while let Some((shortkey, shortevent)) = entries.try_next().await? {
-		let (kind, key) = services_root
-			.short
-			.get_statekey_from_short(shortkey)
-			.await?;
-		let event = services_root
-			.short
-			.get_eventid_from_short::<OwnedEventId>(shortevent)
-			.await?;
-		bytes = bytes
-			.saturating_add(kind.to_cow_str().len())
-			.saturating_add(key.as_str().len())
-			.saturating_add(event.as_str().len());
-		if bytes > MAX_STATE_MAPPING_BYTES {
-			return Err(state_mapping_limit());
-		}
-		if services_root
-			.short
-			.get_shortstatekey(&kind, key.as_str())
-			.await? != shortkey
-			|| services_root
-				.short
-				.get_shorteventid(&event)
-				.await? != shortevent
-		{
-			return Err(Error::bad_database("Federation state dictionaries disagree"));
-		}
-		if kind != StateEventType::RoomMember {
-			continue;
-		}
-		let pdu = self
-			.state_event_for_append(&event, Some(pending))
-			.await?;
-		if pdu.event_id() != event
-			|| pdu.room_id() != pending.room_id
-			|| pdu.event_type().to_cow_str() != kind.to_cow_str()
-			|| pdu.state_key() != Some(key.as_str())
-		{
-			return Err(Error::bad_database("Federation membership binding is invalid"));
-		}
-		let user = UserId::parse(key.as_str())?;
-		let member: RoomMemberEventContent = pdu.get_content()?;
-		if member.membership == MembershipState::Join
+	let members = self.state_members_for_append(state, pending);
+	pin_mut!(members);
+	while let Some((user, membership)) = members.try_next().await? {
+		if membership == MembershipState::Join
 			&& !services_root
 				.globals
 				.server_is_ours(user.server_name())
@@ -110,6 +68,97 @@ pub(crate) async fn federation_servers_for_append(
 		}
 	}
 	Ok(servers.into_iter().collect())
+}
+
+/// Complete joined IDs for notification decisions at the accepted state. The
+/// pending event may not yet be in the canonical timeline. Remote and disabled
+/// users consume the same 1,024-ID / 128-KiB budget before recipient filtering.
+#[implement(super::Service)]
+pub(crate) async fn notification_members_for_append(
+	&self,
+	state: ShortStateHash,
+	pending: &Pdu,
+) -> Result<Vec<OwnedUserId>> {
+	let entries = self.state_members_for_append(state, pending);
+	pin_mut!(entries);
+	let mut members = Vec::new();
+	let mut bytes = 0_usize;
+	while let Some((user, membership)) = entries.try_next().await? {
+		if membership != MembershipState::Join {
+			continue;
+		}
+		bytes = bytes.saturating_add(user.as_bytes().len());
+		if members.len() >= 1024 || bytes > 128 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Notification member inventory limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		members.push(user);
+	}
+	Ok(members)
+}
+
+/// Validate both compact dictionaries and every membership binding before
+/// yielding it. Neither consumer may silently substitute a derived cache.
+#[implement(super::Service)]
+fn state_members_for_append<'a>(
+	&'a self,
+	state: ShortStateHash,
+	pending: &'a Pdu,
+) -> impl Stream<Item = Result<(OwnedUserId, MembershipState)>> + Send + 'a {
+	async_stream::try_stream! {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+		let entries = self.state_full_shortids(state);
+		let mut bytes = 0_usize;
+		pin_mut!(entries);
+		while let Some((shortkey, shortevent)) = entries.try_next().await? {
+			let (kind, key) = services_root
+				.short
+				.get_statekey_from_short(shortkey)
+				.await?;
+			let event = services_root
+				.short
+				.get_eventid_from_short::<OwnedEventId>(shortevent)
+				.await?;
+			bytes = bytes
+				.saturating_add(kind.to_cow_str().len())
+				.saturating_add(key.as_str().len())
+				.saturating_add(event.as_str().len());
+			if bytes > MAX_STATE_MAPPING_BYTES {
+				Err(state_mapping_limit())?;
+			}
+			if services_root
+				.short
+				.get_shortstatekey(&kind, key.as_str())
+				.await? != shortkey
+				|| services_root
+					.short
+					.get_shorteventid(&event)
+					.await? != shortevent
+			{
+				Err(Error::bad_database("Append state dictionaries disagree"))?;
+			}
+			if kind != StateEventType::RoomMember {
+				continue;
+			}
+			let pdu = self
+				.state_event_for_append(&event, Some(pending))
+				.await?;
+			if pdu.event_id() != event
+				|| pdu.room_id() != pending.room_id
+				|| pdu.event_type().to_cow_str() != kind.to_cow_str()
+				|| pdu.state_key() != Some(key.as_str())
+			{
+				Err(Error::bad_database("Append membership binding is invalid"))?;
+			}
+			let user = UserId::parse(key.as_str())?;
+			let member: RoomMemberEventContent = pdu.get_content()?;
+			yield (user, member.membership);
+		}
+	}
 }
 
 fn state_mapping_limit() -> Error {
@@ -434,7 +483,11 @@ async fn state_cell_from_snapshot(
 }
 
 #[implement(super::Service)]
-async fn state_event_for_append(&self, event: &EventId, pending: Option<&Pdu>) -> Result<Pdu> {
+pub(crate) async fn state_event_for_append(
+	&self,
+	event: &EventId,
+	pending: Option<&Pdu>,
+) -> Result<Pdu> {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 

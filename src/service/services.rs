@@ -262,10 +262,10 @@ async fn start_inner(self: &Arc<Self>) -> Result {
 	if !self.server.config.maintenance {
 		self.tasks.preflight_interrupted().await?;
 		self.pusher.restore_notifications().await?;
-		self.tasks.restore_interrupted().await?;
 		self.state_cache
 			.restore_pending_recounts()
 			.await?;
+		self.tasks.restore_interrupted().await?;
 	}
 
 	let manager = Manager::new(self);

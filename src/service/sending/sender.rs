@@ -69,10 +69,13 @@ use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 mod deliveries;
 mod discovery;
 use deliveries::{DELIVERY_LIMIT, SendingFutures};
-use discovery::{DISCOVERY_INTERVAL, Discovery};
+use discovery::{DISCOVERY_IDLE_INTERVAL, DISCOVERY_RETRY_INTERVAL, Discovery};
 
 #[cfg(test)]
 mod edu_tests;
+
+#[cfg(test)]
+mod remote_presence_tests;
 
 #[cfg(test)]
 mod compose_tests;
@@ -228,6 +231,9 @@ type RankedReceipts = SmallVec<[ReceiptMap; 1]>;
 /// common case is a single room, so inline-1 avoids a heap touch.
 type RoomReceipts = SmallVec<[(OwnedRoomId, RankedReceipts); 1]>;
 
+#[cfg(test)]
+static RECEIPT_ROOM_GROUPS: AtomicUsize = AtomicUsize::new(0);
+
 /// Output of one EDU selector. `shipped` rides the current transaction up to
 /// the shared budget; `overflow` past the budget is written as queued rows for
 /// later transactions to drain.
@@ -373,6 +379,7 @@ impl Service {
 			.expect("Missing channel for sender worker");
 		let mut discovery = Discovery::default();
 		let mut discovery_due = Instant::now();
+		let mut discovery_notified = false;
 
 		while !receiver.is_closed() {
 			// Only an exact ACK or an uncommitted failure record owns a slot.
@@ -399,9 +406,14 @@ impl Service {
 							// Release this batch's slot before discovering successors.
 							// A hot destination must not keep all slots indefinitely.
 							stage = QueueRecovery::CleanupAcknowledged(rows);
-							let result = stage.clean_acknowledged(async |members| self.db.acknowledge_active(&owner, members).await).await;
+							let mut result = stage.clean_acknowledged(async |members| self.db.acknowledge_active(&owner, members).await).await;
 							if result.is_ok() {
 								statuses.remove(&owner);
+								if !self.server.config.startup_netburst {
+									// An explicit hint owns this destination's remaining
+									// batches even when automatic discovery is disabled.
+									result = self.resume_queue(&owner, futures, statuses, &mut stage).await;
+								}
 							}
 							result
 						},
@@ -411,6 +423,7 @@ impl Service {
 						defer_queue_error(retries, dest, stage, error)?;
 					}
 					if acknowledged {
+						discovery_notified = true;
 						discovery_due = Instant::now();
 					}
 				},
@@ -432,16 +445,29 @@ impl Service {
 				() = sleep_until(retry_due), if !retries.is_empty() => {
 					self.retry_queue(futures, statuses, retries).await?;
 				},
-				() = sleep_until(discovery_due), if capacity => {
+				() = sleep_until(discovery_due), if capacity && self.server.config.startup_netburst => {
 					let result = self.discover_page(id, futures, statuses, Some(&mut *retries), &mut discovery).await;
-					if let Err(error) = result {
-						if error.status_code() != http::StatusCode::TOO_MANY_REQUESTS {
-							return Err(error);
+					let delay = match result {
+						Ok(complete) => {
+							// Finish the bounded sweep before idling. An ACK during
+							// this sweep also requires another pass: its destination
+							// may already be behind the cursor. Never rewind a page
+							// on ACK, which could starve later destinations.
+							if complete && !std::mem::take(&mut discovery_notified) {
+								DISCOVERY_IDLE_INTERVAL
+							} else {
+								Duration::ZERO
+							}
+						},
+						Err(error) if error.status_code() == http::StatusCode::TOO_MANY_REQUESTS => {
+							trace!("Durable sender discovery waits for database capacity");
+							DISCOVERY_RETRY_INTERVAL
+						},
+						Err(error) => return Err(error),
 						}
-						trace!("Durable sender discovery waits for database capacity");
-					}
+					;
 					let now = Instant::now();
-					discovery_due = now.checked_add(DISCOVERY_INTERVAL).unwrap_or(now);
+					discovery_due = now.checked_add(delay).unwrap_or(now);
 				},
 			}
 		}
@@ -1473,9 +1499,13 @@ impl Service {
 				Ok::<_, Error>((room_id, ranked))
 			})
 			.buffer_unordered(EDU_ROOM_READ_CONCURRENCY)
+			.try_filter(|(_, ranked)| futures::future::ready(!ranked.is_empty()))
 			.try_collect()
 			.boxed()
 			.await?;
+
+		#[cfg(test)]
+		RECEIPT_ROOM_GROUPS.store(by_room.len(), Ordering::Relaxed);
 
 		let max_rank = by_room
 			.iter()

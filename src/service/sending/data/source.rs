@@ -2,7 +2,8 @@
 //! transfer that obligation atomically; hints and post-commit caches do not.
 use std::{sync::atomic::Ordering, time::Duration};
 
-use ruma::{OwnedEventId, OwnedRoomId, OwnedServerName};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
+use sha2::{Digest, Sha256};
 use tokio::sync::OwnedMutexGuard;
 use tuwunel_core::{
 	Error, Result,
@@ -18,6 +19,8 @@ use crate::{
 };
 
 const PREFIX: u8 = 0x08;
+const ROLE_PREFIX: u8 = 0x09;
+const ROLE_MAGIC: &[u8; 5] = b"MSFR\x01";
 const MAGIC: &[u8] = b"MSFP\x01";
 const MAX_PLAN_BYTES: usize = 1_500_000;
 const MAX_RECIPIENTS: usize = 4097;
@@ -41,6 +44,29 @@ fn witness_key(raw: &RawPduId) -> Vec<u8> {
 	key.push(PREFIX);
 	key.extend_from_slice(raw.as_ref());
 	key
+}
+
+fn role_key(raw: &RawPduId) -> Vec<u8> {
+	let mut key = witness_key(raw);
+	key[0] = ROLE_PREFIX;
+	key
+}
+
+// Hash borrowed identifiers without retaining another event body. UTF-8 cannot
+// contain 0xff, so it separates the variable-width room and event
+// unambiguously.
+fn role_record(raw: &RawPduId, room: &RoomId, event: &EventId, owned: bool) -> [u8; 38] {
+	let mut out = [0_u8; 38];
+	out[..5].copy_from_slice(ROLE_MAGIC);
+	out[5] = u8::from(owned);
+	let mut digest = Sha256::new();
+	digest.update(&out[..6]);
+	digest.update(raw.as_ref());
+	digest.update(room.as_bytes());
+	digest.update([0xFF]);
+	digest.update(event.as_bytes());
+	out[6..].copy_from_slice(&digest.finalize());
+	out
 }
 
 fn witness(value: &[u8]) -> [u8; 36] {
@@ -277,6 +303,58 @@ impl Data {
 		Ok((raw_ids, total))
 	}
 
+	/// Every new canonical row records whether this server accepted its
+	/// delivery role. Missing metadata cannot be interpreted as a new role
+	/// after an ACK.
+	pub(crate) fn stage_federation_role(
+		&self,
+		txn: &mut Txn,
+		raw: &RawPduId,
+		room: &RoomId,
+		event: &EventId,
+		owned: bool,
+	) {
+		txn.insert_raw(&self.db["global"], role_key(raw), role_record(raw, room, event, owned));
+	}
+
+	async fn federation_role_owned(&self, raw: &RawPduId, pdu: &PduEvent) -> Result<bool> {
+		let value = self.db["global"]
+			.get(&role_key(raw))
+			.await
+			.map_err(|error| if error.is_not_found() { bad() } else { error })?;
+		if value.len() != 38 || value[5] > 1 {
+			return Err(bad());
+		}
+		let owned = value[5] == 1;
+		if value.as_ref() != role_record(raw, &pdu.room_id, &pdu.event_id, owned) {
+			return Err(bad());
+		}
+		Ok(owned)
+	}
+
+	/// Caller holds the canonical room lock, so erasure and another handshake
+	/// cannot race the role's first admission. Refusal leaves the received role
+	/// unchanged; a completed owned role never creates a new source page.
+	pub(crate) async fn admit_known_federation_role(
+		&self,
+		raw: RawPduId,
+		pdu: &PduEvent,
+		state: ShortStateHash,
+	) -> Result {
+		let _guard = self.lock_federation_sources().await;
+		self.require_active_schema().await?;
+		self.require_deliverable_pdu(&raw).await?;
+		if self.federation_role_owned(&raw, pdu).await? {
+			return Ok(());
+		}
+		let mut txn = self.db.txn();
+		self.prepare_federation_plan(&mut txn, raw, pdu, state)
+			.await?;
+		self.stage_federation_role(&mut txn, &raw, &pdu.room_id, &pdu.event_id, true);
+		txn.check_bridge_admission()?;
+		txn.execute_flushed().await
+	}
+
 	pub(crate) async fn stage_federation_plan(
 		&self,
 		txn: &mut Txn,
@@ -284,10 +362,27 @@ impl Data {
 		pdu: &PduEvent,
 		state: ShortStateHash,
 	) -> Result<OwnedMutexGuard<()>> {
-		let services_guard = self.services.get();
-		let services_root = services_guard.as_ref();
 		let guard = self.lock_federation_sources().await;
 		self.require_active_schema().await?;
+		self.prepare_federation_plan(txn, raw, pdu, state)
+			.await?;
+		Ok(guard)
+	}
+
+	// Caller holds active_write through either the canonical commit or the
+	// existing event's role commit. No hint or cursor can escape before it.
+	async fn prepare_federation_plan(
+		&self,
+		txn: &mut Txn,
+		raw: RawPduId,
+		pdu: &PduEvent,
+		state: ShortStateHash,
+	) -> Result {
+		if self.event_erasure_started(&raw).await? {
+			return Err(Error::bad_database("Cannot admit federation for an erasing event"));
+		}
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
 		let servers = services_root
 			.state_accessor
 			.federation_servers_for_append(state, pdu)
@@ -298,7 +393,7 @@ impl Data {
 				.await?;
 		}
 		if servers.is_empty() {
-			return Ok(guard);
+			return Ok(());
 		}
 		let plan = Plan {
 			state,
@@ -310,6 +405,13 @@ impl Data {
 		};
 		let value = plan.encode()?;
 		let (pending, bytes) = self.source_inventory().await?;
+		// Admission must verify existing bodies before trusting their quota
+		// witnesses. Decode one bounded plan at a time; retain no second inventory.
+		for raw in &pending {
+			if self.source_plan(raw).await?.is_none() {
+				return Err(bad());
+			}
+		}
 		// Reserve every plan's possible cancellation bitmap growth now. Later
 		// cancellation pages cannot exceed the admitted aggregate byte budget.
 		let reserved = pending
@@ -332,7 +434,7 @@ impl Data {
 		}
 		txn.insert_raw(&self.db["global"], witness_key(&raw), witness(&value));
 		txn.insert_raw(&self.db["pduid_federationplan"], raw.as_ref(), value);
-		Ok(guard)
+		Ok(())
 	}
 
 	/// One page transfers responsibility to the ordinary delivery queues. The
@@ -345,20 +447,20 @@ impl Data {
 		};
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
-		let PduCount::Normal(count) = raw.pdu_count() else {
-			return Err(bad());
-		};
-		if count > services_root.globals.pending_count().end {
-			return Err(bad());
-		}
-		if count > services_root.globals.current_count() {
-			return Ok(Vec::new());
+		if let PduCount::Normal(count) = raw.pdu_count() {
+			if count > services_root.globals.pending_count().end {
+				return Err(bad());
+			}
+			if count > services_root.globals.current_count() {
+				return Ok(Vec::new());
+			}
 		}
 		let pdu = services_root
 			.timeline
 			.get_pdu_from_id(&raw)
 			.await?;
-		if pdu.event_id != plan.event
+		if !self.federation_role_owned(&raw, &pdu).await?
+			|| pdu.event_id != plan.event
 			|| pdu.room_id != plan.room
 			|| services_root
 				.timeline
@@ -463,6 +565,22 @@ impl Data {
 
 	/// Caller holds lock_federation_sources through the canonical erase commit.
 	pub(crate) async fn stage_federation_erasure(&self, txn: &mut Txn, raw: &RawPduId) -> Result {
+		self.stage_event_queues_erasure(txn, raw).await?;
+		self.stage_federation_role_erasure(txn, raw);
+		self.stage_federation_source_erasure(txn, raw)
+			.await
+	}
+
+	pub(crate) fn stage_federation_role_erasure(&self, txn: &mut Txn, raw: &RawPduId) {
+		txn.del_raw(&self.db["global"], role_key(raw));
+		self.stage_finish_event_erasure(txn, raw);
+	}
+
+	pub(super) async fn stage_federation_source_erasure(
+		&self,
+		txn: &mut Txn,
+		raw: &RawPduId,
+	) -> Result {
 		if self.source_plan(raw).await?.is_some() {
 			txn.del_raw(&self.db["pduid_federationplan"], raw.as_ref());
 			txn.del_raw(&self.db["global"], witness_key(raw));

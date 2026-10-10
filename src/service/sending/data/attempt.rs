@@ -523,6 +523,43 @@ impl Data {
 		Ok(true)
 	}
 
+	/// Retire the immutable body containing this erased member. Other active
+	/// rows retain their identities and can compose a new transaction. The
+	/// monotonically increasing generation fences an old ACK after
+	/// recomposition.
+	pub(super) async fn stage_erased_attempt(
+		&self,
+		txn: &mut Txn,
+		destination: &Destination,
+		key: &[u8],
+	) -> Result {
+		if AttemptKind::for_destination(destination).is_none() {
+			return Ok(());
+		}
+		let Some((_, record)) = self.read_attempt_header(destination).await? else {
+			return Ok(());
+		};
+		if !record
+			.members
+			.iter()
+			.any(|member| member.key.as_ref() == key)
+		{
+			return Ok(());
+		}
+		self.read_attempt_body(destination, &record)
+			.await?;
+		let prefix = destination.get_prefix();
+		txn.del_raw(&self.sendingtransaction_record, &prefix);
+		txn.del_raw(&self.db["global"], witness_key(destination));
+		for index in 0..record.chunks() {
+			txn.del_raw(
+				&self.sendingtransaction_record,
+				chunk_key(&prefix, record.generation, index),
+			);
+		}
+		Ok(())
+	}
+
 	pub(super) async fn cancel_attempt_and_requests(&self, destination: &Destination) -> Result {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();

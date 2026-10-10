@@ -146,10 +146,18 @@ pub(crate) async fn stage_notification_plan(
 		.lock_owned()
 		.await;
 	let pending = self.notification_inventory().await?;
+	let state = match state {
+		| Some(state) => state,
+		| None =>
+			services_root
+				.state
+				.get_room_shortstatehash(pdu.room_id())
+				.await?,
+	};
 	let mut targets = BTreeSet::new();
 	let members = services_root
-		.state_cache
-		.bounded_room_members(pdu.room_id())
+		.state_accessor
+		.notification_members_for_append(state, pdu)
 		.await?;
 	let joined_count = UInt::try_from(members.len())
 		.map_err(|_| Error::bad_database("Invalid notification member inventory count"))?;
@@ -181,14 +189,6 @@ pub(crate) async fn stage_notification_plan(
 	if targets.is_empty() {
 		return Ok(PreparedNotifications { _admission: admission });
 	}
-	let state = match state {
-		| Some(state) => state,
-		| None =>
-			services_root
-				.state
-				.get_room_shortstatehash(pdu.room_id())
-				.await?,
-	};
 	let power_levels = services_root
 		.state_accessor
 		.get_power_levels_at(pdu.room_id(), state, Some(pdu))

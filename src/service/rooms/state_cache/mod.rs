@@ -1,6 +1,7 @@
 mod erasure;
 mod inventory;
 mod invite_inventory;
+mod projection;
 mod recount;
 #[cfg(test)]
 mod recount_tests;
@@ -16,6 +17,7 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
+use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
 pub use inventory::RoomMemberInventoryCount;
 pub use invite_inventory::InviteStateInventory;
@@ -49,6 +51,8 @@ pub struct Service {
 	// Fresh for every service graph, including replacement after an older
 	// writer ran. Durable per-room stamps never authorize another process.
 	recount_generation: String,
+	projection_stop: tokio::sync::Notify,
+	projection_admission: Arc<tokio::sync::Mutex<()>>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -128,12 +132,15 @@ impl InRoomCache {
 type StrippedStateEventItem = (OwnedRoomId, Vec<Raw<AnyStrippedStateEvent>>);
 type SyncStateEventItem = (OwnedRoomId, Vec<Raw<AnySyncStateEvent>>);
 
+#[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
 			membership_mutex: MutexMap::new(),
 			recount_generation: utils::rand::string(recount::GENERATION_BYTES),
+			projection_stop: tokio::sync::Notify::new(),
+			projection_admission: Arc::new(tokio::sync::Mutex::new(())),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),
@@ -154,6 +161,10 @@ impl crate::Service for Service {
 			},
 		}))
 	}
+
+	async fn worker(self: Arc<Self>) -> Result { self.projection_worker().await }
+
+	async fn interrupt(&self) { self.projection_stop.notify_one(); }
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }

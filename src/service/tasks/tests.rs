@@ -43,6 +43,44 @@ fn nonterminal_match_requires_action_resource_and_nonterminal_status() {
 }
 
 #[test]
+fn restore_allows_old_cross_action_interruptions_but_not_duplicates() {
+	let room = "!room:example.com";
+	let purge = task_for("purge_history", room, Status::Active, 0);
+	let shutdown = task_for("shutdown_and_purge_room", room, Status::Scheduled, 0);
+	assert!(
+		matches_nonterminal(&shutdown, purge.action, room),
+		"new admission stays excluded"
+	);
+	assert!(!super::history::conflicts_on_restore(&purge, &shutdown));
+	assert!(!super::history::conflicts_on_restore(&shutdown, &purge));
+	let duplicate = task_for("purge_history", room, Status::Scheduled, 0);
+	assert!(super::history::conflicts_on_restore(&purge, &duplicate));
+	let complete = task_for("purge_history", room, Status::Complete, 0);
+	assert!(!super::history::conflicts_on_restore(&purge, &complete));
+	assert!(!super::history::conflicts_on_restore(&complete, &purge));
+}
+
+#[test]
+fn restore_keeps_exclusion_for_resumable_history() {
+	let room = "!room:example.com";
+	let mut purge = task_for("purge_history", room, Status::Active, 0);
+	purge.parameters = serde_json::json!({
+		"executor":"history-v1", "boundary":1, "delete_local_events":true,
+		"shortroomid":1, "after":null, "purged":0, "current":null, "done":false,
+	});
+	assert!(
+		super::history::History::decode(&purge.parameters)
+			.expect("valid progress")
+			.is_some()
+	);
+	let shutdown = task_for("shutdown_and_purge_room", room, Status::Scheduled, 0);
+	assert!(super::history::conflicts_on_restore(&purge, &shutdown));
+	assert!(super::history::conflicts_on_restore(&shutdown, &purge));
+	let duplicate = task_for("purge_history", room, Status::Scheduled, 0);
+	assert!(super::history::conflicts_on_restore(&purge, &duplicate));
+}
+
+#[test]
 fn prune_keeps_active_and_recent() {
 	let now = RETENTION_MS.saturating_mul(10);
 	let mut tasks = BTreeMap::from([

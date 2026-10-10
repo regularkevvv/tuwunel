@@ -15,6 +15,10 @@ tuwunel_core::mod_ctor! {}
 tuwunel_core::mod_dtor! {}
 tuwunel_core::rustc_flags_capture! {}
 
+#[cfg(test)]
+#[path = "backend/remote/fixture.rs"]
+pub mod bridge_fixture;
+
 pub mod backend;
 mod cork;
 mod de;

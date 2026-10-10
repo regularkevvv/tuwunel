@@ -624,7 +624,8 @@ async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &
 	let mut edus = BTreeSet::new();
 	let corrupt_case = directory.join("corrupt-case").exists();
 	let expected_deliveries = if corrupt_case { 6 } else { 9 };
-	timeout(Duration::from_secs(15), async {
+	let started = Instant::now();
+	let delivery = timeout(Duration::from_secs(15), async {
 		loop {
 			let (owner, path, body) = stub
 				.receiver
@@ -647,6 +648,12 @@ async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &
 				let service = body["events"]
 					.as_array()
 					.expect("appservice PDU array");
+				eprintln!(
+					"recovery batch: owner={owner}, elapsed={:?}, PDUs={}, EDUs={}",
+					started.elapsed(),
+					service.len(),
+					body["ephemeral"].as_array().map_or(0, Vec::len)
+				);
 				let received = received.entry(owner.into()).or_default();
 				for event in service {
 					received.push(
@@ -684,10 +691,21 @@ async fn verify(services: &Services, stub: &mut Stub, directory: &Path, phase: &
 		}
 		Ok::<(), tuwunel_core::Error>(())
 	})
-	.await
-	.map_err(|_| {
-		err!("durable queue recovery timed out: received {received:?}; EDUs {}", edus.len())
-	})??;
+	.await;
+	if delivery.is_err() {
+		let pending = rows(services, "servernameevent_data")
+			.await?
+			.len();
+		let active = rows(services, "servercurrentevent_data")
+			.await?
+			.len();
+		return Err(err!(
+			"durable queue recovery timed out: received {received:?}; EDUs {}; \
+			 pending={pending}; active={active}",
+			edus.len()
+		));
+	}
+	delivery.expect("checked delivery timeout")?;
 	assert_eq!(
 		edus,
 		(0..EDUS)
@@ -776,12 +794,17 @@ async fn serve(listener: StubListener, sender: UnboundedSender<Captured>, owner:
 			}
 		})
 		.await;
-		if let Ok(Some((path, body))) = result {
-			sender.send((owner, path, body)).ok();
-		}
+		let captured = if let Ok(Some((path, body))) = result {
+			sender.send((owner, path, body)).is_ok()
+		} else {
+			eprintln!("HTTP stub failed to capture the request for {owner}: {result:?}");
+			false
+		};
+		// A failed parser or closed capture channel is not a receiver ACK.
+		let status = if captured { "200 OK" } else { "400 Bad Request" };
 		let body = if owner == "push" { "{\"rejected\":[]}" } else { "{}" };
 		let response = format!(
-			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+			"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: \
 			 {}\r\nConnection: close\r\n\r\n{body}",
 			body.len()
 		);

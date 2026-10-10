@@ -152,6 +152,11 @@ impl Service {
 			.mutex_insert
 			.lock(room_id)
 			.await;
+		let _federation = services_root
+			.sending
+			.db
+			.lock_federation_sources()
+			.await;
 		let txn = self.prepare_storage_erasure(room_id).await?;
 		services_root
 			.state_cache
@@ -174,6 +179,11 @@ impl Service {
 			.timeline
 			.mutex_insert
 			.lock(room_id)
+			.await;
+		let _federation = services_root
+			.sending
+			.db
+			.lock_federation_sources()
 			.await;
 		let txn = self.prepare_storage_erasure(room_id).await?;
 		services_root

@@ -1016,6 +1016,7 @@ async fn old_ack_cannot_remove_same_key_and_bytes_readmitted_after_cancellation(
 	bytes[7] = 1;
 	bytes[15] = 1;
 	let event = SendingEvent::Pdu(crate::rooms::timeline::RawPduId::from_bytes(&bytes)?);
+	fixture.retain_pdu(&event).await?;
 	let first = services
 		.sending
 		.db

@@ -48,9 +48,10 @@ impl Budget {
 
 impl Service {
 	/// Prepare all previously erased room maps without performing a write.
-	/// The caller owns state/timeline exclusion. Key-only scans share 4,096
-	/// keys / 512 KiB; inspected PDU values share 4 MiB. The full storage and
-	/// membership transaction is checked against the 900-op bridge cap.
+	/// The caller owns state/timeline/source exclusion. Key-only scans share
+	/// 4,096 keys / 512 KiB; inspected PDU values share 4 MiB. The full
+	/// storage and membership transaction is checked against the 900-op bridge
+	/// cap.
 	pub(super) async fn prepare_storage_erasure(&self, room: &RoomId) -> Result<Txn> {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
@@ -131,7 +132,7 @@ impl Service {
 		pin_mut!(keys);
 		while let Some(key) = keys.try_next().await? {
 			budget.key(key)?;
-			RawPduId::from_bytes(key)?;
+			let raw = RawPduId::from_bytes(key)?;
 			let value = map.get(key).await?;
 			budget.value(&value)?;
 			let pdu: PduEvent = serde_json::from_slice(&value)
@@ -148,6 +149,11 @@ impl Service {
 			if pdu.room_id != room || binding.as_ref() != key {
 				return Err(Error::bad_database("Room erasure PDU indexes disagree"));
 			}
+			services_root
+				.sending
+				.db
+				.stage_federation_erasure(txn, &raw)
+				.await?;
 			txn.del_raw(map, key);
 			txn.del_raw(&services_root.db["eventid_pduid"], &pdu.event_id);
 			txn.del_raw(&services_root.db["eventid_outlierpdu"], &pdu.event_id);

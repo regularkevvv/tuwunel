@@ -45,7 +45,7 @@ use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Err, Result, err,
 	log::capture::{Capture, Data},
-	matrix::PduCount,
+	matrix::PduBuilder,
 	ruma::{
 		EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, UserId,
 		api::appservice::{Namespace, Namespaces, Registration, RegistrationInit},
@@ -55,7 +55,6 @@ use tuwunel_core::{
 use tuwunel_database::{Interfix, refusal, serialize_key};
 use tuwunel_service::{
 	Services,
-	rooms::state_cache::MembershipUpdate,
 	sending::{Destination, SendingEvent},
 	users::Register,
 };
@@ -753,25 +752,21 @@ async fn send_message(
 	Ok(event_id.try_into()?)
 }
 
-/// Records a remote member, so the room's servers include theirs. No event of
-/// theirs is stored: the servers an event goes to come from this cache.
+/// Stores a remote join in room state, so canonical federation plans include
+/// the remote server rather than relying on a cache-only membership.
 async fn join_remote(services: &Services, room: &RoomId) -> Result<OwnedServerName> {
 	let remote = UserId::parse(REMOTE)?;
-	let count = PduCount::Normal(*services.globals.next_count().await?);
+	let builder = PduBuilder::state(
+		remote.to_string(),
+		&RoomMemberEventContent::new(MembershipState::Join),
+	);
+	let state_lock = services.state.mutex.lock(room).await;
 
 	services
-		.state_cache
-		.update_membership(MembershipUpdate {
-			room_id: room,
-			user_id: &remote,
-			membership_event: RoomMemberEventContent::new(MembershipState::Join),
-			sender: &remote,
-			last_state: None,
-			invite_via: None,
-			update_joined_count: true,
-			count,
-		})
+		.timeline
+		.build_and_append_pdu(builder, &remote, room, &state_lock)
 		.await?;
+	drop(state_lock);
 
 	let server = remote.server_name().to_owned();
 	let servers: Vec<OwnedServerName> = services

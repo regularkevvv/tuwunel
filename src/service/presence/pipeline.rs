@@ -116,100 +116,74 @@ impl Service {
 		status_msg: StatusMsg,
 		refresh_window_ms: Option<u64>,
 	) -> Result {
+		let _update = self.update_mutex.lock(user_id).await;
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
-
 		let now = tuwunel_core::utils::millis_since_unix_epoch();
 		let preserve_status = matches!(status_msg, StatusMsg::Unchanged);
-
-		// 1) Capture per-device presence snapshot for aggregation.
-		debug!(
-			?user_id,
-			?device_key,
-			?state,
-			currently_active,
-			last_active_ago = last_active_ago.map(u64::from),
-			"Presence update received"
-		);
-
-		self.device_presence
-			.update(
-				user_id,
-				device_key,
-				state,
-				currently_active,
-				last_active_ago,
-				status_msg,
-				now,
-			)
-			.await;
-
-		// 2) Compute the aggregated presence across all devices.
-		let aggregated = self
-			.device_presence
-			.aggregate(user_id, now, self.idle_timeout, self.offline_timeout)
-			.await;
-
-		debug!(
-			?user_id,
-			agg_state = ?aggregated.state,
-			agg_currently_active = aggregated.currently_active,
-			agg_last_active_ts = aggregated.last_active_ts,
-			agg_device_count = aggregated.device_count,
-			"Presence aggregate computed"
-		);
-
-		// 3) Load the last persisted presence to decide whether to skip or merge.
-		let last_presence = self.db.get_presence(user_id).await;
-		let (last_count, last_event) = match last_presence {
-			| Ok((count, event)) => (Some(count), Some(event)),
-			| Err(_) => (None, None),
+		let last_presence = match self.db.get_presence(user_id).await {
+			| Ok(presence) => Some(presence),
+			| Err(error) if error.is_not_found() => None,
+			| Err(error) => return Err(error),
 		};
-
+		let (last_count, last_event) = match last_presence {
+			| Some((count, event)) => (Some(count), Some(event)),
+			| None => (None, None),
+		};
+		self.device_presence
+			.reconcile(user_id, last_count);
+		let checkpoint = self
+			.device_presence
+			.checkpoint(user_id, &device_key);
+		self.device_presence.update(
+			user_id,
+			device_key,
+			state,
+			currently_active,
+			last_active_ago,
+			status_msg,
+			now,
+		);
+		let aggregated =
+			self.device_presence
+				.aggregate(user_id, now, self.idle_timeout, self.offline_timeout);
 		let last_state = last_event
 			.as_ref()
 			.map(|event| event.content.presence.clone());
-
-		let state_changed = match &last_event {
-			| Some(event) => event.content.presence != aggregated.state,
-			| None => true,
-		};
-
-		// 4) For rapid pings with no state change, skip writes and reschedule.
+		let state_changed = last_state.as_ref() != Some(&aggregated.state);
 		if !state_changed
-			&& let Some((count, last_last_active_ago)) =
+			&& let Some((count, _)) =
 				Self::refresh_skip_decision(refresh_window_ms, last_event.as_ref(), last_count)
 		{
-			let presence = last_event
-				.as_ref()
-				.map(|event| &event.content.presence)
-				.unwrap_or(state);
-
-			self.schedule_presence_timer(user_id, presence, count)
+			self.schedule_presence_timer(user_id, &aggregated.state, count)
 				.log_err()
 				.ok();
-
-			debug!(
-				?user_id,
-				?state,
-				last_last_active_ago,
-				"Skipping presence update: refresh window (timer rescheduled)"
-			);
-
+			checkpoint.accept(last_count);
 			return Ok(());
 		}
-
-		// 5) If we just transitioned away from online, flush suppressed pushes.
+		let fallback_status = || {
+			last_event
+				.and_then(|event| event.content.status_msg)
+				.filter(|msg| !msg.is_empty())
+		};
+		let status_msg = aggregated
+			.status_msg
+			.or_else(|| preserve_status.then(fallback_status).flatten());
+		let last_active_ago =
+			Some(UInt::new_saturating(now.saturating_sub(aggregated.last_active_ts)));
+		let count = self
+			.persist_presence(
+				user_id,
+				&aggregated.state,
+				Some(aggregated.currently_active),
+				last_active_ago,
+				status_msg,
+			)
+			.await?;
+		checkpoint.accept(count.or(last_count));
 		if matches!(last_state, Some(PresenceState::Online))
 			&& aggregated.state != PresenceState::Online
 		{
-			debug!(
-				?user_id,
-				from = ?PresenceState::Online,
-				to = ?aggregated.state,
-				"Presence went inactive; flushing suppressed pushes"
-			);
-
 			services_root
 				.sending
 				.schedule_resume_pushes_for_user(
@@ -217,29 +191,7 @@ impl Service {
 					"presence->inactive (aggregate)",
 				);
 		}
-
-		// 6) Unchanged preserves the last non-empty status; explicit None clears it.
-		let fallback_status = || {
-			last_event
-				.and_then(|event| event.content.status_msg)
-				.filter(|msg| !msg.is_empty())
-		};
-
-		let status_msg = aggregated
-			.status_msg
-			.or_else(|| preserve_status.then(fallback_status).flatten());
-
-		let last_active_ago =
-			Some(UInt::new_saturating(now.saturating_sub(aggregated.last_active_ts)));
-
-		self.set_presence(
-			user_id,
-			&aggregated.state,
-			Some(aggregated.currently_active),
-			last_active_ago,
-			status_msg,
-		)
-		.await
+		Ok(())
 	}
 
 	/// Pings the presence of the given user, defaulting the state to online.
@@ -337,30 +289,41 @@ impl Service {
 		last_active_ago: Option<UInt>,
 		status_msg: Option<String>,
 	) -> Result {
-		let services_guard = self.services.get();
-		let services_root = services_guard.as_ref();
+		let _update = self.update_mutex.lock(user_id).await;
+		if self
+			.persist_presence(user_id, state, currently_active, last_active_ago, status_msg)
+			.await?
+			.is_some()
+		{
+			self.device_presence.invalidate(user_id);
+		}
+		Ok(())
+	}
 
+	async fn persist_presence(
+		&self,
+		user_id: &UserId,
+		state: &PresenceState,
+		currently_active: Option<bool>,
+		last_active_ago: Option<UInt>,
+		status_msg: Option<String>,
+	) -> Result<Option<u64>> {
 		let presence_state = match state.as_str() {
-			| "" => &PresenceState::Offline, // default an empty string to 'offline'
-			| &_ => state,
+			| "" => &PresenceState::Offline,
+			| _ => state,
 		};
-
 		let count = self
 			.db
 			.set_presence(user_id, presence_state, currently_active, last_active_ago, status_msg)
 			.await?;
-
 		if let Some(count) = count {
-			let is_local = services_root.globals.user_is_local(user_id);
-			let is_server_user = user_id == services_root.globals.server_user;
-			let allow_timeout = self.timeout_remote_users || is_local;
-
-			if allow_timeout && !is_server_user {
-				self.schedule_presence_timer(user_id, presence_state, count)?;
-			}
+			// A timer is a post-commit hint; its failure cannot turn a committed
+			// presence mutation into a reported persistence rejection.
+			self.schedule_presence_timer(user_id, presence_state, count)
+				.log_err()
+				.ok();
 		}
-
-		Ok(())
+		Ok(count)
 	}
 
 	pub(super) async fn process_presence_timer(
@@ -368,6 +331,7 @@ impl Service {
 		user_id: &OwnedUserId,
 		expected_count: u64,
 	) -> Result {
+		let _update = self.update_mutex.lock(user_id).await;
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
@@ -380,12 +344,13 @@ impl Service {
 			return Ok(());
 		}
 
+		self.device_presence
+			.reconcile(user_id, Some(current_count));
 		let presence_state = presence.state.clone();
 		let now = tuwunel_core::utils::millis_since_unix_epoch();
-		let aggregated = self
-			.device_presence
-			.aggregate(user_id, now, self.idle_timeout, self.offline_timeout)
-			.await;
+		let aggregated =
+			self.device_presence
+				.aggregate(user_id, now, self.idle_timeout, self.offline_timeout);
 
 		if aggregated.device_count == 0 {
 			let last_active_ago =
@@ -406,6 +371,14 @@ impl Service {
 			);
 
 			if let Some(new_state) = new_state {
+				self.persist_presence(
+					user_id,
+					&new_state,
+					Some(false),
+					last_active_ago,
+					status_msg,
+				)
+				.await?;
 				if matches!(new_state, PresenceState::Unavailable | PresenceState::Offline) {
 					services_root
 						.sending
@@ -414,8 +387,6 @@ impl Service {
 							"presence->inactive",
 						);
 				}
-				self.set_presence(user_id, &new_state, Some(false), last_active_ago, status_msg)
-					.await?;
 			}
 
 			return Ok(());
@@ -428,24 +399,26 @@ impl Service {
 			return Ok(());
 		}
 
+		let status_msg = aggregated.status_msg.or(presence.status_msg);
+		let last_active_ago =
+			Some(UInt::new_saturating(now.saturating_sub(aggregated.last_active_ts)));
+
+		let count = self
+			.persist_presence(
+				user_id,
+				&aggregated.state,
+				Some(aggregated.currently_active),
+				last_active_ago,
+				status_msg,
+			)
+			.await?;
+		self.device_presence
+			.committed_count(user_id, count.or(Some(current_count)));
 		if matches!(aggregated.state, PresenceState::Unavailable | PresenceState::Offline) {
 			services_root
 				.sending
 				.schedule_resume_pushes_for_user(user_id.to_owned(), "presence->inactive");
 		}
-
-		let status_msg = aggregated.status_msg.or(presence.status_msg);
-		let last_active_ago =
-			Some(UInt::new_saturating(now.saturating_sub(aggregated.last_active_ts)));
-
-		self.set_presence(
-			user_id,
-			&aggregated.state,
-			Some(aggregated.currently_active),
-			last_active_ago,
-			status_msg,
-		)
-		.await?;
 
 		Ok(())
 	}

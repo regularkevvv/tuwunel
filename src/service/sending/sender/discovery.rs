@@ -10,7 +10,10 @@ use super::{
 };
 use crate::sending::data::{DISCOVERY_PAGE_LIMIT, RecoverySource};
 
-pub(super) const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+// Four empty indexes previously cost four one-second page delays. Keep that
+// idle sweep budget, without delaying every page of accepted recovery work.
+pub(super) const DISCOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(4);
 
 #[derive(Default)]
 pub(super) struct Discovery {

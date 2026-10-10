@@ -83,7 +83,9 @@ mod tests;
 // Older senders must refuse before recomposing an already attempted delivery.
 // Version 23 commits canonical federation obligations with their source PDU.
 // Older writers cannot resume these plans and must refuse the database.
-pub(crate) const DATABASE_VERSION: u64 = 23;
+// Version 24 retains received/owned federation roles after queue ACK.
+// Older writers cannot classify new canonical rows and must refuse.
+pub(crate) const DATABASE_VERSION: u64 = 24;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 
@@ -176,6 +178,25 @@ async fn check_database_version(
 		return Err!(Database(
 			"Database schema version {discovered} is newer than this build supports \
 			 ({DATABASE_VERSION}). Upgrade tuwunel to a build supporting this database."
+		));
+	}
+
+	// Before version 22 the active rows did not retain the HTTP transaction
+	// body or its identity. Rebuilding them under the new sender can duplicate
+	// a transaction already applied remotely whose acknowledgement was lost.
+	// Refuse before server-name repair, fresh stamping or any migration writes;
+	// the previous writer must finish these sends while admission is quiesced.
+	// Foreign schema numbers cannot establish that our journal is present.
+	if (foreign_lineage || discovered < 22)
+		&& !services.db["servercurrentevent_data"]
+			.raw_keys_after(None, 1)
+			.await?
+			.is_empty()
+	{
+		return Err!(Database(
+			"Legacy active deliveries have no durable transaction body. Drain active deliveries \
+			 with the previous writer while admission is quiesced before upgrading; do not \
+			 delete or requeue them."
 		));
 	}
 

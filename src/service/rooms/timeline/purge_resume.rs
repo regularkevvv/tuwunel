@@ -109,29 +109,33 @@ pub(crate) async fn prepare_history_step(
 			.user_is_local(&snapshot.pdu.sender),
 	)?;
 	let raw = RawPduId::from_bytes(&target.key)?;
+	if (target.phase == Phase::OutgoingActive
+		|| (target.phase == Phase::OutgoingPending && target.after.is_some()))
+		&& !services_root
+			.sending
+			.db
+			.event_erasure_started(&raw)
+			.await?
+	{
+		return Err(Error::bad_database("History erasure lost its admission marker"));
+	}
+	// Older history-v1 checkpoints may already be at Final. They must run
+	// the new queue cleanup rather than skip directly to canonical deletion.
+	if target.phase == Phase::Final
+		&& !services_root
+			.sending
+			.db
+			.event_erasure_started(&raw)
+			.await?
+	{
+		target.phase = Phase::OutgoingPending;
+		target.after = None;
+		history.current = Some(target);
+		return Ok((txn, history));
+	}
 	let (after, done) = match target.phase {
-		| Phase::SearchCurrent | Phase::SearchOriginal => {
-			let pdu = if target.phase == Phase::SearchCurrent {
-				Some(&snapshot.pdu)
-			} else {
-				snapshot.original.as_ref()
-			};
-			let body = pdu
-				.filter(|pdu| pdu.kind == ruma::events::TimelineEventType::RoomMessage)
-				.map(Event::get_content::<ExtractBody>)
-				.transpose()?
-				.and_then(|body| body.body);
-			match body {
-				| Some(body) => services_root.search.append_deindex_page(
-					&mut txn,
-					history.shortroomid,
-					&raw,
-					&body,
-					target.after.as_deref(),
-				)?,
-				| None => (None, true),
-			}
-		},
+		| Phase::SearchCurrent | Phase::SearchOriginal =>
+			self.stage_history_search_page(&mut txn, &history, &target, &snapshot)?,
 		| Phase::LegacyRelations | Phase::TypedRelations =>
 			services_root
 				.pdu_metadata
@@ -148,32 +152,27 @@ pub(crate) async fn prepare_history_step(
 				.pusher
 				.stage_notification_erasure_page(&mut txn, &raw, room, target.after.as_deref())
 				.await?,
-		| Phase::Final => {
-			txn = self
-				.prepare_history_base(&raw, &snapshot.pdu)
+		| Phase::OutgoingPending | Phase::OutgoingActive => {
+			services_root
+				.sending
+				.db
+				.stage_begin_event_erasure(&mut txn, &raw)
 				.await?;
 			services_root
 				.sending
 				.db
-				.stage_federation_erasure(&mut txn, &raw)
-				.await?;
-			services_root
-				.pusher
-				.stage_notification_erasure(&mut txn, &raw, room)
-				.await?;
-			services_root
-				.pdu_metadata
-				.append_history_points(
+				.stage_event_queue_erasure_page(
 					&mut txn,
-					history.shortroomid,
-					raw.pdu_count(),
-					room,
-					&target.event_id,
+					&raw,
+					target.phase == Phase::OutgoingActive,
+					target.after.as_deref(),
 				)
+				.await?
+		},
+		| Phase::Final => {
+			txn = self
+				.prepare_history_final(&history, &target, &snapshot)
 				.await?;
-			services_root
-				.retention
-				.append_purge_original(&mut txn, &target.event_id);
 			history.purged = history
 				.purged
 				.checked_add(1)
@@ -189,13 +188,86 @@ pub(crate) async fn prepare_history_step(
 			| Phase::SearchOriginal => Phase::LegacyRelations,
 			| Phase::LegacyRelations => Phase::TypedRelations,
 			| Phase::TypedRelations => Phase::Notifications,
-			| Phase::Notifications | Phase::Final => Phase::Final,
+			| Phase::Notifications => Phase::OutgoingPending,
+			| Phase::OutgoingPending => Phase::OutgoingActive,
+			| Phase::OutgoingActive | Phase::Final => Phase::Final,
 		};
 	} else {
 		target.after = after;
 	}
 	history.current = Some(target);
 	Ok((txn, history))
+}
+
+#[implement(super::Service)]
+fn stage_history_search_page(
+	&self,
+	txn: &mut Txn,
+	history: &History,
+	target: &Target,
+	snapshot: &Snapshot,
+) -> Result<(Option<Vec<u8>>, bool)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let raw = RawPduId::from_bytes(&target.key)?;
+	let pdu = if target.phase == Phase::SearchCurrent {
+		Some(&snapshot.pdu)
+	} else {
+		snapshot.original.as_ref()
+	};
+	let body = pdu
+		.filter(|pdu| pdu.kind == ruma::events::TimelineEventType::RoomMessage)
+		.map(Event::get_content::<ExtractBody>)
+		.transpose()?
+		.and_then(|body| body.body);
+	match body {
+		| Some(body) => services_root.search.append_deindex_page(
+			txn,
+			history.shortroomid,
+			&raw,
+			&body,
+			target.after.as_deref(),
+		),
+		| None => Ok((None, true)),
+	}
+}
+
+#[implement(super::Service)]
+async fn prepare_history_final(
+	&self,
+	history: &History,
+	target: &Target,
+	snapshot: &Snapshot,
+) -> Result<Txn> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let raw = RawPduId::from_bytes(&target.key)?;
+	let room = &snapshot.pdu.room_id;
+	let mut txn = self
+		.prepare_history_base(&raw, &snapshot.pdu)
+		.await?;
+	services_root
+		.sending
+		.db
+		.stage_federation_role_erasure(&mut txn, &raw);
+	services_root
+		.pusher
+		.stage_notification_erasure(&mut txn, &raw, room)
+		.await?;
+	services_root
+		.pdu_metadata
+		.append_history_points(
+			&mut txn,
+			history.shortroomid,
+			raw.pdu_count(),
+			room,
+			&target.event_id,
+		)
+		.await?;
+	services_root
+		.retention
+		.append_purge_original(&mut txn, &target.event_id);
+	Ok(txn)
 }
 
 #[implement(super::Service)]

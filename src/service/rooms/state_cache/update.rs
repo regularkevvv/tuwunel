@@ -189,33 +189,32 @@ pub(super) async fn update_joined_count_locked(
 	let knockedcount = inventory.knocked.to_be_bytes();
 	let mut txn = services_root.db.txn();
 
-	txn.insert_raw(&self.db.roomid_joinedcount, room_id, joinedcount);
-	txn.insert_raw(&self.db.roomid_invitedcount, room_id, invitedcount);
-	txn.insert_raw(&self.db.roomid_knockedcount, room_id, knockedcount);
-
+	// Server pairs commit in bounded pages. The durable recount marker stays
+	// until every page and the final counts commit; replay recomputes the delta.
 	for old_joined_server in &inventory.old_servers {
 		if joined_servers.remove(old_joined_server) {
 			continue;
 		}
-
-		// Server not in room anymore
-		let roomserver_id = (room_id, old_joined_server);
-		let serverroom_id = (old_joined_server, room_id);
-
-		txn.del(&self.db.roomserverids, roomserver_id);
-		txn.del(&self.db.serverroomids, serverroom_id);
+		txn.del(&self.db.roomserverids, (room_id, old_joined_server));
+		txn.del(&self.db.serverroomids, (old_joined_server, room_id));
+		if txn.len() >= 400 {
+			txn.check_bridge_admission()?;
+			txn.execute_flushed().await?;
+			txn = services_root.db.txn();
+		}
 	}
-
-	// Now only new servers are in joined_servers anymore
 	for server in &joined_servers {
-		let roomserver_id = (room_id, server);
-		let serverroom_id = (server, room_id);
-		let roomserver_id = serialize_key(roomserver_id)?;
-		let serverroom_id = serialize_key(serverroom_id)?;
-
-		txn.insert_raw(&self.db.roomserverids, roomserver_id, []);
-		txn.insert_raw(&self.db.serverroomids, serverroom_id, []);
+		txn.put_raw(&self.db.roomserverids, (room_id, server), []);
+		txn.put_raw(&self.db.serverroomids, (server, room_id), []);
+		if txn.len() >= 400 {
+			txn.check_bridge_admission()?;
+			txn.execute_flushed().await?;
+			txn = services_root.db.txn();
+		}
 	}
+	txn.insert_raw(&self.db.roomid_joinedcount, room_id, joinedcount);
+	txn.insert_raw(&self.db.roomid_invitedcount, room_id, invitedcount);
+	txn.insert_raw(&self.db.roomid_knockedcount, room_id, knockedcount);
 
 	txn.put_raw(
 		&services_root.db["global"],
@@ -223,7 +222,8 @@ pub(super) async fn update_joined_count_locked(
 		self.recount_generation.as_bytes(),
 	);
 	txn.del(&services_root.db["global"], (RECOUNT_PENDING, room_id));
-	txn.execute().await
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await
 }
 
 /// Also retain the obligation when an explicit recount of older data fails.
@@ -321,6 +321,9 @@ pub(super) async fn commit_membership_erasure_locked(
 
 	txn.del(&services_root.db["global"], (RECOUNT_PENDING, room_id));
 	txn.del(&services_root.db["global"], (super::recount::RECOUNT_GENERATION, room_id));
+	txn.del(&services_root.db["global"], (super::projection::PENDING, room_id));
+	txn.del(&services_root.db["global"], (super::projection::WITNESS, room_id));
+	txn.del(&services_root.db["global"], (super::projection::CURSOR, room_id));
 	self.commit_membership_txn_locked(room_id, txn, guard)
 		.await
 }
@@ -458,6 +461,16 @@ pub(crate) async fn mark_as_knocked(
 pub async fn forget(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
+	let state = services_root.state.mutex.lock(room_id).await;
+	self.resume_membership_projection(room_id, &state)
+		.await?;
+	self.forget_indexes(room_id, user_id).await
+}
+
+#[implement(super::Service)]
+async fn forget_indexes(&self, room_id: &RoomId, user_id: &UserId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
 	let userroom_id = (user_id, room_id);
 	let roomuser_id = (room_id, user_id);
@@ -526,7 +539,7 @@ pub(crate) async fn mark_as_invited(
 
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-async fn ensure_remote_user(&self, user_id: &UserId) -> Result {
+pub(super) async fn ensure_remote_user(&self, user_id: &UserId) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
@@ -555,7 +568,7 @@ async fn handle_join(&self, room_id: &RoomId, user_id: &UserId, count: PduCount)
 }
 
 #[implement(super::Service)]
-async fn copy_predecessor_data(&self, room_id: &RoomId, user_id: &UserId) -> Result {
+pub(super) async fn copy_predecessor_data(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
@@ -625,6 +638,9 @@ async fn copy_predecessor_direct(
 				if !room_ids
 					.iter()
 					.any(|direct_room_id| direct_room_id == predecessor)
+					|| room_ids
+						.iter()
+						.any(|direct_room_id| direct_room_id == room_id)
 				{
 					return updated;
 				}
@@ -663,7 +679,7 @@ async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount
 			|| services_root.metadata.is_banned(room_id).await
 			|| services_root.metadata.is_disabled(room_id).await)
 	{
-		self.forget(room_id, user_id).await?;
+		self.forget_indexes(room_id, user_id).await?;
 	}
 
 	Ok(())

@@ -29,7 +29,6 @@ use crate::rooms::{
 	read_receipt::PrivateRead,
 	short::{ShortRoomId, ShortStateHash},
 	state_accessor::plain_text_topic,
-	state_cache::MembershipUpdate,
 	state_compressor::CompressedState,
 };
 
@@ -44,8 +43,8 @@ type Band<'a> = SmallVec<[&'a EventId; 1]>;
 /// and the rest still run. The pdu stays sent: its sender is told so, and a
 /// retry of the sender's transaction finds the record and runs nothing again.
 ///
-/// Federation and notifications have separate durable plans. The other
-/// effects run at most once per live process. Nothing records an
+/// Federation, notifications and membership have separate durable plans. The
+/// other effects run at most once per live process. Nothing records an
 /// effect as owed, so one that failed, or one a crash cut short, is not
 /// replayed.
 pub(crate) trait Effect {
@@ -213,6 +212,10 @@ where
 {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
+	services_root
+		.state_cache
+		.resume_membership_projection(pdu.room_id(), state_lock)
+		.await?;
 
 	// Coalesce database writes for the remainder of this scope.
 	let _cork = self.db.db.cork_and_flush();
@@ -223,47 +226,8 @@ where
 		.await
 		.map_err(|_| err!(Database("Room does not exist")))?;
 
-	// Make unsigned fields correct. This is not properly documented in the spec,
-	// but state events need to have previous content in the unsigned field, so
-	// clients can easily interpret things like membership changes
-	if let Some(state_key) = pdu.state_key() {
-		if let CanonicalJsonValue::Object(unsigned) = pdu_json
-			.entry("unsigned".into())
-			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
-		{
-			if let Ok(shortstatehash) = services_root
-				.state
-				.pdu_shortstatehash(pdu.event_id())
-				.await && let Ok(prev_state) = services_root
-				.state_accessor
-				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
-				.await
-			{
-				unsigned.insert(
-					"prev_content".into(),
-					CanonicalJsonValue::Object(
-						utils::to_canonical_object(prev_state.get_content_as_value()).map_err(
-							|e| {
-								err!(Database(error!(
-									"Failed to convert prev_state to canonical JSON: {e}",
-								)))
-							},
-						)?,
-					),
-				);
-				unsigned.insert(
-					"prev_sender".into(),
-					CanonicalJsonValue::String(prev_state.sender().to_string()),
-				);
-				unsigned.insert(
-					"replaces_state".into(),
-					CanonicalJsonValue::String(prev_state.event_id().to_string()),
-				);
-			}
-		} else {
-			error!("Invalid unsigned type in pdu.");
-		}
-	}
+	self.correct_append_unsigned(pdu, &mut pdu_json)
+		.await?;
 
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
 	let next_count = services_root.globals.next_count().await?;
@@ -276,12 +240,13 @@ where
 	// that state current. A failed commit leaves none of them, so the pdu is
 	// never visible beside the state it replaced, and the frontier never names
 	// a pdu that was not stored.
-	let mut txn = self.append_pdu_txn(
+	let mut txn = self.append_pdu_txn_with_role(
 		&pdu_id,
 		pdu,
 		&pdu_json,
 		txnid,
 		room_state.map(|room_state| (room_state, state_lock)),
+		federate,
 	);
 
 	// We must keep track of all events that have been referenced.
@@ -338,8 +303,20 @@ where
 	};
 	// This is one indivisible admission, including metadata, deletions, client
 	// transaction identity, state and both notification/federation plans.
+	let projection = services_root
+		.state_cache
+		.stage_membership_projection(
+			&mut txn,
+			pdu.room_id(),
+			room_state,
+			Some(pdu),
+			count,
+			state_lock,
+		)
+		.await?;
 	txn.check_bridge_admission()?;
 	txn.execute_flushed().await?;
+	drop(projection);
 	drop(federation);
 	drop(notifications);
 
@@ -367,6 +344,12 @@ where
 		.append_pdu(pdu_id, pdu, state_lock)
 		.await
 		.effect("push", event_id);
+
+	services_root
+		.state_cache
+		.resume_membership_projection(pdu.room_id(), state_lock)
+		.await
+		.effect("membership projection", event_id);
 
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
 		.await;
@@ -397,6 +380,114 @@ where
 		.effect("appservice delivery", event_id);
 
 	Ok(pdu_id)
+}
+
+#[implement(super::Service)]
+async fn correct_append_unsigned(
+	&self,
+	pdu: &PduEvent,
+	pdu_json: &mut CanonicalJsonObject,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	// Make unsigned fields correct. This is not properly documented in the spec,
+	// but state events need to have previous content in the unsigned field, so
+	// clients can easily interpret things like membership changes
+	if let Some(state_key) = pdu.state_key() {
+		if let CanonicalJsonValue::Object(unsigned) = pdu_json
+			.entry("unsigned".into())
+			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
+		{
+			if let Ok(shortstatehash) = services_root
+				.state
+				.pdu_shortstatehash(pdu.event_id())
+				.await && let Ok(prev_state) = services_root
+				.state_accessor
+				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
+				.await
+			{
+				unsigned.insert(
+					"prev_content".into(),
+					CanonicalJsonValue::Object(
+						utils::to_canonical_object(prev_state.get_content_as_value()).map_err(
+							|e| {
+								err!(Database(error!(
+									"Failed to convert prev_state to canonical JSON: {e}",
+								)))
+							},
+						)?,
+					),
+				);
+				unsigned.insert(
+					"prev_sender".into(),
+					CanonicalJsonValue::String(prev_state.sender().to_string()),
+				);
+				unsigned.insert(
+					"replaces_state".into(),
+					CanonicalJsonValue::String(prev_state.event_id().to_string()),
+				);
+			}
+		} else {
+			error!("Invalid unsigned type in pdu.");
+		}
+	}
+
+	Ok(())
+}
+
+/// Admit an existing canonical membership event's first producer role without
+/// rewriting the PDU, current state or client transaction. A completed role
+/// stays completed even after all its queues have been acknowledged.
+#[implement(super::Service)]
+pub(crate) async fn federate_existing_pdu(
+	&self,
+	raw: RawPduId,
+	room: &ruma::RoomId,
+	event: &EventId,
+	state_lock: Option<&RoomMutexGuard>,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let owned_lock = if state_lock.is_none() {
+		Some(services_root.state.mutex.lock(room).await)
+	} else {
+		None
+	};
+	let _state_lock = state_lock
+		.or(owned_lock.as_ref())
+		.expect("canonical room lock");
+	let pdu = self.get_pdu_from_id(&raw).await?;
+	if pdu.room_id != room || pdu.event_id != event || pdu.kind != TimelineEventType::RoomMember {
+		return Err(err!(Request(InvalidParam(
+			"Known event is not the requested membership event"
+		))));
+	}
+	if self.get_pdu_id(event).await? != raw
+		|| services_root
+			.short
+			.get_shortroomid(room)
+			.await?
+			.to_be_bytes()
+			!= raw.shortroomid()
+	{
+		return Err(err!(Database("Known canonical event bindings disagree")));
+	}
+	let state = services_root
+		.state
+		.get_room_shortstatehash(room)
+		.await?;
+	services_root
+		.sending
+		.db
+		.admit_known_federation_role(raw, &pdu, state)
+		.await?;
+	services_root
+		.sending
+		.resume_federation_source(raw)
+		.await
+		.effect("known federation page", event);
+	services_root.sending.wake_federation_sources();
+	Ok(())
 }
 
 /// The effects a durable pdu's type and relations call for.
@@ -574,7 +665,7 @@ async fn append_redaction_effects(
 /// user who is invited or knocked and leaves immediately still leaves the
 /// earlier event on record for auth.
 #[implement(super::Service)]
-async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result {
+async fn append_member_effects(&self, pdu: &PduEvent, _count: PduCount) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
@@ -590,30 +681,14 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 	let is_invite = content.membership == MembershipState::Invite;
 	let is_direct = content.is_direct;
 
-	let stripped_state = match content.membership {
-		| MembershipState::Invite | MembershipState::Knock => services_root
-			.state
-			.summary_stripped(pdu)
-			.await
-			.into(),
-		| _ => None,
-	};
-
-	services_root
-		.state_cache
-		.update_membership(MembershipUpdate {
-			room_id: pdu.room_id(),
-			user_id: &user_id,
-			membership_event: content,
-			sender: pdu.sender(),
-			last_state: stripped_state,
-			invite_via: None,
-			update_joined_count: true,
-			count,
-		})
-		.await?;
-
-	if is_invite {
+	if is_invite
+		&& services_root
+			.state_accessor
+			.room_state_get(pdu.room_id(), &ruma::events::StateEventType::RoomMember, state_key)
+			.await?
+			.event_id()
+			== pdu.event_id()
+	{
 		services_root
 			.membership
 			.auto_accept(pdu.room_id(), &user_id, pdu.sender(), is_direct);
@@ -640,12 +715,33 @@ pub fn append_pdu_txn(
 	txnid: Option<&[u8]>,
 	room_state: Option<(ShortStateHash, &RoomMutexGuard)>,
 ) -> Txn {
+	self.append_pdu_txn_with_role(pdu_id, pdu, json, txnid, room_state, false)
+}
+
+#[implement(super::Service)]
+fn append_pdu_txn_with_role(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &PduEvent,
+	json: &CanonicalJsonObject,
+	txnid: Option<&[u8]>,
+	room_state: Option<(ShortStateHash, &RoomMutexGuard)>,
+	federate: bool,
+) -> Txn {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
 	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
 	let mut txn = self.db.db.txn();
+
+	services_root.sending.db.stage_federation_role(
+		&mut txn,
+		pdu_id,
+		pdu.room_id(),
+		pdu.event_id(),
+		federate,
+	);
 
 	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
 	txn.insert_raw(&self.db.eventid_pduid, pdu.event_id.as_bytes(), pdu_id);

@@ -144,6 +144,7 @@ async fn verify(federation: bool, fault: Fault) -> Result {
 			SendingEvent::DeviceListChanged(value)
 		},
 	};
+	fixture.retain_pdu(&event).await?;
 	services
 		.sending
 		.queue_and_dispatch(destination.clone(), event)

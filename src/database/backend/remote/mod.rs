@@ -28,6 +28,8 @@ pub(crate) mod cache;
 pub(crate) mod client;
 #[cfg(test)]
 mod close_tests;
+#[cfg(test)]
+pub(crate) use crate::bridge_fixture as fixture;
 pub(crate) mod lease;
 mod outcome;
 pub(crate) mod scan;

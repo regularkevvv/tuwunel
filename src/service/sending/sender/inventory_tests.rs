@@ -257,6 +257,7 @@ async fn cancelled_push_failure_cannot_recreate_backoff_for_a_new_incarnation() 
 	bytes[7] = 1;
 	bytes[15] = 1;
 	let event = SendingEvent::Pdu(crate::rooms::timeline::RawPduId::from_bytes(&bytes)?);
+	fixture.retain_pdu(&event).await?;
 	let keys = data
 		.queue_requests(once((&event, &destination)))
 		.await?;

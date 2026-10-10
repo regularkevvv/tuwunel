@@ -28,6 +28,18 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
+	/// Queue identity controls use opaque canonical rows and never decode PDUs.
+	/// Retain the referenced row so they exercise the real admission
+	/// precondition.
+	pub(super) async fn retain_pdu(&self, event: &super::SendingEvent) -> Result {
+		if let Some(raw) = event.pdu_id() {
+			self.services.db["pduid_pdu"]
+				.insert(raw.as_ref(), b"{}".as_slice())
+				.await?;
+		}
+		Ok(())
+	}
+
 	pub(super) async fn new() -> Result<Self> {
 		// Match the main runtime's descriptor setup. The outer test runner
 		// owns scratch cleanup after this process exits.
@@ -44,8 +56,31 @@ impl Fixture {
 	/// Open only a scratch root owned by the invoking fixture. Cold-start
 	/// controls reopen it in a new process after the preceding child exits.
 	pub(super) async fn open(root: &std::path::Path) -> Result<Self> {
+		Self::open_options(root, false).await
+	}
+
+	/// Exercise the real service startup order on a current-schema scratch DB.
+	/// No migration or outbound federation is part of this control.
+	pub(super) async fn open_startup(root: &std::path::Path) -> Result<Self> {
+		Self::open_options(root, true).await
+	}
+
+	async fn open_options(root: &std::path::Path, startup: bool) -> Result<Self> {
+		Self::open_config(root, startup, None).await
+	}
+
+	/// Open only the owned loopback bridge oracle for remote service controls.
+	pub(super) async fn open_remote(root: &std::path::Path, url: &str) -> Result<Self> {
+		Self::open_config(root, false, Some(url)).await
+	}
+
+	async fn open_config(
+		root: &std::path::Path,
+		startup: bool,
+		remote: Option<&str>,
+	) -> Result<Self> {
 		sys::maximize_fd_limit()?;
-		let raw = Figment::new()
+		let mut raw = Figment::new()
 			.merge(("server_name", "localhost"))
 			.merge(("database_backend", "rocksdb"))
 			.merge(("database_path", root.join("database")))
@@ -53,6 +88,20 @@ impl Fixture {
 			.merge(("allow_outgoing_read_receipts", true))
 			.merge(("startup_netburst", true))
 			.merge(("startup_netburst_keep", -1));
+		if let Some(url) = remote {
+			raw = raw
+				.merge(("database_backend", "d1"))
+				.merge(("d1_bridge_url", url))
+				.merge(("d1_bridge_token", crate::bridge_fixture::TOKEN))
+				.merge(("d1_read_cache_mb", 1))
+				.merge(("d1_lease_ttl_ms", 15_000));
+		}
+		if startup {
+			raw = raw
+				.merge(("database_migrations", false))
+				.merge(("allow_federation", false))
+				.merge(("startup_netburst", false));
+		}
 		let config = Config::new(&raw)?;
 		let runtime = Handle::current();
 		let log = Logging {

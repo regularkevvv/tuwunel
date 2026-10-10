@@ -27,6 +27,7 @@ fn pdu() -> Result<SendingEvent> {
 }
 
 async fn promote(fixture: &Fixture, destination: &Destination, event: &SendingEvent) -> Result {
+	fixture.retain_pdu(event).await?;
 	let data = &fixture.services.sending.db;
 	let keys = data
 		.queue_requests(std::iter::once((event, destination)))
@@ -75,6 +76,7 @@ async fn verify_unsupported_schema_refuses_identity_writes_and_cursor_consumptio
 	let fixture = Fixture::new().await?;
 	let destination = Destination::Federation("remote.example".try_into()?);
 	let event = pdu()?;
+	fixture.retain_pdu(&event).await?;
 	let data = &fixture.services.sending.db;
 	let keys = data
 		.queue_requests(std::iter::once((&event, &destination)))
@@ -391,4 +393,61 @@ pub(super) fn isolated(test: &str, exercise: impl Future<Output = Result>) -> Re
 		.enable_all()
 		.build()?
 		.block_on(exercise)
+}
+
+async fn verify_legacy_active_migration_refuses_without_mutating_retained_rows() -> Result {
+	for (version, foreign) in [(13, false), (17, false), (21, false), (99, true)] {
+		let fixture = Fixture::new().await?;
+		let services = &fixture.services;
+		// Empty accounts must not let fresh-database initialization bypass the
+		// gate. No worker runs; these are the old sender's actual row shapes.
+		assert_eq!(services.users.count().await, 0);
+		services.db["global"]
+			.insert(b"server_name", services.server.name.as_str())
+			.await?;
+		if foreign {
+			services.db["global"]
+				.insert(b"populate_userroomid_leftstate_table", b"".as_slice())
+				.await?;
+		}
+		services
+			.globals
+			.db
+			.bump_database_version(version)
+			.await?;
+		let destination = Destination::Appservice("legacy-active-migration".into());
+		let mut active = destination.get_prefix();
+		active.extend_from_slice(&[1_u8; 16]);
+		let mut pending = destination.get_prefix();
+		pending.extend_from_slice(&[2_u8; 16]);
+		let mut txn = services.db.txn();
+		txn.insert_raw(&services.db["servercurrentevent_data"], &active, b"");
+		txn.insert_raw(&services.db["servernameevent_data"], &pending, b"");
+		txn.insert_raw(&services.db["pduid_pdu"], [1_u8; 16], b"retained active source");
+		txn.insert_raw(&services.db["pduid_pdu"], [2_u8; 16], b"retained pending source");
+		txn.execute_flushed().await?;
+		let maps = ["global", "servercurrentevent_data", "servernameevent_data", "pduid_pdu"];
+		let mut before = Vec::new();
+		for map in maps {
+			before.push(rows(services, map).await?);
+		}
+		let error = crate::migrations::migrations(services)
+			.await
+			.expect_err("old active sends cannot acquire a replacement transaction identity");
+		assert!(
+			error
+				.to_string()
+				.contains("Drain active deliveries with the previous writer")
+		);
+		for (map, expected) in maps.into_iter().zip(before) {
+			assert_eq!(rows(services, map).await?, expected, "refusal changed {map}");
+		}
+		fixture.finish().await;
+	}
+	Ok(())
+}
+
+#[test]
+fn legacy_active_migration_refuses_without_mutating_retained_rows() -> Result {
+	isolated("sending::sender::incarnation_tests::legacy_active_migration_refuses_without_mutating_retained_rows", verify_legacy_active_migration_refuses_without_mutating_retained_rows())
 }

@@ -16,6 +16,7 @@ mod active;
 mod attempt;
 mod backoff;
 mod discovery;
+mod erasure;
 mod source;
 pub(super) use ack::ActiveAcknowledgement;
 pub(super) use attempt::{BODY_LIMIT, PreparedAttempt, appservice_owner};
@@ -274,6 +275,13 @@ impl Data {
 			budget
 				.try_put(key_len, event.value_bytes())
 				.map_err(|error| admission_error(&error))?;
+		}
+		// Erasure and direct admissions share this exclusion. A stale producer
+		// must not recreate a delivery after the canonical event was removed.
+		for (event, _) in requests.clone() {
+			if let Some(raw) = event.pdu_id() {
+				self.require_deliverable_pdu(raw).await?;
+			}
 		}
 		for (_, destination) in requests.clone() {
 			self.resume_cancellation(destination).await?;

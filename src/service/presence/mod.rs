@@ -23,7 +23,7 @@ use tuwunel_core::{
 	Result, checked, debug, debug_warn, err,
 	result::LogErr,
 	trace,
-	utils::{self, TryFutureExtExt},
+	utils::{self, MutexMap, TryFutureExtExt},
 };
 
 use self::{aggregate::PresenceAggregator, data::Data};
@@ -66,6 +66,7 @@ pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	last_sync_seen: RwLock<HashMap<OwnedUserId, u64>>,
 	device_presence: PresenceAggregator,
+	update_mutex: MutexMap<OwnedUserId, ()>,
 }
 
 type TimerType = (OwnedUserId, Duration, u64);
@@ -86,6 +87,7 @@ impl crate::Service for Service {
 			services: args.services.clone(),
 			last_sync_seen: RwLock::new(HashMap::new()),
 			device_presence: PresenceAggregator::new(),
+			update_mutex: MutexMap::new(),
 		}))
 	}
 
@@ -96,7 +98,7 @@ impl crate::Service for Service {
 		// reset dormant online/away statuses to offline, and set the server user as
 		// online
 		self.unset_all_presence().await;
-		self.device_presence.clear().await;
+		self.device_presence.clear();
 		_ = self
 			.maybe_ping_presence(&services_root.globals.server_user, Ping::default())
 			.await;
