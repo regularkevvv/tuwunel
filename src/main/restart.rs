@@ -103,6 +103,11 @@ mod tests {
 			time::{Duration, Instant},
 		};
 
+		struct Directory(PathBuf);
+		impl Drop for Directory {
+			fn drop(&mut self) { fs::remove_dir_all(&self.0).ok(); }
+		}
+
 		const FIXTURE: &str = "TUWUNEL_EXEC_RESTART_FIXTURE";
 		const CONFIG: &str = "/disposable-restart-fixture/tuwunel.toml";
 		if let Ok(directory) = var(FIXTURE) {
@@ -119,10 +124,6 @@ mod tests {
 			return Ok(());
 		}
 
-		struct Directory(PathBuf);
-		impl Drop for Directory {
-			fn drop(&mut self) { fs::remove_dir_all(&self.0).ok(); }
-		}
 		let directory = Directory(
 			std::env::temp_dir()
 				.join(format!("tuwunel-exec-restart-{}", tuwunel_core::utils::rand::string(20))),
