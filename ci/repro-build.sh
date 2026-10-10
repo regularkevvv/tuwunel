@@ -18,7 +18,7 @@
 #
 # Env overrides:
 #   REPRO_PROFILE   cargo profile (default: release)
-#   REPRO_PACKAGE   package to build (default: tuwunel)
+#   REPRO_PACKAGE   must be tuwunel (the declared Container binary)
 #   PROVENANCE_OUT  save the result and failed-comparison diagnostics
 set -euo pipefail
 
@@ -30,8 +30,14 @@ PROVENANCE_OUT="${PROVENANCE_OUT:-$ROOT/evidence/provenance}"
 REPRO_OUT="$PROVENANCE_OUT/diagnostics"
 
 # Cargo discovers .cargo/config.toml and rustup selects its toolchain from
-# the working directory, not --manifest-path. Match the deployed fork build.
+# the working directory, not --manifest-path. Match the Container feature set;
+# native-host/linker/version metadata remain separate from image identity.
 cd "$FORK"
+[[ "$PACKAGE" == tuwunel ]] || {
+  echo 'Container reproducibility requires REPRO_PACKAGE=tuwunel' >&2
+  exit 1
+}
+FEATURES="$(python3 ci/check-container-lifecycle.py --features)"
 
 EPOCH="$(git -C "$FORK" log -1 --format=%ct)"
 SYSROOT="$(rustc --print sysroot)"
@@ -60,7 +66,8 @@ build_once() {
     CARGO_TARGET_DIR="$target_dir" \
     RUSTFLAGS="$rustflags" \
     cargo build --manifest-path "$FORK/Cargo.toml" \
-      --profile "$PROFILE" --locked -p "$PACKAGE"
+      --profile "$PROFILE" --locked -p "$PACKAGE" --bin "$PACKAGE" \
+      --no-default-features --features "$FEATURES"
 }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/repro.XXXXXX")"
@@ -105,10 +112,10 @@ fi
 echo "Reproducible-build gate: PASS ($HASH_A)"
 
 mkdir -p "$PROVENANCE_OUT"
-python3 - "$PROVENANCE_OUT/reproducibility.json" "$HASH_A" "$HASH_B" "$(git rev-parse HEAD)" "$EPOCH" "$PROFILE" "$PACKAGE" <<'PY_REPORT'
+python3 - "$PROVENANCE_OUT/reproducibility.json" "$HASH_A" "$HASH_B" "$(git rev-parse HEAD)" "$EPOCH" "$PROFILE" "$PACKAGE" "$FEATURES" <<'PY_REPORT'
 import json, sys
 from pathlib import Path
-path, first, second, source, epoch, profile, package = sys.argv[1:]
-Path(path).write_text(json.dumps({'source_commit': source, 'source_date_epoch': int(epoch), 'profile': profile, 'package': package, 'build_a_sha256': first, 'build_b_sha256': second}, indent=2) + '\n')
+path, first, second, source, epoch, profile, package, features = sys.argv[1:]
+Path(path).write_text(json.dumps({'source_commit': source, 'source_date_epoch': int(epoch), 'profile': profile, 'package': package, 'default_features': False, 'features': features.split(','), 'scope': 'native binary reproducibility with declared Container features; signed image identity qualified separately', 'build_a_sha256': first, 'build_b_sha256': second}, indent=2) + '\n')
 PY_REPORT
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'binary=%s\n' "$HASH_A" >> "$GITHUB_OUTPUT"; fi

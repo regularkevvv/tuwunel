@@ -14,6 +14,8 @@ on:
       - "ci/install-cyclonedx.sh"
       - "ci/sbom.sh"
       - "ci/repro-build.sh"
+      - "ci/container-features.txt"
+      - "ci/check-container-lifecycle.py"
       - "ci/tests/test_provenance.py"
       - ".github/workflows/ci-provenance.yml"
 

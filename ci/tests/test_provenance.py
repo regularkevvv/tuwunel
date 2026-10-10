@@ -21,8 +21,10 @@ class ProvenanceDrivers(unittest.TestCase):
         self.base = Path(scratch.name).resolve()
         self.root = self.base / "source"
         (self.root / "ci").mkdir(parents=True)
-        for name in ("repro-build.sh", "sbom.sh", "install-cyclonedx.sh"):
+        for name in ("repro-build.sh", "sbom.sh", "install-cyclonedx.sh", "container-features.txt", "check-container-lifecycle.py"):
             shutil.copy2(ROOT / "ci" / name, self.root / "ci" / name)
+        (self.root / "src/main").mkdir(parents=True)
+        shutil.copy2(ROOT / "src/main/Cargo.toml", self.root / "src/main/Cargo.toml")
         (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["member"]\n')
         (self.root / "member").mkdir()
         (self.root / "member/Cargo.toml").write_text('[package]\nname = "member"\nversion = "0.1.0"\n')
@@ -91,14 +93,36 @@ else:
         self.assertEqual(len(calls), 2)
         self.assertNotEqual(calls[0]["target"], calls[1]["target"])
         self.assertEqual(calls[0]["flags"], calls[1]["flags"])
+        expected_features = (ROOT / "ci/container-features.txt").read_text().strip().split(",")
         for call in calls:
+            self.assertIn("--no-default-features", call["args"])
+            self.assertEqual(call["args"][call["args"].index("--features") + 1].split(","), expected_features)
+            self.assertEqual(call["args"][call["args"].index("--bin") + 1], "tuwunel")
             self.assertIn("--remap-path-prefix=" + call["target"] + "=/target", calls[0]["flags"])
             self.assertFalse(Path(call["target"]).exists())
         report = json.loads((self.out / "reproducibility.json").read_text())
         self.assertEqual(report["build_a_sha256"], report["build_b_sha256"])
+        self.assertFalse(report["default_features"])
+        self.assertEqual(report["features"], expected_features)
+        self.assertIn("signed image identity qualified separately", report["scope"])
         source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
         self.assertEqual(report["source_commit"], source)
         self.assertIn("binary=" + report["build_a_sha256"], (self.base / "github-output").read_text())
+
+    def test_repro_refuses_feature_contract_drift_before_building(self):
+        path = self.root / "ci/container-features.txt"
+        path.write_text(path.read_text().strip() + ",io_uring\n")
+        result = self.run_driver("repro-build.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.base / "calls.jsonl").exists())
+        self.assertFalse((self.out / "reproducibility.json").exists())
+
+    def test_repro_refuses_a_different_package_before_building(self):
+        self.env["REPRO_PACKAGE"] = "member"
+        result = self.run_driver("repro-build.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.base / "calls.jsonl").exists())
+        self.assertFalse((self.out / "reproducibility.json").exists())
 
     def test_repro_mismatch_preserves_both_binaries_and_refuses_receipt(self):
         self.env["TEST_MISMATCH"] = "1"
