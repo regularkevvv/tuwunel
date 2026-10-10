@@ -148,7 +148,7 @@ async fn key_metadata_refuses_complete_oversized_device_inventory() -> Result {
 	let user = user_id!("@metadata:localhost");
 	for index in 0..128 {
 		let device = ruma::OwnedDeviceId::from(format!("DEVICE{index:03}"));
-		let key = serialize_key((user, device.as_ref()))?;
+		let key = serialize_key((user, &*device))?;
 		fixture.services.db["userdeviceid_metadata"]
 			.insert(&key, b"{}".as_slice())
 			.await?;

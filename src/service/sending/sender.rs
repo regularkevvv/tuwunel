@@ -52,7 +52,7 @@ use tuwunel_core::{
 	smallvec::SmallVec,
 	trace,
 	utils::{
-		BoolExt, ReadyExt,
+		BoolExt,
 		rand::secs as rand_secs,
 		stream::{IterStream, WidebandExt},
 	},

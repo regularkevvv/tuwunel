@@ -451,7 +451,7 @@ pub(crate) async fn outgoing_key_metadata(
 	let rows = self
 		.db
 		.userdeviceidalgorithm_fallback
-		.stream_prefix_capped::<((Ignore, Ignore, OneTimeKeyAlgorithm), &[u8]), _>(
+		.stream_prefix_capped::<(Ignore, Ignore, OneTimeKeyAlgorithm), &[u8], _>(
 			&prefix,
 			budget.rows.min(16).saturating_add(1),
 		);
