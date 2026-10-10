@@ -19,7 +19,8 @@ pub fn restart() -> ! {
 	let envs: Vec<_> = strip_listen_fds(vars()).collect();
 	let args: Vec<_> = strip_restore_backup(args().skip(1)).collect();
 
-	debug!(?exe, ?args, ?envs, "Restart");
+	// Environment values and CLI overrides can carry credentials.
+	debug!(?exe, arguments = args.len(), environment_variables = envs.len(), "Restart");
 
 	if LISTEN_VARS
 		.iter()
