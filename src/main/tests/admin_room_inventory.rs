@@ -229,6 +229,7 @@ async fn exercise(endpoint: &Endpoint<'_>) -> Result {
 	empty_deletion_inventory(endpoint, &alpha).await?;
 	complete_empty_deletion(endpoint).await?;
 	complete_room_pruning(endpoint).await?;
+	directory_source_budgets(services, &zeta).await?;
 	corrupt_inputs(endpoint, &alpha).await?;
 	member_budgets(endpoint, &alpha).await?;
 	aggregate_members(endpoint, &[alpha, zeta]).await
@@ -474,34 +475,64 @@ async fn empty_deletion_preserves_room(services: &Services, room: &RoomId) -> Re
 	Ok(())
 }
 
-async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> Result {
-	assert!(
-		services
-			.admin
-			.command_in_place("rooms list".into(), None)
-			.await
-			.is_err(),
-		"administrative pagination must not hide an incomplete room inventory"
-	);
+async fn admin_listing_refused(services: &Services, command: &str, reason: Option<&str>) {
+	match services
+		.admin
+		.command_in_place(command.to_owned(), None)
+		.await
+	{
+		| Err(output) => {
+			assert!(
+				output.as_str().contains("Command failed"),
+				"listing must reach the handler and refuse: {}",
+				output.as_str()
+			);
+			if let Some(reason) = reason {
+				assert!(
+					output.as_str().contains(reason),
+					"listing must refuse the actual source budget/corruption: {}",
+					output.as_str()
+				);
+			}
+		},
+		| Ok(Some(output)) =>
+			panic!("{command} returned a partial successful listing: {}", output.as_str()),
+		| Ok(None) => panic!("{command} succeeded without output over an incomplete source"),
+	}
+}
+
+async fn directory_source_budgets(services: &Services, anchor: &RoomId) -> Result {
 	let published = &services.db["publicroomids"];
+	let original = published.get(anchor).await?.to_vec();
 	for index in 0..1025 {
 		published
 			.insert(&format!("!directory-boundary-{index:04}:localhost"), "")
 			.await?;
 	}
+	admin_listing_refused(
+		services,
+		"rooms directory list",
+		Some("Published room source exceeds"),
+	)
+	.await;
+	assert_eq!(published.get(anchor).await?.to_vec(), original);
 	assert!(
-		services
-			.admin
-			.command_in_place("rooms directory list".into(), None)
+		published
+			.get("!directory-boundary-0000:localhost")
 			.await
-			.is_err(),
-		"directory pagination must not hide an incomplete publication inventory"
+			.is_ok(),
+		"refused listing must leave its source rows intact"
 	);
 	for index in 0..1025 {
 		published
 			.remove(&format!("!directory-boundary-{index:04}:localhost"))
 			.await?;
 	}
+	assert_eq!(published.get(anchor).await?.to_vec(), original);
+	Ok(())
+}
+
+async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> Result {
 	let rooms = &services.db["roomid_shortroomid"];
 	let states = &services.db["roomid_shortstatehash"];
 	let original_room = rooms.get(room).await?.to_vec();
@@ -571,6 +602,8 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 	endpoint
 		.refused("search_term=unmatched&limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
 		.await?;
+	admin_listing_refused(services, "rooms list", None).await;
+	assert_eq!(rooms.get("not-a-room").await?.as_ref(), 0_u64.to_be_bytes());
 	rooms.remove("not-a-room").await?;
 	let counts = &services.db["roomid_joinedcount"];
 	let count = counts.get(room).await?.to_vec();
@@ -617,6 +650,9 @@ async fn corrupt_inputs(endpoint: &Endpoint<'_>, room: &RoomId) -> Result {
 		endpoint
 			.refused("limit=1", http::StatusCode::INTERNAL_SERVER_ERROR)
 			.await?;
+		admin_listing_refused(services, "rooms list", Some("Invalid room inventory record"))
+			.await;
+		assert_eq!(rooms.get(room).await?.as_ref(), value);
 	}
 	rooms.insert(room, room_key).await?;
 	endpoint.page("", 2).await?;
@@ -733,6 +769,15 @@ async fn room_source_budgets(endpoint: &Endpoint<'_>) -> Result {
 	endpoint
 		.refused("search_term=unmatched&limit=1", http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;
+	admin_listing_refused(endpoint.services, "rooms list", Some("Room inventory limit reached"))
+		.await;
+	assert_eq!(
+		rooms
+			.get("!budget-0000:localhost")
+			.await?
+			.as_ref(),
+		0_u64.to_be_bytes()
+	);
 	rooms.clear().await?;
 	for index in 0..600 {
 		rooms
@@ -742,5 +787,14 @@ async fn room_source_budgets(endpoint: &Endpoint<'_>) -> Result {
 	endpoint
 		.refused("search_term=unmatched&limit=1", http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;
+	admin_listing_refused(endpoint.services, "rooms list", Some("Room inventory limit reached"))
+		.await;
+	assert_eq!(
+		rooms
+			.get(&format!("!{}-0000:localhost", "x".repeat(220)))
+			.await?
+			.as_ref(),
+		0_u64.to_be_bytes()
+	);
 	Ok(())
 }
