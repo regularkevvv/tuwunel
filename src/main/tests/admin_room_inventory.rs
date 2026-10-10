@@ -475,15 +475,32 @@ async fn empty_deletion_preserves_room(services: &Services, room: &RoomId) -> Re
 }
 
 async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> Result {
-	for command in ["rooms list", "rooms directory list"] {
-		assert!(
-			services
-				.admin
-				.command_in_place(command.into(), None)
-				.await
-				.is_err(),
-			"administrative pagination must not hide incomplete room sources: {command}"
-		);
+	assert!(
+		services
+			.admin
+			.command_in_place("rooms list".into(), None)
+			.await
+			.is_err(),
+		"administrative pagination must not hide an incomplete room inventory"
+	);
+	let published = &services.db["publicroomids"];
+	for index in 0..1025 {
+		published
+			.insert(&format!("!directory-boundary-{index:04}:localhost"), "")
+			.await?;
+	}
+	assert!(
+		services
+			.admin
+			.command_in_place("rooms directory list".into(), None)
+			.await
+			.is_err(),
+		"directory pagination must not hide an incomplete publication inventory"
+	);
+	for index in 0..1025 {
+		published
+			.remove(&format!("!directory-boundary-{index:04}:localhost"))
+			.await?;
 	}
 	let rooms = &services.db["roomid_shortroomid"];
 	let states = &services.db["roomid_shortstatehash"];

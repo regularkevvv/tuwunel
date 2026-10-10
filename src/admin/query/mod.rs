@@ -134,7 +134,8 @@ pub(super) fn remote_scan_allowed(command: &QueryCommand) -> bool {
 			| RawCommand::Iter { limit: Some(limit), .. } => (1..=16).contains(limit),
 			| _ => false,
 		},
-		| QueryCommand::Globals(_) | QueryCommand::Short(_) => true,
+		| QueryCommand::Globals(_)
+		| QueryCommand::Short(_)
 		| QueryCommand::AccountData(AccountDataCommand::AccountDataGet { .. })
 		| QueryCommand::Presence(PresenceCommand::GetPresence { .. })
 		| QueryCommand::Appservice(AppserviceCommand::GetRegistration { .. })
@@ -158,7 +159,7 @@ pub(super) fn remote_scan_allowed(command: &QueryCommand) -> bool {
 			| OauthCommand::ShowSession { .. } | OauthCommand::TokenInfo { .. }
 			// Required immediate operator revocation is an audited behavior flow,
 			// not a diagnostic dump. Its service bounds need separate review.
-			| OauthCommand::RevokeSessions { .. }
+			| OauthCommand::RevokeSessions { .. } | OauthCommand::Associate { .. }
 		),
 		| _ => false,
 	}

@@ -73,7 +73,24 @@ pub(crate) async fn bounded_room_listing(
 	exclude_disabled: bool,
 	exclude_banned: bool,
 ) -> Result<Vec<(OwnedRoomId, u64, String)>> {
-	let inventory = services.metadata.bounded_room_ids().await?;
+	let inventory = if published_only {
+		use futures::{StreamExt, pin_mut};
+		let source = services.db["publicroomids"].stream_capped::<&RoomId, &[u8]>(1025);
+		pin_mut!(source);
+		let mut inventory = Vec::new();
+		let mut bytes = 0_usize;
+		while let Some(room) = source.next().await {
+			let (room, _) = room?;
+			bytes = bytes.saturating_add(room.as_str().len());
+			if inventory.len() >= 1024 || bytes > 128 * 1024 {
+				return Err!("Published room source exceeds the supported inventory bound.");
+			}
+			inventory.push(room.to_owned());
+		}
+		inventory
+	} else {
+		services.metadata.bounded_room_ids().await?
+	};
 	let mut rows = Vec::new();
 	let mut bytes = 0_usize;
 	for room in inventory {
