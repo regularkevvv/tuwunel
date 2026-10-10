@@ -397,20 +397,27 @@ impl Data {
 		mxc: &Mxc<'_>,
 		dim: &Dim,
 	) -> Result<Metadata> {
+		self.search_file_metadata_checked(mxc, dim)
+			.await?
+			.ok_or_else(|| err!(Request(NotFound("Media not found"))))
+	}
+
+	pub(super) async fn search_file_metadata_checked(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+	) -> Result<Option<Metadata>> {
 		let dim: &[u32] = &[dim.width, dim.height];
 		let prefix = (mxc, dim, Interfix);
 
 		let keys = self
 			.mediaid_file
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.map(ToOwned::to_owned);
-
+			.keys_prefix_raw_capped(&prefix, 1);
 		pin_mut!(keys);
-		let key = keys
-			.next()
-			.await
-			.ok_or_else(|| err!(Request(NotFound("Media not found"))))?;
+		let Some(key) = keys.next().await.transpose()? else {
+			return Ok(None);
+		};
+		let key = key.to_vec();
 
 		let mut parts = key.rsplit(|&b| b == 0xFF);
 
@@ -433,7 +440,7 @@ impl Data {
 			.transpose()
 			.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?;
 
-		Ok(Metadata { content_disposition, content_type, key })
+		Ok(Some(Metadata { content_disposition, content_type, key }))
 	}
 
 	/// Uploading local user of the media at the given MXC, from the uploader

@@ -315,6 +315,47 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 	map.clear().await?;
 	map.put((anchor, &user), &user).await?;
 	assert_eq!(services.media.user_media(&user).await?.len(), 1);
+	let orphan = Mxc {
+		server_name: services.globals.server_name(),
+		media_id: "stale-uploader",
+	};
+	map.put((&orphan, &user), &user).await?;
+	assert_eq!(
+		services.media.user_media(&user).await?.len(),
+		1,
+		"an actually absent metadata record remains a skipped stale index"
+	);
+	let dimensions: &[u32] = &[0, 0];
+	let missing_object_key = (&orphan, dimensions, None::<&str>, Some("text/plain"));
+	services.db["mediaid_file"]
+		.put(missing_object_key, 0_u64.to_be_bytes())
+		.await?;
+	let inventory = services.media.user_media(&user).await?;
+	assert_eq!(inventory.len(), 2, "an absent object retains its source metadata");
+	let orphan_uri = orphan.to_string();
+	let missing_object = inventory
+		.iter()
+		.find(|entry| entry.mxc.as_str() == orphan_uri)
+		.expect("source metadata remains visible");
+	assert_eq!(missing_object.media_length, None);
+	assert_eq!(missing_object.created_ts, 0);
+	services.db["mediaid_file"]
+		.del(missing_object_key)
+		.await?;
+	let invalid_utf8: &[u8] = &[0x80];
+	let corrupt_key = (&orphan, dimensions, None::<&str>, Some(invalid_utf8));
+	services.db["mediaid_file"]
+		.put(corrupt_key, 0_u64.to_be_bytes())
+		.await?;
+	services
+		.media
+		.user_media(&user)
+		.await
+		.expect_err("malformed metadata cannot disappear from a complete inventory");
+	assert_eq!(services.media.get(anchor, None).await?.content, bytes);
+	services.db["mediaid_file"]
+		.del(corrupt_key)
+		.await?;
 	map.clear().await?;
 	for index in 0..4096 {
 		map.put((&format!("mxc://localhost/unrelated-{index:04}"), &unrelated), &unrelated)

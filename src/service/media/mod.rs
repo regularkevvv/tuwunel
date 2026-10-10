@@ -781,7 +781,7 @@ impl Service {
 		let mut retained = 0_usize;
 		let mut entries = Vec::new();
 		for mxc in mxcs {
-			if let Some(entry) = self.user_media_entry(Some(user), mxc).await {
+			if let Some(entry) = self.user_media_entry_checked(user, mxc).await? {
 				retained = retained.saturating_add(entry.retained_bytes());
 				if retained > MAX_RETAINED_BYTES {
 					return Err(Error::Request(
@@ -828,6 +828,35 @@ impl Service {
 			user_id: user.map(ToOwned::to_owned),
 			mxc,
 		})
+	}
+
+	/// An absent source record is a stale uploader index, not a storage error.
+	/// An absent object retains the existing unknown-size metadata semantics.
+	/// Other storage and decoding failures refuse the complete admin inventory.
+	async fn user_media_entry_checked(
+		&self,
+		user: &UserId,
+		mxc: OwnedMxcUri,
+	) -> Result<Option<UserMediaEntry>> {
+		let parts = mxc
+			.parts()
+			.map_err(|_| Error::bad_database("Invalid uploader media URI"))?;
+		let Some(Metadata { content_type, content_disposition, key }) = self
+			.db
+			.search_file_metadata_checked(&parts, &Dim::default())
+			.await?
+		else {
+			return Ok(None);
+		};
+		let object = self.head_meta_checked(&key).await?;
+		Ok(Some(UserMediaEntry {
+			media_type: content_type,
+			upload_name: content_disposition.and_then(|disposition| disposition.filename),
+			media_length: object.as_ref().map(|object| object.size),
+			created_ts: object.as_ref().map(mtime_millis).unwrap_or(0),
+			user_id: Some(user.to_owned()),
+			mxc,
+		}))
 	}
 
 	/// Uploader, byte length and storage modification time of every media item
@@ -913,6 +942,24 @@ impl Service {
 
 		pin_mut!(stream);
 		stream.next().await
+	}
+
+	/// Only an explicit not-found permits trying another storage provider.
+	async fn head_meta_checked(&self, key: &[u8]) -> Result<Option<ObjectMeta>> {
+		let path = self.get_media_name_sha256(key);
+		let mut observed = false;
+		for provider in self.storage_providers() {
+			observed = true;
+			match provider.head(&path).await {
+				| Ok(metadata) => return Ok(Some(metadata)),
+				| Err(error) if absent(&error) => {},
+				| Err(error) => return Err(error),
+			}
+		}
+		if !observed {
+			return Err(Error::bad_database("No media storage provider configured"));
+		}
+		Ok(None)
 	}
 
 	/// Deletes all media files before or after the given time. Returns a usize
