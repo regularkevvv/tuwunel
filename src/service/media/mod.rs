@@ -10,6 +10,7 @@ mod thumbnail;
 mod video;
 use std::{
 	collections::{HashMap, HashSet},
+	mem::size_of,
 	path::PathBuf,
 	sync::{Arc, Mutex, OnceLock},
 	time::{Duration, Instant, SystemTime},
@@ -83,7 +84,7 @@ pub struct UserMediaEntry {
 
 impl UserMediaEntry {
 	fn retained_bytes(&self) -> usize {
-		std::mem::size_of::<Self>()
+		size_of::<Self>()
 			.saturating_add(self.mxc.as_str().len())
 			.saturating_add(self.media_type.as_ref().map_or(0, String::len))
 			.saturating_add(self.upload_name.as_ref().map_or(0, String::len))
@@ -480,7 +481,7 @@ impl Service {
 	/// currently, this is only practical for local users
 	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete_from_user(&self, user: &UserId) -> Result<usize> {
-		let mxcs = self.db.get_all_user_mxcs(user).await;
+		let mxcs = self.db.get_all_user_mxcs(user).await?;
 		let mut deletion_count: usize = 0;
 
 		for mxc in mxcs {
