@@ -8,8 +8,8 @@
 //! refused whole, before it reaches the backend, so nothing in it applies and
 //! later commits proceed.
 //!
-//! Only the `tuwunel` package's dev-dependencies enable the feature, so a
-//! release build compiles none of this.
+//! Only test dev-dependencies enable the feature, including optimized test
+//! builds. A normal release build compiles none of this.
 
 use std::{
 	collections::BTreeSet,
@@ -78,7 +78,6 @@ where
 	Ok(())
 }
 
-#[cfg(debug_assertions)]
 mod pause {
 	use std::sync::{Arc, Mutex};
 
@@ -119,7 +118,7 @@ mod pause {
 		}
 	}
 
-	/// Debug-only integration control, enabled by the existing dev dependency.
+	/// Test-only integration control, enabled by the existing dev dependency.
 	///
 	/// It pauses the next Txn touching this map after preparation and refusal
 	/// checks, before backend dispatch. No environment switch or provider
@@ -155,9 +154,7 @@ mod pause {
 	}
 }
 
-#[cfg(debug_assertions)]
 pub(crate) use pause::pause_before_dispatch;
-#[cfg(debug_assertions)]
 pub use pause::{CommitPause, pause_next};
 
 #[cfg(test)]

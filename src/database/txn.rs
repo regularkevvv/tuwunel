@@ -443,7 +443,7 @@ async fn execute_with_flush(self, force_wal_flush: bool) -> Result {
 
 	#[cfg(feature = "commit_refusals")]
 	crate::refusal::check(self.ops.iter().map(|(map, _)| map.name()))?;
-	#[cfg(all(feature = "commit_refusals", debug_assertions))]
+	#[cfg(feature = "commit_refusals")]
 	crate::refusal::pause_before_dispatch(self.ops.iter().map(|(map, _)| map.name())).await;
 
 	STATS.txn_ops.record(self.len());
