@@ -105,6 +105,9 @@ mod allocation_tests;
 mod admission_tests;
 
 #[cfg(test)]
+mod producer_tests;
+
+#[cfg(test)]
 mod source_handoff_tests;
 
 /// Bookkeeping for admitted tasks and exact cleanup/persistence retries.
@@ -165,10 +168,6 @@ type OtkCounts =
 /// MSC3202 `device_unused_fallback_key_types`: algorithms with an unused
 /// fallback key, keyed by user then device.
 type FallbackTypes = BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, Vec<OneTimeKeyAlgorithm>>>;
-
-/// The MSC3202-interesting devices of one transaction: the appservice
-/// sender's plus matched PDU senders' devices and the to-device recipients.
-type Devices = SmallVec<[(OwnedUserId, OwnedDeviceId); 1]>;
 
 /// Bounded, coalesced timer hints. Durable rows and failure records recover
 /// hints dropped at capacity, including across process restart.
@@ -1715,7 +1714,12 @@ impl Service {
 		let services_root = services_guard.as_ref();
 
 		let service = services_root.sending.clone();
-		async move { service.deliver_events(dest, events).await }.boxed()
+		let timeout = Duration::from_secs(self.server.config.sender_timeout.max(1));
+		deliveries::with_deadline(
+			dest.clone(),
+			async move { service.deliver_events(dest, events).await }.boxed(),
+			timeout,
+		)
 	}
 
 	async fn deliver_events(
@@ -1922,7 +1926,7 @@ impl Service {
 
 				let (counts, fallbacks) = self
 					.msc3202_key_counts(otk_users, otk_recipients)
-					.await;
+					.await?;
 
 				(DeviceLists { changed, left: Vec::new() }, counts, fallbacks)
 			} else {
@@ -2041,63 +2045,40 @@ impl Service {
 		&self,
 		users: BTreeSet<OwnedUserId>,
 		recipients: BTreeSet<(OwnedUserId, OwnedDeviceId)>,
-	) -> (OtkCounts, FallbackTypes) {
+	) -> Result<(OtkCounts, FallbackTypes)> {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
-
-		let mut devices: Devices = users
-			.into_iter()
-			.stream()
-			.broad_then(async |user_id: OwnedUserId| {
-				services_root
-					.users
-					.all_device_ids(&user_id)
-					.map(|device_id| (user_id.clone(), device_id.to_owned()))
-					.collect()
-					.await
-			})
-			.flat_map(|pairs: Vec<(OwnedUserId, OwnedDeviceId)>| pairs.into_iter().stream())
-			.chain(recipients.into_iter().stream())
-			.collect()
-			.await;
-
-		devices.sort_unstable();
-		devices.dedup();
-
-		devices
-			.into_iter()
-			.stream()
-			.broad_then(async |(user_id, device_id): (OwnedUserId, OwnedDeviceId)| {
-				let counts = services_root
-					.users
-					.count_one_time_keys(&user_id, &device_id);
-
-				let fallbacks = services_root
-					.users
-					.unused_fallback_key_algorithms(&user_id, &device_id)
-					.collect();
-
-				let (counts, fallbacks) = join(counts, fallbacks).await;
-
-				(user_id, device_id, counts, fallbacks)
-			})
-			.ready_fold(
-				(OtkCounts::new(), FallbackTypes::new()),
-				|(mut counts, mut fallbacks), (user_id, device_id, otk, fallback)| {
-					counts
-						.entry(user_id.clone())
-						.or_default()
-						.insert(device_id.clone(), otk);
-
-					fallbacks
-						.entry(user_id)
-						.or_default()
-						.insert(device_id, fallback);
-
-					(counts, fallbacks)
-				},
-			)
-			.await
+		let mut devices = BTreeSet::new();
+		let mut bytes = 0_usize;
+		for user in users {
+			for device in services_root
+				.users
+				.bounded_device_ids(&user)
+				.await?
+			{
+				admit_metadata_device(&mut devices, &mut bytes, user.clone(), device)?;
+			}
+		}
+		for (user, device) in recipients {
+			admit_metadata_device(&mut devices, &mut bytes, user, device)?;
+		}
+		let mut budget = crate::users::OutgoingKeyBudget::default();
+		let (mut counts, mut fallbacks) = (OtkCounts::new(), FallbackTypes::new());
+		for (user, device) in devices {
+			let (otk, fallback) = services_root
+				.users
+				.outgoing_key_metadata(&user, &device, &mut budget)
+				.await?;
+			counts
+				.entry(user.clone())
+				.or_default()
+				.insert(device.clone(), otk);
+			fallbacks
+				.entry(user)
+				.or_default()
+				.insert(device, fallback);
+		}
+		Ok((counts, fallbacks))
 	}
 
 	#[tracing::instrument(
@@ -2494,6 +2475,28 @@ impl Service {
 			| Err(error) => Err((Destination::Federation(server), error)),
 		}
 	}
+}
+
+fn admit_metadata_device(
+	devices: &mut BTreeSet<(OwnedUserId, OwnedDeviceId)>,
+	bytes: &mut usize,
+	user: OwnedUserId,
+	device: OwnedDeviceId,
+) -> Result {
+	if devices.contains(&(user.clone(), device.clone())) {
+		return Ok(());
+	}
+	let retained = bytes
+		.saturating_add(user.as_bytes().len())
+		.saturating_add(device.as_str().len());
+	if devices.len() >= 256 || retained > 64 * 1024 {
+		return Err(tuwunel_core::err!(Request(TooLarge(
+			"Outgoing device metadata inventory limit"
+		))));
+	}
+	devices.insert((user, device));
+	*bytes = retained;
+	Ok(())
 }
 
 fn arm_wake(wakes: &mut WakeQueue, dest: Destination, earliest_retry: SystemTime) {

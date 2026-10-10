@@ -55,9 +55,46 @@ struct Record {
 	generation: u64,
 	kind: AttemptKind,
 	recipient: Option<[u8; 32]>,
+	#[serde(deserialize_with = "deserialize_members")]
 	members: Vec<Member>,
 	body_len: usize,
 	body_digest: [u8; 32],
+}
+
+// Refuse hostile CBOR length hints before Vec reserves from them. The sealed
+// encoded-header byte limit alone does not bound a declared array length.
+fn deserialize_members<'de, D: serde::Deserializer<'de>>(
+	decoder: D,
+) -> std::result::Result<Vec<Member>, D::Error> {
+	struct Members;
+	impl<'de> serde::de::Visitor<'de> for Members {
+		type Value = Vec<Member>;
+
+		fn expecting(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			out.write_str("bounded outgoing membership")
+		}
+
+		fn visit_seq<S: serde::de::SeqAccess<'de>>(
+			self,
+			mut sequence: S,
+		) -> std::result::Result<Self::Value, S::Error> {
+			if sequence
+				.size_hint()
+				.is_some_and(|size| size > MEMBER_LIMIT)
+			{
+				return Err(serde::de::Error::custom("outgoing membership count limit"));
+			}
+			let mut members = Vec::new();
+			while let Some(member) = sequence.next_element()? {
+				if members.len() == MEMBER_LIMIT {
+					return Err(serde::de::Error::custom("outgoing membership count limit"));
+				}
+				members.push(member);
+			}
+			Ok(members)
+		}
+	}
+	decoder.deserialize_seq(Members)
 }
 
 impl Record {

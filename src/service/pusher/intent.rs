@@ -260,7 +260,7 @@ pub(crate) async fn stage_notification_plan(
 }
 
 #[implement(super::Service)]
-async fn notification_pushkeys(&self, user: &UserId) -> Result<Vec<String>> {
+pub(crate) async fn notification_pushkeys(&self, user: &UserId) -> Result<Vec<String>> {
 	let keys = self
 		.db
 		.senderkey_pusher

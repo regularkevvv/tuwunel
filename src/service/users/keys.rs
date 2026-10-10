@@ -392,6 +392,89 @@ pub async fn count_one_time_keys(
 	complete_one_time_key_counts(algorithm_counts)
 }
 
+/// Shared work budget for one appservice transaction's read-only key metadata.
+pub(crate) struct OutgoingKeyBudget {
+	rows: usize,
+	bytes: usize,
+}
+
+impl Default for OutgoingKeyBudget {
+	fn default() -> Self { Self { rows: 4096, bytes: 1024 * 1024 } }
+}
+
+impl OutgoingKeyBudget {
+	fn charge(&mut self, bytes: usize) -> Result {
+		if self.rows == 0 || bytes > self.bytes {
+			return Err(err!(Request(TooLarge("Outgoing key metadata inventory limit"))));
+		}
+		self.rows -= 1;
+		self.bytes -= bytes;
+		Ok(())
+	}
+}
+
+/// Complete bounded metadata without pruning keys or silently skipping errors.
+#[implement(super::Service)]
+pub(crate) async fn outgoing_key_metadata(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	budget: &mut OutgoingKeyBudget,
+) -> Result<(BTreeMap<OneTimeKeyAlgorithm, UInt>, Vec<OneTimeKeyAlgorithm>)> {
+	let device = (user_id.to_owned(), device_id.to_owned());
+	let _guard = self.one_time_key_locks.lock(&device).await;
+	let mut counts = BTreeMap::new();
+	if let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() {
+		let prefix = (user_id, device_id, Interfix);
+		let keys =
+			otk.keys_prefix_capped::<OtkRowKey<'_>, _>(&prefix, budget.rows.saturating_add(1));
+		pin_mut!(keys);
+		while let Some((owner, device, _, id)) = keys.try_next().await? {
+			budget.charge(
+				owner
+					.as_bytes()
+					.len()
+					.saturating_add(device.as_str().len())
+					.saturating_add(id.as_str().len()),
+			)?;
+			let algorithm = id.algorithm();
+			if !counts.contains_key(&algorithm) && counts.len() >= 16 {
+				return Err(err!(Request(TooLarge("Outgoing key algorithm inventory limit"))));
+			}
+			let count: &mut UInt = counts.entry(algorithm).or_default();
+			*count = count.saturating_add(1_u32.into());
+		}
+		counts = complete_one_time_key_counts(counts);
+	}
+	let prefix = (user_id, device_id);
+	let rows = self
+		.db
+		.userdeviceidalgorithm_fallback
+		.stream_prefix_capped::<((Ignore, Ignore, OneTimeKeyAlgorithm), &[u8]), _>(
+			&prefix,
+			budget.rows.min(16).saturating_add(1),
+		);
+	pin_mut!(rows);
+	let mut fallbacks = Vec::new();
+	let mut examined = 0_usize;
+	while let Some(((.., algorithm), bytes)) = rows.try_next().await? {
+		budget.charge(
+			bytes
+				.len()
+				.saturating_add(algorithm.as_str().len()),
+		)?;
+		if examined >= 16 || bytes.len() > 64 * 1024 {
+			return Err(err!(Request(TooLarge("Outgoing fallback metadata inventory limit"))));
+		}
+		examined += 1;
+		let entry: FallbackEntry = serde_json::from_slice(bytes)?;
+		if !entry.used {
+			fallbacks.push(algorithm);
+		}
+	}
+	Ok((counts, fallbacks))
+}
+
 /// Keep zero-count algorithms visible to clients after an OTK pool is drained.
 ///
 /// An empty map is omitted from `/sync` by ruma. Some clients interpret an

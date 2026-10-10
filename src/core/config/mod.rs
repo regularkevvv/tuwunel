@@ -3675,10 +3675,10 @@ pub struct Config {
 	#[serde(default = "default_stream_amplification")]
 	pub stream_amplification: usize,
 
-	/// Number of sender task workers; determines sender parallelism. Default is
-	/// '0' which means the value is determined internally, likely matching the
-	/// number of tokio worker-threads or number of cores, etc. Override by
-	/// setting a non-zero value.
+	/// Number of sender task workers; determines sender parallelism. Zero uses
+	/// one worker. Nonzero values are limited to four and to available runtime
+	/// workers/cores. Each worker admits at most sixteen deliveries; this gives
+	/// the process a fixed maximum of sixty-four concurrent deliveries.
 	///
 	/// default: 0
 	#[serde(default)]

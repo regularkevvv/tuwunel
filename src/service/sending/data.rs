@@ -253,6 +253,28 @@ impl Data {
 		Ok(destinations)
 	}
 
+	/// Producer preflight uses the same complete wire budget before retaining
+	/// payload copies. queue_requests rechecks it under the admission lock.
+	pub(super) fn queue_budget(&self) -> Result<tuwunel_bridge::request::PutBatchBudget> {
+		self.servernameevent_data.put_batch_budget()
+	}
+
+	pub(super) fn admit_request(
+		budget: &mut tuwunel_bridge::request::PutBatchBudget,
+		event: &SendingEvent,
+		destination: &Destination,
+	) -> Result {
+		active::validate_payload(event.value_bytes())?;
+		let key_len = queue_key_len(
+			event,
+			destination.prefix_len(),
+			matches!(destination, Destination::Push(..)),
+		)?;
+		budget
+			.try_put(key_len, event.value_bytes())
+			.map_err(|error| admission_error(&error))
+	}
+
 	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>
 	where
 		I: Iterator<Item = (&'a SendingEvent, &'a Destination)> + Clone + Debug + Send,
@@ -266,15 +288,7 @@ impl Data {
 		}
 		let mut budget = self.servernameevent_data.put_batch_budget()?;
 		for (event, destination) in requests.clone() {
-			active::validate_payload(event.value_bytes())?;
-			let key_len = queue_key_len(
-				event,
-				destination.prefix_len(),
-				matches!(destination, Destination::Push(..)),
-			)?;
-			budget
-				.try_put(key_len, event.value_bytes())
-				.map_err(|error| admission_error(&error))?;
+			Self::admit_request(&mut budget, event, destination)?;
 		}
 		// Erasure and direct admissions share this exclusion. A stale producer
 		// must not recreate a delivery after the canonical event was removed.

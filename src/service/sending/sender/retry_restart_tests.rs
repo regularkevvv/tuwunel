@@ -302,7 +302,7 @@ async fn child(root: &Path, phase: &str) -> Result {
 	let (counts, _) = services
 		.sending
 		.msc3202_key_counts(BTreeSet::from([sender.to_owned()]), BTreeSet::new())
-		.await;
+		.await?;
 	assert_eq!(counts[sender].len(), 2, "fresh composition would change MSC3202 counts");
 	let tail = enqueue(services, &destination, 1).await?;
 	services

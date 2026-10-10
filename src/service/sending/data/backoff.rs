@@ -34,9 +34,12 @@ impl PushBackoff {
 	}
 
 	pub(in crate::sending) fn remaining(&self, min: u64, max: u64) -> Result<Option<Duration>> {
-		// A backwards wall-clock step holds the full bounded retry window.
-		let elapsed = Duration::from_millis(now_ms()?.saturating_sub(self.failed_at_ms));
-		Ok(exponential_backoff_remaining_secs(min, max, elapsed, self.tries))
+		Ok(self.remaining_at(now_ms()?, min, max))
+	}
+
+	fn remaining_at(&self, now: u64, min: u64, max: u64) -> Option<Duration> {
+		let elapsed = Duration::from_millis(now.saturating_sub(self.failed_at_ms));
+		exponential_backoff_remaining_secs(min, max, elapsed, self.tries)
 	}
 
 	fn encode(self) -> [u8; WIDTH] {
@@ -87,11 +90,26 @@ impl Data {
 		&self,
 		destination: &Destination,
 	) -> Result<Option<PushBackoff>> {
-		match self.db["global"].get(&key(destination)?).await {
-			| Ok(value) => PushBackoff::decode(&value).map(Some),
-			| Err(error) if error.is_not_found() => Ok(None),
-			| Err(error) => Err(error),
+		let _guard = self.active_write.lock().await;
+		let key = key(destination)?;
+		let mut backoff = match self.db["global"].get(&key).await {
+			| Ok(value) => PushBackoff::decode(&value)?,
+			| Err(error) if error.is_not_found() => return Ok(None),
+			| Err(error) => return Err(error),
+		};
+		// A backward wall-clock step starts one full bounded retry window from
+		// the corrected clock. Persist the rebase so a future timestamp cannot
+		// repeatedly renew the hold after every wake or process restart. Do not
+		// expire retry metadata by age: it belongs to the still-owed active rows
+		// and retires only with their matching ACK/cancellation/erasure.
+		let now = now_ms()?;
+		if backoff.failed_at_ms > now {
+			backoff.failed_at_ms = now;
+			let mut txn = self.db.txn();
+			txn.insert_raw(&self.db["global"], key, backoff.encode());
+			txn.execute().await?;
 		}
+		Ok(Some(backoff))
 	}
 
 	pub(in crate::sending) async fn persist_push_backoff(
@@ -160,5 +178,17 @@ mod tests {
 		let mut value = backoff.encode();
 		value[1..5].fill(0);
 		PushBackoff::decode(&value).expect_err("zero retry streak");
+	}
+	#[test]
+	fn retry_clock_policy_honors_exact_expiry_and_bounded_backward_steps() {
+		use std::time::Duration;
+		let backoff = PushBackoff { tries: 2, failed_at_ms: 10_000 };
+		assert_eq!(backoff.remaining_at(9_000, 3, 60), Some(Duration::from_secs(12)));
+		assert_eq!(backoff.remaining_at(21_999, 3, 60), Some(Duration::from_millis(1)));
+		assert_eq!(backoff.remaining_at(22_000, 3, 60), None);
+		assert_eq!(backoff.remaining_at(u64::MAX, 3, 60), None);
+		let maximum = PushBackoff { tries: u32::MAX, failed_at_ms: 10_000 };
+		assert_eq!(maximum.remaining_at(0, u64::MAX, 60), Some(Duration::from_secs(60)));
+		assert_eq!(maximum.remaining_at(10_000, 0, 0), None);
 	}
 }

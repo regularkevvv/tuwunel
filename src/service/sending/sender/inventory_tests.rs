@@ -618,3 +618,70 @@ async fn shutdown_drain_finishes_inherited_durable_stages_without_dispatching_su
 	fixture.finish().await;
 	Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn future_push_retry_timestamp_is_rebased_once_and_persisted() -> Result {
+	let fixture = Fixture::new().await?;
+	let destination = push(0);
+	let mut key = vec![0x07];
+	key.extend_from_slice(&destination.get_prefix());
+	let mut value = vec![1];
+	value.extend_from_slice(&2_u32.to_be_bytes());
+	value.extend_from_slice(&u64::MAX.to_be_bytes());
+	fixture.services.db["global"]
+		.insert(&key, &value)
+		.await?;
+	let backoff = fixture
+		.services
+		.sending
+		.db
+		.push_backoff(&destination)
+		.await?
+		.expect("retained delay");
+	let rebased = fixture.services.db["global"]
+		.get(&key)
+		.await?
+		.to_vec();
+	assert_ne!(rebased, value, "future timestamp was durably corrected");
+	assert_eq!(backoff.tries, 2, "clock correction preserves failure streak");
+	assert!(
+		backoff
+			.remaining(3, 60)?
+			.is_some_and(|delay| delay <= Duration::from_secs(12))
+	);
+	tokio::time::sleep(Duration::from_millis(2)).await;
+	assert_eq!(
+		fixture
+			.services
+			.sending
+			.db
+			.push_backoff(&destination)
+			.await?,
+		Some(backoff)
+	);
+	assert_eq!(
+		fixture.services.db["global"]
+			.get(&key)
+			.await?
+			.as_ref(),
+		rebased.as_slice(),
+		"later read does not renew delay"
+	);
+	fixture
+		.services
+		.sending
+		.db
+		.delete_all_requests_for(&destination)
+		.await?;
+	assert!(
+		fixture
+			.services
+			.sending
+			.db
+			.push_backoff(&destination)
+			.await?
+			.is_none()
+	);
+	fixture.finish().await;
+	Ok(())
+}

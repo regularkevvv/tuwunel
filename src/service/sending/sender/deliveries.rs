@@ -1,8 +1,9 @@
 //! Deliveries must progress while the sender awaits queue mutations. Startup
 //! stages them without HTTP; polling starts owned tasks, joined before exit.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
+use futures::FutureExt;
 use tokio::{
 	runtime::Handle,
 	task::{Id, JoinSet},
@@ -12,6 +13,29 @@ use tuwunel_core::Error;
 use super::{Delivery, Destination, SendingFuture, SendingResult};
 
 pub(super) const DELIVERY_LIMIT: usize = 16;
+
+/// Bound the entire selected delivery, including composition, storage and HTTP.
+/// Cancellation never ACKs an uncertain outcome: durable rows and immutable
+/// attempt bytes remain the recovery owner.
+pub(super) fn with_deadline(
+	owner: Destination,
+	delivery: SendingFuture,
+	timeout: Duration,
+) -> SendingFuture {
+	async move {
+		match tokio::time::timeout(timeout, delivery).await {
+			| Ok(outcome) => outcome,
+			| Err(_) => Ok(Delivery::LocalFailure(
+				owner,
+				Box::new(Error::from(std::io::Error::new(
+					std::io::ErrorKind::TimedOut,
+					"Outgoing delivery exceeded its deadline",
+				))),
+			)),
+		}
+	}
+	.boxed()
+}
 
 #[derive(Default)]
 pub(super) struct SendingFutures {
@@ -222,5 +246,40 @@ mod tests {
 		);
 		assert!(deliveries.is_empty());
 		assert!(deliveries.owners.is_empty());
+	}
+	#[tokio::test]
+	async fn deadline_releases_guards_and_preserves_local_failure_ownership() {
+		let lock = Arc::new(Mutex::new(()));
+		let task_lock = lock.clone();
+		let destination = Destination::Appservice("deadline-owner".into());
+		let outcome = super::with_deadline(
+			destination.clone(),
+			async move {
+				let _guard = task_lock.lock().await;
+				std::future::pending().await
+			}
+			.boxed(),
+			Duration::from_millis(10),
+		)
+		.await;
+		assert!(matches!(outcome, Ok(Delivery::LocalFailure(owner, error))
+			if owner == destination && matches!(error.as_ref(), super::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)));
+		assert!(lock.try_lock().is_ok(), "deadline must release provider/registration guards");
+	}
+
+	#[tokio::test]
+	async fn deadline_keeps_ack_and_transport_failure_outcomes() {
+		let destination = Destination::Appservice("deadline-complete".into());
+		let acknowledged = transport_acknowledged(destination.clone());
+		assert!(
+			matches!(super::with_deadline(destination.clone(), futures::future::ready(Ok(acknowledged)).boxed(), Duration::from_secs(1)).await,
+			Ok(Delivery::Acknowledged(owner, _)) if owner == destination)
+		);
+		let error =
+			super::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+		assert!(
+			matches!(super::with_deadline(destination.clone(), futures::future::ready(Err((destination.clone(), error))).boxed(), Duration::from_secs(1)).await,
+			Err((owner, super::Error::Io(io))) if owner == destination && io.kind() == std::io::ErrorKind::ConnectionRefused)
+		);
 	}
 }

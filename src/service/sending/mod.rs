@@ -19,7 +19,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt, pin_mut};
 use loole::{TrySendError, bounded};
 use ruma::{DeviceId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::Serialize;
@@ -82,6 +82,10 @@ pub type EduBuf = SmallVec<[u8; EDU_BUF_CAP]>;
 pub type EduVec = SmallVec<[EduBuf; EDU_VEC_CAP]>;
 
 const SENDER_HINT_LIMIT: usize = 128;
+// Every worker owns at most sixteen deliveries, plus bounded hint/timer pages.
+// A fixed process-wide cap prevents CPU count or config from multiplying those
+// inventories without limit. Default zero remains one sender.
+const MAX_SENDER_WORKERS: usize = 4;
 const EDU_BUF_CAP: usize = 128 - 16;
 const EDU_VEC_CAP: usize = 1;
 
@@ -257,6 +261,27 @@ impl Service {
 		})
 	}
 
+	async fn queue_and_dispatch_batch(
+		&self,
+		requests: Vec<(Destination, SendingEvent)>,
+	) -> Result {
+		if requests.is_empty() {
+			return Ok(());
+		}
+		let keys = self
+			.db
+			.queue_requests(requests.iter().map(|(dest, event)| (event, dest)))
+			.await?;
+		for ((dest, _event), queue_id) in requests.into_iter().zip(keys) {
+			self.dispatch(Msg {
+				dest,
+				event: SendingEvent::BadgeRefresh,
+				queue_id,
+			})?;
+		}
+		Ok(())
+	}
+
 	/// Queue a counts-only push refresh for every pusher owned by a user.
 	///
 	/// Rows are durable, coalesced, and recomputed at send time.
@@ -265,19 +290,22 @@ impl Service {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
-		let pushkeys: Vec<String> = services_root
+		let pushkeys = services_root
 			.pusher
-			.get_pushkeys(user_id)
-			.map(ToOwned::to_owned)
-			.collect()
-			.await;
-
+			.notification_pushkeys(user_id)
+			.await?;
+		if pushkeys.is_empty() {
+			return Ok(());
+		}
+		let mut budget = self.db.queue_budget()?;
+		let mut requests = Vec::new();
 		for pushkey in pushkeys {
 			let dest = Destination::Push(user_id.to_owned(), pushkey);
-
-			self.queue_and_dispatch(dest, SendingEvent::BadgeRefresh)
-				.await?;
+			let event = SendingEvent::BadgeRefresh;
+			Data::admit_request(&mut budget, &event, &dest)?;
+			requests.push((dest, event));
 		}
+		self.queue_and_dispatch_batch(requests).await?;
 
 		Ok(())
 	}
@@ -364,10 +392,8 @@ impl Service {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
-		let appservice_ids = services_root
-			.appservice
-			.read()
-			.await
+		let registrations = services_root.appservice.read().await;
+		let appservice_ids = registrations
 			.values()
 			.stream()
 			.filter(|&appservice| async move {
@@ -392,21 +418,27 @@ impl Service {
 					.or(pin!(matching_aliases))
 					.await
 			})
-			.map(|appservice| appservice.registration.id.clone())
-			.collect::<Vec<_>>()
-			.await;
-
-		for appservice_id in appservice_ids {
-			let mut buf = EduBuf::new();
-
-			serializer(&mut buf)?;
-			self.send_edu_appservice(appservice_id, buf)
-				.await
-				.log_err()
-				.ok();
+			.map(|appservice| appservice.registration.id.clone());
+		pin_mut!(appservice_ids);
+		let mut budget = None;
+		let mut requests = Vec::new();
+		while let Some(appservice_id) = appservice_ids.next().await {
+			let frozen::Body::Ready(bytes) = frozen::bounded_custom(
+				|writer| serializer(writer),
+				tuwunel_bridge::MAX_VALUE_BYTES.saturating_sub(10),
+			)?
+			else {
+				return Err(err!(Request(TooLarge("Appservice EDU payload limit"))));
+			};
+			let event = SendingEvent::Edu(EduBuf::from_slice(&bytes));
+			let dest = Destination::Appservice(appservice_id);
+			if budget.is_none() {
+				budget = Some(self.db.queue_budget()?);
+			}
+			Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
+			requests.push((dest, event));
 		}
-
-		Ok(())
+		self.queue_and_dispatch_batch(requests).await
 	}
 
 	/// Queue stored to-device events for delivery to interested appservices
@@ -438,22 +470,39 @@ impl Service {
 		let _cork = self.db.db.cork();
 
 		let mut payloads: Option<EduVec> = None;
+		let mut requests = Vec::new();
+		let mut budget = None;
 		for info in registrations.values() {
 			if !info.is_user_match(target_user) {
 				continue;
 			}
-
-			let payloads = payloads.get_or_insert_with(|| {
-				to_device_payloads(sender, target_user, deliveries.clone(), event_type, content)
-			});
-
-			for buf in &*payloads {
-				let dest = Destination::Appservice(info.registration.id.clone());
+			if payloads.is_none() {
+				payloads = Some(to_device_payloads(
+					sender,
+					target_user,
+					deliveries.clone(),
+					event_type,
+					content,
+				)?);
+			}
+			if payloads
+				.as_ref()
+				.expect("prepared payloads")
+				.is_empty()
+			{
+				continue;
+			}
+			if budget.is_none() {
+				budget = Some(self.db.queue_budget()?);
+			}
+			let dest = Destination::Appservice(info.registration.id.clone());
+			for buf in payloads.as_ref().expect("prepared payloads") {
 				let event = SendingEvent::ToDevice(buf.clone());
-
-				self.queue_and_dispatch(dest, event).await?;
+				Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
+				requests.push((dest.clone(), event));
 			}
 		}
+		self.queue_and_dispatch_batch(requests).await?;
 
 		Ok(())
 	}
@@ -486,6 +535,8 @@ impl Service {
 		let _cork = self.db.db.cork();
 
 		let mut payload = None;
+		let mut requests = Vec::new();
+		let mut budget = None;
 		for info in registrations.values() {
 			if !info.registration.msc3202_transaction_extensions {
 				continue;
@@ -501,10 +552,13 @@ impl Service {
 			let dest = Destination::Appservice(info.registration.id.clone());
 			let event = SendingEvent::DeviceListChanged(payload.clone());
 
-			self.queue_and_dispatch(dest, event).await?;
+			if budget.is_none() {
+				budget = Some(self.db.queue_budget()?);
+			}
+			Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
+			requests.push((dest, event));
 		}
-
-		Ok(())
+		self.queue_and_dispatch_batch(requests).await
 	}
 
 	/// Whether `user_id` shares a device-list-interesting room with `info`: a
@@ -678,6 +732,11 @@ impl Service {
 	}
 
 	fn dispatch(&self, mut msg: Msg) -> Result {
+		// Flush callers also pass through admission: bounded hint counts must
+		// not retain arbitrarily wide destination identifiers.
+		if msg.dest.prefix_len() > tuwunel_bridge::MAX_KEY_BYTES {
+			return Err(err!(Request(TooLarge("Outgoing hint destination limit"))));
+		}
 		// The queue has already accepted the event. Hints never own a second
 		// payload/key copy; an empty-key flush remains an explicit retry.
 		if !msg.queue_id.is_empty() {
@@ -720,30 +779,39 @@ fn to_device_payloads<'a, I>(
 	deliveries: I,
 	event_type: &str,
 	content: &serde_json::Value,
-) -> EduVec
+) -> Result<EduVec>
 where
 	I: Iterator<Item = (&'a DeviceId, u64)>,
 {
-	deliveries
-		.map(|(to_device_id, count)| {
-			let mut buf = EduBuf::new();
-			buf.push(TAG_TO_DEVICE);
-			buf.extend_from_slice(&count.to_be_bytes());
-
-			let event = AsToDeviceEvent {
-				kind: event_type,
-				sender,
-				content,
-				to_user_id: target_user,
-				to_device_id,
-			};
-
-			serde_json::to_writer(&mut buf, &event)
-				.expect("to-device appservice event serializes");
-
-			buf
-		})
-		.collect()
+	let mut payloads = EduVec::new();
+	let mut bytes = 0_usize;
+	for (to_device_id, count) in deliveries {
+		if payloads.len() >= tuwunel_bridge::MAX_COMMIT_OPS {
+			return Err(err!(Request(TooLarge("Appservice to-device recipient limit"))));
+		}
+		let event = AsToDeviceEvent {
+			kind: event_type,
+			sender,
+			content,
+			to_user_id: target_user,
+			to_device_id,
+		};
+		let remaining = data::BODY_LIMIT
+			.saturating_sub(bytes)
+			.saturating_sub(TAG_PREFIX_LEN);
+		let limit =
+			remaining.min(tuwunel_bridge::MAX_VALUE_BYTES.saturating_sub(TAG_PREFIX_LEN + 10));
+		let frozen::Body::Ready(body) = frozen::bounded_json(&event, limit)? else {
+			return Err(err!(Request(TooLarge("Appservice to-device payload limit"))));
+		};
+		let mut buf = EduBuf::new();
+		buf.push(TAG_TO_DEVICE);
+		buf.extend_from_slice(&count.to_be_bytes());
+		buf.extend_from_slice(&body);
+		bytes = bytes.saturating_add(buf.len());
+		payloads.push(buf);
+	}
+	Ok(payloads)
 }
 
 fn device_list_payload(user_id: &UserId, count: u64) -> EduBuf {
@@ -756,19 +824,16 @@ fn device_list_payload(user_id: &UserId, count: u64) -> EduBuf {
 }
 
 fn num_senders(args: &crate::Args<'_>) -> usize {
-	const MIN_SENDERS: usize = 1;
-	// Limit the number of senders to the number of workers threads or number of
-	// cores, conservatively.
-	let max_senders = args
-		.server
-		.metrics
-		.num_workers()
-		.min(available_parallelism());
+	sender_count(
+		args.server.config.sender_workers,
+		args.server.metrics.num_workers(),
+		available_parallelism(),
+	)
+}
 
-	// If the user doesn't override the default 0, this is intended to then default
-	// to 1 for now as multiple senders is experimental.
-	args.server
-		.config
-		.sender_workers
-		.clamp(MIN_SENDERS, max_senders)
+fn sender_count(configured: usize, runtime_workers: usize, parallelism: usize) -> usize {
+	let maximum = runtime_workers
+		.min(parallelism)
+		.clamp(1, MAX_SENDER_WORKERS);
+	configured.clamp(1, maximum)
 }

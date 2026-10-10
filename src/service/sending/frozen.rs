@@ -72,7 +72,7 @@ where
 	bounded_json(&body, super::data::BODY_LIMIT)
 }
 
-fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Body> {
+pub(super) fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Body> {
 	let mut writer = BudgetWriter {
 		bytes: Vec::new(),
 		limit,
@@ -82,6 +82,24 @@ fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Body> {
 		| Ok(()) => Ok(Body::Ready(writer.bytes)),
 		| Err(_) if writer.exceeded => Ok(Body::TooLarge),
 		| Err(_) => Err(Error::bad_database("Cannot serialize outgoing transaction body")),
+	}
+}
+
+/// Bound caller-supplied appservice serializers before retaining their bytes.
+pub(super) fn bounded_custom<F>(serialize: F, limit: usize) -> Result<Body>
+where
+	F: FnOnce(&mut dyn Write) -> Result,
+{
+	let mut writer = BudgetWriter {
+		bytes: Vec::new(),
+		limit,
+		exceeded: false,
+	};
+	match serialize(&mut writer) {
+		| Ok(()) if writer.exceeded => Ok(Body::TooLarge),
+		| Ok(()) => Ok(Body::Ready(writer.bytes)),
+		| Err(_) if writer.exceeded => Ok(Body::TooLarge),
+		| Err(error) => Err(error),
 	}
 }
 
@@ -160,6 +178,32 @@ mod tests {
 			.expect("size classification"),
 			Body::TooLarge
 		));
+	}
+
+	#[test]
+	fn custom_serializer_cannot_hide_a_size_refusal() {
+		assert!(matches!(
+			super::bounded_custom(
+				|writer| {
+					let _ignored = writer.write_all(b"too large");
+					Ok(())
+				},
+				2
+			)
+			.unwrap(),
+			Body::TooLarge
+		));
+		let Body::Ready(bytes) = super::bounded_custom(
+			|writer| {
+				writer.write_all(b"ok")?;
+				Ok(())
+			},
+			2,
+		)
+		.unwrap() else {
+			panic!("exact serializer boundary");
+		};
+		assert_eq!(bytes, b"ok");
 	}
 
 	#[test]

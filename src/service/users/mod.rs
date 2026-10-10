@@ -10,6 +10,7 @@ mod register;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
+pub(crate) use keys::OutgoingKeyBudget;
 use ruma::{
 	MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
