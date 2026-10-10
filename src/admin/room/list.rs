@@ -1,7 +1,6 @@
-use futures::{StreamExt, TryStreamExt};
 use tuwunel_core::{Err, Result};
 
-use crate::{PAGE_SIZE, admin_command, get_room_info};
+use crate::{PAGE_SIZE, admin_command, utils::bounded_room_listing};
 
 #[admin_command]
 pub(super) async fn room_list(
@@ -13,21 +12,8 @@ pub(super) async fn room_list(
 ) -> Result {
 	// TODO: i know there's a way to do this with clap, but i can't seem to find it
 	let page = page.unwrap_or(1);
-	let mut rooms = self
-		.services
-		.metadata
-		.iter_ids()
-		.filter_map(async |room_id| {
-			(!exclude_disabled || !self.services.metadata.is_disabled(room_id).await)
-				.then_some(room_id)
-		})
-		.filter_map(async |room_id| {
-			(!exclude_banned || !self.services.metadata.is_banned(room_id).await)
-				.then_some(room_id)
-		})
-		.then(|room_id| get_room_info(self.services, room_id))
-		.try_collect::<Vec<_>>()
-		.await?;
+	let mut rooms =
+		bounded_room_listing(self.services, false, exclude_disabled, exclude_banned).await?;
 
 	rooms.sort_by_key(|r| r.1);
 	rooms.reverse();

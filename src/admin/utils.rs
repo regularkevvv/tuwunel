@@ -63,3 +63,51 @@ pub(crate) async fn parse_active_local_user_id(
 
 	Ok(user_id)
 }
+
+/// Complete room inventory and details before sorting/pagination. Unmatched
+/// rooms consume the source cap; read errors and oversized retained names
+/// refuse without a partial administrative list.
+pub(crate) async fn bounded_room_listing(
+	services: &Services,
+	published_only: bool,
+	exclude_disabled: bool,
+	exclude_banned: bool,
+) -> Result<Vec<(OwnedRoomId, u64, String)>> {
+	let inventory = services.metadata.bounded_room_ids().await?;
+	let mut rows = Vec::new();
+	let mut bytes = 0_usize;
+	for room in inventory {
+		if published_only
+			&& !services
+				.directory
+				.is_public_room_checked(&room)
+				.await?
+		{
+			continue;
+		}
+		if exclude_disabled
+			&& services.db["disabledroomids"]
+				.contains_checked(&(&room,))
+				.await?
+		{
+			continue;
+		}
+		if exclude_banned
+			&& services.db["bannedroomids"]
+				.contains_checked(&(&room,))
+				.await?
+		{
+			continue;
+		}
+		let row = get_room_info(services, &room).await?;
+		bytes = bytes
+			.saturating_add(row.0.as_str().len())
+			.saturating_add(row.2.len())
+			.saturating_add(size_of::<(OwnedRoomId, u64, String)>());
+		if bytes > 256 * 1024 {
+			return Err!("Room listing retained details exceed the supported bound.");
+		}
+		rows.push(row);
+	}
+	Ok(rows)
+}

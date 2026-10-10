@@ -199,3 +199,49 @@ fn parse_ok(argv: &[&str]) -> AdminCommand {
 	AdminCommand::try_parse_from(argv)
 		.unwrap_or_else(|error| panic!("parsing {argv:?} must succeed: {error}"))
 }
+
+#[test]
+fn production_diagnostic_boundary_preserves_bounded_queries_and_operator_commands() {
+	for args in [
+		vec!["query", "raw", "count"],
+		vec!["query", "raw", "keys", "missing-map"],
+		vec!["query", "raw", "iter", "missing-map", "--limit", "17"],
+		vec!["query", "raw", "vals-total"],
+		vec!["query", "sending", "active-requests"],
+		vec!["query", "room-alias", "all-local-aliases"],
+		vec!["query", "presence", "presence-since", "0"],
+		vec!["query", "storage", "list"],
+		vec!["query", "storage", "sync", "missing-source", "missing-destination"],
+		vec!["query", "users", "get-to-device-events", "@user:localhost", "device"],
+		vec!["rooms", "list-joined-members", "!room:localhost"],
+		vec!["users", "list-joined-rooms", "@user:localhost"],
+	] {
+		let command = parse_ok(&[vec!["admin"], args].concat());
+		assert!(
+			crate::admin::check_remote_scan_command(&command, true).is_err(),
+			"D1 must refuse unaudited scans before resolving maps/providers: {command:?}"
+		);
+		assert!(
+			crate::admin::check_remote_scan_command(&command, false).is_ok(),
+			"reference diagnostics must remain available: {command:?}"
+		);
+	}
+	for args in [
+		vec!["query", "raw", "get", "missing-map", "key"],
+		vec!["query", "raw", "keys", "missing-map", "--limit", "16"],
+		vec!["query", "users", "iter-users"],
+		vec!["query", "users", "list-devices", "@user:localhost"],
+		vec!["query", "users", "list-devices-metadata", "@user:localhost"],
+		vec!["query", "oauth", "revoke-sessions", "@user:localhost"],
+		vec!["server", "uptime"],
+		vec!["server", "rotate-signing-key"],
+		vec!["rooms", "list"],
+		vec!["rooms", "directory", "list"],
+	] {
+		let command = parse_ok(&[vec!["admin"], args].concat());
+		assert!(
+			crate::admin::check_remote_scan_command(&command, true).is_ok(),
+			"audited bounded/required operator command remains reachable: {command:?}"
+		);
+	}
+}

@@ -475,6 +475,16 @@ async fn empty_deletion_preserves_room(services: &Services, room: &RoomId) -> Re
 }
 
 async fn prune_refuses_without_deletion(services: &Services, room: &RoomId) -> Result {
+	for command in ["rooms list", "rooms directory list"] {
+		assert!(
+			services
+				.admin
+				.command_in_place(command.into(), None)
+				.await
+				.is_err(),
+			"administrative pagination must not hide incomplete room sources: {command}"
+		);
+	}
 	let rooms = &services.db["roomid_shortroomid"];
 	let states = &services.db["roomid_shortstatehash"];
 	let original_room = rooms.get(room).await?.to_vec();
