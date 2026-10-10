@@ -81,6 +81,20 @@ pub struct UserMediaEntry {
 	pub user_id: Option<OwnedUserId>,
 }
 
+impl UserMediaEntry {
+	fn retained_bytes(&self) -> usize {
+		std::mem::size_of::<Self>()
+			.saturating_add(self.mxc.as_str().len())
+			.saturating_add(self.media_type.as_ref().map_or(0, String::len))
+			.saturating_add(self.upload_name.as_ref().map_or(0, String::len))
+			.saturating_add(
+				self.user_id
+					.as_ref()
+					.map_or(0, |user| user.as_str().len()),
+			)
+	}
+}
+
 /// One locally-uploaded media item's uploader and storage-object byte length
 /// and modification time, the row shape of the media-statistics scan.
 #[derive(Clone, Debug)]
@@ -762,16 +776,25 @@ impl Service {
 	/// quarantine, url-cache) are not represented.
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn user_media(&self, user: &UserId) -> Result<Vec<UserMediaEntry>> {
-		let entries = self
-			.db
-			.get_all_user_mxcs(user)
-			.await
-			.into_iter()
-			.stream()
-			.broad_filter_map(async |mxc| self.user_media_entry(Some(user), mxc).await)
-			.collect()
-			.await;
-
+		const MAX_RETAINED_BYTES: usize = 1024 * 1024;
+		let mxcs = self.db.get_all_user_mxcs(user).await?;
+		let mut retained = 0_usize;
+		let mut entries = Vec::new();
+		for mxc in mxcs {
+			if let Some(entry) = self.user_media_entry(Some(user), mxc).await {
+				retained = retained.saturating_add(entry.retained_bytes());
+				if retained > MAX_RETAINED_BYTES {
+					return Err(Error::Request(
+						ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData {
+							retry_after: None,
+						}),
+						"User media retained metadata limit reached".into(),
+						StatusCode::TOO_MANY_REQUESTS,
+					));
+				}
+				entries.push(entry);
+			}
+		}
 		Ok(entries)
 	}
 

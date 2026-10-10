@@ -60,6 +60,7 @@ async fn exercise(services: &Services) -> Result {
 		.create(&anchor, None, None, None, bytes)
 		.await?;
 	assert_eq!(services.media.get_all_mxcs().await?.len(), 1);
+	uploader_inventory(services, &anchor, bytes).await?;
 	for index in 0..4095 {
 		map.insert(&format!("mxc://localhost/record-{index:04}"), 0_u64.to_be_bytes())
 			.await?;
@@ -302,5 +303,89 @@ async fn corruption_and_byte_budget(services: &Services) -> Result {
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
+	Ok(())
+}
+
+/// Output pagination cannot hide an incomplete source inventory, even when
+/// every examined uploader is unrelated to the requested user.
+async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8]) -> Result {
+	let map = &services.db["mediaid_user"];
+	let user = UserId::parse("@inventory:localhost")?;
+	let unrelated = UserId::parse("@unrelated:localhost")?;
+	map.clear().await?;
+	map.put((anchor, &user), &user).await?;
+	assert_eq!(services.media.user_media(&user).await?.len(), 1);
+	map.clear().await?;
+	for index in 0..4096 {
+		map.put((&format!("mxc://localhost/unrelated-{index:04}"), &unrelated), &unrelated)
+			.await?;
+	}
+	assert!(services.media.user_media(&user).await?.is_empty());
+	map.put(("mxc://localhost/overflow", &unrelated), &unrelated)
+		.await?;
+	assert_eq!(
+		services
+			.media
+			.user_media(&user)
+			.await
+			.expect_err("unmatched rows must consume the source cap")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	assert_eq!(services.media.get(anchor, None).await?.content, bytes);
+	map.clear().await?;
+	map.put((anchor, &user), b"not-a-user").await?;
+	services
+		.media
+		.user_media(&user)
+		.await
+		.expect_err("corrupt uploader records cannot become a partial successful list");
+	map.clear().await?;
+	for index in 0..27 {
+		let mxc = format!("mxc://localhost/{}-{index:02}", "x".repeat(40_000));
+		map.put((&mxc, &unrelated), &unrelated).await?;
+	}
+	assert_eq!(
+		services
+			.media
+			.user_media(&user)
+			.await
+			.expect_err("unmatched source bytes must be bounded before owned copies")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	map.clear().await?;
+	// Legacy reference-backend metadata can be much larger than current
+	// bridge keys. The retained metadata guard is independent of the small
+	// uploader inventory, and refusal must preserve all owned objects.
+	let content_type = "x".repeat(400_000);
+	for id in ["metadata-a", "metadata-b", "metadata-c"] {
+		let mxc = Mxc {
+			server_name: services.globals.server_name(),
+			media_id: id,
+		};
+		services
+			.media
+			.create(&mxc, Some(&user), None, Some(&content_type), bytes)
+			.await?;
+	}
+	assert_eq!(
+		services
+			.media
+			.user_media(&user)
+			.await
+			.expect_err("retained metadata has its own aggregate bound")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
+	for id in ["metadata-a", "metadata-b", "metadata-c"] {
+		let mxc = Mxc {
+			server_name: services.globals.server_name(),
+			media_id: id,
+		};
+		assert_eq!(services.media.get(&mxc, None).await?.content, bytes);
+		services.media.delete(&mxc).await?;
+	}
+	map.clear().await?;
 	Ok(())
 }

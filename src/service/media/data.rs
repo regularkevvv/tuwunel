@@ -450,16 +450,46 @@ impl Data {
 		users.next().await
 	}
 
-	/// Gets all the MXCs associated with a user
-	pub(super) async fn get_all_user_mxcs(&self, user_id: &UserId) -> Vec<OwnedMxcUri> {
-		self.mediaid_user
-			.stream()
-			.ignore_err()
-			.ready_filter_map(|((key, _), user): ((&str, Ignore), &UserId)| {
-				(user == user_id).then(|| key.into())
-			})
-			.collect()
-			.await
+	/// Complete uploader inventory, bounded before filtering or owned copies.
+	/// Unrelated uploaders consume the same 4,096-row / 1 MiB source budget.
+	/// Refuse overflow and read/decoding errors rather than return a short
+	/// list.
+	pub(super) async fn get_all_user_mxcs(&self, user_id: &UserId) -> Result<Vec<OwnedMxcUri>> {
+		const MAX_ROWS: usize = 4096;
+		const MAX_BYTES: usize = 1024 * 1024;
+		let rows = self
+			.mediaid_user
+			.stream_capped::<&[u8], &[u8]>(MAX_ROWS.saturating_add(1));
+		pin_mut!(rows);
+		let mut examined = 0_usize;
+		let mut bytes = 0_usize;
+		let mut mxcs = Vec::new();
+		while let Some(row) = rows.next().await {
+			let (key, value) = row?;
+			examined = examined.saturating_add(1);
+			bytes = bytes
+				.saturating_add(key.len())
+				.saturating_add(value.len());
+			if examined > MAX_ROWS || bytes > MAX_BYTES {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"User media source inventory limit reached".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			let (key, index_user): (&str, &UserId) = deserialize_from_slice(key)?;
+			let user: &UserId = deserialize_from_slice(value)?;
+			if index_user != user {
+				return Err(Error::bad_database("Mismatched uploader media owner"));
+			}
+			if user == user_id {
+				let mxc: OwnedMxcUri = key.into();
+				mxc.parts()
+					.map_err(|_| Error::bad_database("Invalid uploader media URI"))?;
+				mxcs.push(mxc);
+			}
+		}
+		Ok(mxcs)
 	}
 
 	/// Gets all the media keys in our database (this includes all the metadata
