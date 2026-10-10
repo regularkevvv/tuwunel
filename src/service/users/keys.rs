@@ -71,9 +71,12 @@ pub async fn add_one_time_keys(
 	keys: &BTreeMap<OwnedOneTimeKeyId, Raw<OneTimeKey>>,
 	limit: usize,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let device = (user_id.to_owned(), device_id.to_owned());
 	let _guard = self.one_time_key_locks.lock(&device).await;
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 	// Hold the oldest permit so the retirement frontier cannot pass this batch
 	// before commit.
 	let mut oldest_count = None;
@@ -110,6 +113,9 @@ async fn add_one_time_key(
 	one_time_key_value: &Raw<OneTimeKey>,
 	txn: &mut Txn,
 ) -> Result<Option<impl Deref<Target = u64> + Send + use<>>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		return Err!(Database("one-time-key column unavailable"));
 	};
@@ -148,7 +154,7 @@ async fn add_one_time_key(
 		return Ok(None);
 	}
 
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 
 	// MSC4225: RocksDB iterates the (user, device) prefix in count_be ascending
 	// order, so /keys/claim issues one-time keys in the order they were uploaded.
@@ -171,7 +177,10 @@ pub async fn add_fallback_keys<'a, Keys>(
 where
 	Keys: Iterator<Item = (&'a OneTimeKeyId, &'a Raw<OneTimeKey>)> + Send + 'a,
 {
-	let mut txn = self.services.db.txn();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let mut txn = services_root.db.txn();
 	// Hold the oldest permit so the retirement frontier cannot pass this batch
 	// before commit.
 	let mut oldest_count = None;
@@ -208,6 +217,9 @@ pub async fn add_fallback_key(
 	one_time_key_value: &Raw<OneTimeKey>,
 	txn: &mut Txn,
 ) -> Result<impl Deref<Target = u64> + Send + use<>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if !self.device_exists(user_id, device_id).await {
 		return Err!(Database(error!(
 			?user_id,
@@ -236,7 +248,7 @@ pub async fn add_fallback_key(
 	};
 
 	let key = (user_id, device_id, one_time_key_key.algorithm());
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 
 	txn.put(&self.db.userdeviceidalgorithm_fallback, key, Json(&entry));
 
@@ -304,13 +316,16 @@ pub async fn take_one_time_key(
 	device_id: &DeviceId,
 	key_algorithm: &OneTimeKeyAlgorithm,
 ) -> Result<(OwnedKeyId<OneTimeKeyAlgorithm, OneTimeKeyName>, Raw<OneTimeKey>)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let device = (user_id.to_owned(), device_id.to_owned());
 	let _guard = self.one_time_key_locks.lock(&device).await;
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		return Err!(Request(NotFound("No one-time-key found")));
 	};
 
-	let update_count = self.services.globals.next_count().await?;
+	let update_count = services_root.globals.next_count().await?;
 	self.db
 		.userid_lastonetimekeyupdate
 		.insert(user_id, update_count.to_be_bytes())
@@ -339,6 +354,9 @@ pub async fn count_one_time_keys(
 	user_id: &UserId,
 	device_id: &DeviceId,
 ) -> BTreeMap<OneTimeKeyAlgorithm, UInt> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let device = (user_id.to_owned(), device_id.to_owned());
 	let _guard = self.one_time_key_locks.lock(&device).await;
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
@@ -365,13 +383,100 @@ pub async fn count_one_time_keys(
 		.filter_map(Result::ok)
 		.fold(0_usize, usize::saturating_add);
 
-	let limit = self.services.config.one_time_key_limit;
+	let limit = services_root.config.one_time_key_limit;
 	if let Some(excess) = total.checked_sub(limit).filter(|&n| n > 0) {
 		self.prune_one_time_keys(user_id, device_id, excess)
 			.await;
 	}
 
 	complete_one_time_key_counts(algorithm_counts)
+}
+
+/// Shared work budget for one appservice transaction's read-only key metadata.
+pub(crate) struct OutgoingKeyBudget {
+	rows: usize,
+	bytes: usize,
+}
+
+impl Default for OutgoingKeyBudget {
+	fn default() -> Self { Self { rows: 4096, bytes: 1024 * 1024 } }
+}
+
+impl OutgoingKeyBudget {
+	fn charge(&mut self, bytes: usize) -> Result {
+		if self.rows == 0 || bytes > self.bytes {
+			return Err(err!(Request(TooLarge("Outgoing key metadata inventory limit"))));
+		}
+		self.rows = self.rows.saturating_sub(1);
+		self.bytes = self.bytes.saturating_sub(bytes);
+		Ok(())
+	}
+}
+
+/// Complete bounded metadata without pruning keys or silently skipping errors.
+#[implement(super::Service)]
+pub(crate) async fn outgoing_key_metadata(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	budget: &mut OutgoingKeyBudget,
+) -> Result<(BTreeMap<OneTimeKeyAlgorithm, UInt>, Vec<OneTimeKeyAlgorithm>)> {
+	let device = (user_id.to_owned(), device_id.to_owned());
+	let _guard = self.one_time_key_locks.lock(&device).await;
+	let mut counts = BTreeMap::new();
+	if let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() {
+		let prefix = (user_id, device_id, Interfix);
+		let keys =
+			otk.keys_prefix_capped::<OtkRowKey<'_>, _>(&prefix, budget.rows.saturating_add(1));
+		pin_mut!(keys);
+		while let Some((owner, device, _, id)) = keys.try_next().await? {
+			budget.charge(
+				owner
+					.as_bytes()
+					.len()
+					.saturating_add(device.as_str().len())
+					.saturating_add(id.as_str().len())
+					.saturating_add(16),
+			)?;
+			let algorithm = id.algorithm();
+			if !counts.contains_key(&algorithm) && counts.len() >= 16 {
+				return Err(err!(Request(TooLarge("Outgoing key algorithm inventory limit"))));
+			}
+			let count: &mut UInt = counts.entry(algorithm).or_default();
+			*count = count.saturating_add(1_u32.into());
+		}
+		counts = complete_one_time_key_counts(counts);
+	}
+	let prefix = (user_id, device_id);
+	let rows = self
+		.db
+		.userdeviceidalgorithm_fallback
+		.stream_prefix_capped::<(Ignore, Ignore, OneTimeKeyAlgorithm), &[u8], _>(
+			&prefix,
+			budget.rows.min(16).saturating_add(1),
+		);
+	pin_mut!(rows);
+	let mut fallbacks = Vec::new();
+	let mut examined = 0_usize;
+	while let Some(((.., algorithm), bytes)) = rows.try_next().await? {
+		budget.charge(
+			bytes
+				.len()
+				.saturating_add(algorithm.as_str().len())
+				.saturating_add(user_id.as_bytes().len())
+				.saturating_add(device_id.as_str().len())
+				.saturating_add(16),
+		)?;
+		if examined >= 16 || bytes.len() > 64 * 1024 {
+			return Err(err!(Request(TooLarge("Outgoing fallback metadata inventory limit"))));
+		}
+		examined = examined.saturating_add(1);
+		let entry: FallbackEntry = serde_json::from_slice(bytes)?;
+		if !entry.used {
+			fallbacks.push(algorithm);
+		}
+	}
+	Ok((counts, fallbacks))
 }
 
 /// Keep zero-count algorithms visible to clients after an OTK pool is drained.
@@ -435,6 +540,9 @@ pub async fn add_cross_signing_keys(
 	user_signing_key: &Option<Raw<CrossSigningKey>>,
 	notify: bool,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// TODO: Check signatures
 	{
 		let master_key_key = master_key
@@ -452,7 +560,7 @@ pub async fn add_cross_signing_keys(
 			.map(parse_user_signing_key)
 			.transpose()?;
 
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 
 		if let Some((master_key, master_key_key)) =
 			master_key.as_ref().zip(master_key_key.as_ref())
@@ -944,22 +1052,22 @@ fn keys_changed_user_or_room_fallible<'a>(
 	fields(%user_id),
 )]
 pub async fn mark_device_key_update(&self, user_id: &UserId) {
-	let update_all_rooms = !self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let update_all_rooms = !services_root
 		.config
 		.device_key_update_encrypted_rooms_only;
 
 	let all_or_is_encrypted = async |room_id: &RoomId| {
 		update_all_rooms
-			|| self
-				.services
+			|| services_root
 				.state_accessor
 				.is_encrypted_room(room_id)
 				.await
 	};
 
-	let count = self
-		.services
+	let count = services_root
 		.globals
 		.next_count()
 		.await
@@ -973,7 +1081,7 @@ pub async fn mark_device_key_update(&self, user_id: &UserId) {
 		.await
 		.expect("database insert error");
 
-	self.services
+	services_root
 		.state_cache
 		.rooms_joined(user_id)
 		.filter(|room_id| all_or_is_encrypted(*room_id))
@@ -987,29 +1095,28 @@ pub async fn mark_device_key_update(&self, user_id: &UserId) {
 		})
 		.await;
 
-	self.services
+	services_root
 		.sending
 		.send_device_list_appservices(user_id, *count)
 		.await
 		.log_err()
 		.ok();
 
-	if !self.services.globals.user_is_local(user_id) {
+	if !services_root.globals.user_is_local(user_id) {
 		return;
 	}
 
 	// device_list_update EDUs reach remote servers only on a sender flush.
-	let mut servers: Servers = self
-		.services
+	let mut servers: Servers = services_root
 		.state_cache
 		.rooms_joined(user_id)
 		.filter(|room_id| all_or_is_encrypted(*room_id))
 		.map(ToOwned::to_owned)
 		.broad_then(async |room_id: OwnedRoomId| {
-			self.services
+			services_root
 				.state_cache
 				.room_servers(&room_id)
-				.ready_filter(|server| !self.services.globals.server_is_ours(server))
+				.ready_filter(|server| !services_root.globals.server_is_ours(server))
 				.map(ToOwned::to_owned)
 				.collect()
 				.await
@@ -1021,7 +1128,7 @@ pub async fn mark_device_key_update(&self, user_id: &UserId) {
 	servers.sort_unstable();
 	servers.dedup();
 
-	self.services
+	services_root
 		.sending
 		.flush_servers(servers.iter().map(|server| &**server).stream())
 		.await

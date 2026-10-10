@@ -19,7 +19,8 @@ pub fn restart() -> ! {
 	let envs: Vec<_> = strip_listen_fds(vars()).collect();
 	let args: Vec<_> = strip_restore_backup(args().skip(1)).collect();
 
-	debug!(?exe, ?args, ?envs, "Restart");
+	// Environment values and CLI overrides can carry credentials.
+	debug!(?exe, arguments = args.len(), environment_variables = envs.len(), "Restart");
 
 	if LISTEN_VARS
 		.iter()
@@ -85,6 +86,90 @@ mod tests {
 			.map(|&(name, value)| (name.to_owned(), value.to_owned()));
 
 		strip_listen_fds(envs).collect()
+	}
+
+	/// Execute the real restart path in an isolated harness process, not in
+	/// the parent runner. An exec must keep the PID and selected configuration
+	/// while dropping stale socket-activation claims.
+	#[test]
+	fn exec_restart_keeps_pid_and_configuration_and_drops_activation() -> tuwunel_core::Result {
+		use std::{
+			env::{current_exe, var},
+			fs,
+			os::unix::fs::DirBuilderExt,
+			path::PathBuf,
+			process::{Command, Stdio, id},
+			thread::sleep,
+			time::{Duration, Instant},
+		};
+
+		struct Directory(PathBuf);
+		impl Drop for Directory {
+			fn drop(&mut self) { fs::remove_dir_all(&self.0).ok(); }
+		}
+
+		const FIXTURE: &str = "TUWUNEL_EXEC_RESTART_FIXTURE";
+		const CONFIG: &str = "/disposable-restart-fixture/tuwunel.toml";
+		if let Ok(directory) = var(FIXTURE) {
+			let marker = PathBuf::from(directory).join("previous-pid");
+			if !marker.exists() {
+				fs::write(&marker, id().to_string())?;
+				super::restart();
+			}
+			assert_eq!(fs::read_to_string(&marker)?, id().to_string(), "restart uses exec");
+			assert_eq!(var("TUWUNEL_CONFIG").as_deref(), Ok(CONFIG));
+			for name in super::LISTEN_VARS {
+				assert!(std::env::var_os(name).is_none(), "stale activation survives: {name}");
+			}
+			return Ok(());
+		}
+
+		let directory = Directory(
+			std::env::temp_dir()
+				.join(format!("tuwunel-exec-restart-{}", tuwunel_core::utils::rand::string(20))),
+		);
+		fs::DirBuilder::new()
+			.mode(0o700)
+			.create(&directory.0)?;
+		let mut child = Command::new(current_exe()?)
+			.args([
+				"--exact",
+				"restart::tests::exec_restart_keeps_pid_and_configuration_and_drops_activation",
+				"--test-threads=1",
+			])
+			.env(FIXTURE, &directory.0)
+			.env("TUWUNEL_CONFIG", CONFIG)
+			.env("LISTEN_PID", "1")
+			.env("LISTEN_FDS", "3")
+			.env("LISTEN_FDNAMES", "disposable-stale-activation")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()?;
+		let deadline = Instant::now() + Duration::from_secs(15);
+		while match child.try_wait() {
+			| Ok(status) => status.is_none(),
+			| Err(error) => {
+				child.kill().ok();
+				child.wait().ok();
+				return Err(error.into());
+			},
+		} {
+			if Instant::now() >= deadline {
+				child.kill().ok();
+				child.wait().ok();
+				panic!("isolated exec restart exceeded its deadline");
+			}
+			sleep(Duration::from_millis(10));
+		}
+		let output = child.wait_with_output()?;
+		assert!(
+			output.status.success(),
+			"isolated exec restart failed: {}\n{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert!(directory.0.join("previous-pid").is_file(), "exec path was exercised");
+		Ok(())
 	}
 
 	#[test]

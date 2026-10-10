@@ -1,8 +1,8 @@
 use axum::extract::State;
 use futures::{TryFutureExt, future::join3, pin_mut};
-use ruma::api::client::room::get_room_event;
+use ruma::api::{client::room::get_room_event, error::ErrorKind};
 use tuwunel_core::{
-	Err, Event, Pdu, Result, err,
+	Err, Error, Event, Pdu, Result, err,
 	result::IsErrOr,
 	utils::{BoolExt, FutureBoolExt, TryFutureExtExt, future::OptionFutureExt},
 };
@@ -26,7 +26,13 @@ pub(crate) async fn get_room_event_route(
 	let event = services
 		.timeline
 		.get_pdu(event_id)
-		.map_err(|_| err!(Request(NotFound("Event {} not found.", event_id))));
+		.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				err!(Request(NotFound("Event {} not found.", event_id)))
+			} else {
+				error
+			}
+		});
 
 	let retained_event = body
 		.include_unredacted_content
@@ -53,7 +59,13 @@ pub(crate) async fn get_room_event_route(
 					.retention
 					.get_original_pdu(event_id)
 					.await
-					.map_err(|_| err!(Request(NotFound("Event {} not found.", event_id))))
+					.map_err(|error| {
+						if error.kind() == ErrorKind::NotFound {
+							err!(Request(NotFound("Event {} not found.", event_id)))
+						} else {
+							error
+						}
+					})
 			} else {
 				Err!(Request(Forbidden("You are not allowed to see the original event")))
 			}
@@ -86,12 +98,11 @@ pub(crate) async fn get_room_event_route(
 		}));
 	}
 
-	debug_assert!(
-		event.event_id() == event_id && event.room_id() == room_id,
-		"Fetched PDU must match requested"
-	);
+	if event.event_id() != event_id || event.room_id() != room_id {
+		return Err(Error::bad_database("Mismatched requested room event"));
+	}
 
-	event.add_age().ok();
+	event.add_age()?;
 
 	let encrypted = services
 		.state_accessor
@@ -103,7 +114,7 @@ pub(crate) async fn get_room_event_route(
 	let event = services
 		.pdu_metadata
 		.bundle_aggregations(sender_user, event)
-		.await;
+		.await?;
 
 	Ok(get_room_event::v3::Response { event: event.into_format() })
 }

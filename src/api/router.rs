@@ -423,6 +423,9 @@ fn register_client_misc_routes(router: Router<State>) -> Router<State> {
 		// Unauthenticated by design: the platform probes readiness before any
 		// credential exists (ADR-0012, "Lease").
 		.route("/_tuwunel/readiness", get(client::tuwunel_readiness))
+		// Aggregate metrics require the runtime bridge credential independently
+		// of the Worker's admin-host gate. Ordinary Matrix tokens do not authorize it.
+		.route("/_tuwunel/operation_metrics", get(client::tuwunel_operation_metrics))
 		.route(
 			"/_tuwunel/3pid/email/validate",
 			get(client::get_email_validate_route).post(client::post_email_validate_route),

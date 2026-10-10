@@ -22,6 +22,9 @@ pub async fn ping(
 	registration: Registration,
 	request: send_ping::v1::Request,
 ) -> Result<()> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(dest) = registration.url else {
 		return Ok(());
 	};
@@ -47,8 +50,7 @@ pub async fn ping(
 
 	let reqwest_request = Request::try_from(http_request)?;
 
-	let response = self
-		.services
+	let response = services_root
 		.client
 		.appservice
 		.execute(reqwest_request)
@@ -76,7 +78,7 @@ pub async fn ping(
 		return Ok(());
 	}
 
-	let limit = self.services.config.max_response_size;
+	let limit = services_root.config.max_response_size;
 	let body = read_response_capped(response, limit)
 		.await
 		.ok()

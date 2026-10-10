@@ -38,6 +38,9 @@ pub async fn leave<'a>(
 	remote_leave_now: bool,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let leave_content = RoomMemberEventContent {
 		membership: MembershipState::Leave,
 		reason: reason.clone(),
@@ -49,8 +52,8 @@ pub async fn leave<'a>(
 		blurhash: None,
 	};
 
-	let is_banned = self.services.metadata.is_banned(room_id);
-	let is_disabled = self.services.metadata.is_disabled(room_id);
+	let is_banned = services_root.metadata.is_banned(room_id);
+	let is_disabled = services_root.metadata.is_disabled(room_id);
 	pin_mut!(is_banned, is_disabled);
 	if is_banned.or(is_disabled).await {
 		return self
@@ -58,8 +61,7 @@ pub async fn leave<'a>(
 			.await;
 	}
 
-	let member_event = self
-		.services
+	let member_event = services_root
 		.state_accessor
 		.room_state_get_content::<RoomMemberEventContent>(
 			room_id,
@@ -68,15 +70,13 @@ pub async fn leave<'a>(
 		)
 		.await;
 
-	let dont_have_room = self
-		.services
+	let dont_have_room = services_root
 		.state_cache
-		.server_in_room(self.services.globals.server_name(), room_id)
+		.server_in_room(services_root.globals.server_name(), room_id)
 		.is_false()
 		.and(ready(member_event.as_ref().is_err()));
 
-	let not_knocked = self
-		.services
+	let not_knocked = services_root
 		.state_cache
 		.is_knocked(user_id, room_id)
 		.is_false();
@@ -120,16 +120,19 @@ async fn last_known_strip_state(
 	user_id: &UserId,
 	room_id: &RoomId,
 ) -> Option<Vec<Raw<AnyStrippedStateEvent>>> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state_cache
 		.invite_state(user_id, room_id)
 		.or_else(|_| {
-			self.services
+			services_root
 				.state_cache
 				.knock_state(user_id, room_id)
 		})
 		.or_else(|_| {
-			self.services
+			services_root
 				.state_cache
 				.left_state(user_id, room_id)
 		})
@@ -147,6 +150,9 @@ async fn leave_locally(
 	member_event: Result<RoomMemberEventContent>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Ok(event) = member_event else {
 		debug_warn!(
 			"Trying to leave a room you are not a member of, marking room as left locally."
@@ -168,8 +174,7 @@ async fn leave_locally(
 			.await;
 	}
 
-	let build_result = self
-		.services
+	let build_result = services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
@@ -194,8 +199,7 @@ async fn leave_locally(
 	match build_result {
 		| Ok(_) => Ok(()),
 		| Err(Error::AuthCheck(inner)) => {
-			let current = self
-				.services
+			let current = services_root
 				.state_accessor
 				.room_state_get_content::<RoomMemberEventContent>(
 					room_id,
@@ -230,8 +234,11 @@ async fn clear_local_leave(
 	leave_content: RoomMemberEventContent,
 	last_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
 ) -> Result {
-	let count = self.services.globals.next_count().await?;
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let count = services_root.globals.next_count().await?;
+	services_root
 		.state_cache
 		.update_membership(MembershipUpdate {
 			room_id,
@@ -254,20 +261,21 @@ async fn remote_leave(
 	room_id: &RoomId,
 	reason: Option<String>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut make_leave_response_and_server =
 		Err!(BadServerResponse("No remote server available to assist in leaving {room_id}."));
 
-	let mut servers: HashSet<OwnedServerName> = self
-		.services
+	let mut servers: HashSet<OwnedServerName> = services_root
 		.state_cache
 		.servers_invite_via(room_id)
-		.chain(self.services.state_cache.room_servers(room_id))
+		.chain(services_root.state_cache.room_servers(room_id))
 		.map(ToOwned::to_owned)
 		.collect()
 		.await;
 
-	match self
-		.services
+	match services_root
 		.state_cache
 		.invite_state(user_id, room_id)
 		.await
@@ -282,8 +290,7 @@ async fn remote_leave(
 			);
 		},
 		| _ => {
-			match self
-				.services
+			match services_root
 				.state_cache
 				.knock_state(user_id, room_id)
 				.await
@@ -295,7 +302,7 @@ async fn remote_leave(
 							.filter_map(|event| event.get_field("sender").ok().flatten())
 							.filter_map(|sender: &str| UserId::parse(sender).ok())
 							.filter_map(|sender| {
-								(!self.services.globals.user_is_local(&sender))
+								(!services_root.globals.user_is_local(&sender))
 									.then(|| sender.server_name().to_owned())
 							}),
 					);
@@ -314,10 +321,9 @@ async fn remote_leave(
 
 	for remote_server in servers
 		.into_iter()
-		.filter(|server| !self.services.globals.server_is_ours(server))
+		.filter(|server| !services_root.globals.server_is_ours(server))
 	{
-		let make_leave_response = self
-			.services
+		let make_leave_response = services_root
 			.federation
 			.execute(&remote_server, federation::membership::prepare_leave_event::v1::Request {
 				room_id: room_id.to_owned(),
@@ -341,8 +347,7 @@ async fn remote_leave(
 		)));
 	};
 
-	if !self
-		.services
+	if !services_root
 		.config
 		.supported_room_version(&room_version_id)
 	{
@@ -366,7 +371,7 @@ async fn remote_leave(
 		..RoomMemberEventContent::new(MembershipState::Leave)
 	};
 
-	self.services
+	services_root
 		.profile
 		.fill_profile_data(user_id, &mut content)
 		.await;
@@ -376,7 +381,7 @@ async fn remote_leave(
 	event.insert(
 		"origin".into(),
 		CanonicalJsonValue::String(
-			self.services
+			services_root
 				.globals
 				.server_name()
 				.as_str()
@@ -397,20 +402,18 @@ async fn remote_leave(
 
 	event.insert("type".into(), CanonicalJsonValue::String("m.room.member".into()));
 
-	let event_id = self
-		.services
+	let event_id = services_root
 		.server_keys
 		.gen_id_hash_and_sign_event(&mut event, &room_version_id)?;
 
 	check_rules(&event, &room_version_rules.event_format)?;
 
-	self.services
+	services_root
 		.federation
 		.execute(&remote_server, federation::membership::create_leave_event::v2::Request {
 			room_id: room_id.to_owned(),
 			event_id,
-			pdu: self
-				.services
+			pdu: services_root
 				.federation
 				.format_pdu_into(event.clone(), Some(&room_version_id))
 				.await,

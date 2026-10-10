@@ -25,6 +25,7 @@ pub(crate) async fn admin_delete_status_by_id_route(
 	let task = services
 		.tasks
 		.get(&body.delete_id)
+		.await?
 		.filter(|task| task.action == super::DELETE_ROOM_ACTION)
 		.ok_or_else(|| err!(Request(NotFound("Unknown delete task"))))?;
 
@@ -44,6 +45,7 @@ pub(crate) async fn admin_delete_status_by_room_route(
 	let results = services
 		.tasks
 		.by_resource(body.room_id.as_str())
+		.await?
 		.into_iter()
 		.filter(|task| {
 			task.action == super::DELETE_ROOM_ACTION && task.status != Status::Scheduled

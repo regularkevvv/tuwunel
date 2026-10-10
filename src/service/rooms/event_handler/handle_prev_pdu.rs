@@ -31,8 +31,11 @@ pub(super) async fn handle_prev_pdu(
 	prev_id: &EventId,
 	create_event_id: &EventId,
 ) -> Result<Option<(RawPduId, bool)>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Check for disabled again because it might have changed
-	if self.services.metadata.is_disabled(room_id).await {
+	if services_root.metadata.is_disabled(room_id).await {
 		return Err!(Request(Forbidden(debug_warn!(
 			"Federaton of room {room_id} is currently disabled on this server. Request by \
 			 origin {origin} and event ID {event_id}"
@@ -70,6 +73,7 @@ pub(super) async fn handle_prev_pdu(
 		room_version,
 		recursion_level,
 		create_event_id,
+		false,
 	)
 	.boxed()
 	.await

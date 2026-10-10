@@ -128,16 +128,18 @@ where
 	R::Authentication: FedAuth,
 	R::PathBuilder: FedPath,
 {
-	let dests = self
-		.services
-		.state_cache
-		.room_servers(room_id)
-		.ready_filter(move |server| {
-			!opts.exclude_self || !self.services.globals.server_is_ours(server)
-		})
-		.map(ToOwned::to_owned);
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		let dests = services_root
+			.state_cache
+			.room_servers(room_id)
+			.ready_filter(move |server| {
+				!opts.exclude_self || !services_root.globals.server_is_ours(server)
+			})
+			.map(ToOwned::to_owned);
 
-	self.fanout_to(dests, make, opts)
+		self.fanout_to(dests, make, opts)
+	})
 }
 
 /// Builds one request for every destination and drives the resulting pairs.
@@ -190,33 +192,36 @@ where
 	R::Authentication: FedAuth,
 	R::PathBuilder: FedPath,
 {
-	let config = &self.services.server.config;
-	let opts = resolve_opts(opts, config.feds_max_width, config.feds_timeout);
-	let client = &self.services.client.federation;
-	let record = opts.record;
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		let config = &services_root.server.config;
+		let opts = resolve_opts(opts, config.feds_max_width, config.feds_timeout);
+		let client = &services_root.client.federation;
+		let record = opts.record;
 
-	fanout_with(
-		pairs,
-		move |dest, request| async move {
-			match record {
-				| Record::Observe =>
-					self.execute_uncounted_allow_self(client, &dest, request)
-						.await,
-				| Record::Contribute =>
-					self.execute_on_allow_self(client, &dest, request)
-						.await,
+		fanout_with(
+			pairs,
+			move |dest, request| async move {
+				match record {
+					| Record::Observe =>
+						self.execute_uncounted_allow_self(client, &dest, request)
+							.await,
+					| Record::Contribute =>
+						self.execute_on_allow_self(client, &dest, request)
+							.await,
+				}
+			},
+			opts,
+		)
+		.then(move |outcome| async move {
+			if record == Record::Contribute && matches!(&outcome.result, Err(Fault::Elapsed)) {
+				self.record_failure(&outcome.origin, Classification::Transient)
+					.await
+					.expect("database write error");
 			}
-		},
-		opts,
-	)
-	.then(move |outcome| async move {
-		if record == Record::Contribute && matches!(&outcome.result, Err(Fault::Elapsed)) {
-			self.record_failure(&outcome.origin, Classification::Transient)
-				.await
-				.expect("database write error");
-		}
 
-		outcome
+			outcome
+		})
 	})
 }
 

@@ -62,7 +62,10 @@ pub fn consume_register_nonce(&self, nonce: &str) -> bool {
 /// gates takes no authentication and is not rate limited.
 #[implement(super::Service)]
 pub fn register_is_enabled(&self) -> bool {
-	let config = &self.services.server.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.server.config;
 
 	is_secret_set(
 		config.registration_shared_secret_file.as_deref(),
@@ -74,7 +77,10 @@ pub fn register_is_enabled(&self) -> bool {
 /// takes effect without a restart.
 #[implement(super::Service)]
 pub fn register_shared_secret(&self) -> Option<Secret> {
-	let config = &self.services.server.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.server.config;
 
 	resolve_secret(
 		config.registration_shared_secret_file.as_deref(),

@@ -62,7 +62,10 @@ pub async fn servers_route_via(&self, room_id: &RoomId) -> Result<Vec<OwnedServe
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn most_powerful_user_server(&self, room_id: &RoomId) -> Option<OwnedServerName> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state_accessor
 		.room_state_get_content(room_id, &StateEventType::RoomPowerLevels, "")
 		.await

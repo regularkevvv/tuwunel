@@ -15,6 +15,10 @@ tuwunel_core::mod_ctor! {}
 tuwunel_core::mod_dtor! {}
 tuwunel_core::rustc_flags_capture! {}
 
+#[cfg(test)]
+#[path = "backend/remote/fixture.rs"]
+pub mod bridge_fixture;
+
 pub mod backend;
 mod cork;
 mod de;
@@ -160,13 +164,18 @@ impl Database {
 		}
 	}
 
-	/// Stops background lease renewal and releases the writer lease.
+	/// Drains accepted native reads or stops renewal and releases the remote
+	/// writer lease.
 	///
-	/// A no-op off the remote backend. Releasing is best effort: a successor
-	/// otherwise waits out the lease's natural expiry.
+	/// RocksDB waits for offloaded reads and seeks already submitted, including
+	/// commands whose requesting futures were cancelled. It keeps the pool open
+	/// for lazy queries retained by callers after the service graph stops.
+	/// Remote lease release is best effort: a successor otherwise waits out the
+	/// lease's natural expiry.
 	pub async fn close(&self) {
-		if let Inner::Remote(backend) = &self.inner {
-			backend.close().await;
+		match &self.inner {
+			| Inner::Rocks { engine, .. } => engine.pool.drain().await,
+			| Inner::Remote(backend) => backend.close().await,
 		}
 	}
 
@@ -269,6 +278,10 @@ impl Database {
 	/// Shutdown paths that cannot guarantee this database's drop (dangling
 	/// shutdown references) call this explicitly; drop also invokes it.
 	pub fn dump_operation_metrics(&self) { backend::metrics::dump_on_close(); }
+
+	/// Aggregate counts, sizes and histograms. No keys, values or map names.
+	#[must_use]
+	pub fn operation_metrics(&self) -> serde_json::Value { backend::metrics::snapshot() }
 }
 
 impl Drop for Database {

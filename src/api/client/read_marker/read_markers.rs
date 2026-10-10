@@ -13,7 +13,7 @@ use ruma::{
 use tuwunel_core::Result;
 use tuwunel_service::presence::Ping;
 
-use super::{reset_and_refresh_badge, set_private_marker};
+use super::{refresh_badge, set_private_marker};
 use crate::{ClientIp, Ruma};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/read_markers`
@@ -80,7 +80,7 @@ pub(crate) async fn set_read_marker_route(
 					content: ReceiptEventContent(receipt_content),
 					room_id: body.room_id.clone(),
 				})
-				.await;
+				.await?;
 
 			let ping = Ping {
 				device_id: body.sender_device.as_deref(),
@@ -102,13 +102,7 @@ pub(crate) async fn set_read_marker_route(
 	// Route through the dispatcher so per-thread counts are also cleared;
 	// `/read_markers` predates MSC3771 and carries no thread field.
 	if private_advanced || public_advanced {
-		reset_and_refresh_badge(
-			&services,
-			sender_user,
-			&body.room_id,
-			&ReceiptThread::Unthreaded,
-		)
-		.await;
+		refresh_badge(&services, sender_user).await?;
 	}
 
 	Ok(set_read_marker::v3::Response {})

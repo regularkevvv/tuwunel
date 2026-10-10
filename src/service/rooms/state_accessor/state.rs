@@ -1,10 +1,11 @@
-use std::{ops::Deref, sync::Arc};
+use std::{collections::BTreeSet, ops::Deref, sync::Arc};
 
 use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
 };
 use ruma::{
-	EventId, OwnedEventId, RoomId, UserId,
+	EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, UserId,
+	api::error::{ErrorKind, LimitExceededErrorData},
 	events::{
 		StateEventType, TimelineEventType,
 		room::{
@@ -19,8 +20,9 @@ use tuwunel_core::{
 	matrix::{Event, Pdu, PduCount, StateKey},
 	pair_of,
 	utils::{
+		json::serialized_len,
 		result::FlatOk,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, TryIgnore},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore},
 	},
 };
 
@@ -28,6 +30,144 @@ use crate::rooms::{
 	short::{ShortEventId, ShortStateHash, ShortStateKey},
 	state_compressor::{CompressedState, compress_state_event, parse_compressed_state_event},
 };
+
+const MAX_STATE_MAPPING_BYTES: usize = 512 * 1024;
+
+/// Freeze recipients from complete authoritative state, including the event
+/// being admitted. Membership caches may lag a commit or a restart.
+#[implement(super::Service)]
+pub(crate) async fn federation_servers_for_append(
+	&self,
+	state: ShortStateHash,
+	pending: &tuwunel_core::PduEvent,
+) -> Result<Vec<OwnedServerName>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let mut servers = BTreeSet::new();
+	let members = self.state_members_for_append(state, pending);
+	pin_mut!(members);
+	while let Some((user, membership)) = members.try_next().await? {
+		if membership == MembershipState::Join
+			&& !services_root
+				.globals
+				.server_is_ours(user.server_name())
+		{
+			servers.insert(user.server_name().to_owned());
+		}
+	}
+	// Departed, banned and invited targets still need the membership event.
+	if pending.kind == TimelineEventType::RoomMember {
+		let user = UserId::parse(pending.state_key.as_deref().ok_or_else(|| {
+			Error::bad_database("Federation membership event lacks its state key")
+		})?)?;
+		if !services_root
+			.globals
+			.server_is_ours(user.server_name())
+		{
+			servers.insert(user.server_name().to_owned());
+		}
+	}
+	Ok(servers.into_iter().collect())
+}
+
+/// Complete joined IDs for notification decisions at the accepted state. The
+/// pending event may not yet be in the canonical timeline. Remote and disabled
+/// users consume the same 1,024-ID / 128-KiB budget before recipient filtering.
+#[implement(super::Service)]
+pub(crate) async fn notification_members_for_append(
+	&self,
+	state: ShortStateHash,
+	pending: &Pdu,
+) -> Result<Vec<OwnedUserId>> {
+	let entries = self.state_members_for_append(state, pending);
+	pin_mut!(entries);
+	let mut members = Vec::new();
+	let mut bytes = 0_usize;
+	while let Some((user, membership)) = entries.try_next().await? {
+		if membership != MembershipState::Join {
+			continue;
+		}
+		bytes = bytes.saturating_add(user.as_bytes().len());
+		if members.len() >= 1024 || bytes > 128 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Notification member inventory limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		members.push(user);
+	}
+	Ok(members)
+}
+
+/// Validate both compact dictionaries and every membership binding before
+/// yielding it. Neither consumer may silently substitute a derived cache.
+#[implement(super::Service)]
+fn state_members_for_append<'a>(
+	&'a self,
+	state: ShortStateHash,
+	pending: &'a Pdu,
+) -> impl Stream<Item = Result<(OwnedUserId, MembershipState)>> + Send + 'a {
+	async_stream::try_stream! {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+		let entries = self.state_full_shortids(state);
+		let mut bytes = 0_usize;
+		pin_mut!(entries);
+		while let Some((shortkey, shortevent)) = entries.try_next().await? {
+			let (kind, key) = services_root
+				.short
+				.get_statekey_from_short(shortkey)
+				.await?;
+			let event = services_root
+				.short
+				.get_eventid_from_short::<OwnedEventId>(shortevent)
+				.await?;
+			bytes = bytes
+				.saturating_add(kind.to_cow_str().len())
+				.saturating_add(key.as_str().len())
+				.saturating_add(event.as_str().len());
+			if bytes > MAX_STATE_MAPPING_BYTES {
+				Err(state_mapping_limit())?;
+			}
+			if services_root
+				.short
+				.get_shortstatekey(&kind, key.as_str())
+				.await? != shortkey
+				|| services_root
+					.short
+					.get_shorteventid(&event)
+					.await? != shortevent
+			{
+				Err(Error::bad_database("Append state dictionaries disagree"))?;
+			}
+			if kind != StateEventType::RoomMember {
+				continue;
+			}
+			let pdu = self
+				.state_event_for_append(&event, Some(pending))
+				.await?;
+			if pdu.event_id() != event
+				|| pdu.room_id() != pending.room_id
+				|| pdu.event_type().to_cow_str() != kind.to_cow_str()
+				|| pdu.state_key() != Some(key.as_str())
+			{
+				Err(Error::bad_database("Append membership binding is invalid"))?;
+			}
+			let user = UserId::parse(key.as_str())?;
+			let member: RoomMemberEventContent = pdu.get_content()?;
+			yield (user, member.membership);
+		}
+	}
+}
+
+fn state_mapping_limit() -> Error {
+	Error::Request(
+		ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+		"Room state mapping byte limit reached".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	)
+}
 
 /// The user was a joined member at this state (potentially in the past)
 #[implement(super::Service)]
@@ -66,6 +206,9 @@ pub async fn user_membership(
 /// targeting `user_id` overrides that lookup with its own content.
 #[implement(super::Service)]
 pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> MembershipState {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if pdu.kind() == &TimelineEventType::RoomMember
 		&& pdu.state_key() == Some(user_id.as_str())
 		&& let Ok(content) = pdu.get_content::<RoomMemberEventContent>()
@@ -73,8 +216,7 @@ pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> Membe
 		return content.membership;
 	}
 
-	let Ok(shortstatehash) = self
-		.services
+	let Ok(shortstatehash) = services_root
 		.state
 		.pdu_shortstatehash(pdu.event_id())
 		.await
@@ -109,8 +251,10 @@ pub async fn state_contains(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> bool {
-	let Ok(shortstatekey) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(shortstatekey) = services_root
 		.short
 		.get_shortstatekey(event_type, state_key)
 		.await
@@ -175,14 +319,30 @@ pub async fn state_get_optional(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<Option<Pdu>> {
-	let direct_shortstatekey = match self
-		.services
+	self.state_get_optional_for_append(shortstatehash, event_type, state_key, None)
+		.await
+}
+
+/// The authenticated event being accepted may already be named by its
+/// candidate state snapshot. Resolve only that exact ID from the caller's
+/// event; every stored cell retains its normal strict binding checks.
+#[implement(super::Service)]
+pub(crate) async fn state_get_optional_for_append(
+	&self,
+	shortstatehash: ShortStateHash,
+	event_type: &StateEventType,
+	state_key: &str,
+	pending: Option<&Pdu>,
+) -> Result<Option<Pdu>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let direct_shortstatekey = match services_root
 		.short
 		.get_shortstatekey(event_type, state_key)
 		.await
 	{
-		| Ok(shortstatekey) => self
-			.services
+		| Ok(shortstatekey) => services_root
 			.short
 			.get_statekey_from_short(shortstatekey)
 			.await
@@ -195,76 +355,48 @@ pub async fn state_get_optional(
 		| Err(_) => None,
 	};
 
-	let event_id: OwnedEventId = match direct_shortstatekey {
+	let direct_shorteventid = match direct_shortstatekey {
 		| Some(shortstatekey) => {
 			let start = compress_state_event(shortstatekey, 0);
 			let end = compress_state_event(shortstatekey, u64::MAX);
-
-			let shorteventid = self
-				.load_full_state(shortstatehash)
-				.await?
-				.range(start..=end)
+			let full_state = self.load_full_state(shortstatehash).await?;
+			let mut candidates = full_state.range(start..=end).copied();
+			let shorteventid = candidates
 				.next()
-				.copied()
 				.map(parse_compressed_state_event)
 				.map(at!(1));
-			let Some(shorteventid) = shorteventid else {
-				return Ok(None);
-			};
-
-			self.services
-				.short
-				.get_eventid_from_short(shorteventid)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
+			if candidates.next().is_some() {
+				return Err(Error::bad_database("Duplicate state key mapping"));
+			}
+			shorteventid
 		},
-
-		// Proving the cell absent needs every entry's compact key mapped, since an
-		// unmapped one could be this cell, but only the matching entry's event
-		// id: another entry's missing event mapping cannot hide it.
-		| None => {
-			let (shortstatekeys, shorteventids): (Vec<_>, Vec<_>) = self
-				.state_full_shortids(shortstatehash)
-				.try_collect::<Vec<_>>()
-				.await?
-				.into_iter()
-				.unzip();
-
-			let shorteventid = self
-				.services
-				.short
-				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
-				.zip(shorteventids.into_iter().stream())
-				.map(|(state_key, shorteventid)| {
-					state_key
-						.map(|state_key| (state_key, shorteventid))
-						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
-				})
-				.try_collect::<Vec<_>>()
-				.await?
-				.into_iter()
-				.find(|((candidate_type, candidate_key), _)| {
-					candidate_type == event_type && candidate_key.as_str() == state_key
-				})
-				.map(at!(1));
-			let Some(shorteventid) = shorteventid else {
-				return Ok(None);
-			};
-
-			self.services
-				.short
-				.get_eventid_from_short(shorteventid)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?
-		},
+		| None => None,
 	};
 
-	let pdu = self
-		.services
-		.timeline
-		.get_pdu(&event_id)
+	let shorteventid = match direct_shorteventid {
+		| Some(shorteventid) => shorteventid,
+		// Absence requires complete mappings bound to their stored events. A
+		// corrupt reverse key can decode as another type and hide this cell.
+		// Even a valid shortcut outside the snapshot cannot establish absence.
+		| None => {
+			let Some(shorteventid) = self
+				.state_cell_from_snapshot(shortstatehash, event_type, state_key, pending)
+				.await?
+			else {
+				return Ok(None);
+			};
+			shorteventid
+		},
+	};
+	let event_id: OwnedEventId = services_root
+		.short
+		.get_eventid_from_short(shorteventid)
 		.await
-		.map_err(|_| Error::bad_database("Incomplete state event"))?;
+		.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
+
+	let pdu = self
+		.state_event_for_append(&event_id, pending)
+		.await?;
 	if pdu.event_id() != event_id
 		|| pdu.event_type().to_cow_str() != event_type.to_cow_str()
 		|| pdu.state_key() != Some(state_key)
@@ -273,6 +405,106 @@ pub async fn state_get_optional(
 	}
 
 	Ok(Some(pdu))
+}
+
+/// Proves optional-state presence or absence from every bounded mapped cell.
+#[implement(super::Service)]
+async fn state_cell_from_snapshot(
+	&self,
+	shortstatehash: ShortStateHash,
+	event_type: &StateEventType,
+	state_key: &str,
+	pending: Option<&Pdu>,
+) -> Result<Option<ShortEventId>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let entries = self
+		.state_full_shortids(shortstatehash)
+		.try_collect::<Vec<_>>()
+		.await?;
+	let mut shorteventid = None;
+	let mut bytes = 0_usize;
+	let mut decoded = Vec::new();
+	for (shortstatekey, candidate_event) in entries {
+		let (candidate_type, candidate_key) = services_root
+			.short
+			.get_statekey_from_short(shortstatekey)
+			.await
+			.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+		bytes = bytes
+			.saturating_add(candidate_type.to_cow_str().len())
+			.saturating_add(candidate_key.as_str().len());
+		if bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		let event_id: OwnedEventId = services_root
+			.short
+			.get_eventid_from_short(candidate_event)
+			.await
+			.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
+		bytes = bytes.saturating_add(event_id.as_str().len());
+		if bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		if candidate_type == *event_type
+			&& candidate_key.as_str() == state_key
+			&& shorteventid.replace(candidate_event).is_some()
+		{
+			return Err(Error::bad_database("Duplicate state key mapping"));
+		}
+		decoded.push((candidate_type, candidate_key, event_id));
+	}
+	let mut source_bytes = 0_usize;
+	let mut snapshot_room: Option<OwnedRoomId> = None;
+	for (candidate_type, candidate_key, event_id) in decoded {
+		let pdu = self
+			.state_event_for_append(&event_id, pending)
+			.await?;
+		source_bytes = source_bytes.saturating_add(
+			serialized_len(pdu.as_pdu())
+				.map_err(|_| Error::bad_database("Invalid state event serialization"))?,
+		);
+		if source_bytes > MAX_STATE_MAPPING_BYTES {
+			return Err(state_mapping_limit());
+		}
+		if pdu.event_id() != event_id
+			|| pdu.event_type().to_cow_str() != candidate_type.to_cow_str()
+			|| pdu.state_key() != Some(candidate_key.as_str())
+			|| snapshot_room
+				.as_ref()
+				.is_some_and(|room| room.as_str() != pdu.room_id().as_str())
+		{
+			return Err(Error::bad_database("Mismatched state event mapping"));
+		}
+		snapshot_room = Some(pdu.room_id().to_owned());
+	}
+	Ok(shorteventid)
+}
+
+#[implement(super::Service)]
+pub(crate) async fn state_event_for_append(
+	&self,
+	event: &EventId,
+	pending: Option<&Pdu>,
+) -> Result<Pdu> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if let Some(pdu) = pending.filter(|pdu| pdu.event_id() == event) {
+		return Ok(pdu.clone());
+	}
+	services_root
+		.timeline
+		.get_pdu(event)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("Incomplete state event")
+			} else {
+				error
+			}
+		})
 }
 
 /// Gets history visibility from an event's state without converting corrupt
@@ -304,7 +536,10 @@ pub async fn history_visibility_at(
 /// hash is absent.
 #[implement(super::Service)]
 pub async fn is_initial_room_create(&self, room_id: &RoomId, event_id: &EventId) -> bool {
-	let Ok(pdu) = self.services.timeline.get_pdu(event_id).await else {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(pdu) = services_root.timeline.get_pdu(event_id).await else {
 		return false;
 	};
 
@@ -336,8 +571,10 @@ pub async fn snapshotless_state(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> Option<ShortStateHash> {
-	let pdu = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let pdu = services_root
 		.timeline
 		.get_pdu(event_id)
 		.await
@@ -346,8 +583,7 @@ pub async fn snapshotless_state(
 		return None;
 	}
 
-	match self
-		.services
+	match services_root
 		.timeline
 		.get_pdu_count(event_id)
 		.await
@@ -357,7 +593,7 @@ pub async fn snapshotless_state(
 		| Ok(PduCount::Normal(_)) | Err(_) => return None,
 	}
 
-	self.services
+	services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -373,11 +609,14 @@ pub async fn state_get_id(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let shorteventid = self
 		.state_get_shortid(shortstatehash, event_type, state_key)
 		.await?;
 
-	self.services
+	services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await
@@ -407,14 +646,15 @@ pub async fn state_get_shortid_optional(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> Result<Option<ShortEventId>> {
-	let direct_shortstatekey = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let direct_shortstatekey = match services_root
 		.short
 		.get_shortstatekey(event_type, state_key)
 		.await
 	{
-		| Ok(shortstatekey) => self
-			.services
+		| Ok(shortstatekey) => services_root
 			.short
 			.get_statekey_from_short(shortstatekey)
 			.await
@@ -444,8 +684,7 @@ pub async fn state_get_shortid_optional(
 	for compressed in full_state.iter().copied() {
 		let (candidate_shortstatekey, candidate_shorteventid) =
 			parse_compressed_state_event(compressed);
-		let (candidate_type, candidate_key) = self
-			.services
+		let (candidate_type, candidate_key) = services_root
 			.short
 			.get_statekey_from_short(candidate_shortstatekey)
 			.await
@@ -466,15 +705,18 @@ pub fn state_type_pdus<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = impl Event> + Send + 'a {
-	self.state_keys_with_ids(shortstatehash, event_type)
-		.map(at!(1))
-		.broad_filter_map(move |event_id: OwnedEventId| async move {
-			self.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-		})
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_keys_with_ids(shortstatehash, event_type)
+			.map(at!(1))
+			.broad_filter_map(move |event_id: OwnedEventId| async move {
+				services_root
+					.timeline
+					.get_pdu(&event_id)
+					.await
+					.ok()
+			})
+	})
 }
 
 /// Iterates every current-state PDU of an event type without treating a
@@ -499,16 +741,19 @@ pub fn state_keys_with_ids<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = (StateKey, OwnedEventId)> + Send + 'a {
-	self.state_keys_with_shortids(shortstatehash, event_type)
-		.unzip()
-		.map(|(state_keys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
-				.zip(state_keys.into_iter().stream())
-				.ready_filter_map(|(eid, sk)| eid.map(move |eid| (sk, eid)).ok())
-		})
-		.flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_keys_with_shortids(shortstatehash, event_type)
+			.unzip()
+			.map(|(state_keys, shorteventids): (Vec<_>, Vec<_>)| {
+				services_root
+					.short
+					.multi_get_eventid_from_short(shorteventids.into_iter().stream())
+					.zip(state_keys.into_iter().stream())
+					.ready_filter_map(|(eid, sk)| eid.map(move |eid| (sk, eid)).ok())
+			})
+			.flatten_stream()
+	})
 }
 
 /// Iterates current-state keys and IDs for an event type with complete
@@ -535,22 +780,25 @@ pub fn state_keys_with_shortids<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = (StateKey, ShortEventId)> + Send + 'a {
-	self.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.unzip()
-		.map(move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
-				.zip(shorteventids.into_iter().stream())
-				.ready_filter_map(|(res, id)| res.map(|res| (res, id)).ok())
-				.ready_filter_map(move |((event_type_, state_key), event_id)| {
-					event_type_
-						.eq(event_type)
-						.then_some((state_key, event_id))
-				})
-		})
-		.flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.unzip()
+			.map(move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
+				services_root
+					.short
+					.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
+					.zip(shorteventids.into_iter().stream())
+					.ready_filter_map(|(res, id)| res.map(|res| (res, id)).ok())
+					.ready_filter_map(move |((event_type_, state_key), event_id)| {
+						event_type_
+							.eq(event_type)
+							.then_some((state_key, event_id))
+					})
+			})
+			.flatten_stream()
+	})
 }
 
 /// Iterates the state_keys for an event_type in the state
@@ -560,18 +808,21 @@ pub fn state_keys<'a>(
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = StateKey> + Send + 'a {
-	let short_ids = self
-		.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.map(at!(0));
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		let short_ids = self
+			.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.map(at!(0));
 
-	self.services
-		.short
-		.multi_get_statekey_from_short(short_ids)
-		.ready_filter_map(Result::ok)
-		.ready_filter_map(move |(event_type_, state_key)| {
-			event_type_.eq(event_type).then_some(state_key)
-		})
+		services_root
+			.short
+			.multi_get_statekey_from_short(short_ids)
+			.ready_filter_map(Result::ok)
+			.ready_filter_map(move |(event_type_, state_key)| {
+				event_type_.eq(event_type).then_some(state_key)
+			})
+	})
 }
 
 /// Iterates current-state keys for an event type with complete snapshot and
@@ -647,22 +898,25 @@ pub fn state_full_pdus(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = impl Event> + Send + '_ {
-	let short_ids = self
-		.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.map(at!(1));
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		let short_ids = self
+			.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.map(at!(1));
 
-	self.services
-		.short
-		.multi_get_eventid_from_short(short_ids)
-		.ready_filter_map(Result::ok)
-		.broad_filter_map(move |event_id: OwnedEventId| async move {
-			self.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-		})
+		services_root
+			.short
+			.multi_get_eventid_from_short(short_ids)
+			.ready_filter_map(Result::ok)
+			.broad_filter_map(move |event_id: OwnedEventId| async move {
+				services_root
+					.timeline
+					.get_pdu(&event_id)
+					.await
+					.ok()
+			})
+	})
 }
 
 /// Builds complete current-state entries from the snapshot. Both directions of
@@ -673,25 +927,29 @@ pub fn state_full_entries_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<((StateEventType, StateKey), OwnedEventId)>> + Send + '_ {
-	self.state_full_ids_strict(shortstatehash)
-		.try_collect::<Vec<_>>()
-		.and_then(async move |entries| {
-			let (shortstatekeys, event_ids): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-			self.services
+	let services_guard = self.services.get();
+	async_stream::try_stream! {
+		let services_root = services_guard.as_ref();
+		let entries = self.state_full_ids_strict(shortstatehash).try_collect::<Vec<_>>().await?;
+		let mut decoded = Vec::new();
+		let mut bytes = 0_usize;
+		for (shortstatekey, event_id) in entries {
+			let state_key = services_root
 				.short
-				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
-				.zip(event_ids.into_iter().stream())
-				.map(|(state_key, event_id)| {
-					state_key
-						.map(|state_key| (state_key, event_id))
-						.map_err(|_| Error::bad_database("Incomplete state key mapping"))
-				})
-				.try_collect::<Vec<_>>()
+				.get_statekey_from_short(shortstatekey)
 				.await
-		})
-		.map_ok(Vec::into_iter)
-		.map_ok(IterStream::try_stream)
-		.try_flatten_stream()
+				.map_err(|_| Error::bad_database("Incomplete state key mapping"))?;
+			bytes = bytes
+				.saturating_add(state_key.0.to_cow_str().len())
+				.saturating_add(state_key.1.as_str().len())
+				.saturating_add(event_id.as_str().len());
+			if bytes > MAX_STATE_MAPPING_BYTES {
+				Err(state_mapping_limit())?;
+			}
+			decoded.push((state_key, event_id));
+		}
+		for item in decoded { yield item; }
+	}
 }
 
 /// Iterates complete current-state PDUs. Every PDU must bind to its snapshot
@@ -701,22 +959,30 @@ pub fn state_full_pdus_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<((StateEventType, StateKey), Pdu)>> + Send + '_ {
-	self.state_full_entries_strict(shortstatehash)
-		.broad_and_then(async |(state_key, event_id)| {
-			let pdu = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete state event"))?;
-			if pdu.event_id() != event_id
-				|| pdu.event_type().to_cow_str() != state_key.0.to_cow_str()
-				|| pdu.state_key() != Some(state_key.1.as_str())
-			{
-				return Err(Error::bad_database("Mismatched state event"));
-			}
-			Ok((state_key, pdu))
-		})
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_full_entries_strict(shortstatehash)
+			.and_then(async |(state_key, event_id)| {
+				let pdu = services_root
+					.timeline
+					.get_pdu(&event_id)
+					.await
+					.map_err(|error| {
+						if error.kind() == ErrorKind::NotFound {
+							Error::bad_database("Incomplete state event")
+						} else {
+							error
+						}
+					})?;
+				if pdu.event_id() != event_id
+					|| pdu.event_type().to_cow_str() != state_key.0.to_cow_str()
+					|| pdu.state_key() != Some(state_key.1.as_str())
+				{
+					return Err(Error::bad_database("Mismatched state event"));
+				}
+				Ok((state_key, pdu))
+			})
+	})
 }
 
 /// Builds a StateMap by iterating over all keys that start
@@ -726,17 +992,20 @@ pub fn state_full_ids(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = (ShortStateKey, OwnedEventId)> + Send + '_ {
-	self.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.unzip()
-		.map(|(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
-				.zip(shortstatekeys.into_iter().stream())
-				.ready_filter_map(|(eid, ssk)| eid.ok().map(|eid| (ssk, eid)))
-		})
-		.flatten_stream()
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.state_full_shortids(shortstatehash)
+			.ignore_err()
+			.unzip()
+			.map(|(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
+				services_root
+					.short
+					.multi_get_eventid_from_short(shorteventids.into_iter().stream())
+					.zip(shortstatekeys.into_iter().stream())
+					.ready_filter_map(|(eid, ssk)| eid.ok().map(|eid| (ssk, eid)))
+			})
+			.flatten_stream()
+	})
 }
 
 /// Builds a complete StateMap for the given state hash.
@@ -748,32 +1017,26 @@ pub fn state_full_ids_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<(ShortStateKey, OwnedEventId)>> + Send + '_ {
-	self.state_full_shortids(shortstatehash)
-		.try_fold(
-			(Vec::new(), Vec::new()),
-			async |(mut shortstatekeys, mut shorteventids), (shortstatekey, shorteventid)| {
-				shortstatekeys.push(shortstatekey);
-				shorteventids.push(shorteventid);
-
-				Ok((shortstatekeys, shorteventids))
-			},
-		)
-		.and_then(async move |(shortstatekeys, shorteventids)| {
-			self.services
+	let services_guard = self.services.get();
+	async_stream::try_stream! {
+		let services_root = services_guard.as_ref();
+		let entries = self.state_full_shortids(shortstatehash).try_collect::<Vec<_>>().await?;
+		let mut decoded = Vec::new();
+		let mut bytes = 0_usize;
+		for (shortstatekey, shorteventid) in entries {
+			let event_id = services_root
 				.short
-				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
-				.zip(shortstatekeys.into_iter().stream())
-				.map(|(event_id, shortstatekey)| {
-					event_id
-						.map(|event_id| (shortstatekey, event_id))
-						.map_err(|_| Error::bad_database("Incomplete state event mapping"))
-				})
-				.try_collect::<Vec<_>>()
+				.get_eventid_from_short::<OwnedEventId>(shorteventid)
 				.await
-		})
-		.map_ok(Vec::into_iter)
-		.map_ok(IterStream::try_stream)
-		.try_flatten_stream()
+				.map_err(|_| Error::bad_database("Incomplete state event mapping"))?;
+			bytes = bytes.saturating_add(event_id.as_str().len());
+			if bytes > MAX_STATE_MAPPING_BYTES {
+				Err(state_mapping_limit())?;
+			}
+			decoded.push((shortstatekey, event_id));
+		}
+		for item in decoded { yield item; }
+	}
 }
 
 #[implement(super::Service)]
@@ -798,10 +1061,19 @@ pub fn state_full_shortids(
 #[implement(super::Service)]
 #[tracing::instrument(name = "load", level = "debug", skip(self))]
 async fn load_full_state(&self, shortstatehash: ShortStateHash) -> Result<Arc<CompressedState>> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.state_compressor
 		.load_shortstatehash_info(shortstatehash)
-		.map_err(|e| err!(Database("Missing state IDs: {e}")))
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Database("Missing state IDs"))
+			} else {
+				error
+			}
+		})
 		.map_ok(|vec| {
 			vec.last()
 				.expect("at least one layer")

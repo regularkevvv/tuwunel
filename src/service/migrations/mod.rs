@@ -52,11 +52,16 @@ mod injectivity;
 mod migrate_media;
 mod migrate_profile_keys;
 mod moderation;
+mod notification_cutoffs;
+mod notification_index;
 mod rebuild_roomid_tscount_pducount;
 mod remove_remote_media_userid;
 mod retroactively_fix_bad_data_from_roomuserid_joined;
 mod split_conduit_highlight_counts;
 mod upgrade_legacy_mediaid_user;
+
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub use self::notification_index::NotificationIndexMigrationPause;
 
 #[cfg(test)]
 mod tests;
@@ -67,16 +72,29 @@ mod tests;
 /// - If database is opened at lesser version we apply migrations up to this.
 ///   Note that named-feature migrations may also be performed when opening at
 ///   equal or lesser version. These are expected to be backward-compatible.
-pub(crate) const DATABASE_VERSION: u64 = 17;
+// Version 19 adds durable notification plans, frozen push decisions and read
+// cutoffs. Older senders must refuse the new queue semantics before readiness.
+// Version 20 adds a reciprocal room/user notification index. Older writers
+// must refuse before accepting notifications that would omit this index.
+// Version 21 gives active deliveries persistent counter identities. Older
+// senders must not interpret their envelopes as EDUs or acknowledge
+// replacements.
+// Version 22 persists immutable outgoing transaction bodies and membership.
+// Older senders must refuse before recomposing an already attempted delivery.
+// Version 23 commits canonical federation obligations with their source PDU.
+// Older writers cannot resume these plans and must refuse the database.
+// Version 24 retains received/owned federation roles after queue ACK.
+// Older writers cannot classify new canonical rows and must refuse.
+pub(crate) const DATABASE_VERSION: u64 = 24;
 
 const SERVER_NAME_KEY: &[u8] = b"server_name";
 
 const FORCE_MIGRATION_DELAY: Duration = Duration::from_secs(15);
 
 /// A marker written by a sibling conduwuit-lineage server but never by tuwunel.
-/// Its presence identifies a foreign database at a higher schema number even
-/// after tuwunel has stamped its own `server_name`, so a database opened by
-/// both servers in turn keeps booting rather than being refused as too new.
+/// Its presence identifies a foreign database at a higher schema number.
+/// A completed import removes it when claiming our incompatible schema, so
+/// older tuwunel builds cannot misclassify our version as a foreign import.
 const FOREIGN_LINEAGE_MARKER: &[u8] = b"populate_userroomid_leftstate_table";
 
 /// Inline budget for a local user id assembled from a foreign localpart.
@@ -95,21 +113,21 @@ pub(crate) async fn migrations(services: &Services) -> Result {
 		sleep(FORCE_MIGRATION_DELAY).await;
 	}
 
+	let users_count = services.users.count().await;
+	// Computed before check_server_name backfills SERVER_NAME_KEY, which would
+	// otherwise mask a Conduit-lineage database (it carries no foreign marker).
+	let foreign_lineage = is_foreign_lineage(services).await;
+	// An empty account inventory or disabled migrations must not bypass the
+	// incompatible-version gate and rewrite a newer native database as fresh.
+	check_database_version(services, foreign_lineage, users_count != 0).await?;
+
 	if !services.config.database_migrations {
 		warn!("Skipping database migrations due to configuration...");
 		return Ok(());
 	}
-
-	let users_count = services.users.count().await;
 	if users_count == 0 {
 		return fresh(services).await;
 	}
-
-	// Computed before check_server_name backfills SERVER_NAME_KEY, which would
-	// otherwise mask a Conduit-lineage database (it carries no foreign marker).
-	let foreign_lineage = is_foreign_lineage(services).await;
-
-	check_database_version(services, foreign_lineage).await?;
 	check_server_name(services).await?;
 
 	// Repairs residue rather than the schema, so it sits behind the gates
@@ -137,10 +155,22 @@ async fn is_foreign_lineage(services: &Services) -> bool {
 /// gated. Within our lineage a version below 13 is refused as unmigratable and
 /// one above this build as too new to open safely; force_migration overrides
 /// the latter for a deliberate downgrade.
-async fn check_database_version(services: &Services, foreign_lineage: bool) -> Result {
-	let discovered = services.globals.db.database_version().await;
+async fn check_database_version(
+	services: &Services,
+	foreign_lineage: bool,
+	has_users: bool,
+) -> Result {
+	let discovered: u64 = match services.db["global"]
+		.get(b"version")
+		.await
+		.deserialized()
+	{
+		| Ok(version) => version,
+		| Err(error) if error.is_not_found() => 0,
+		| Err(error) => return Err(error),
+	};
 
-	if discovered < 13 {
+	if discovered < 13 && has_users {
 		return Err!(Database("Database schema version {discovered} is no longer supported"));
 	}
 
@@ -148,6 +178,25 @@ async fn check_database_version(services: &Services, foreign_lineage: bool) -> R
 		return Err!(Database(
 			"Database schema version {discovered} is newer than this build supports \
 			 ({DATABASE_VERSION}). Upgrade tuwunel to a build supporting this database."
+		));
+	}
+
+	// Before version 22 the active rows did not retain the HTTP transaction
+	// body or its identity. Rebuilding them under the new sender can duplicate
+	// a transaction already applied remotely whose acknowledgement was lost.
+	// Refuse before server-name repair, fresh stamping or any migration writes;
+	// the previous writer must finish these sends while admission is quiesced.
+	// Foreign schema numbers cannot establish that our journal is present.
+	if (foreign_lineage || discovered < 22)
+		&& !services.db["servercurrentevent_data"]
+			.raw_keys_after(None, 1)
+			.await?
+			.is_empty()
+	{
+		return Err!(Database(
+			"Legacy active deliveries have no durable transaction body. Drain active deliveries \
+			 with the previous writer while admission is quiesced before upgrading; do not \
+			 delete or requeue them."
 		));
 	}
 
@@ -266,6 +315,12 @@ async fn fresh(services: &Services) -> Result {
 	db["global"]
 		.insert(b"media_usage_counters", [])
 		.await?;
+	db["global"]
+		.insert(b"notification_read_cutoffs_v1", [])
+		.await?;
+	db["global"]
+		.insert(b"notification_index_v1", [])
+		.await?;
 	mark_clean_injectivity(services).await?;
 
 	// Create the admin room and server user on first run
@@ -302,7 +357,7 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 			.await?;
 	}
 
-	migrate_media(services).await?;
+	migrate_media(services).boxed().await?;
 
 	if db["global"]
 		.get(b"fix_pdu_missing_room_id")
@@ -484,14 +539,20 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 			.await?;
 	}
 
-	// A newer same-lineage database was already refused; stamping ours is safe. A
-	// foreign import above our version was already stamped down before the import
-	// ran, so this is a no-op for it.
-	services
-		.globals
-		.db
-		.bump_database_version(target_version)
+	notification_cutoffs::migrate(services, discovered < 19 || foreign_lineage)
+		.boxed()
 		.await?;
+	notification_index::migrate(services)
+		.boxed()
+		.await?;
+
+	// Claim our schema and lineage together after the import finishes. Retaining
+	// the foreign marker would let older builds bypass their newer-schema gate
+	// and open a database containing destructive jobs they cannot resume.
+	let mut txn = db.txn();
+	txn.raw_put(&db["global"], b"version", target_version);
+	txn.del_raw(&db["global"], FOREIGN_LINEAGE_MARKER);
+	txn.execute().await?;
 
 	match discovered.cmp(&target_version) {
 		| Ordering::Less =>

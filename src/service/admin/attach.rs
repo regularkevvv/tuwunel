@@ -20,6 +20,9 @@ use crate::media::MXC_LENGTH;
 /// message referencing it. The caller attaches the relation.
 #[implement(super::Service)]
 pub(super) async fn attach(&self, output: &CommandOutput) -> Result<RoomMessageEventContent> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let (mime, ext) = match output {
 		| CommandOutput::Markdown(_) => ("text/markdown", "md"),
 		| CommandOutput::Plain(_) => ("text/plain", "txt"),
@@ -29,17 +32,17 @@ pub(super) async fn attach(&self, output: &CommandOutput) -> Result<RoomMessageE
 	let filename = format!("admin-output-{}.{ext}", now_secs());
 	let media_id = random_string(MXC_LENGTH);
 	let mxc = Mxc {
-		server_name: self.services.globals.server_name(),
+		server_name: services_root.globals.server_name(),
 		media_id: &media_id,
 	};
 
 	let content_disposition = make_content_disposition(None, Some(mime), Some(&filename));
 
-	self.services
+	services_root
 		.media
 		.create(
 			&mxc,
-			Some(&self.services.globals.server_user),
+			Some(&services_root.globals.server_user),
 			Some(&content_disposition),
 			Some(mime),
 			text.as_bytes(),

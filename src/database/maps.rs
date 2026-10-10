@@ -83,6 +83,10 @@ pub(crate) fn descriptor(name: &str) -> &'static Descriptor {
 /// tombstones but are not opened for use.
 pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
+		name: "adminjobid_record",
+		..descriptor::RANDOM
+	},
+	Descriptor {
 		name: "alias_roomid",
 		..descriptor::RANDOM_SMALL
 	},
@@ -303,6 +307,18 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "notificationreceiptid_record",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "notificationid_index",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "pduid_notificationplan",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "pduid_pdu",
 		cache_disp: CacheDisp::SharedWith("eventid_outlierpdu"),
 		key_size_hint: Some(16),
@@ -416,6 +432,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "roomuserid_notificationcutoff",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "roomuserid_lastnotificationread",
 		..descriptor::RANDOM_SMALL
 	},
@@ -458,6 +478,14 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "servercurrentevent_data",
 		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "sendingtransaction_record",
+		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "pduid_federationplan",
+		..descriptor::RANDOM
 	},
 	Descriptor {
 		name: "servername_destination",

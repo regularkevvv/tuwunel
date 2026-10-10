@@ -93,7 +93,10 @@ pub fn keypair(&self) -> &Ed25519KeyPair { &self.keypair }
 /// key expiring then.
 #[implement(Service)]
 pub async fn stage_signing_key(&self) -> Result<OwnedServerSigningKeyId> {
-	keypair::stage_next(&self.services.db).await
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	keypair::stage_next(&services_root.db).await
 }
 
 #[implement(Service)]
@@ -174,7 +177,10 @@ pub async fn cached_key(
 	key_id: &ServerSigningKeyId,
 	usage: KeyUse,
 ) -> Option<VerifyKey> {
-	if self.services.globals.server_is_ours(origin)
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.globals.server_is_ours(origin)
 		&& let Some(key) = self.verify_keys.get(key_id)
 	{
 		return Some(key.clone());
@@ -188,13 +194,16 @@ pub async fn cached_key(
 
 #[implement(Service)]
 pub async fn verify_keys_for(&self, origin: &ServerName) -> VerifyKeys {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut keys = self
 		.signing_keys_for(origin)
 		.await
 		.map(|keys| merge_old_keys(keys).verify_keys)
 		.unwrap_or(BTreeMap::new());
 
-	if self.services.globals.server_is_ours(origin) {
+	if services_root.globals.server_is_ours(origin) {
 		keys.extend(self.verify_keys.clone());
 	}
 

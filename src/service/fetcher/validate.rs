@@ -58,7 +58,10 @@ async fn verify_pdu(&self, opts: &Opts, bytes: &[u8]) -> Result {
 	}
 
 	if opts.check_signature || opts.check_hashes {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.server_keys
 			.verify_event(&value, Some(room_version))
 			.await?;

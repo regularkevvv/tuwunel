@@ -29,7 +29,6 @@ use crate::rooms::{
 	read_receipt::PrivateRead,
 	short::{ShortRoomId, ShortStateHash},
 	state_accessor::plain_text_topic,
-	state_cache::MembershipUpdate,
 	state_compressor::CompressedState,
 };
 
@@ -39,13 +38,13 @@ type Band<'a> = SmallVec<[&'a EventId; 1]>;
 ///
 /// A pdu's effects follow the commit that stores it, each on its own: push
 /// counts, notification rows and pushes, membership, the search index,
-/// relations and threads, appservice delivery, and, for a local pdu, the queue
-/// to the room's other servers. One that fails is logged at error level under
-/// its name, with the pdu's event id and never its content, and the rest still
-/// run. The pdu stays sent: its sender is told so, and a retry of the sender's
-/// transaction finds the record and runs nothing again.
+/// relations and threads, and appservice delivery. One that fails is logged at
+/// error level under its name, with the pdu's event id and never its content,
+/// and the rest still run. The pdu stays sent: its sender is told so, and a
+/// retry of the sender's transaction finds the record and runs nothing again.
 ///
-/// So each effect runs at most once per live process. Nothing records an
+/// Federation, notifications and membership have separate durable plans. The
+/// other effects run at most once per live process. Nothing records an
 /// effect as owed, so one that failed, or one a crash cut short, is not
 /// replayed.
 pub(crate) trait Effect {
@@ -63,6 +62,7 @@ impl Effect for Result {
 /// Append the incoming event setting the state snapshot to the state from
 /// the server that sent the event.
 #[implement(super::Service)]
+#[expect(clippy::too_many_arguments)]
 #[tracing::instrument(
 	name = "append_incoming",
 	level = "debug",
@@ -76,21 +76,25 @@ pub(crate) async fn append_incoming_pdu<'a, Leafs>(
 	new_room_leafs: Leafs,
 	state_ids_compressed: Arc<CompressedState>,
 	soft_fail: bool,
+	room_state: Option<ShortStateHash>,
+	federate: bool,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<Option<RawPduId>>
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
 {
-	// We append to state before appending the pdu, so we don't have a moment in
-	// time with the pdu without it's state. This is okay because append_pdu can't
-	// fail.
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	// Save the immutable event-before snapshot. It does not publish current
+	// room state; that pointer changes only in the canonical event commit.
+	services_root
 		.state
 		.set_event_state(&pdu.event_id, &pdu.room_id, state_ids_compressed)
 		.await?;
 
 	if soft_fail {
-		self.services
+		services_root
 			.pdu_metadata
 			.mark_as_referenced(&pdu.room_id, pdu.prev_events.iter().map(AsRef::as_ref))
 			.await?;
@@ -98,7 +102,7 @@ where
 		// Keep the previous band rather than let a soft-failed event empty it; a
 		// later accepted event self-chains and heals it.
 		if let Some(new_room_leafs) = nonempty_band(new_room_leafs) {
-			self.services
+			services_root
 				.state
 				.set_forward_extremities(&pdu.room_id, new_room_leafs.into_iter(), state_lock)
 				.await;
@@ -107,9 +111,18 @@ where
 		return Ok(None);
 	}
 
-	// The event handler made the resolved state current before this call.
+	// Publish resolved current state and any required federation obligation
+	// together with the canonical event.
 	let pdu_id = self
-		.append_pdu(pdu, pdu_json, new_room_leafs, None, state_lock)
+		.append_pdu_with_delivery(
+			pdu,
+			pdu_json,
+			new_room_leafs,
+			None,
+			room_state,
+			federate,
+			state_lock,
+		)
 		.await?;
 
 	Ok(Some(pdu_id))
@@ -165,11 +178,10 @@ where
 /// `txnid` is a `userdevicetxnid_response` key from
 /// [`crate::transaction_ids::key`], written with the event id as its value.
 #[implement(super::Service)]
-#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
 pub async fn append_pdu_with_txnid<'a, Leafs>(
 	&'a self,
 	pdu: &'a PduEvent,
-	mut pdu_json: CanonicalJsonObject,
+	pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
 	txnid: Option<&'a [u8]>,
 	room_state: Option<ShortStateHash>,
@@ -178,16 +190,206 @@ pub async fn append_pdu_with_txnid<'a, Leafs>(
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
 {
+	self.append_pdu_with_delivery(pdu, pdu_json, leafs, txnid, room_state, false, state_lock)
+		.await
+}
+
+#[implement(super::Service)]
+#[expect(clippy::too_many_arguments)]
+#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
+pub(crate) async fn append_pdu_with_delivery<'a, Leafs>(
+	&'a self,
+	pdu: &'a PduEvent,
+	mut pdu_json: CanonicalJsonObject,
+	leafs: Leafs,
+	txnid: Option<&'a [u8]>,
+	room_state: Option<ShortStateHash>,
+	federate: bool,
+	state_lock: &'a RoomMutexGuard,
+) -> Result<RawPduId>
+where
+	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
+{
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	services_root
+		.state_cache
+		.resume_membership_projection(pdu.room_id(), state_lock)
+		.await?;
+
 	// Coalesce database writes for the remainder of this scope.
 	let _cork = self.db.db.cork_and_flush();
 
-	let shortroomid = self
-		.services
+	let shortroomid = services_root
 		.short
 		.get_shortroomid(pdu.room_id())
 		.await
 		.map_err(|_| err!(Database("Room does not exist")))?;
 
+	self.correct_append_unsigned(pdu, &mut pdu_json)
+		.await?;
+
+	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
+	let next_count = services_root.globals.next_count().await?;
+
+	let count = PduCount::Normal(*next_count);
+	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
+
+	// One commit stores the pdu, marks the events it references, and makes it
+	// the room's frontier. When `room_state` is given, the same commit makes
+	// that state current. A failed commit leaves none of them, so the pdu is
+	// never visible beside the state it replaced, and the frontier never names
+	// a pdu that was not stored.
+	let mut txn = self.append_pdu_txn_with_role(
+		&pdu_id,
+		pdu,
+		&pdu_json,
+		txnid,
+		room_state.map(|room_state| (room_state, state_lock)),
+		federate,
+	);
+
+	// We must keep track of all events that have been referenced.
+	services_root.pdu_metadata.mark_as_referenced_txn(
+		&mut txn,
+		pdu.room_id(),
+		pdu.prev_events().map(AsRef::as_ref),
+	);
+
+	services_root
+		.state
+		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
+		.await;
+
+	let notifications = services_root
+		.pusher
+		.stage_notification_plan(&mut txn, pdu_id, pdu, room_state)
+		.await?;
+
+	let sender_read = services_root
+		.read_receipt
+		.stage_private_read(
+			PrivateRead {
+				room_id: pdu.room_id(),
+				user_id: pdu.sender(),
+				count: *next_count,
+				ts: pdu.origin_server_ts(),
+				thread: &ReceiptThread::Unthreaded,
+				announce: false,
+			},
+			&mut txn,
+			state_lock,
+		)
+		.await?;
+
+	let federation = if federate {
+		let state = match room_state {
+			| Some(state) => state,
+			| None =>
+				services_root
+					.state
+					.get_room_shortstatehash(pdu.room_id())
+					.await?,
+		};
+		Some(
+			services_root
+				.sending
+				.db
+				.stage_federation_plan(&mut txn, pdu_id, pdu, state)
+				.await?,
+		)
+	} else {
+		None
+	};
+	// This is one indivisible admission, including metadata, deletions, client
+	// transaction identity, state and both notification/federation plans.
+	let projection = services_root
+		.state_cache
+		.stage_membership_projection(
+			&mut txn,
+			pdu.room_id(),
+			room_state,
+			Some(pdu),
+			count,
+			state_lock,
+		)
+		.await?;
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await?;
+	drop(projection);
+	drop(federation);
+	drop(notifications);
+
+	if let Some(sender_read) = sender_read {
+		sender_read.committed(&services_root.pusher);
+	}
+
+	drop(insert_lock);
+
+	// The pdu is durable. Nothing below returns an error: an effect that fails
+	// is logged and the rest still run (`Effect`).
+	let event_id = pdu.event_id();
+
+	// Only local senders can own pushers.
+	if services_root.globals.user_is_local(pdu.sender()) {
+		services_root
+			.sending
+			.refresh_push_badge(pdu.sender())
+			.await
+			.effect("push badge", event_id);
+	}
+
+	services_root
+		.pusher
+		.append_pdu(pdu_id, pdu, state_lock)
+		.await
+		.effect("push", event_id);
+
+	services_root
+		.state_cache
+		.resume_membership_projection(pdu.room_id(), state_lock)
+		.await
+		.effect("membership projection", event_id);
+
+	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
+		.await;
+
+	// A recount that failed to commit, an earlier event's or this event's own,
+	// is retried here, before this event goes to the room's servers.
+	services_root
+		.state_cache
+		.repair_joined_count(pdu.room_id())
+		.await
+		.effect("joined count repair", event_id);
+
+	drop(next_count);
+
+	if federate {
+		services_root
+			.sending
+			.resume_federation_source(pdu_id)
+			.await
+			.effect("federation page", event_id);
+		services_root.sending.wake_federation_sources();
+	}
+
+	services_root
+		.appservice
+		.append_pdu(pdu_id, pdu)
+		.await
+		.effect("appservice delivery", event_id);
+
+	Ok(pdu_id)
+}
+
+#[implement(super::Service)]
+async fn correct_append_unsigned(
+	&self,
+	pdu: &PduEvent,
+	pdu_json: &mut CanonicalJsonObject,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 	// Make unsigned fields correct. This is not properly documented in the spec,
 	// but state events need to have previous content in the unsigned field, so
 	// clients can easily interpret things like membership changes
@@ -196,12 +398,10 @@ where
 			.entry("unsigned".into())
 			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
 		{
-			if let Ok(shortstatehash) = self
-				.services
+			if let Ok(shortstatehash) = services_root
 				.state
 				.pdu_shortstatehash(pdu.event_id())
-				.await && let Ok(prev_state) = self
-				.services
+				.await && let Ok(prev_state) = services_root
 				.state_accessor
 				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
 				.await
@@ -232,104 +432,62 @@ where
 		}
 	}
 
-	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
-	let next_count = self.services.globals.next_count().await?;
+	Ok(())
+}
 
-	// Mark as read first so the sending client doesn't get a notification even if
-	// appending fails. Route through the dispatcher so per-thread counts are
-	// also cleared; the sender's own send subsumes any thread receipt.
-	self.services
-		.read_receipt
-		.private_read_set(PrivateRead {
-			room_id: pdu.room_id(),
-			user_id: pdu.sender(),
-			count: *next_count,
-			ts: pdu.origin_server_ts(),
-			thread: &ReceiptThread::Unthreaded,
-			announce: false,
-		})
-		.await;
-
-	self.services
-		.pusher
-		.reset_notification_counts_for_thread(
-			pdu.sender(),
-			pdu.room_id(),
-			&ReceiptThread::Unthreaded,
-		)
-		.await;
-
-	let count = PduCount::Normal(*next_count);
-	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
-
-	// One commit stores the pdu, marks the events it references, and makes it
-	// the room's frontier. When `room_state` is given, the same commit makes
-	// that state current. A failed commit leaves none of them, so the pdu is
-	// never visible beside the state it replaced, and the frontier never names
-	// a pdu that was not stored.
-	let mut txn = self.append_pdu_txn(
-		&pdu_id,
-		pdu,
-		&pdu_json,
-		txnid,
-		room_state.map(|room_state| (room_state, state_lock)),
-	);
-
-	// We must keep track of all events that have been referenced.
-	self.services.pdu_metadata.mark_as_referenced_txn(
-		&mut txn,
-		pdu.room_id(),
-		pdu.prev_events().map(AsRef::as_ref),
-	);
-
-	self.services
-		.state
-		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
-		.await;
-
-	txn.execute().await?;
-
-	drop(insert_lock);
-
-	// The pdu is durable. Nothing below returns an error: an effect that fails
-	// is logged and the rest still run (`Effect`).
-	let event_id = pdu.event_id();
-
-	// Only local senders can own pushers.
-	if self.services.globals.user_is_local(pdu.sender()) {
-		self.services
-			.sending
-			.refresh_push_badge(pdu.sender())
-			.await
-			.effect("push badge", event_id);
+/// Admit an existing canonical membership event's first producer role without
+/// rewriting the PDU, current state or client transaction. A completed role
+/// stays completed even after all its queues have been acknowledged.
+#[implement(super::Service)]
+pub(crate) async fn federate_existing_pdu(
+	&self,
+	raw: RawPduId,
+	room: &ruma::RoomId,
+	event: &EventId,
+	state_lock: Option<&RoomMutexGuard>,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let owned_lock = if state_lock.is_none() {
+		Some(services_root.state.mutex.lock(room).await)
+	} else {
+		None
+	};
+	let _state_lock = state_lock
+		.or(owned_lock.as_ref())
+		.expect("canonical room lock");
+	let pdu = self.get_pdu_from_id(&raw).await?;
+	if pdu.room_id != room || pdu.event_id != event || pdu.kind != TimelineEventType::RoomMember {
+		return Err(err!(Request(InvalidParam(
+			"Known event is not the requested membership event"
+		))));
 	}
-
-	self.services
-		.pusher
-		.append_pdu(pdu_id, pdu)
+	if self.get_pdu_id(event).await? != raw
+		|| services_root
+			.short
+			.get_shortroomid(room)
+			.await?
+			.to_be_bytes()
+			!= raw.shortroomid()
+	{
+		return Err(err!(Database("Known canonical event bindings disagree")));
+	}
+	let state = services_root
+		.state
+		.get_room_shortstatehash(room)
+		.await?;
+	services_root
+		.sending
+		.db
+		.admit_known_federation_role(raw, &pdu, state)
+		.await?;
+	services_root
+		.sending
+		.resume_federation_source(raw)
 		.await
-		.effect("push", event_id);
-
-	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
-		.await;
-
-	// A recount that failed to commit, an earlier event's or this event's own,
-	// is retried here, before this event goes to the room's servers.
-	self.services
-		.state_cache
-		.repair_joined_count(pdu.room_id())
-		.await
-		.effect("joined count repair", event_id);
-
-	drop(next_count);
-
-	self.services
-		.appservice
-		.append_pdu(pdu_id, pdu)
-		.await
-		.effect("appservice delivery", event_id);
-
-	Ok(pdu_id)
+		.effect("known federation page", event);
+	services_root.sending.wake_federation_sources();
+	Ok(())
 }
 
 /// The effects a durable pdu's type and relations call for.
@@ -344,6 +502,9 @@ async fn append_pdu_effects(
 	count: PduCount,
 	state_lock: &RoomMutexGuard,
 ) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = pdu.event_id();
 
 	match *pdu.kind() {
@@ -363,19 +524,18 @@ async fn append_pdu_effects(
 				.and_then(|content| content.body);
 
 			if let Some(body) = body {
-				self.services
+				services_root
 					.search
 					.index_pdu(shortroomid, &pdu_id, &body)
 					.await
 					.effect("search index", event_id);
 
-				if self
-					.services
+				if services_root
 					.admin
 					.is_admin_command(pdu, &body)
 					.await
 				{
-					self.services
+					services_root
 						.admin
 						.command(body, Some(event_id.into()))
 						.await
@@ -385,7 +545,7 @@ async fn append_pdu_effects(
 		},
 		| TimelineEventType::RoomTopic =>
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
-				self.services
+				services_root
 					.search
 					.index_pdu(shortroomid, &pdu_id, &topic)
 					.await
@@ -396,7 +556,7 @@ async fn append_pdu_effects(
 
 	// The cached hierarchy summary projects room state; evict on any state change.
 	if pdu.state_key().is_some() {
-		self.services
+		services_root
 			.spaces
 			.cache_evict(pdu.room_id())
 			.await
@@ -408,7 +568,7 @@ async fn append_pdu_effects(
 			.get_pdu_count(&content.relates_to.event_id)
 			.await
 	{
-		self.services
+		services_root
 			.pdu_metadata
 			.add_relation(count, related_pducount)
 			.await
@@ -421,7 +581,7 @@ async fn append_pdu_effects(
 				// We need to do it again here, because replies don't have
 				// event_id as a top level field
 				if let Ok(related_pducount) = self.get_pdu_count(&in_reply_to.event_id).await {
-					self.services
+					services_root
 						.pdu_metadata
 						.add_relation(count, related_pducount)
 						.await
@@ -429,14 +589,14 @@ async fn append_pdu_effects(
 				}
 			},
 			| Relation::Thread(thread) => {
-				self.services
+				services_root
 					.threads
 					.add_to_thread(&thread.event_id, pdu_id, pdu)
 					.await
 					.effect("thread", event_id);
 			},
 			| Relation::Replacement(replacement) => {
-				self.services
+				services_root
 					.pdu_metadata
 					.add_typed_relation(
 						shortroomid,
@@ -445,10 +605,11 @@ async fn append_pdu_effects(
 						pdu,
 						RelationType::Replacement,
 					)
-					.await;
+					.await
+					.effect("typed relation", event_id);
 			},
 			| Relation::Reference(reference) => {
-				self.services
+				services_root
 					.pdu_metadata
 					.add_typed_relation(
 						shortroomid,
@@ -457,7 +618,8 @@ async fn append_pdu_effects(
 						pdu,
 						RelationType::Reference,
 					)
-					.await;
+					.await
+					.effect("typed relation", event_id);
 			},
 			| _ => {}, // TODO: Aggregate other types
 		}
@@ -472,8 +634,10 @@ async fn append_redaction_effects(
 	shortroomid: ShortRoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	let room_version = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let room_version = services_root
 		.state
 		.get_room_version(pdu.room_id())
 		.await?;
@@ -483,8 +647,7 @@ async fn append_redaction_effects(
 	let redacts_id = pdu.redacts_id(&room_rules);
 
 	if let Some(redacts_id) = &redacts_id
-		&& self
-			.services
+		&& services_root
 			.state_accessor
 			.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
 			.await?
@@ -502,7 +665,10 @@ async fn append_redaction_effects(
 /// user who is invited or knocked and leaves immediately still leaves the
 /// earlier event on record for auth.
 #[implement(super::Service)]
-async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result {
+async fn append_member_effects(&self, pdu: &PduEvent, _count: PduCount) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(state_key) = pdu.state_key() else {
 		return Ok(());
 	};
@@ -515,32 +681,15 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 	let is_invite = content.membership == MembershipState::Invite;
 	let is_direct = content.is_direct;
 
-	let stripped_state = match content.membership {
-		| MembershipState::Invite | MembershipState::Knock => self
-			.services
-			.state
-			.summary_stripped(pdu)
-			.await
-			.into(),
-		| _ => None,
-	};
-
-	self.services
-		.state_cache
-		.update_membership(MembershipUpdate {
-			room_id: pdu.room_id(),
-			user_id: &user_id,
-			membership_event: content,
-			sender: pdu.sender(),
-			last_state: stripped_state,
-			invite_via: None,
-			update_joined_count: true,
-			count,
-		})
-		.await?;
-
-	if is_invite {
-		self.services
+	if is_invite
+		&& services_root
+			.state_accessor
+			.room_state_get(pdu.room_id(), &ruma::events::StateEventType::RoomMember, state_key)
+			.await?
+			.event_id()
+			== pdu.event_id()
+	{
+		services_root
 			.membership
 			.auto_accept(pdu.room_id(), &user_id, pdu.sender(), is_direct);
 	}
@@ -566,9 +715,33 @@ pub fn append_pdu_txn(
 	txnid: Option<&[u8]>,
 	room_state: Option<(ShortStateHash, &RoomMutexGuard)>,
 ) -> Txn {
+	self.append_pdu_txn_with_role(pdu_id, pdu, json, txnid, room_state, false)
+}
+
+#[implement(super::Service)]
+fn append_pdu_txn_with_role(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &PduEvent,
+	json: &CanonicalJsonObject,
+	txnid: Option<&[u8]>,
+	room_state: Option<(ShortStateHash, &RoomMutexGuard)>,
+	federate: bool,
+) -> Txn {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
 	let mut txn = self.db.db.txn();
+
+	services_root.sending.db.stage_federation_role(
+		&mut txn,
+		pdu_id,
+		pdu.room_id(),
+		pdu.event_id(),
+		federate,
+	);
 
 	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
 	txn.insert_raw(&self.db.eventid_pduid, pdu.event_id.as_bytes(), pdu_id);
@@ -584,7 +757,7 @@ pub fn append_pdu_txn(
 	}
 
 	if let Some((room_state, state_lock)) = room_state {
-		self.services
+		services_root
 			.state
 			.set_room_state_txn(&mut txn, pdu.room_id(), room_state, state_lock);
 	}

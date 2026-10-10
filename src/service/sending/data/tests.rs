@@ -7,8 +7,8 @@ use tuwunel_core::{
 };
 
 use super::{
-	SendingEvent, decode_badge_destination, decode_outgoing, decode_sending,
-	missing_count_is_zero, retain_existing, within_prefix,
+	SendingEvent, decode_outgoing, decode_sending, missing_count_is_zero, retain_existing,
+	within_prefix,
 };
 
 fn unavailable() -> Error { err!(Database("queue read unavailable")) }
@@ -58,14 +58,17 @@ fn prefix_end_and_malformed_rows_remain_distinct_from_scan_failure() {
 }
 
 #[test]
-fn badge_filter_preserves_errors_and_ignores_only_non_badge_rows() {
-	assert!(decode_badge_destination(Ok((b"$unused", b"edu"))).is_none());
-	decode_badge_destination(Err(unavailable()))
-		.expect("failed scan is retained")
-		.expect_err("failed scan is not a destination");
-	decode_badge_destination(Ok((b"$malformed", &[super::TAG_BADGE_REFRESH])))
-		.expect("badge row is retained")
-		.expect_err("malformed badge is reported");
+fn malformed_pending_pdu_ids_are_errors_for_every_destination() {
+	for prefix in
+		[b"+as1\xff".as_slice(), b"$@u:remote.example\xffkey\xff", b"remote.example\xff"]
+	{
+		for suffix in [b"".as_slice(), b"short", &[0x80; 16], &[1; 17]] {
+			let mut key = prefix.to_vec();
+			key.extend_from_slice(suffix);
+			decode_outgoing(Ok((&key, b"")))
+				.expect_err("corrupt pending PDU IDs cannot panic or disappear");
+		}
+	}
 }
 
 #[test]
@@ -91,4 +94,47 @@ fn edu_watermark_defaults_only_when_missing() {
 		.expect_err("failed lookup is not a new destination");
 	missing_count_is_zero(Err(Error::bad_database("malformed watermark")))
 		.expect_err("corrupt counters never rewind to zero");
+}
+
+#[test]
+fn frozen_push_tags_require_a_push_destination_and_a_valid_pdu_id() {
+	let mut raw = 1_u64.to_be_bytes().to_vec();
+	raw.extend_from_slice(&2_u64.to_be_bytes());
+	let mut key = b"$@u:remote.example\xffkey\xff".to_vec();
+	key.extend_from_slice(&raw);
+	let (_, event, _) =
+		decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH]))).expect("frozen queue row");
+	assert!(matches!(event, SendingEvent::FrozenPush(_)));
+	decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH, 0])))
+		.expect_err("exact frozen tag shape required");
+	for prefix in [b"+as\xff".as_slice(), b"remote.example\xff"] {
+		let mut key = prefix.to_vec();
+		key.extend_from_slice(&raw);
+		decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH])))
+			.expect_err("frozen decisions are push-only");
+	}
+	let mut key = b"$@u:remote.example\xffkey\xff".to_vec();
+	key.extend_from_slice(b"invalid");
+	decode_outgoing(Ok((&key, &[super::TAG_FROZEN_PUSH])))
+		.expect_err("corrupt ID cannot disappear as an EDU");
+}
+
+#[test]
+fn identity_envelopes_are_active_only_and_reject_corrupt_headers() -> Result {
+	let key = b"remote.example\xff0000000000000001";
+	let event = SendingEvent::Edu(super::super::EduBuf::from_slice(b"{}"));
+	let framed = super::active::encode(&event, 1)?;
+	assert_eq!(decode_outgoing(Ok((key, &framed)))?.1, event);
+	decode_sending(Ok((key, &framed))).expect_err("pending rows cannot own active identities");
+	for end in 1..10 {
+		decode_outgoing(Ok((key, &framed[..end])))
+			.expect_err("a truncated identity must not be an EDU or PDU");
+	}
+	let mut corrupt = framed;
+	corrupt[1] = 2;
+	decode_outgoing(Ok((key, &corrupt))).expect_err("unknown envelope version");
+	corrupt[1] = 1;
+	corrupt[2..10].fill(0);
+	decode_outgoing(Ok((key, &corrupt))).expect_err("zero identity");
+	Ok(())
 }

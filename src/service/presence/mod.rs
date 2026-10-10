@@ -23,7 +23,7 @@ use tuwunel_core::{
 	Result, checked, debug, debug_warn, err,
 	result::LogErr,
 	trace,
-	utils::{self, TryFutureExtExt},
+	utils::{self, MutexMap, TryFutureExtExt},
 };
 
 use self::{aggregate::PresenceAggregator, data::Data};
@@ -66,6 +66,7 @@ pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	last_sync_seen: RwLock<HashMap<OwnedUserId, u64>>,
 	device_presence: PresenceAggregator,
+	update_mutex: MutexMap<OwnedUserId, ()>,
 }
 
 type TimerType = (OwnedUserId, Duration, u64);
@@ -86,23 +87,27 @@ impl crate::Service for Service {
 			services: args.services.clone(),
 			last_sync_seen: RwLock::new(HashMap::new()),
 			device_presence: PresenceAggregator::new(),
+			update_mutex: MutexMap::new(),
 		}))
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// reset dormant online/away statuses to offline, and set the server user as
 		// online
 		self.unset_all_presence().await;
-		self.device_presence.clear().await;
+		self.device_presence.clear();
 		_ = self
-			.maybe_ping_presence(&self.services.globals.server_user, Ping::default())
+			.maybe_ping_presence(&services_root.globals.server_user, Ping::default())
 			.await;
 
 		let receiver = self.timer_channel.1.clone();
 
 		let mut presence_timers: FuturesUnordered<_> = FuturesUnordered::new();
 		let mut timer_handles: HashMap<OwnedUserId, (u64, AbortHandle)> = HashMap::new();
-		while !receiver.is_closed() && self.services.server.is_running() {
+		while !receiver.is_closed() && services_root.server.is_running() {
 			tokio::select! {
 				Some(result) = presence_timers.next() => {
 					let Ok((user_id, count)) = result else {
@@ -147,7 +152,7 @@ impl crate::Service for Service {
 		};
 
 		_ = self
-			.maybe_ping_presence(&self.services.globals.server_user, ping)
+			.maybe_ping_presence(&services_root.globals.server_user, ping)
 			.await;
 
 		Ok(())
@@ -167,7 +172,10 @@ impl Service {
 	/// record that a user has just successfully completed a /sync (or
 	/// equivalent activity)
 	pub async fn note_sync(&self, user_id: &UserId, appservice: Option<&RegistrationInfo>) {
-		if appservice.is_some() || !self.services.config.suppress_push_when_active {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if appservice.is_some() || !services_root.config.suppress_push_when_active {
 			return;
 		}
 
@@ -205,19 +213,21 @@ impl Service {
 
 	// Unset online/unavailable presence to offline on startup
 	async fn unset_all_presence(&self) {
-		if !self.services.server.config.allow_local_presence || self.services.db.is_read_only() {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !services_root.server.config.allow_local_presence || services_root.db.is_read_only() {
 			return;
 		}
 
-		let _cork = self.services.db.cork();
+		let _cork = services_root.db.cork();
 
 		// Accounts are read in bounded batches from a cursor, each read closed
 		// before its presence is written, so the reset never holds a scan of
 		// every account open, nor every account in memory.
 		let mut after: Option<Vec<u8>> = None;
 		loop {
-			let (users, next) = match self
-				.services
+			let (users, next) = match services_root
 				.users
 				.local_users_after(after.as_deref(), RESET_BATCH)
 				.await
@@ -305,11 +315,14 @@ impl Service {
 
 	/// Creates a PresenceEvent from available data.
 	async fn to_presence_event(&self, presence: Presence, user_id: &UserId) -> PresenceEvent {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let now = utils::millis_since_unix_epoch();
 		let last_active_ago = now.saturating_sub(presence.last_active_ts);
 
-		let avatar_url = self.services.profile.avatar_url(user_id).ok();
-		let displayname = self.services.profile.displayname(user_id).ok();
+		let avatar_url = services_root.profile.avatar_url(user_id).ok();
+		let displayname = services_root.profile.displayname(user_id).ok();
 		let (avatar_url, displayname) = join(avatar_url, displayname).await;
 
 		PresenceEvent {

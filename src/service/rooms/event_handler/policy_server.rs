@@ -200,8 +200,11 @@ fn current_policy_state(
 /// entirely.
 #[implement(super::Service)]
 pub async fn lookup_policy_server(&self, room_id: &RoomId) -> Option<RoomPolicyEventContent> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let read = async |event_type: &StateEventType| {
-		self.services
+		services_root
 			.state_accessor
 			.room_state_get_content::<UnstablePolicyContent>(room_id, event_type, "")
 			.await
@@ -214,7 +217,7 @@ pub async fn lookup_policy_server(&self, room_id: &RoomId) -> Option<RoomPolicyE
 		| None => read(&StateEventType::from(UNSTABLE_POLICY_TYPE.to_owned())).await?,
 	};
 
-	self.services
+	services_root
 		.state_cache
 		.server_in_room(&content.via, room_id)
 		.await
@@ -232,7 +235,10 @@ pub async fn sign_outgoing_pdu<E>(&self, pdu_json: &mut CanonicalJsonObject, pdu
 where
 	E: Event,
 {
-	if !self.services.server.config.enable_policy_servers {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root.server.config.enable_policy_servers {
 		return Ok(());
 	}
 
@@ -240,8 +246,7 @@ where
 		return Ok(());
 	}
 
-	let Ok(room_version) = self
-		.services
+	let Ok(room_version) = services_root
 		.state
 		.get_room_version(pdu.room_id())
 		.await
@@ -314,6 +319,9 @@ async fn fetch_policy_signature(
 	pdu_json: &CanonicalJsonObject,
 	room_version: &RoomVersionId,
 ) -> FetchOutcome {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let outgoing = into_outgoing_federation(pdu_json.clone(), room_version);
 	let Ok(raw) = to_raw_value(&outgoing) else {
 		warn!(via = %policy.via, "failed to serialize PDU for policy /sign; failing open");
@@ -321,7 +329,7 @@ async fn fetch_policy_signature(
 	};
 
 	let timeout = Duration::from_secs(
-		self.services
+		services_root
 			.server
 			.config
 			.policy_server_request_timeout,
@@ -329,7 +337,7 @@ async fn fetch_policy_signature(
 
 	let response = match tokio::time::timeout(
 		timeout,
-		self.services
+		services_root
 			.federation
 			.execute(&policy.via, sign_event::Request::new(raw)),
 	)
@@ -460,12 +468,14 @@ async fn fetch_inbound_policy_signature<E>(
 where
 	E: Event,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(policy) = self.lookup_policy_server(pdu.room_id()).await else {
 		return PolicyCheck::NotApplicable;
 	};
 
-	let Ok(room_version) = self
-		.services
+	let Ok(room_version) = services_root
 		.state
 		.get_room_version(pdu.room_id())
 		.await
@@ -542,7 +552,10 @@ pub async fn check_inbound_policy_signature<E>(
 where
 	E: Event,
 {
-	if !self.services.server.config.enable_policy_servers {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root.server.config.enable_policy_servers {
 		return PolicyCheck::NotApplicable;
 	}
 
@@ -554,8 +567,7 @@ where
 		return PolicyCheck::NotApplicable;
 	};
 
-	let Ok(room_version) = self
-		.services
+	let Ok(room_version) = services_root
 		.state
 		.get_room_version(pdu.room_id())
 		.await

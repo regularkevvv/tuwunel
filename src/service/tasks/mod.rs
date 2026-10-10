@@ -1,48 +1,51 @@
-//! In-memory background-task tracker for the Synapse admin API.
+//! Durable admission and status records for long-running admin requests.
 //!
-//! Long-running admin actions (room deletion, history purge, bulk redaction)
-//! run detached on the runtime and are polled by their id or by the resource
-//! they act on. State is process-local: a restart drops history where Synapse
-//! persists it for seven days, which consumers tolerate (they poll right after
-//! issuing, and a post-restart miss reads as Synapse's post-retention 404).
+//! Requests are stored before an id is returned and outcomes before they are
+//! exposed as complete. Typed history jobs resume from mutation-coupled
+//! progress; generic futures retain an explicit interruption failure.
+
+mod data;
+pub(crate) mod history;
 
 use std::{
 	collections::BTreeMap,
+	panic::AssertUnwindSafe,
 	sync::{Arc, Mutex as StdMutex},
 	time::Duration,
 };
 
 use async_trait::async_trait;
+use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 use tuwunel_core::{
 	Result,
 	arrayvec::ArrayString,
-	implement,
+	err, error, implement,
 	utils::{rand::string_array, time::now_millis},
 };
 
-/// Random task-id length, matching Synapse's `random_string(16)`.
+use self::data::Data;
+
 const TASK_ID_LEN: usize = 16;
-
-/// Terminal tasks older than this (seven days) are pruned by the worker.
 const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-
-/// Cap on retained terminal tasks; the oldest are pruned once it is exceeded.
+/// Bound the complete retained journal, including accepted running work.
 const CAPACITY: usize = 1024;
-
-/// Interval between worker garbage-collection sweeps.
+const MAX_RUNNING: usize = 16;
 const GC_INTERVAL: Duration = Duration::from_hours(1);
 
-/// A task's random id: a fixed 16-byte string kept inline.
 type TaskId = ArrayString<TASK_ID_LEN>;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
-	tasks: StdMutex<BTreeMap<TaskId, Task>>,
+	db: Data,
+	journal: Mutex<()>,
+	handles: StdMutex<BTreeMap<TaskId, JoinHandle<()>>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
 	Scheduled,
 	Active,
@@ -50,7 +53,6 @@ pub enum Status {
 	Failed,
 }
 
-/// A tracked task's public snapshot, cloned out from under the lock.
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
 	pub id: TaskId,
@@ -62,14 +64,15 @@ pub struct TaskInfo {
 	pub error: Option<String>,
 }
 
+#[derive(Clone)]
 struct Task {
 	action: &'static str,
 	resource_id: String,
+	parameters: JsonValue,
 	status: Status,
 	timestamp_ms: u64,
 	result: Option<JsonValue>,
 	error: Option<String>,
-	handle: Option<JoinHandle<()>>,
 }
 
 #[async_trait]
@@ -77,121 +80,199 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
-			tasks: StdMutex::new(BTreeMap::new()),
+			db: Data::new(args),
+			journal: Mutex::new(()),
+			handles: StdMutex::new(BTreeMap::new()),
 		}))
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		loop {
-			self.prune();
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
 
+		if services_root.server.config.maintenance {
+			services_root.server.until_shutdown().await;
+			return Ok(());
+		}
+		loop {
+			self.prune().await?;
 			tokio::select! {
 				() = sleep(GC_INTERVAL) => {},
-				() = self.services.server.until_shutdown() => return Ok(()),
+				() = services_root.server.until_shutdown() => return Ok(()),
 			}
 		}
 	}
 
-	async fn interrupt(&self) { self.abort_all(); }
+	async fn interrupt(&self) { self.abort_all().await; }
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
-/// Spawn `work` on the runtime as a tracked task, returning its id. The record
-/// transitions Scheduled -> Active -> Complete/Failed; `work`'s `Ok` value is
-/// stored as the result, its `Err` as the error string.
+/// Admit a request durably, then run its future. Admission is serialized with
+/// the duplicate check and retention. No future is polled until Active is
+/// durable, and a refused admission starts no work.
 #[implement(Service)]
-pub fn spawn<F>(self: &Arc<Self>, action: &'static str, resource_id: String, work: F) -> TaskId
+pub async fn spawn<F>(
+	self: &Arc<Self>,
+	action: &'static str,
+	resource_id: String,
+	parameters: JsonValue,
+	work: F,
+) -> Result<TaskId>
 where
 	F: Future<Output = Result<JsonValue>> + Send + 'static,
 {
-	let id = string_array::<TASK_ID_LEN>();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	// Hold the lock across the spawn+insert so the task cannot mark itself
-	// Active before its record exists.
-	let mut tasks = self.tasks.lock().expect("locked");
+	let _guard = self.journal.lock().await;
+	if parameters.get("executor").is_some() {
+		return Err(err!("Typed admin requests require their registered handler"));
+	}
+	let id = self
+		.admit(action, resource_id, parameters)
+		.await?;
+
 	let this = Arc::clone(self);
-	let task_id = id;
-	let handle = self.services.server.runtime().spawn(async move {
-		this.set_active(&task_id);
-		let outcome = work.await;
-		this.finish(&task_id, outcome);
+	let handle = services_root.server.runtime().spawn(async move {
+		let result = async {
+			this.set_active(&id).await?;
+			let outcome = AssertUnwindSafe(work)
+				.catch_unwind()
+				.await
+				.unwrap_or_else(|_| Err(err!("Admin task panicked; partial changes may exist")));
+			this.finish(&id, outcome).await
+		}
+		.await;
+		if let Err(error) = result {
+			error!(%id, %error, "Admin task journal transition failed; task remains unresolved");
+		}
+		this.handles.lock().expect("locked").remove(&id);
 	});
+	self.handles
+		.lock()
+		.expect("locked")
+		.insert(id, handle);
+	Ok(id)
+}
 
-	tasks.insert(id, Task {
+#[implement(Service)]
+async fn admit(
+	&self,
+	action: &'static str,
+	resource_id: String,
+	parameters: JsonValue,
+) -> Result<TaskId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.server.config.maintenance {
+		return Err(err!("Admin tasks are unavailable in maintenance mode"));
+	}
+	if !services_root.server.is_running() {
+		return Err(err!("Admin tasks are unavailable during shutdown"));
+	}
+	data::action(action)?;
+	data::validate_parameters(&parameters)?;
+	let tasks = self.db.load().await?;
+	if tasks
+		.values()
+		.any(|task| matches_nonterminal(task, action, &resource_id))
+	{
+		return Err(err!(Request(InvalidParam("Admin task already in progress for resource"))));
+	}
+	if tasks
+		.values()
+		.filter(|task| !task.status.is_terminal())
+		.count()
+		>= MAX_RUNNING
+	{
+		return data::limit();
+	}
+	let mut id = string_array::<TASK_ID_LEN>();
+	while tasks.contains_key(&id) {
+		id = string_array::<TASK_ID_LEN>();
+	}
+	let task = Task {
 		action,
 		resource_id,
+		parameters,
 		status: Status::Scheduled,
 		timestamp_ms: now_millis(),
 		result: None,
 		error: None,
-		handle: Some(handle),
-	});
+	};
+	// Validate the prospective record before any retention deletion.
+	data::validate_record(&id, &task)?;
+	self.db
+		.remove(&prune_ids(&tasks, now_millis(), 1))
+		.await?;
+	self.db.put(&id, &task).await?;
 
-	id
+	Ok(id)
 }
 
-/// The task with this id, if it is still tracked.
+/// Canonical storage errors propagate; an unavailable journal is not a 404.
 #[implement(Service)]
-pub fn get(&self, id: &str) -> Option<TaskInfo> {
-	self.tasks
-		.lock()
-		.expect("locked")
-		.get_key_value(id)
-		.map(|(id, task)| task.info(id))
+pub async fn get(&self, id: &str) -> Result<Option<TaskInfo>> {
+	let _guard = self.journal.lock().await;
+	Ok(self
+		.db
+		.get(id)
+		.await?
+		.map(|(id, task)| task.info(&id)))
 }
 
-/// Every tracked task acting on `resource_id`, newest ordering not guaranteed.
 #[implement(Service)]
-pub fn by_resource(&self, resource_id: &str) -> Vec<TaskInfo> {
-	self.tasks
-		.lock()
-		.expect("locked")
-		.iter()
-		.filter(|(_, task)| task.resource_id.as_str() == resource_id)
-		.map(|(id, task)| task.info(id))
-		.collect()
-}
-
-/// Whether a nonterminal task matches both `action` and `resource_id`.
-#[implement(Service)]
-pub fn has_nonterminal(&self, action: &str, resource_id: &str) -> bool {
-	self.tasks
-		.lock()
-		.expect("locked")
-		.values()
-		.any(|task| matches_nonterminal(task, action, resource_id))
+pub async fn by_resource(&self, resource_id: &str) -> Result<Vec<TaskInfo>> {
+	Ok(self
+		.list()
+		.await?
+		.into_iter()
+		.filter(|task| task.resource_id == resource_id)
+		.collect())
 }
 
 fn matches_nonterminal(task: &Task, action: &str, resource_id: &str) -> bool {
-	task.action == action && task.resource_id == resource_id && !task.status.is_terminal()
+	task.resource_id == resource_id
+		&& !task.status.is_terminal()
+		&& (task.action == action
+			|| (matches!(task.action, "purge_history" | "shutdown_and_purge_room")
+				&& matches!(action, "purge_history" | "shutdown_and_purge_room")))
 }
 
-/// Every tracked task; callers filter by action or status.
 #[implement(Service)]
-pub fn list(&self) -> Vec<TaskInfo> {
-	self.tasks
-		.lock()
-		.expect("locked")
+pub async fn list(&self) -> Result<Vec<TaskInfo>> {
+	let _guard = self.journal.lock().await;
+	Ok(self
+		.db
+		.load()
+		.await?
 		.iter()
 		.map(|(id, task)| task.info(id))
-		.collect()
+		.collect())
 }
 
 #[implement(Service)]
-fn set_active(&self, id: &str) {
-	if let Some(task) = self.tasks.lock().expect("locked").get_mut(id) {
-		task.status = Status::Active;
-	}
+async fn set_active(&self, id: &TaskId) -> Result {
+	let _guard = self.journal.lock().await;
+	let (_, mut task) = self
+		.db
+		.get(id)
+		.await?
+		.ok_or_else(|| err!("Accepted admin task is missing"))?;
+	task.status = Status::Active;
+	self.db.put(id, &task).await
 }
 
 #[implement(Service)]
-fn finish(&self, id: &str, outcome: Result<JsonValue>) {
-	let mut tasks = self.tasks.lock().expect("locked");
-	let Some(task) = tasks.get_mut(id) else {
-		return;
-	};
-
+async fn finish(&self, id: &TaskId, outcome: Result<JsonValue>) -> Result {
+	let _guard = self.journal.lock().await;
+	let (_, mut task) = self
+		.db
+		.get(id)
+		.await?
+		.ok_or_else(|| err!("Accepted admin task is missing"))?;
 	match outcome {
 		| Ok(value) => {
 			task.status = Status::Complete;
@@ -202,23 +283,59 @@ fn finish(&self, id: &str, outcome: Result<JsonValue>) {
 			task.error = Some(error.to_string());
 		},
 	}
+	self.db.put(id, &task).await
 }
 
 #[implement(Service)]
-fn prune(&self) {
-	let now = now_millis();
-
-	prune_tasks(&mut self.tasks.lock().expect("locked"), now);
+async fn prune(&self) -> Result {
+	let _guard = self.journal.lock().await;
+	let tasks = self.db.load().await?;
+	self.db
+		.remove(&prune_ids(&tasks, now_millis(), 0))
+		.await
 }
 
 #[implement(Service)]
-fn abort_all(&self) {
-	self.tasks
-		.lock()
-		.expect("locked")
-		.values()
-		.filter_map(|task| task.handle.as_ref())
-		.for_each(JoinHandle::abort);
+async fn abort_all(&self) {
+	// Admission holds the journal until its handle is registered. Once the
+	// server is stopping, reject new admissions and wait for earlier ones
+	// before collecting every handle that shutdown must join.
+	let handles = {
+		let _journal = self.journal.lock().await;
+		std::mem::take(&mut *self.handles.lock().expect("locked"))
+	};
+	let mut joining = AbortedTasks {
+		registry: &self.handles,
+		pending: handles,
+	};
+	for handle in joining.pending.values() {
+		handle.abort();
+	}
+	// Borrow each handle until it finishes. Cancellation returns every
+	// unjoined handle to the registry for the next shutdown owner.
+	while let Some(mut entry) = joining.pending.first_entry() {
+		let id = *entry.key();
+		if let Err(error) = entry.get_mut().await
+			&& !error.is_cancelled()
+		{
+			error!(%id, %error, "Admin task failed while shutting down");
+		}
+		entry.remove();
+	}
+}
+
+struct AbortedTasks<'a> {
+	registry: &'a StdMutex<BTreeMap<TaskId, JoinHandle<()>>>,
+	pending: BTreeMap<TaskId, JoinHandle<()>>,
+}
+
+impl Drop for AbortedTasks<'_> {
+	fn drop(&mut self) {
+		self.registry
+			.lock()
+			.expect("locked")
+			.append(&mut self.pending);
+	}
 }
 
 impl Status {
@@ -250,27 +367,27 @@ impl Task {
 	}
 }
 
-/// Drop terminal tasks past the retention window, then cap the survivors.
-fn prune_tasks(tasks: &mut BTreeMap<TaskId, Task>, now_ms: u64) {
-	tasks.retain(|_, task| {
-		!task.status.is_terminal() || now_ms.saturating_sub(task.timestamp_ms) < RETENTION_MS
-	});
-
-	let mut timestamps: Vec<u64> = tasks
-		.values()
-		.filter(|task| task.status.is_terminal())
-		.map(|task| task.timestamp_ms)
+/// Retention and total admission cap have a deterministic id tie-break.
+/// Active requests are never selected, including beyond their retention age.
+fn prune_ids(tasks: &BTreeMap<TaskId, Task>, now_ms: u64, reserve: usize) -> Vec<TaskId> {
+	let mut terminal: Vec<_> = tasks
+		.iter()
+		.filter(|(_, task)| task.status.is_terminal())
+		.map(|(id, task)| (task.timestamp_ms, *id))
 		.collect();
-
-	if timestamps.len() <= CAPACITY {
-		return;
-	}
-
-	timestamps.sort_unstable();
-
-	let cutoff = timestamps[timestamps.len().saturating_sub(CAPACITY)];
-
-	tasks.retain(|_, task| !task.status.is_terminal() || task.timestamp_ms >= cutoff);
+	terminal.sort_unstable();
+	let minimum = tasks
+		.len()
+		.saturating_add(reserve)
+		.saturating_sub(CAPACITY);
+	terminal
+		.into_iter()
+		.enumerate()
+		.filter(|(index, (timestamp, _))| {
+			*index < minimum || now_ms.saturating_sub(*timestamp) >= RETENTION_MS
+		})
+		.map(|(_, (_, id))| id)
+		.collect()
 }
 
 #[cfg(test)]

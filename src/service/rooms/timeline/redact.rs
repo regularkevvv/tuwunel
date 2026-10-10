@@ -16,6 +16,9 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 	shortroomid: ShortRoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Ok(pdu_id) = self.get_pdu_id(event_id).await else {
 		// If event does not exist, just noop
 		// TODO this is actually wrong!
@@ -29,10 +32,10 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 			err!(Database(error!(?pdu_id, ?event_id, ?e, "PDU ID points to invalid PDU.")))
 		})?;
 
-	self.services
+	services_root
 		.retention
 		.save_original_pdu(event_id, &pdu, state_lock)
-		.await;
+		.await?;
 
 	let body = pdu["content"]
 		.as_object()
@@ -40,7 +43,7 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		.and_then(|body| body.as_str());
 
 	if let Some(body) = body {
-		self.services
+		services_root
 			.search
 			.deindex_pdu(shortroomid, &pdu_id, body)
 			.await?;
@@ -48,8 +51,7 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 
 	let room_id: &RoomId = pdu.get("room_id").try_into()?;
 
-	let room_version_id = self
-		.services
+	let room_version_id = services_root
 		.state
 		.get_room_version(room_id)
 		.await?;
@@ -60,7 +62,7 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		)))
 	})?;
 
-	self.services
+	services_root
 		.pdu_metadata
 		.delete_typed_relation(&pdu_id, &pdu)
 		.await;

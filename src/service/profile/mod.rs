@@ -60,6 +60,9 @@ pub async fn update_all_rooms(
 	profile_values: &[(ProfileFieldName, Option<Value>)],
 	propagation: Propagation,
 ) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if matches!(propagation, Propagation::None) {
 		return;
 	}
@@ -72,7 +75,7 @@ pub async fn update_all_rooms(
 
 	// Suspended senders may not emit member events; OIDC, SSO, and MAS profile
 	// updates reach here without passing any suspension-blocked route.
-	if self.services.users.is_suspended(user_id).await {
+	if services_root.users.is_suspended(user_id).await {
 		return;
 	}
 
@@ -83,8 +86,7 @@ pub async fn update_all_rooms(
 			(None, None)
 		};
 
-	let rooms: Vec<OwnedRoomId> = self
-		.services
+	let rooms: Vec<OwnedRoomId> = services_root
 		.state_cache
 		.rooms_joined(user_id)
 		.map(Into::into)
@@ -127,14 +129,16 @@ async fn update_room(
 	current_displayname: Option<&str>,
 	current_avatar_url: Option<&MxcUri>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let unchanged = match propagation {
 		| Propagation::All => false,
 		| Propagation::Unchanged => true,
 		| Propagation::None => return Ok(()),
 	};
 
-	let mut content = self
-		.services
+	let mut content = services_root
 		.state_accessor
 		.get_member(room_id, user_id)
 		.await?;
@@ -183,9 +187,9 @@ async fn update_room(
 
 	content.reason = None;
 
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let state_lock = services_root.state.mutex.lock(room_id).await;
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.as_str(), &content),
@@ -321,7 +325,10 @@ pub async fn set_profile_keys(
 	profile_values: &[(ProfileFieldName, Option<Value>)],
 	propagation: Option<Propagation>,
 ) -> Result {
-	if self.services.globals.user_is_local(user_id) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.globals.user_is_local(user_id) {
 		for (name, value) in profile_values {
 			check_profile_key(name.as_str())?;
 
@@ -333,8 +340,7 @@ pub async fn set_profile_keys(
 	}
 
 	let propagation = propagation.unwrap_or(
-		if self
-			.services
+		if services_root
 			.config
 			.preserve_room_profile_overrides
 		{
@@ -344,7 +350,7 @@ pub async fn set_profile_keys(
 		},
 	);
 
-	if !matches!(propagation, Propagation::None) && self.services.globals.user_is_local(user_id) {
+	if !matches!(propagation, Propagation::None) && services_root.globals.user_is_local(user_id) {
 		self.update_all_rooms(user_id, profile_values, propagation)
 			.await;
 	}
@@ -375,7 +381,13 @@ where
 		.useridprofilekey_value
 		.qry(&key)
 		.await
-		.map_err(|_| err!(Request(NotFound("The requested profile key does not exist."))))?
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Request(NotFound("The requested profile key does not exist.")))
+			} else {
+				error
+			}
+		})?
 		.deserialized()
 		.map_err(|_| err!(Database("Cannot deserialize database profile value")))?;
 
@@ -395,13 +407,15 @@ pub async fn fill_profile_data(&self, user_id: &UserId, content: &mut RoomMember
 
 #[implement(Service)]
 pub async fn fetch_remote_profile(&self, user_id: &UserId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	assert!(
-		!self.services.globals.user_is_local(user_id),
+		!services_root.globals.user_is_local(user_id),
 		"fetch remote profile called with a local user"
 	);
 
-	if let Ok(response) = self
-		.services
+	if let Ok(response) = services_root
 		.federation
 		.execute(user_id.server_name(), get_profile_information::v1::Request {
 			user_id: user_id.to_owned(),
@@ -409,8 +423,8 @@ pub async fn fetch_remote_profile(&self, user_id: &UserId) -> Result {
 		})
 		.await
 	{
-		if !self.services.users.exists(user_id).await {
-			self.services
+		if !services_root.users.exists(user_id).await {
+			services_root
 				.users
 				.create(user_id, None, None)
 				.await?;

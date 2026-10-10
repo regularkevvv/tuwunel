@@ -81,6 +81,9 @@ fn resolve_device_id(device_id: Option<&DeviceId>) -> OwnedDeviceId {
 #[implement(super::Service)]
 #[tracing::instrument(level = "info", skip(self))]
 pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Remove access tokens
 	self.remove_tokens(user_id, device_id).await;
 
@@ -100,14 +103,14 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 		.await;
 
 	// Remove pushers
-	self.services
+	services_root
 		.pusher
 		.get_device_pushkeys(user_id, device_id)
 		.map(Vec::into_iter)
 		.map(IterStream::stream)
 		.flatten_stream()
 		.for_each(|pushkey| async move {
-			self.services
+			services_root
 				.pusher
 				.delete_pusher(user_id, &pushkey)
 				.await;
@@ -138,7 +141,7 @@ pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
 
 	// MSC3890: drop this device's local notification settings.
 	let event_type = format!("org.matrix.msc3890.local_notification_settings.{device_id}").into();
-	self.services
+	services_root
 		.account_data
 		.delete(None, user_id, event_type)
 		.await
@@ -223,6 +226,9 @@ pub async fn set_access_token(
 	expires_in: Option<Duration>,
 	refresh_token: Option<&str>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	assert!(
 		access_token.len() >= TOKEN_LENGTH,
 		"Caller must supply an access_token >= {TOKEN_LENGTH} chars."
@@ -251,7 +257,7 @@ pub async fn set_access_token(
 		.deserialized::<String>()
 		.ok();
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	if let Some(previous) = previous.as_deref() {
 		let key = (user_id, device_id, previous);
@@ -275,6 +281,9 @@ pub async fn set_access_token(
 /// care to not leave dangling devices if using this method.
 #[implement(super::Service)]
 pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let prefix = (user_id, device_id, Interfix);
 	self.db
 		.userdeviceidtoken_index
@@ -303,7 +312,7 @@ pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) 
 		.deserialized::<String>()
 		.ok();
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	if let Some(token) = token.as_deref() {
 		txn.del_raw(&self.db.token_userdeviceid, token);
@@ -320,6 +329,9 @@ pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) 
 /// tokens it holds intact.
 #[implement(super::Service)]
 pub async fn remove_access_token_value(&self, access_token: &str) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let owner = self
 		.db
 		.token_userdeviceid
@@ -328,7 +340,7 @@ pub async fn remove_access_token_value(&self, access_token: &str) {
 		.deserialized::<(OwnedUserId, OwnedDeviceId, Option<u64>)>()
 		.ok();
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	if let Some((user_id, device_id, _)) = owner {
 		let user_device_token = (&*user_id, &*device_id, access_token);
@@ -343,9 +355,12 @@ pub async fn remove_access_token_value(&self, access_token: &str) {
 
 #[implement(super::Service)]
 pub fn generate_access_token(&self, expires: bool) -> (String, Option<Duration>) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let access_token = random_string(TOKEN_LENGTH);
 	let expires_in = expires
-		.then_some(self.services.server.config.access_token_ttl)
+		.then_some(services_root.server.config.access_token_ttl)
 		.map(Duration::from_secs);
 
 	(access_token, expires_in)
@@ -360,9 +375,12 @@ pub async fn set_refresh_token(
 	device_id: &DeviceId,
 	refresh_token: &str,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_assert!(refresh_token.starts_with("refresh_"), "refresh_token missing prefix");
 
-	let config = &self.services.server.config;
+	let config = &services_root.server.config;
 	let ttl = config.refresh_token_ttl;
 	let idle_only = config.refresh_token_idle_only;
 
@@ -400,7 +418,7 @@ pub async fn set_refresh_token(
 
 	let userdeviceid = (user_id, device_id);
 	let value = (user_id, device_id, expires_at_secs);
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.raw_put(&self.db.token_userdeviceid, refresh_token, value);
 	txn.put_raw(&self.db.userdeviceid_refresh, userdeviceid, refresh_token);
@@ -456,6 +474,9 @@ async fn find_refresh_token_expires_at(
 /// dangling devices if using this method.
 #[implement(super::Service)]
 pub async fn remove_refresh_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let userdeviceid = (user_id, device_id);
 	let refresh_token = self
 		.db
@@ -463,7 +484,7 @@ pub async fn remove_refresh_token(&self, user_id: &UserId, device_id: &DeviceId)
 		.qry(&userdeviceid)
 		.await;
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	if let Ok(refresh_token) = refresh_token {
 		txn.del_raw(&self.db.token_userdeviceid, &refresh_token);
@@ -530,6 +551,9 @@ pub enum RefreshToken {
 /// Classify a presented refresh token for the token-endpoint rotation path.
 #[implement(super::Service)]
 pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// The current refresh token resolves and matches the device's active
 	// pointer (an access token resolves but will not match).
 	if let Ok((user_id, device_id, expires_at)) = self.find_from_token(presented).await {
@@ -566,8 +590,7 @@ pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
 		.deserialized()
 		.ok();
 
-	let grace_window = self
-		.services
+	let grace_window = services_root
 		.server
 		.config
 		.refresh_token_reuse_grace;
@@ -608,8 +631,10 @@ pub async fn add_to_device_event(
 	event_type: &str,
 	content: &serde_json::Value,
 ) -> u64 {
-	let count = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let count = services_root
 		.globals
 		.next_count()
 		.await
@@ -652,6 +677,9 @@ pub async fn deliver_to_device(
 	targets: &[ToDeviceTarget],
 	txnid: Option<&[u8]>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Resolve every addressed device, and draw each delivery's count, before
 	// anything is written. The permits stay held until the commit lands so no
 	// reader advances past a count whose inbox row is still in flight.
@@ -664,7 +692,7 @@ pub async fn deliver_to_device(
 					.map(ToOwned::to_owned)
 					.collect()
 					.await,
-				self.services
+				services_root
 					.appservice
 					.is_interested_in_user(&target.user_id)
 					.await,
@@ -673,7 +701,7 @@ pub async fn deliver_to_device(
 
 		let mut deliveries = Vec::with_capacity(device_ids.len());
 		for device_id in device_ids {
-			deliveries.push((device_id, self.services.globals.next_count().await?));
+			deliveries.push((device_id, services_root.globals.next_count().await?));
 		}
 
 		resolved.push((target, deliveries, forward));
@@ -708,7 +736,7 @@ pub async fn deliver_to_device(
 			continue;
 		}
 
-		self.services
+		services_root
 			.sending
 			.send_to_device_appservices(
 				sender,
@@ -745,7 +773,10 @@ pub fn to_device_txn<'a, I>(
 where
 	I: IntoIterator<Item = (&'a UserId, &'a DeviceId, u64, &'a serde_json::Value)>,
 {
-	let mut txn = self.services.db.txn();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let mut txn = services_root.db.txn();
 
 	for (target_user_id, target_device_id, count, content) in deliveries {
 		txn.put(

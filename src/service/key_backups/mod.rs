@@ -44,12 +44,15 @@ pub async fn create_backup(
 	user_id: &UserId,
 	backup_metadata: &Raw<BackupAlgorithm>,
 ) -> Result<String> {
-	let version = self.services.globals.next_count().await?;
-	let count = self.services.globals.next_count().await?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let version = services_root.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 
 	let version_string = version.to_string();
 	let key = (user_id, &version_string);
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.put(&self.db.backupid_algorithm, key, Json(backup_metadata));
 	txn.put(&self.db.backupid_etag, key, *count);
@@ -94,6 +97,9 @@ pub async fn update_backup<'a>(
 	version: &'a str,
 	backup_metadata: &Raw<BackupAlgorithm>,
 ) -> Result<&'a str> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let key = (user_id, version);
 	if self
 		.db
@@ -105,8 +111,8 @@ pub async fn update_backup<'a>(
 		return Err!(Request(NotFound("Tried to update nonexistent backup.")));
 	}
 
-	let count = self.services.globals.next_count().await?;
-	let mut txn = self.services.db.txn();
+	let count = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
 
 	txn.put(&self.db.backupid_etag, key, *count);
 	txn.put_raw(&self.db.backupid_algorithm, key, backup_metadata.json().get());
@@ -174,6 +180,9 @@ pub async fn add_key(
 	session_id: &str,
 	key_data: &Raw<KeyBackupData>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let key = (user_id, version);
 	if self
 		.db
@@ -198,8 +207,8 @@ pub async fn add_key(
 		return Ok(());
 	}
 
-	let count = self.services.globals.next_count().await?;
-	let mut txn = self.services.db.txn();
+	let count = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
 
 	txn.put(&self.db.backupid_etag, key, *count);
 

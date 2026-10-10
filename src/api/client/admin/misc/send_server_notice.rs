@@ -260,7 +260,7 @@ async fn create_notice_room(services: &Services, target: &UserId) -> Result<Owne
 	let _short_id = services
 		.short
 		.get_or_create_shortroomid(&room_id)
-		.await;
+		.await?;
 
 	let state_lock = services.state.mutex.lock(&room_id).await;
 	let server_user: &UserId = services.globals.server_user.as_ref();

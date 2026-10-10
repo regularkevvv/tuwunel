@@ -27,7 +27,10 @@ pub async fn invite(
 	reason: Option<&String>,
 	is_direct: bool,
 ) -> Result {
-	if self.services.globals.user_is_local(user_id) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.globals.user_is_local(user_id) {
 		self.local_invite(sender_user, user_id, room_id, reason, is_direct)
 			.boxed()
 			.await?;
@@ -50,8 +53,11 @@ async fn remote_invite(
 	reason: Option<&String>,
 	is_direct: bool,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let (pdu, pdu_json, invite_room_state, room_version_id) = {
-		let state_lock = self.services.state.mutex.lock(room_id).await;
+		let state_lock = services_root.state.mutex.lock(room_id).await;
 
 		let mut content = RoomMemberEventContent {
 			is_direct,
@@ -59,13 +65,12 @@ async fn remote_invite(
 			..RoomMemberEventContent::new(MembershipState::Invite)
 		};
 
-		self.services
+		services_root
 			.profile
 			.fill_profile_data(user_id, &mut content)
 			.await;
 
-		let (pdu, pdu_json) = self
-			.services
+		let (pdu, pdu_json) = services_root
 			.timeline
 			.create_hash_and_sign_event(
 				PduBuilder::state(user_id.to_string(), &content),
@@ -75,14 +80,12 @@ async fn remote_invite(
 			)
 			.await?;
 
-		let room_version_id = self
-			.services
+		let room_version_id = services_root
 			.state
 			.get_room_version(room_id)
 			.await?;
 
-		let invite_room_state = self
-			.services
+		let invite_room_state = services_root
 			.state
 			.summary_pdus(&pdu, &pdu_json, &room_version_id)
 			.await;
@@ -92,15 +95,13 @@ async fn remote_invite(
 		(pdu, pdu_json, invite_room_state, room_version_id)
 	};
 
-	let response = self
-		.services
+	let response = services_root
 		.federation
 		.execute(user_id.server_name(), create_invite::v2::Request {
 			room_id: room_id.to_owned(),
 			event_id: (*pdu.event_id).to_owned(),
 			room_version: room_version_id.clone(),
-			event: self
-				.services
+			event: services_root
 				.federation
 				.format_pdu_into(pdu_json.clone(), Some(&room_version_id))
 				.await,
@@ -108,8 +109,7 @@ async fn remote_invite(
 				.into_iter()
 				.map(RawStrippedState::Pdu)
 				.collect(),
-			via: self
-				.services
+			via: services_root
 				.state_cache
 				.servers_route_via(room_id)
 				.await
@@ -154,20 +154,14 @@ async fn remote_invite(
 		err!(Request(BadJson(warn!("Origin field in event is not a valid server name: {e}"))))
 	})?;
 
-	let pdu_id = self
-		.services
+	let _accepted = services_root
 		.event_handler
-		.handle_incoming_pdu(&origin, room_id, &event_id, value, true)
+		.handle_incoming_pdu_and_federate(&origin, room_id, &event_id, value)
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| {
 			err!(Request(InvalidParam("Could not accept incoming PDU as timeline event.")))
 		})?;
-
-	self.services
-		.sending
-		.send_pdu_room(room_id, &pdu_id)
-		.await?;
 
 	Ok(())
 }
@@ -182,12 +176,14 @@ async fn local_invite(
 	reason: Option<&String>,
 	is_direct: bool,
 ) -> Result {
-	if self.services.users.invites_blocked(user_id).await {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.users.invites_blocked(user_id).await {
 		return Err!(Request(InviteBlocked("{user_id} has blocked invites.")));
 	}
 
-	if !self
-		.services
+	if !services_root
 		.state_cache
 		.is_joined(sender_user, room_id)
 		.await
@@ -197,7 +193,7 @@ async fn local_invite(
 		)));
 	}
 
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let state_lock = services_root.state.mutex.lock(room_id).await;
 
 	let mut content = RoomMemberEventContent {
 		is_direct,
@@ -205,12 +201,12 @@ async fn local_invite(
 		..RoomMemberEventContent::new(MembershipState::Invite)
 	};
 
-	self.services
+	services_root
 		.profile
 		.fill_profile_data(user_id, &mut content)
 		.await;
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.to_string(), &content),

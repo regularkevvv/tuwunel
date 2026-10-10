@@ -52,6 +52,9 @@ pub(super) async fn load_session(
 /// from resurrecting a session concurrently consumed by the client.
 #[implement(Service)]
 pub async fn complete_sso(&self, user_id: &UserId, session: &str) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let _transition = self
 		.transitions
 		.lock(&SessionKey::new(session))
@@ -74,7 +77,7 @@ pub async fn complete_sso(&self, user_id: &UserId, session: &str) -> Result {
 	}
 
 	if oauth && !info.completed.contains(&AuthType::OAuth) {
-		self.services
+		services_root
 			.users
 			.allow_cross_signing_replacement(&owner)
 			.await;

@@ -76,6 +76,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	assert_required_state_contains(&owner, &room, topic.as_str(), "healthy").await?;
 	assert_absent_required_state_keeps_room(&owner, &room).await?;
+	count_controls(&owner, &room).await?;
 
 	let pdu_id = services.timeline.get_pdu_id(&topic).await?;
 	let pdus = &services.db["pduid_pdu"];
@@ -103,6 +104,56 @@ async fn set_topic(client: &Client<'_>, room: &RoomId) -> Result {
 		.await?
 		.error_for_status()?;
 
+	Ok(())
+}
+
+async fn count_controls(client: &Client<'_>, room: &RoomId) -> Result {
+	for name in ["roomid_joinedcount", "roomid_invitedcount"] {
+		let map = &client.services.db[name];
+		let saved = map.get(room).await?.as_ref().to_vec();
+		for corrupt in [vec![], vec![0_u8; 7], vec![0_u8; 9], u64::MAX.to_be_bytes().to_vec()] {
+			map.insert(room.as_bytes(), corrupt.as_slice())
+				.await?;
+			let response = required_state_response(client, "m.room.topic").await?;
+			assert!(
+				response["rooms"].get(room.as_str()).is_none(),
+				"bad counts withhold complete room"
+			);
+			assert_eq!(map.get(room).await?.as_ref(), corrupt, "refusal preserves counter");
+		}
+		map.insert(room.as_bytes(), saved.as_slice())
+			.await?;
+	}
+	let global = &client.services.db["global"];
+	for (name, bytes) in [
+		("membership_recount_generation_v1", b"invalid-generation".as_slice()),
+		("membership_recount_pending", b"invalid-marker".as_slice()),
+	] {
+		let key = tuwunel_database::serialize_key((name, room))?;
+		let saved = match global.get(key.as_slice()).await {
+			| Ok(value) => Some(value.as_ref().to_vec()),
+			| Err(error) if error.is_not_found() => None,
+			| Err(error) => return Err(error),
+		};
+		global.insert(key.as_slice(), bytes).await?;
+		let response = required_state_response(client, "m.room.topic").await?;
+		assert!(
+			response["rooms"].get(room.as_str()).is_none(),
+			"bad repair metadata withholds room"
+		);
+		assert_eq!(global.get(key.as_slice()).await?.as_ref(), bytes);
+		if let Some(saved) = saved {
+			global
+				.insert(key.as_slice(), saved.as_slice())
+				.await?;
+		} else {
+			global.remove(key.as_slice()).await?;
+		}
+	}
+	let healthy = required_state_response(client, "m.room.topic").await?;
+	let payload = room_payload(&healthy, room, "restored counts")?;
+	assert_eq!(payload["joined_count"], 1);
+	assert_eq!(payload["invited_count"], 0);
 	Ok(())
 }
 

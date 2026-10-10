@@ -180,8 +180,10 @@ impl Console {
 	}
 
 	async fn process(self: Arc<Self>, line: String) {
-		match self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		match services_root
 			.admin
 			.command_in_place(line, None)
 			.await
@@ -221,7 +223,10 @@ impl Console {
 	}
 
 	fn tab_complete(&self, line: &str) -> String {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.admin
 			.complete_command(line)
 			.unwrap_or_else(|| line.to_owned())

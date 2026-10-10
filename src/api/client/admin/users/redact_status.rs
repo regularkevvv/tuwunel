@@ -30,6 +30,7 @@ pub(crate) async fn admin_redact_status_route(
 	let task = services
 		.tasks
 		.get(&body.redact_id)
+		.await?
 		.filter(|task| task.action == super::REDACT_USER_ACTION)
 		.ok_or_else(|| err!(Request(NotFound("Unknown redact task"))))?;
 

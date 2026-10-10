@@ -2,11 +2,15 @@ mod dehydrated_device;
 pub mod device;
 mod keys;
 mod ldap;
+mod local_activity;
+mod local_count;
+mod local_page;
 mod register;
 
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
+pub(crate) use keys::OutgoingKeyBudget;
 use ruma::{
 	MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
@@ -26,7 +30,14 @@ use tuwunel_core::{
 use tuwunel_database::{Deserialized, Json, Map};
 
 pub use self::{
-	dehydrated_device::DehydratedDevice, device::ToDeviceTarget, keys::parse_master_key,
+	dehydrated_device::DehydratedDevice,
+	device::ToDeviceTarget,
+	keys::parse_master_key,
+	local_activity::{
+		DeviceMetadataInventory, LocalUserActivity, MAX_ADMIN_DEVICE_BYTES, MAX_ADMIN_DEVICE_ROWS,
+	},
+	local_count::MAX_LOCAL_USER_COUNT_ROWS,
+	local_page::{MAX_LOCAL_USER_PAGE_ROWS, UserInventoryPage},
 	register::Register,
 };
 
@@ -128,7 +139,10 @@ impl Service {
 	/// Returns true/false based on whether the recipient/receiving user has
 	/// blocked the sender
 	pub async fn user_is_ignored(&self, sender_user: &UserId, recipient_user: &UserId) -> bool {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.account_data
 			.get_global(recipient_user, GlobalAccountDataEventType::IgnoredUserList)
 			.await
@@ -141,9 +155,48 @@ impl Service {
 			})
 	}
 
+	pub(crate) async fn user_is_ignored_checked(
+		&self,
+		sender: &UserId,
+		recipient: &UserId,
+	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		match services_root
+			.account_data
+			.get_global::<IgnoredUserListEvent>(
+				recipient,
+				GlobalAccountDataEventType::IgnoredUserList,
+			)
+			.await
+		{
+			| Ok(event) => Ok(event.content.ignored_users.contains_key(sender)),
+			| Err(error) if error.is_not_found() => Ok(false),
+			| Err(error) => Err(error),
+		}
+	}
+
+	pub(crate) async fn notification_recipient_active(&self, user: &UserId) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !services_root.globals.user_is_local(user) || self.is_erased_checked(user).await? {
+			return Ok(false);
+		}
+		match self.is_deactivated(user).await {
+			| Ok(disabled) => Ok(!disabled),
+			| Err(error) if error.is_not_found() => Ok(false),
+			| Err(error) => Err(error),
+		}
+	}
+
 	/// MSC4380: `m.invite_permission_config.default_action == "block"`.
 	pub async fn invites_blocked(&self, user_id: &UserId) -> bool {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.account_data
 			.get_global(user_id, GlobalAccountDataEventType::InvitePermissionConfig)
 			.await
@@ -174,9 +227,12 @@ impl Service {
 
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// Revoke and drop every stored upstream grant. The identity association
 		// stays, so the identity cannot provision a second account (ADR-0004).
-		self.services
+		services_root
 			.oauth
 			.clear_user_grants(user_id)
 			.await;
@@ -208,7 +264,13 @@ impl Service {
 			.userid_password
 			.get(user_id)
 			.map_ok(|val| val.is_empty())
-			.map_err(|_| err!(Request(NotFound("User does not exist."))))
+			.map_err(|error| {
+				if error.is_not_found() {
+					err!(Request(NotFound("User does not exist.")))
+				} else {
+					error
+				}
+			})
 			.await
 	}
 
@@ -219,7 +281,10 @@ impl Service {
 
 	/// Check if account is active, infallible
 	pub async fn is_active_local(&self, user_id: &UserId) -> bool {
-		self.services.globals.user_is_local(user_id) && self.is_active(user_id).await
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root.globals.user_is_local(user_id) && self.is_active(user_id).await
 	}
 
 	/// Gate an LDAP-authenticated login into an existing local account.
@@ -266,10 +331,27 @@ impl Service {
 		self.db.userid_locked.get(user_id).await.is_ok()
 	}
 
+	/// Returns the lock row's presence, preserving storage failures rather than
+	/// interpreting an unavailable row as an unlocked account.
+	pub async fn is_locked_checked(&self, user_id: &UserId) -> Result<bool> {
+		self.db
+			.userid_locked
+			.contains_checked(&(user_id,))
+			.await
+	}
+
 	/// MSC4025: the user's events serve as pruned copies to recipients not
 	/// joined at the event. Presence-only for the serving gate.
 	pub async fn is_erased(&self, user_id: &UserId) -> bool {
 		self.db.userid_erased.get(user_id).await.is_ok()
+	}
+
+	/// Returns the erasure row's presence without masking storage failures.
+	pub async fn is_erased_checked(&self, user_id: &UserId) -> Result<bool> {
+		self.db
+			.userid_erased
+			.contains_checked(&(user_id,))
+			.await
 	}
 
 	/// MSC4025: the global count recorded at erasure, for admin surfacing;
@@ -326,7 +408,14 @@ impl Service {
 
 	/// MSC4025: mark the user erased, recording the current global count.
 	pub async fn set_erased(&self, user_id: &UserId) -> Result {
-		let count = self.services.globals.current_count();
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let _notifications = services_root
+			.pusher
+			.lock_notification_user(user_id)
+			.await;
+		let count = services_root.globals.current_count();
 
 		self.db
 			.userid_erased
@@ -337,6 +426,13 @@ impl Service {
 	/// MSC4025: erasure is reversible; clearing the marker restores the
 	/// unredacted view.
 	pub async fn clear_erased(&self, user_id: &UserId) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let _notifications = services_root
+			.pusher
+			.lock_notification_user(user_id)
+			.await;
 		self.db.userid_erased.remove(user_id).await
 	}
 
@@ -442,6 +538,13 @@ impl Service {
 
 	/// Hash and set the user's password to the Argon2 hash
 	pub async fn set_password(&self, user_id: &UserId, password: Option<&str>) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let _notifications = services_root
+			.pusher
+			.lock_notification_user(user_id)
+			.await;
 		// Cannot change the password of a LDAP user. There are two special cases :
 		// - a `None` password can be used to deactivate a LDAP user
 		// - a "*" password is used as the default password of an active LDAP user
@@ -530,7 +633,10 @@ impl Service {
 	pub async fn create_openid_token(&self, user_id: &UserId, token: &str) -> Result<u64> {
 		use std::num::Saturating as Sat;
 
-		let expires_in = self.services.server.config.openid_token_ttl;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let expires_in = services_root.server.config.openid_token_ttl;
 		let expires_at = Sat(utils::millis_since_unix_epoch()) + Sat(expires_in) * Sat(1000);
 
 		let mut value = expires_at.0.to_be_bytes().to_vec();
@@ -584,7 +690,10 @@ impl Service {
 	pub async fn create_login_token(&self, user_id: &UserId, token: &str) -> u64 {
 		use std::num::Saturating as Sat;
 
-		let expires_in = self.services.server.config.login_token_ttl;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let expires_in = services_root.server.config.login_token_ttl;
 		let expires_at = Sat(utils::millis_since_unix_epoch()) + Sat(expires_in);
 
 		let value = (expires_at.0, user_id);

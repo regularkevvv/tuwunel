@@ -31,7 +31,9 @@ use tuwunel_core::{
 	warn,
 };
 
+pub(crate) use self::data::PreparedPrivateRead;
 use self::data::{Data, ReceiptItem};
+use crate::rooms::state::RoomMutexGuard;
 
 /// Private read receipts surfaced by `private_read_get`. One legacy
 /// unthreaded row plus zero or more per-thread rows; inline-1 catches the
@@ -96,21 +98,30 @@ impl Service {
 		user_id: &UserId,
 		room_id: &RoomId,
 		event: &ReceiptEvent,
-	) -> bool {
-		if self
-			.db
-			.readreceipt_update(user_id, room_id, event)
-			.await
-			.is_false()
-		{
-			return false;
+	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let stored = {
+			let state = services_root.state.mutex.lock(room_id).await;
+			match services_root.short.get_shortroomid(room_id).await {
+				| Ok(_) => {},
+				| Err(error) if error.is_not_found() => return Ok(false),
+				| Err(error) => return Err(error),
+			}
+			self.db
+				.readreceipt_update(user_id, room_id, event, &state)
+				.await?
+		};
+		if stored.is_false() {
+			return Ok(false);
 		}
 
 		// The receipt is stored. Each delivery that follows runs whether or not the
 		// other failed; one that fails is logged, and the receipt stays stored.
 		let event_id = event.content.keys().next();
 
-		self.services
+		services_root
 			.sending
 			.send_edu_room_appservices(room_id, |buf| {
 				let edu = EphemeralData::Receipt(ReceiptEvent {
@@ -129,8 +140,8 @@ impl Service {
 				);
 			});
 
-		if self.services.globals.user_is_local(user_id) {
-			self.services
+		if services_root.globals.user_is_local(user_id) {
+			services_root
 				.sending
 				.flush_room(room_id)
 				.await
@@ -139,7 +150,7 @@ impl Service {
 				});
 		}
 
-		true
+		Ok(true)
 	}
 
 	/// Gets every stored private read receipt for `(room, user)`. Returns
@@ -151,8 +162,10 @@ impl Service {
 		room_id: &RoomId,
 		user_id: &UserId,
 	) -> Result<PrivateReadEvents> {
-		let shortroomid = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let shortroomid = services_root
 			.short
 			.get_shortroomid(room_id)
 			.await
@@ -202,6 +215,9 @@ impl Service {
 		user_id: &UserId,
 		update: u64,
 	) -> Result<PrivateReadEvents> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let snapshot = self
 			.db
 			.private_read_sync_update_fallible(user_id, room_id)
@@ -219,7 +235,7 @@ impl Service {
 		}
 
 		let shortroomid = async {
-			self.services
+			services_root
 				.short
 				.get_shortroomid(room_id)
 				.await
@@ -333,13 +349,15 @@ impl Service {
 		user_id: &UserId,
 		thread: ReceiptThread,
 	) -> Result<Raw<AnySyncEphemeralRoomEvent>> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let pdu_id: RawPduId = PduId {
 			shortroomid,
 			count: PduCount::Normal(count),
 		}
 		.into();
-		let pdu = self
-			.services
+		let pdu = services_root
 			.timeline
 			.get_pdu_from_id(&pdu_id)
 			.await?;
@@ -396,8 +414,46 @@ impl Service {
 	/// receipt subsumes thread state. Returns whether the marker advanced; a
 	/// position at or behind the stored one writes nothing.
 	#[tracing::instrument(skip(self), level = "debug", name = "set_private")]
-	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> bool {
-		self.db.private_read_set(private_read).await
+	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let state = services_root
+			.state
+			.mutex
+			.lock(private_read.room_id)
+			.await;
+		self.private_read_set_with_state(private_read, &state)
+			.await
+	}
+
+	/// Stores a private marker while the caller owns canonical room state.
+	///
+	/// Client event lookup must use this same guard so deletion cannot strand
+	/// a marker resolved before erasure. Trusted position writers still require
+	/// an existing canonical room.
+	pub async fn private_read_set_with_state(
+		&self,
+		read: PrivateRead<'_>,
+		state: &RoomMutexGuard,
+	) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
+			.short
+			.get_shortroomid(read.room_id)
+			.await?;
+		self.db.private_read_set(read, state).await
+	}
+
+	pub(crate) async fn stage_private_read(
+		&self,
+		read: PrivateRead<'_>,
+		txn: &mut tuwunel_database::Txn,
+		state: &RoomMutexGuard,
+	) -> Result<Option<PreparedPrivateRead>> {
+		self.db.stage_private_read(read, txn, state).await
 	}
 
 	/// Returns the private read marker PDU count.
@@ -470,10 +526,6 @@ impl Service {
 		self.db
 			.last_privateread_update_fallible(user_id, room_id)
 			.await
-	}
-
-	pub async fn delete_all_read_receipts(&self, room_id: &RoomId) -> Result {
-		self.db.delete_all_read_receipts(room_id).await
 	}
 }
 

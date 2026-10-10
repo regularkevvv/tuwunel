@@ -26,6 +26,20 @@ pub(super) fn get_prefix(&self) -> Vec<u8> { self.get_prefix_with_capacity(0) }
 
 #[implement(Destination)]
 #[must_use]
+pub(super) fn prefix_len(&self) -> usize {
+	match self {
+		| Self::Federation(server) => server.as_bytes().len().saturating_add(1),
+		| Self::Appservice(server) => server.len().saturating_add(2),
+		| Self::Push(user, pushkey) => user
+			.as_bytes()
+			.len()
+			.saturating_add(pushkey.len())
+			.saturating_add(3),
+	}
+}
+
+#[implement(Destination)]
+#[must_use]
 pub(super) fn get_prefix_with_capacity(&self, additional: usize) -> Vec<u8> {
 	match self {
 		| Self::Federation(server) => {

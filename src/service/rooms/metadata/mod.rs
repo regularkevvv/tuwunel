@@ -3,8 +3,9 @@ use std::sync::Arc;
 use futures::{FutureExt, Stream, StreamExt, pin_mut};
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId, events::room::join_rules::JoinRule};
 use tuwunel_core::{
-	Result, implement,
+	Error, Result, implement,
 	utils::{
+		bytes::u64_from_bytes,
 		future::BoolExt,
 		stream::{TryIgnore, WidebandExt},
 	},
@@ -41,7 +42,10 @@ impl crate::Service for Service {
 
 #[implement(Service)]
 pub async fn exists(&self, room_id: &RoomId) -> bool {
-	let Ok(prefix) = self.services.short.get_shortroomid(room_id).await else {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(prefix) = services_root.short.get_shortroomid(room_id).await else {
 		return false;
 	};
 
@@ -54,6 +58,31 @@ pub async fn exists(&self, room_id: &RoomId) -> bool {
 
 	pin_mut!(keys);
 	keys.next().await.is_some()
+}
+
+/// Checks the room index and its first timeline key without hiding failed
+/// reads. Only a missing index or a successful empty key scan means absence.
+/// The scan declares a one-key cap to remote fetch/drain handling.
+#[implement(Service)]
+pub async fn exists_checked(&self, room_id: &RoomId) -> Result<bool> {
+	let room = match self.db.roomid_shortroomid.get(room_id).await {
+		| Ok(room) => room,
+		| Err(error) if error.is_not_found() => return Ok(false),
+		| Err(error) => return Err(error),
+	};
+	let prefix = u64_from_bytes(room.as_ref())
+		.map_err(|_| Error::bad_database("Invalid room inventory record"))?;
+	let keys = self
+		.db
+		.pduid_pdu
+		.keys_prefix_capped::<&[u8], _>(&prefix, 1);
+	pin_mut!(keys);
+	match keys.next().await {
+		| Some(Ok(key)) if matches!(key.len(), 16 | 24) => Ok(true),
+		| Some(Ok(_)) => Err(Error::bad_database("Invalid room timeline key")),
+		| Some(Err(error)) => Err(error),
+		| None => Ok(false),
+	}
 }
 
 #[implement(Service)]
@@ -79,12 +108,46 @@ pub fn iter_ids(&self) -> impl Stream<Item = &RoomId> + Send + '_ {
 	self.db.roomid_shortroomid.keys().ignore_err()
 }
 
+/// A complete room-ID inventory through 1,024 rows and 128 KiB retained IDs.
+/// Refuses overflow, malformed records and read failures without a partial
+/// list.
+#[implement(Service)]
+pub async fn bounded_room_ids(&self) -> Result<Vec<OwnedRoomId>> {
+	use ruma::api::error::{ErrorKind, LimitExceededErrorData};
+	const MAX_ROWS: usize = 1024;
+	const MAX_BYTES: usize = 128 * 1024;
+	let rows = self
+		.db
+		.roomid_shortroomid
+		.stream_capped::<&RoomId, &[u8]>(MAX_ROWS + 1);
+	pin_mut!(rows);
+	let mut rooms = Vec::new();
+	let mut bytes = 0_usize;
+	while let Some(row) = rows.next().await {
+		let (room, short) = row?;
+		u64_from_bytes(short)
+			.map_err(|_| Error::bad_database("Invalid room inventory record"))?;
+		bytes = bytes.saturating_add(room.as_bytes().len());
+		if rooms.len() >= MAX_ROWS || bytes > MAX_BYTES {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Room inventory limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		rooms.push(room.to_owned());
+	}
+	Ok(rooms)
+}
+
 #[implement(Service)]
 pub async fn is_public(&self, room_id: &RoomId) -> bool {
-	let listed_public = self.services.directory.is_public_room(room_id);
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	let join_rule_public = self
-		.services
+	let listed_public = services_root.directory.is_public_room(room_id);
+
+	let join_rule_public = services_root
 		.state_accessor
 		.get_join_rules(room_id)
 		.map(|rule| matches!(rule, JoinRule::Public));

@@ -9,22 +9,18 @@ use serde::{
 	Deserialize, de,
 	de::{DeserializeSeed, Visitor},
 };
-use tuwunel_core::{
-	Error, Result, arrayvec::ArrayVec, checked, debug::DebugInspect, err, unhandled,
-	utils::string,
-};
+use tuwunel_core::{Error, Result, arrayvec::ArrayVec, checked, err, unhandled, utils::string};
 
 /// Deserializes a value from database record bytes.
 ///
 /// The result may borrow from `buf` according to `T`'s deserialization
-/// implementation. Debug builds additionally verify that decoding consumed the
-/// input, apart from one trailing record separator.
+/// implementation. Decoding must consume the input, apart from one trailing
+/// record separator. Invalid record boundaries return errors in every build.
 ///
 /// # Panics
 ///
 /// Panics if `T` requests a Serde data-model operation unsupported by this
-/// codec. In debug builds, decoding also panics when record-layout invariants
-/// are violated or unexpected trailing bytes remain.
+/// codec.
 #[cfg_attr(
 	unabridged,
 	tracing::instrument(
@@ -40,11 +36,9 @@ where
 {
 	let mut deserializer = Deserializer { buf, pos: 0, rec: 0, seq: 0 };
 
-	T::deserialize(&mut deserializer).debug_inspect(|_| {
-		deserializer
-			.finished()
-			.expect("deserialization failed to consume trailing bytes");
-	})
+	let value = T::deserialize(&mut deserializer)?;
+	deserializer.finished()?;
+	Ok(value)
 }
 
 /// Cursor state for decoding the compact database record format.
@@ -80,26 +74,22 @@ impl<'de> Deserializer<'de> {
 	const SEP: u8 = crate::ser::SEP;
 
 	/// Determine if the input was fully consumed and error if bytes remaining.
-	/// This is intended for debug assertions; not optimized for parsing logic.
 	fn finished(&self) -> Result {
-		let pos = self.pos;
-		let len = self.buf.len();
-		let parsed = &self.buf[0..pos];
-		let unparsed = &self.buf[pos..];
 		let remain = self.remaining()?;
-		let trailing_sep = remain == 1 && unparsed[0] == Self::SEP;
+		let trailing_sep = remain == 1 && self.buf.get(self.pos) == Some(&Self::SEP);
 		(remain == 0 || trailing_sep)
 			.then_some(())
-			.ok_or(err!(SerdeDe(
-				"{remain} trailing of {len} bytes not deserialized.\n{parsed:?}\n{unparsed:?}",
-			)))
+			.ok_or(err!(SerdeDe("Unexpected trailing database record bytes",)))
 	}
 
 	/// Called at the start of arrays and tuples
 	#[inline]
-	fn sequence_start(&mut self, len: usize) {
-		debug_assert!(self.seq == 0, "Nested sequences are not handled at this time");
+	fn sequence_start(&mut self, len: usize) -> Result {
+		if self.seq != 0 {
+			return Err(err!(SerdeDe("Nested database record sequences are unsupported")));
+		}
 		self.seq = len;
+		Ok(())
 	}
 
 	/// Consume the current record to ignore it. Inside a sequence the next
@@ -134,15 +124,15 @@ impl<'de> Deserializer<'de> {
 	/// Peek at the first byte of the current record. If all records were
 	/// consumed None is returned instead.
 	#[inline]
-	fn record_peek_byte(&self) -> Option<u8> {
+	fn record_peek_byte(&self) -> Result<Option<u8>> {
 		let started = self.pos != 0 || self.rec > 0;
-		let buf = &self.buf[self.pos..];
-		debug_assert!(
-			!started || buf[0] == Self::SEP,
-			"Missing expected record separator at current position"
-		);
-
-		buf.get::<usize>(started.into()).copied()
+		if started && self.pos < self.buf.len() && self.buf.get(self.pos) != Some(&Self::SEP) {
+			return Err(err!(SerdeDe("Missing database record separator")));
+		}
+		Ok(self
+			.buf
+			.get(self.pos.saturating_add(started.into()))
+			.copied())
 	}
 
 	/// Consume the record separator such that the position cleanly points to
@@ -151,19 +141,19 @@ impl<'de> Deserializer<'de> {
 	/// empty slice. See `next_element_seed` for the additive-tail mechanic
 	/// this enables.
 	#[inline]
-	fn record_start(&mut self) {
+	fn record_start(&mut self) -> Result {
 		let started = self.pos != 0 || self.rec > 0;
 		let input_done = self.pos >= self.buf.len();
 		let output_done = self.rec >= self.seq;
 		let incomplete = input_done && !output_done;
-		debug_assert!(
-			!started || incomplete || self.buf.get(self.pos) == Some(&Self::SEP),
-			"Missing expected record separator at current position"
-		);
+		if started && !incomplete && self.buf.get(self.pos) != Some(&Self::SEP) {
+			return Err(err!(SerdeDe("Missing database record separator")));
+		}
 
 		let inc = started && !incomplete;
 		self.inc_pos(inc.into());
 		self.inc_rec(1);
+		Ok(())
 	}
 
 	/// Consume all remaining bytes, which may include record separators,
@@ -213,7 +203,7 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	where
 		V: Visitor<'de>,
 	{
-		self.sequence_start(1);
+		self.sequence_start(1)?;
 		visitor.visit_seq(self)
 	}
 
@@ -225,7 +215,7 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	where
 		V: Visitor<'de>,
 	{
-		self.sequence_start(len);
+		self.sequence_start(len)?;
 		visitor.visit_seq(self)
 	}
 
@@ -242,7 +232,7 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	where
 		V: Visitor<'de>,
 	{
-		self.sequence_start(len);
+		self.sequence_start(len)?;
 		visitor.visit_seq(self)
 	}
 
@@ -253,7 +243,9 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	{
 		let input = self.record_next();
 		let mut d = serde_json::Deserializer::from_slice(input);
-		d.deserialize_map(visitor).map_err(Into::into)
+		let value = d.deserialize_map(visitor)?;
+		d.end()?;
+		Ok(value)
 	}
 
 	#[cfg_attr(
@@ -271,8 +263,9 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	{
 		let input = self.record_next();
 		let mut d = serde_json::Deserializer::from_slice(input);
-		d.deserialize_struct(name, fields, visitor)
-			.map_err(Into::into)
+		let value = d.deserialize_struct(name, fields, visitor)?;
+		d.end()?;
+		Ok(value)
 	}
 
 	#[cfg_attr(
@@ -302,15 +295,26 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 	{
 		match name {
 			| "$serde_json::private::RawValue" => visitor.visit_map(self),
-			| "Json" => visitor
-				.visit_newtype_struct(&mut serde_json::Deserializer::from_slice(
-					self.record_trail(),
-				))
-				.map_err(|e| Self::Error::SerdeDe(format!("{name}: {e}").into())),
+			| "Json" => {
+				let mut d = serde_json::Deserializer::from_slice(self.record_trail());
+				let value = visitor
+					.visit_newtype_struct(&mut d)
+					.map_err(|e| Self::Error::SerdeDe(format!("{name}: {e}").into()))?;
+				d.end()?;
+				Ok(value)
+			},
 
-			| "Cbor" => visitor
-				.visit_newtype_struct(&mut minicbor_serde::Deserializer::new(self.record_trail()))
-				.map_err(|e| Self::Error::SerdeDe(format!("{name}: {e}").into())),
+			| "Cbor" => {
+				let bytes = self.record_trail();
+				let mut decoder = minicbor_serde::Deserializer::new(bytes);
+				let value = visitor
+					.visit_newtype_struct(&mut decoder)
+					.map_err(|_| Self::Error::SerdeDe("Invalid CBOR database record".into()))?;
+				if decoder.decoder().position() != bytes.len() {
+					return Err(Self::Error::SerdeDe("Trailing CBOR database bytes".into()));
+				}
+				Ok(value)
+			},
 
 			| _ => visitor.visit_newtype_struct(self),
 		}
@@ -483,11 +487,14 @@ impl<'a, 'de: 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 			tuwunel_core::debug::type_name::<V>()
 		);
 
-		match self.record_peek_byte() {
+		match self.record_peek_byte()? {
 			| Some(b'{') => self.deserialize_map(visitor),
-			| Some(b'[') => serde_json::Deserializer::from_slice(self.record_next())
-				.deserialize_seq(visitor)
-				.map_err(Into::into),
+			| Some(b'[') => {
+				let mut d = serde_json::Deserializer::from_slice(self.record_next());
+				let value = d.deserialize_seq(visitor)?;
+				d.end()?;
+				Ok(value)
+			},
 
 			| _ => self.deserialize_str(visitor),
 		}
@@ -527,7 +534,7 @@ impl<'a, 'de: 'a> de::SeqAccess<'de> for &'a mut Deserializer<'de> {
 			return Ok(None);
 		}
 
-		self.record_start();
+		self.record_start()?;
 		seed.deserialize(&mut **self).map(Some)
 	}
 }

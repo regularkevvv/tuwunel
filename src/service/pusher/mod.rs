@@ -1,9 +1,10 @@
 mod append;
 mod badge;
+mod index;
+mod intent;
 mod notification;
 mod request;
 mod send;
-mod suppressed;
 #[cfg(test)]
 mod tests;
 
@@ -12,14 +13,14 @@ use std::{
 	sync::{Arc, LazyLock},
 };
 
-use futures::{Stream, StreamExt, TryFutureExt, future::join};
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use ruma::{
-	DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+	DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
 	api::client::push::{Pusher, PusherKind, set_pusher::v3::PusherAction},
 	events::{AnySyncTimelineEvent, room::power_levels::RoomPowerLevels},
 	push::{Action, FlattenedJson, PushConditionPowerLevelsCtx, PushConditionRoomCtx, Ruleset},
 	serde::Raw,
-	uint,
 };
 use serde::Deserialize;
 use tuwunel_core::{
@@ -27,15 +28,20 @@ use tuwunel_core::{
 	matrix::Event,
 	utils::{
 		MutexMap,
-		future::TryExtExt,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore, WidebandExt},
+		stream::{BroadbandExt, TryIgnore},
 	},
 };
 use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Json, Map};
 use url::Url;
 
-pub use self::append::Notified;
 use self::badge::SentBadges;
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub use self::intent::NotificationCommitPause;
+pub use self::{
+	append::Notified,
+	notification::{NotificationState, checked_add, count_uint},
+};
+pub(crate) use self::{append::parse_notified, notification::NotificationGuard};
 
 /// The events an event relates to, keyed by relation type, for MSC3664.
 type RelatedEvents = BTreeMap<String, FlattenedJson>;
@@ -86,10 +92,16 @@ struct InReplyTo {
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
-	notification_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
-	highlight_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
+	notification_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
+	notification_users: MutexMap<OwnedUserId, ()>,
+	notification_admission: Arc<tokio::sync::Mutex<()>>,
+	notification_plans: MutexMap<Vec<u8>, ()>,
+	notification_stop: tokio::sync::Notify,
+	#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+	notification_retry_paused: std::sync::atomic::AtomicBool,
+	#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+	notification_commit_pause: std::sync::Mutex<Option<intent::CommitPause>>,
 	db: Data,
-	suppressed: suppressed::SuppressedQueue,
 	sent_badges: SentBadges,
 }
 
@@ -101,16 +113,32 @@ struct Data {
 	userroomid_highlightcount: Arc<Map>,
 	userroomid_notificationcount: Arc<Map>,
 	roomuserid_lastnotificationread: Arc<Map>,
+	roomuserid_notificationcutoff: Arc<Map>,
+	pduid_notificationplan: Arc<Map>,
+	notificationreceiptid_record: Arc<Map>,
+	notificationid_index: Arc<Map>,
 }
 
+#[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
-			notification_increment_mutex: MutexMap::new(),
-			highlight_increment_mutex: MutexMap::new(),
+			notification_mutex: MutexMap::new(),
+			notification_users: MutexMap::new(),
+			notification_admission: Arc::new(tokio::sync::Mutex::new(())),
+			notification_plans: MutexMap::new(),
+			notification_stop: tokio::sync::Notify::new(),
+			#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+			notification_retry_paused: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+			notification_commit_pause: std::sync::Mutex::new(None),
 			db: Data {
 				db: args.db.clone(),
+				pduid_notificationplan: args.db["pduid_notificationplan"].clone(),
+				roomuserid_notificationcutoff: args.db["roomuserid_notificationcutoff"].clone(),
+				notificationreceiptid_record: args.db["notificationreceiptid_record"].clone(),
+				notificationid_index: args.db["notificationid_index"].clone(),
 				senderkey_pusher: args.db["senderkey_pusher"].clone(),
 				pushkey_deviceid: args.db["pushkey_deviceid"].clone(),
 				useridcount_notification: args.db["useridcount_notification"].clone(),
@@ -119,10 +147,13 @@ impl crate::Service for Service {
 				roomuserid_lastnotificationread: args.db["roomuserid_lastnotificationread"]
 					.clone(),
 			},
-			suppressed: suppressed::SuppressedQueue::default(),
 			sent_badges: SentBadges::default(),
 		}))
 	}
+
+	async fn worker(self: Arc<Self>) -> Result { self.notification_worker().await }
+
+	async fn interrupt(&self) { self.notification_stop.notify_one(); }
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
@@ -195,6 +226,9 @@ async fn set_pusher_post(
 
 #[implement(Service)]
 fn check_http_pusher_url(&self, url: &Url) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if ["http", "https"]
 		.iter()
 		.all(|&scheme| !scheme.eq_ignore_ascii_case(url.scheme()))
@@ -204,13 +238,13 @@ fn check_http_pusher_url(&self, url: &Url) -> Result {
 		)));
 	}
 
-	if self.services.client.proxy.resolver_alias(url) {
+	if services_root.client.proxy.resolver_alias(url) {
 		return Err!(Request(InvalidParam(
 			warn!(%url, "HTTP pusher URL is a forbidden proxy endpoint")
 		)));
 	}
 
-	if !self.services.client.valid_cidr_range_url(url) {
+	if !services_root.client.valid_cidr_range_url(url) {
 		return Err!(Request(InvalidParam(
 			warn!(%url, "HTTP pusher URL is a forbidden remote address")
 		)));
@@ -221,6 +255,9 @@ fn check_http_pusher_url(&self, url: &Url) -> Result {
 
 #[implement(Service)]
 pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let key = (sender, pushkey);
 	self.db
 		.senderkey_pusher
@@ -232,10 +269,9 @@ pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
 		.remove(pushkey)
 		.await
 		.expect("database write error");
-	self.clear_suppressed_pushkey(sender, pushkey);
 	self.forget_sent_badge(sender, pushkey);
 
-	self.services
+	services_root
 		.sending
 		.cleanup_events(None, Some(sender), Some(pushkey))
 		.await
@@ -299,29 +335,68 @@ pub fn get_pushkeys<'a>(&'a self, sender: &'a UserId) -> impl Stream<Item = &str
 		.map(|(_, pushkey): (Ignore, &str)| pushkey)
 }
 
+/// Checked, prefix-bounded reverse notification page. `from` is exclusive.
 #[implement(Service)]
-#[tracing::instrument(level = "debug", skip_all)]
-pub fn get_notifications<'a>(
-	&'a self,
-	sender: &'a UserId,
+pub async fn get_notifications(
+	&self,
+	sender: &UserId,
 	from: Option<u64>,
-) -> impl Stream<Item = (u64, Notified)> + Send + 'a {
-	let from = from
-		.map(|from| from.saturating_sub(1))
-		.unwrap_or(u64::MAX);
-
-	self.db
+	limit: usize,
+) -> Result<Vec<(u64, Notified, usize)>> {
+	let from = match from {
+		| Some(0) => return Ok(Vec::new()),
+		| Some(from) if from > i64::MAX.unsigned_abs() =>
+			return Err(err!(Request(InvalidParam("Invalid notification cursor")))),
+		| Some(from) => from.saturating_sub(1),
+		| None => u64::MAX,
+	};
+	if limit > 64 {
+		return Err(err!(Request(InvalidParam("Notification page limit exceeds 64"))));
+	}
+	let _guard = self.lock_notification_user(sender).await;
+	let prefix = tuwunel_database::serialize_key((sender, Interfix))?;
+	let from = tuwunel_database::serialize_key((sender, from))?;
+	let keys = self
+		.db
 		.useridcount_notification
-		.rev_stream_from(&(sender, from))
-		.ignore_err()
-		.map(|item: ((&UserId, u64), _)| (item.0, item.1))
-		.ready_take_while(move |((user_id, _count), _)| sender == *user_id)
-		.map(|((_, count), notified)| (count, notified))
+		.raw_keys_prefix_reverse(&prefix, &from, limit)
+		.await?;
+	let mut page = Vec::with_capacity(keys.len());
+	for key in keys {
+		let (user, count): (&UserId, u64) = tuwunel_database::deserialize_from_slice(&key)?;
+		if user != sender
+			|| count == 0
+			|| count > i64::MAX.unsigned_abs()
+			|| tuwunel_database::serialize_key((user, count))?.as_slice() != key.as_slice()
+		{
+			return Err(tuwunel_core::Error::bad_database("Invalid notification key"));
+		}
+		let value = self.db.useridcount_notification.get(&key).await?;
+		let notified = parse_notified(&value)?;
+		page.push((count, notified, key.len().saturating_add(value.len())));
+	}
+	Ok(page)
 }
 
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub async fn get_actions<'a>(
+pub async fn get_actions<'a>(&self, evaluation: Evaluate<'a, '_>) -> Result<&'a [Action]> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let count = services_root
+		.state_cache
+		.room_joined_count_uint(evaluation.room_id)
+		.await?;
+	self.get_actions_with_count(evaluation, count)
+		.await
+}
+
+/// The append path supplies the count from its complete, bounded membership
+/// inventory before the accepted event's membership effect runs. Other callers
+/// require a reconciled stored count through `get_actions`.
+#[implement(Service)]
+pub(crate) async fn get_actions_with_count<'a>(
 	&self,
 	Evaluate {
 		user,
@@ -331,22 +406,19 @@ pub async fn get_actions<'a>(
 		room_id,
 		related_events,
 	}: Evaluate<'a, '_>,
-) -> &'a [Action] {
-	let user_display_name = self
-		.services
-		.profile
-		.displayname(user)
-		.unwrap_or_else(|_| user.localpart().to_owned());
+	room_joined_count: UInt,
+) -> Result<&'a [Action]> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	let room_joined_count = self
-		.services
-		.state_cache
-		.room_joined_count(room_id)
-		.map_ok(TryInto::try_into)
-		.map_ok(|res| res.unwrap_or_else(|_| uint!(1)))
-		.unwrap_or_default();
+	let user_display_name = services_root.profile.displayname(user).await;
+	let user_display_name = match user_display_name {
+		| Ok(name) => Ok(name),
+		| Err(error) if error.is_not_found() => Ok(user.localpart().to_owned()),
+		| Err(error) => Err(error),
+	};
 
-	let (room_joined_count, user_display_name) = join(room_joined_count, user_display_name).await;
+	let user_display_name = user_display_name?;
 
 	let power_levels = power_levels.map(|power_levels| PushConditionPowerLevelsCtx {
 		users: power_levels.users.clone(),
@@ -372,7 +444,7 @@ pub async fn get_actions<'a>(
 		| None => ctx,
 	};
 
-	ruleset.get_actions(pdu, &ctx).await
+	Ok(ruleset.get_actions(pdu, &ctx).await)
 }
 
 /// Resolve the events an event relates to, for the MSC3664 push condition.
@@ -384,43 +456,51 @@ pub async fn get_actions<'a>(
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn related_events<E: Event>(&self, event: &E) -> Option<Arc<RelatedEvents>> {
-	let config = &self.services.server.config;
+	self.related_events_checked(event)
+		.await
+		.ok()
+		.flatten()
+}
+
+#[implement(Service)]
+pub(crate) async fn related_events_checked<E: Event>(
+	&self,
+	event: &E,
+) -> Result<Option<Arc<RelatedEvents>>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.server.config;
 
 	if !config.msc3664_related_event_match {
-		return None;
+		return Ok(None);
 	}
 
 	let Ok(ExtractRelatesTo { relates_to }) = event.get_content() else {
-		return Some(NO_RELATED_EVENTS.clone());
+		return Ok(Some(NO_RELATED_EVENTS.clone()));
 	};
 
 	let reply = relates_to
 		.in_reply_to
 		.map(|reply| (IN_REPLY_TO.to_owned(), reply.event_id));
 
-	let related = relates_to
+	let mut related = RelatedEvents::new();
+	for (rel_type, event_id) in relates_to
 		.rel_type
 		.zip(relates_to.event_id)
 		.into_iter()
 		.chain(reply)
-		.stream()
-		.wide_filter_map(async |(rel_type, event_id)| {
-			let related = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-				// A relation crossing rooms is not one the sender could have made, and
-				// following it would expose an event the recipient may not be in a room for.
-				.filter(|related| related.room_id() == event.room_id())?;
-
-			let related: Raw<AnySyncTimelineEvent> = related.to_format();
-
-			Some((rel_type, FlattenedJson::from_raw(&related)))
-		})
-		.collect()
-		.await;
-
-	Some(Arc::new(related))
+	{
+		let pdu = match services_root.timeline.get_pdu(&event_id).await {
+			| Ok(pdu) => pdu,
+			| Err(error) if error.is_not_found() => continue,
+			| Err(error) => return Err(error),
+		};
+		if pdu.room_id() != event.room_id() {
+			continue;
+		}
+		let raw: Raw<AnySyncTimelineEvent> = pdu.to_format();
+		related.insert(rel_type, FlattenedJson::from_raw(&raw));
+	}
+	Ok(Some(Arc::new(related)))
 }

@@ -17,6 +17,7 @@
 //! queue.
 
 use std::{
+	collections::BTreeMap,
 	env::var,
 	net::TcpListener,
 	path::PathBuf,
@@ -44,17 +45,16 @@ use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Err, Result, err,
 	log::capture::{Capture, Data},
-	matrix::PduCount,
+	matrix::PduBuilder,
 	ruma::{
 		EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, UserId,
 		api::appservice::{Namespace, Namespaces, Registration, RegistrationInit},
 		events::room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
-use tuwunel_database::refusal;
+use tuwunel_database::{Interfix, refusal, serialize_key};
 use tuwunel_service::{
 	Services,
-	rooms::state_cache::MembershipUpdate,
 	sending::{Destination, SendingEvent},
 	users::Register,
 };
@@ -164,6 +164,9 @@ fn every_effect_of_a_stored_event_runs() -> Result {
 
 async fn exercise(services: &Services, base: &str) -> Result {
 	wait_until_ready(services, base).await?;
+	services
+		.pusher
+		.pause_notification_retry_for_test(true);
 
 	let logged = Logged::default();
 	let capture = logged.capture(services);
@@ -175,6 +178,22 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	join_room(services, base, &room, BOB_TOKEN).await?;
 	let remote = join_remote(services, &room).await?;
 	let (mut transactions, stub) = register_appservice(services).await?;
+
+	let bob = UserId::parse_with_server_name("effectsbob", services.globals.server_name())?;
+	services
+		.client
+		.clients
+		.default
+		.put(format!("{base}/_matrix/client/v3/pushrules/global/override/effects-atomic"))
+		.bearer_auth(BOB_TOKEN)
+		.json(&json!({
+			"conditions": [], "actions": ["notify", { "set_tweak": "highlight", "value": true }],
+		}))
+		.send()
+		.await?
+		.error_for_status()?;
+
+	let before = notification_snapshot(services, &bob, &room).await?;
 
 	// Bob's notification row for the thread root is refused. The row was
 	// written with `expect`, so the refusal panicked the send.
@@ -190,7 +209,11 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		}),
 	)
 	.await?;
-	refused(services, &logged, "notification row", &root).await?;
+	refused(services, &logged, "push", &root).await?;
+	if notification_snapshot(services, &bob, &room).await? != before {
+		return Err!("refused notification entry left partial counts or recipient metadata");
+	}
+
 	indexed(services, base, "effectsroot", &root).await?;
 	delivered(&mut transactions, &root).await?;
 	federated(services, &remote, &root).await?;
@@ -215,7 +238,345 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	delivered(&mut transactions, &reply).await?;
 	federated(services, &remote, &reply).await?;
 
+	assert_count_pair(services, &bob, &room, Some(&root), (1, 1)).await?;
+	atomic_receipt_resets(services, base, &bob, &room, &root, &reply).await?;
+	notification_counter_errors(services, base, &bob, &room).await?;
+	bounded_receipt_reset(services, base, &bob, &room, &root).await?;
+
+	sender_read_acceptance(services, base, &room).await?;
+
 	stub.abort();
+
+	Ok(())
+}
+
+type Snapshot = BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>;
+
+/// Raw rows include notification counts, their read stamps, the notified
+/// entries and both private-marker stores. Sequence reservations may leave
+/// gaps, so this compares the receipt/notification state, not global `c`.
+async fn notification_snapshot(
+	services: &Services,
+	user: &UserId,
+	room: &RoomId,
+) -> Result<Snapshot> {
+	let mut snapshot = Snapshot::new();
+	for name in [
+		"userroomid_notificationcount",
+		"userroomid_highlightcount",
+		"useridcount_notification",
+		"roomuserid_lastnotificationread",
+		"roomuserid_notificationcutoff",
+		"roomuserid_privateread",
+		"roomuserid_lastprivatereadupdate",
+		"roomuserid_privatereadsync",
+	] {
+		let prefix = if name == "useridcount_notification" {
+			serialize_key((user, Interfix))?
+		} else if name.starts_with("userroomid") {
+			serialize_key((user, room))?
+		} else {
+			serialize_key((room, user))?
+		};
+		snapshot.insert(name.into(), rows(services, name, &prefix).await?);
+	}
+	Ok(snapshot)
+}
+
+async fn rows(services: &Services, map: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+	let mut result = Vec::new();
+	let mut after = None;
+	loop {
+		let page = services.db[map]
+			.raw_rows_prefix_after(prefix, after.as_deref(), 64)
+			.await?;
+		if page.is_empty() {
+			return Ok(result);
+		}
+		if result.len().saturating_add(page.len()) > 4096 {
+			return Err!("fixture inventory overflow");
+		}
+		after = page.last().map(|(key, _)| key.clone());
+		result.extend(page);
+	}
+}
+
+async fn assert_count_pair(
+	services: &Services,
+	user: &UserId,
+	room: &RoomId,
+	thread: Option<&EventId>,
+	want: (u64, u64),
+) -> Result {
+	let key = match thread {
+		| Some(root) => serialize_key((user, room, root))?,
+		| None => serialize_key((user, room))?,
+	};
+	let mut counts = [0_u64; 2];
+	for (at, map) in ["userroomid_notificationcount", "userroomid_highlightcount"]
+		.into_iter()
+		.enumerate()
+	{
+		match services.db[map].get(&key).await {
+			| Ok(value) =>
+				counts[at] = u64::from_be_bytes(
+					value
+						.as_ref()
+						.try_into()
+						.map_err(|_| err!("invalid fixture count"))?,
+				),
+			| Err(error) if error.is_not_found() => {},
+			| Err(error) => return Err(error),
+		}
+	}
+	if (counts[0], counts[1]) != want {
+		return Err!("{thread:?} counts {counts:?}, expected {want:?}");
+	}
+	Ok(())
+}
+
+async fn receipt_request(
+	services: &Services,
+	base: &str,
+	room: &RoomId,
+	event: &EventId,
+	thread: Option<&str>,
+	want: u16,
+) -> Result {
+	let response = services
+		.client
+		.clients
+		.default
+		.post(format!("{base}/_matrix/client/v3/rooms/{room}/receipt/m.read.private/{event}"))
+		.bearer_auth(BOB_TOKEN)
+		.json(&thread.map_or_else(|| json!({}), |thread| json!({ "thread_id": thread })))
+		.send()
+		.await?;
+	let status = response.status().as_u16();
+	let body: Value = response.json().await?;
+	if status != want {
+		return Err!("receipt answered {status}: {body}; expected {want}");
+	}
+	Ok(())
+}
+
+/// Refused resets preserve the marker too, so the identical API retry can
+/// finish. Main/thread/unthreaded scopes also retain their separation.
+async fn atomic_receipt_resets(
+	services: &Services,
+	base: &str,
+	bob: &UserId,
+	room: &RoomId,
+	root: &EventId,
+	reply: &EventId,
+) -> Result {
+	let main = send_message(
+		services,
+		base,
+		room,
+		"atomic-main",
+		&json!({
+			"msgtype": "m.text", "body": "atomic main",
+		}),
+	)
+	.await?;
+	assert_count_pair(services, bob, room, None, (1, 1)).await?;
+	let before = notification_snapshot(services, bob, room).await?;
+	refusal::refuse_next("roomuserid_lastnotificationread");
+	receipt_request(services, base, room, &main, Some("main"), 500).await?;
+	if refusal::pending() != 0 || notification_snapshot(services, bob, room).await? != before {
+		return Err!("refused main receipt advanced marker/counts");
+	}
+	receipt_request(services, base, room, &main, Some("main"), 200).await?;
+	assert_count_pair(services, bob, room, None, (0, 0)).await?;
+	assert_count_pair(services, bob, room, Some(root), (1, 1)).await?;
+	let completed = notification_snapshot(services, bob, room).await?;
+	receipt_request(services, base, room, &main, Some("main"), 200).await?;
+	if notification_snapshot(services, bob, room).await? != completed {
+		return Err!("duplicate completed receipt rewrote notification state");
+	}
+
+	let before = notification_snapshot(services, bob, room).await?;
+	refusal::refuse_next("roomuserid_privatereadsync");
+	receipt_request(services, base, room, reply, Some(root.as_str()), 500).await?;
+	if refusal::pending() != 0 || notification_snapshot(services, bob, room).await? != before {
+		return Err!("refused threaded receipt left a partial snapshot");
+	}
+	receipt_request(services, base, room, reply, Some(root.as_str()), 200).await?;
+	assert_count_pair(services, bob, room, Some(root), (0, 0)).await?;
+	assert_count_pair(services, bob, room, None, (0, 0)).await?;
+
+	let last = send_message(
+		services,
+		base,
+		room,
+		"atomic-unthreaded",
+		&json!({
+			"msgtype": "m.text", "body": "atomic unread", "m.relates_to": {
+				"rel_type": "m.thread", "event_id": root,
+			},
+		}),
+	)
+	.await?;
+	assert_count_pair(services, bob, room, Some(root), (1, 1)).await?;
+	let before = notification_snapshot(services, bob, room).await?;
+	refusal::refuse_next("userroomid_highlightcount");
+	receipt_request(services, base, room, &last, None, 500).await?;
+	if refusal::pending() != 0 || notification_snapshot(services, bob, room).await? != before {
+		return Err!("refused unthreaded sweep left a partial snapshot");
+	}
+	receipt_request(services, base, room, &last, None, 200).await?;
+	assert_count_pair(services, bob, room, Some(root), (0, 0)).await?;
+	assert_count_pair(services, bob, room, None, (0, 0)).await?;
+	Ok(())
+}
+
+/// Malformed and overflowing counters must refuse the complete derived
+/// notification update, while the stored event's other effects still run.
+async fn notification_counter_errors(
+	services: &Services,
+	base: &str,
+	bob: &UserId,
+	room: &RoomId,
+) -> Result {
+	let key = serialize_key((bob, room))?;
+	for (txn_id, map, bad) in [
+		("atomic-corrupt-highlight", "userroomid_highlightcount", b"broken".to_vec()),
+		(
+			"atomic-overflow-highlight",
+			"userroomid_highlightcount",
+			u64::MAX.to_be_bytes().to_vec(),
+		),
+		("atomic-corrupt-notify", "userroomid_notificationcount", b"broken".to_vec()),
+	] {
+		services.db["userroomid_notificationcount"]
+			.insert(&key, 2_u64.to_be_bytes())
+			.await?;
+		services.db["userroomid_highlightcount"]
+			.insert(&key, 3_u64.to_be_bytes())
+			.await?;
+		services.db[map].insert(&key, bad).await?;
+		let before = notification_snapshot(services, bob, room).await?;
+		let event = send_message(
+			services,
+			base,
+			room,
+			txn_id,
+			&json!({
+				"msgtype":"m.text", "body":txn_id,
+			}),
+		)
+		.await?;
+		if notification_snapshot(services, bob, room).await? != before {
+			return Err!("counter error left partial notification state for {event}");
+		}
+		indexed(services, base, txn_id, &event).await?;
+	}
+	services.db["userroomid_notificationcount"]
+		.insert(&key, 0_u64.to_be_bytes())
+		.await?;
+	services.db["userroomid_highlightcount"]
+		.insert(&key, 0_u64.to_be_bytes())
+		.await?;
+	Ok(())
+}
+
+/// A complete thread sweep larger than one commit is refused rather than
+/// clearing a prefix and forgetting the rest. No private marker advances.
+async fn bounded_receipt_reset(
+	services: &Services,
+	base: &str,
+	bob: &UserId,
+	room: &RoomId,
+	event: &EventId,
+) -> Result {
+	let mut seed = services.db.txn();
+	let mut remove = services.db.txn();
+	for index in 0..300 {
+		let root: OwnedEventId = format!("$notification-limit-{index}").try_into()?;
+		for name in ["userroomid_notificationcount", "userroomid_highlightcount"] {
+			seed.put(&services.db[name], (bob, room, &root), 7_u64);
+			remove.del(&services.db[name], (bob, room, &root));
+		}
+		seed.put(&services.db["roomuserid_lastnotificationread"], (room, bob, &root), 1_u64);
+		remove.del(&services.db["roomuserid_lastnotificationread"], (room, bob, &root));
+	}
+	seed.execute().await?;
+	let before = notification_snapshot(services, bob, room).await?;
+	// Use a fresh accepted event so the private unthreaded marker must advance.
+	let newer = send_message(
+		services,
+		base,
+		room,
+		"atomic-boundary",
+		&json!({
+			"msgtype":"m.text", "body":"bounded receipt", "m.relates_to": {
+				"rel_type":"m.thread", "event_id":event,
+			},
+		}),
+	)
+	.await?;
+	let before_request = notification_snapshot(services, bob, room).await?;
+	receipt_request(services, base, room, &newer, None, 429).await?;
+	if notification_snapshot(services, bob, room).await? != before_request {
+		return Err!("oversized reset partially advanced receipt/count state");
+	}
+	remove.execute().await?;
+	receipt_request(services, base, room, &newer, None, 200).await?;
+	assert_count_pair(services, bob, room, None, (0, 0)).await?;
+	if before.get("roomuserid_privateread") != before_request.get("roomuserid_privateread") {
+		return Err!("sending to Bob unexpectedly advanced his private marker");
+	}
+	Ok(())
+}
+
+/// An event-acceptance refusal cannot mark the sender read or clear their
+/// counts before its PDU and transaction receipt become durable.
+async fn sender_read_acceptance(services: &Services, base: &str, room: &RoomId) -> Result {
+	let alice = UserId::parse_with_server_name("effectsalice", services.globals.server_name())?;
+	let sender_key = serialize_key((&alice, room))?;
+	services.db["userroomid_notificationcount"]
+		.insert(&sender_key, 4_u64.to_be_bytes())
+		.await?;
+	services.db["userroomid_highlightcount"]
+		.insert(&sender_key, 2_u64.to_be_bytes())
+		.await?;
+
+	let before = notification_snapshot(services, &alice, room).await?;
+	let pdus = rows(services, "pduid_pdu", &[]).await?;
+	refusal::refuse_next("userdevicetxnid_response");
+	let response = services
+		.client
+		.clients
+		.default
+		.put(format!(
+			"{base}/_matrix/client/v3/rooms/{room}/send/m.room.message/atomic-sender"
+		))
+		.bearer_auth(ALICE_TOKEN)
+		.json(&json!({"msgtype":"m.text", "body":"refused sender"}))
+		.send()
+		.await?;
+	if response.status().as_u16() != 500 {
+		return Err!("refused sender acceptance did not fail");
+	}
+	if refusal::pending() != 0
+		|| notification_snapshot(services, &alice, room).await? != before
+		|| rows(services, "pduid_pdu", &[]).await? != pdus
+	{
+		return Err!("refused event changed sender receipt or accepted PDUs");
+	}
+	send_message(
+		services,
+		base,
+		room,
+		"atomic-sender",
+		&json!({"msgtype":"m.text", "body":"refused sender"}),
+	)
+	.await?;
+	if rows(services, "pduid_pdu", &[]).await?.len() != pdus.len().saturating_add(1) {
+		return Err!("sender retry failed to append exactly one PDU");
+	}
+	assert_count_pair(services, &alice, room, None, (0, 0)).await?;
 
 	Ok(())
 }
@@ -391,25 +752,21 @@ async fn send_message(
 	Ok(event_id.try_into()?)
 }
 
-/// Records a remote member, so the room's servers include theirs. No event of
-/// theirs is stored: the servers an event goes to come from this cache.
+/// Stores a remote join in room state, so canonical federation plans include
+/// the remote server rather than relying on a cache-only membership.
 async fn join_remote(services: &Services, room: &RoomId) -> Result<OwnedServerName> {
 	let remote = UserId::parse(REMOTE)?;
-	let count = PduCount::Normal(*services.globals.next_count().await?);
+	let builder = PduBuilder::state(
+		remote.to_string(),
+		&RoomMemberEventContent::new(MembershipState::Join),
+	);
+	let state_lock = services.state.mutex.lock(room).await;
 
 	services
-		.state_cache
-		.update_membership(MembershipUpdate {
-			room_id: room,
-			user_id: &remote,
-			membership_event: RoomMemberEventContent::new(MembershipState::Join),
-			sender: &remote,
-			last_state: None,
-			invite_via: None,
-			update_joined_count: true,
-			count,
-		})
+		.timeline
+		.build_and_append_pdu(builder, &remote, room, &state_lock)
 		.await?;
+	drop(state_lock);
 
 	let server = remote.server_name().to_owned();
 	let servers: Vec<OwnedServerName> = services

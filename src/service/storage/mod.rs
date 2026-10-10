@@ -20,7 +20,7 @@ pub struct Service {
 	providers: Providers,
 
 	#[debug(skip)]
-	services: Arc<crate::services::OnceServices>,
+	server: Arc<tuwunel_core::Server>,
 }
 
 type Providers = BTreeMap<String, Arc<Provider>>;
@@ -29,7 +29,7 @@ type Providers = BTreeMap<String, Arc<Provider>>;
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			services: args.services.clone(),
+			server: args.server.clone(),
 			providers: Self::build_providers(args)?,
 		}))
 	}
@@ -135,7 +135,7 @@ where
 {
 	let id = id.into();
 
-	self.services
+	self.server
 		.config
 		.storage_provider
 		.iter()

@@ -46,12 +46,8 @@ impl Manager {
 	}
 
 	pub(super) async fn poll(&self) -> Result {
-		if let Some(manager) = &mut *self.manager.lock().await {
-			debug!("Polling service manager...");
-			return manager.await?;
-		}
-
-		Ok(())
+		debug!("Polling service manager...");
+		join_manager(&self.manager).await
 	}
 
 	#[tracing::instrument(
@@ -63,12 +59,9 @@ impl Manager {
 		),
 	)]
 	pub(super) async fn stop(&self) {
-		let Some(manager) = self.manager.lock().await.take() else {
-			return;
-		};
-
-		debug!("Waiting for service manager...");
-		if let Err(e) = manager.await {
+		// Keep the handle in its slot until completion, so cancelling a stop
+		// cannot detach a manager that a later stop still needs to join.
+		if let Err(e) = self.poll().await {
 			error!("Manager shutdown error: {e:?}");
 		}
 	}
@@ -114,22 +107,34 @@ impl Manager {
 	async fn worker(self: &Arc<Self>) -> Result {
 		loop {
 			let mut workers = self.workers.lock().await;
-			tokio::select! {
-				result = workers.join_next() => match result {
-					Some(Ok(result)) => self.handle_result(&mut workers, result).await?,
-					Some(Err(error)) => self.handle_abort(&mut workers, &Error::from(error))?,
-					None => break,
+			let result = match workers.join_next().await {
+				| Some(Ok(result)) => self.handle_result(&mut workers, result).await,
+				| Some(Err(error)) => Err(Error::from(error)),
+				| None => break,
+			};
+			if let Err(error) = result {
+				// The first failure stays authoritative. Notify the listener and
+				// other workers before joining them; returning early would leave
+				// their manager/root references alive in this JoinSet.
+				self.server.shutdown().ok();
+				self.services.interrupt().await;
+				while let Some(result) = workers.join_next().await {
+					match result {
+						| Ok((service, Err(error))) => {
+							error!(name = service.name(), %error, "Service worker failed during fatal shutdown");
+						},
+						| Err(error) if !error.is_cancelled() => {
+							error!(%error, "Service worker task failed during fatal shutdown");
+						},
+						| _ => {},
+					}
 				}
+				return Err(error);
 			}
 		}
 
 		debug!("Worker manager finished");
 		Ok(())
-	}
-
-	fn handle_abort(&self, _workers: &mut WorkersLocked<'_>, error: &Error) -> Result {
-		// not supported until service can be associated with abort
-		unimplemented!("unexpected worker task abort {error:?}");
 	}
 
 	async fn handle_result(
@@ -254,3 +259,51 @@ async fn worker(service: Arc<dyn Service>, mgr: Arc<Manager>) -> WorkerResult {
 	// flattens JoinError for panic into worker's Error
 	(service, result.unwrap_or_else(Err))
 }
+
+/// Await a borrowed handle so cancellation preserves the task's join owner.
+async fn join_manager(manager: &Mutex<Option<JoinHandle<Result>>>) -> Result {
+	let mut slot = manager.lock().await;
+	if let Some(handle) = slot.as_mut() {
+		let result = handle.await;
+		slot.take();
+		return result?;
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn cancelled_join_retains_handle_until_a_later_join_finishes() -> Result {
+		let (release, blocked) = tokio::sync::oneshot::channel();
+		let handle: JoinHandle<Result> = tokio::spawn(async move {
+			blocked
+				.await
+				.expect("fixture releases manager task");
+			Ok(())
+		});
+		let manager = Mutex::new(Some(handle));
+		let mut first_join = Box::pin(join_manager(&manager));
+		assert!(futures::poll!(&mut first_join).is_pending());
+		drop(first_join);
+		assert!(
+			manager
+				.lock()
+				.await
+				.as_ref()
+				.is_some_and(|handle| !handle.is_finished())
+		);
+		release
+			.send(())
+			.expect("manager task remains owned");
+		join_manager(&manager).await?;
+		assert!(manager.lock().await.is_none());
+		join_manager(&manager).await?;
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod failure_tests;

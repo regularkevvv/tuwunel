@@ -52,8 +52,11 @@ async fn append_pdu_to(
 	pdu_id: RawPduId,
 	pdu: &Pdu,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if self.should_append_to(appservice, pdu).await {
-		self.services
+		services_root
 			.sending
 			.send_pdu_appservice(appservice.registration.id.clone(), pdu_id)
 			.await?;
@@ -64,8 +67,10 @@ async fn append_pdu_to(
 
 #[implement(super::Service)]
 async fn should_append_to(&self, appservice: &RegistrationInfo, pdu: &Pdu) -> bool {
-	if self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root
 		.state_cache
 		.appservice_in_room(pdu.room_id(), appservice)
 		.await
@@ -87,8 +92,7 @@ async fn should_append_to(&self, appservice: &RegistrationInfo, pdu: &Pdu) -> bo
 		return true;
 	}
 
-	if self
-		.services
+	if services_root
 		.alias
 		.local_aliases_for_room(pdu.room_id())
 		.ready_any(|room_alias| appservice.aliases.is_match(room_alias.as_str()))

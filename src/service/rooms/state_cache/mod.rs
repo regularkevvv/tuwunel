@@ -1,27 +1,37 @@
+mod erasure;
+mod inventory;
+mod invite_inventory;
+mod projection;
+mod recount;
+#[cfg(test)]
+mod recount_tests;
+mod recovery;
 #[cfg(test)]
 mod tests;
 mod update;
 mod via;
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::HashMap,
 	convert::identity,
-	sync::{Arc, Mutex, RwLock},
+	sync::{Arc, RwLock},
 };
 
+use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, future::join5, pin_mut};
+pub use inventory::RoomMemberInventoryCount;
+pub use invite_inventory::InviteStateInventory;
 use ruma::{
-	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
+	OwnedRoomId, OwnedServerName, RoomId, ServerName, UInt, UserId,
 	events::{AnyStrippedStateEvent, AnySyncStateEvent, room::member::MembershipState},
 	serde::Raw,
 };
 use serde::de::DeserializeOwned;
 use tuwunel_core::{
-	Result, debug_warn, implement,
+	Error, Result, debug_warn, implement,
 	matrix::{Event, Pdu, event::Owned},
-	trace,
 	utils::{
-		self, BoolExt,
+		self, BoolExt, MutexMap, MutexMapGuard,
 		future::OptionStream,
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
 	},
@@ -34,9 +44,15 @@ use crate::appservice::RegistrationInfo;
 
 pub struct Service {
 	appservice_in_room_cache: AppServiceInRoomCache,
-	/// Rooms whose last recount failed to commit; the room's next event
-	/// recounts it ([`Service::repair_joined_count`]).
-	stale_counts: Mutex<HashSet<OwnedRoomId>>,
+	// Within the fenced writer, membership batches and aggregate rebuilds
+	// share this exclusion. Outer room-state locks may precede it; no code
+	// holding it acquires a room-state lock. Repair obligations live in D1.
+	membership_mutex: MutexMap<OwnedRoomId, ()>,
+	// Fresh for every service graph, including replacement after an older
+	// writer ran. Durable per-room stamps never authorize another process.
+	recount_generation: String,
+	projection_stop: tokio::sync::Notify,
+	projection_admission: Arc<tokio::sync::Mutex<()>>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -60,6 +76,7 @@ struct Data {
 }
 
 type AppServiceInRoomCache = RwLock<InRoomCache>;
+type MembershipGuard = MutexMapGuard<OwnedRoomId, ()>;
 
 /// Which appservices are in which rooms, as last computed.
 ///
@@ -115,11 +132,15 @@ impl InRoomCache {
 type StrippedStateEventItem = (OwnedRoomId, Vec<Raw<AnyStrippedStateEvent>>);
 type SyncStateEventItem = (OwnedRoomId, Vec<Raw<AnySyncStateEvent>>);
 
+#[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			appservice_in_room_cache: RwLock::new(InRoomCache::default()),
-			stale_counts: Mutex::new(HashSet::new()),
+			membership_mutex: MutexMap::new(),
+			recount_generation: utils::rand::string(recount::GENERATION_BYTES),
+			projection_stop: tokio::sync::Notify::new(),
+			projection_admission: Arc::new(tokio::sync::Mutex::new(())),
 			services: args.services.clone(),
 			db: Data {
 				roomid_knockedcount: args.db["roomid_knockedcount"].clone(),
@@ -140,6 +161,10 @@ impl crate::Service for Service {
 			},
 		}))
 	}
+
+	async fn worker(self: Arc<Self>) -> Result { self.projection_worker().await }
+
+	async fn interrupt(&self) { self.projection_stop.notify_one(); }
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
@@ -353,37 +378,63 @@ pub fn room_members<'a>(
 		.map(|(_, user_id): (Ignore, &UserId)| user_id)
 }
 
-/// Returns the number of users which are currently in a room
+/// Returns the joined count after pending repair and first-read reconciliation.
+/// Membership cannot change between inspection, repair and this read.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_joined_count(&self, room_id: &RoomId) -> Result<u64> {
-	self.db
-		.roomid_joinedcount
-		.get(room_id)
-		.await
-		.deserialized()
+	Box::pin(self.read_reconciled_count(
+		room_id,
+		&self.db.roomid_joinedcount,
+		"Invalid joined-member count",
+	))
+	.await
 }
 
-/// Returns the number of users which are currently invited to a room
+/// Required joined count for a known room in Matrix responses and push rules.
+/// Missing storage and values outside Matrix's integer range cannot become
+/// zero, an omitted field, or a different rule-evaluation context.
+#[implement(Service)]
+pub async fn room_joined_count_uint(&self, room_id: &RoomId) -> Result<UInt> {
+	let count = self
+		.room_joined_count(room_id)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("Missing known room member count")
+			} else {
+				error
+			}
+		})?;
+	UInt::try_from(count).map_err(|_| Error::bad_database("Invalid joined-member count"))
+}
+
+/// Returns the invited count after completing any durable pending recount.
+/// Malformed counters and refused repairs propagate instead of serving stale
+/// data.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_invited_count(&self, room_id: &RoomId) -> Result<u64> {
-	self.db
-		.roomid_invitedcount
-		.get(room_id)
-		.await
-		.deserialized()
+	Box::pin(self.read_reconciled_count(
+		room_id,
+		&self.db.roomid_invitedcount,
+		"Invalid invited-member count",
+	))
+	.await
 }
 
-/// Returns the number of users which are currently knocking upon a room
+/// Returns the knocked count after completing any durable pending recount.
+/// Malformed counters and refused repairs propagate instead of serving stale
+/// data.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn room_knocked_count(&self, room_id: &RoomId) -> Result<u64> {
-	self.db
-		.roomid_knockedcount
-		.get(room_id)
-		.await
-		.deserialized()
+	Box::pin(self.read_reconciled_count(
+		room_id,
+		&self.db.roomid_knockedcount,
+		"Invalid knocked-member count",
+	))
+	.await
 }
 
 /// Returns an iterator of all our local joined users in a room who are
@@ -394,8 +445,11 @@ pub fn active_local_users_in_room<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &UserId> + Send + 'a {
-	self.local_users_in_room(room_id)
-		.filter(|user| self.services.users.is_active(user))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.local_users_in_room(room_id)
+			.filter(|user| services_root.users.is_active(user))
+	})
 }
 
 /// Returns an iterator of all our local users in the room, even if they're
@@ -406,8 +460,11 @@ pub fn local_users_in_room<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &UserId> + Send + 'a {
-	self.room_members(room_id)
-		.ready_filter(|user| self.services.globals.user_is_local(user))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.room_members(room_id)
+			.ready_filter(|user| services_root.globals.user_is_local(user))
+	})
 }
 
 /// Returns an iterator of only our users invited to this room.
@@ -417,8 +474,11 @@ pub fn local_users_invited_to_room<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = &UserId> + Send + 'a {
-	self.room_members_invited(room_id)
-		.ready_filter(|user| self.services.globals.user_is_local(user))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		self.room_members_invited(room_id)
+			.ready_filter(|user| services_root.globals.user_is_local(user))
+	})
 }
 
 /// Returns an iterator over all User IDs who ever joined a room.
@@ -492,11 +552,9 @@ pub async fn get_knock_count(&self, room_id: &RoomId, user_id: &UserId) -> Resul
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn get_left_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
 	let key = (room_id, user_id);
-	self.db
-		.roomuserid_leftcount
-		.qry(&key)
-		.await
-		.deserialized()
+	let value = self.db.roomuserid_leftcount.qry(&key).await?;
+	utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid departure count"))
 }
 
 #[implement(Service)]
@@ -774,6 +832,15 @@ pub async fn once_joined(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 	self.db.roomuseroncejoinedids.contains(&key).await
 }
 
+/// Checks past-membership presence while preserving failed point reads.
+#[implement(Service)]
+pub async fn once_joined_checked(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.roomuseroncejoinedids
+		.contains_checked(&(user_id, room_id))
+		.await
+}
+
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn is_joined<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) -> bool {
@@ -781,6 +848,16 @@ pub async fn is_joined<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) -
 	self.db
 		.userroomid_joinedcount
 		.contains(&key)
+		.await
+}
+
+/// Checks joined-membership presence without folding storage failures into
+/// an absent membership. The stored count value is not deserialized.
+#[implement(Service)]
+pub async fn is_joined_checked(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.userroomid_joinedcount
+		.contains_checked(&(user_id, room_id))
 		.await
 }
 
@@ -804,6 +881,15 @@ pub async fn is_invited(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 		.await
 }
 
+/// Checks invitation presence while preserving failed point reads.
+#[implement(Service)]
+pub async fn is_invited_checked(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.userroomid_invitestate
+		.contains_checked(&(user_id, room_id))
+		.await
+}
+
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn is_left(&self, user_id: &UserId, room_id: &RoomId) -> bool {
@@ -811,99 +897,28 @@ pub async fn is_left(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 	self.db.userroomid_leftstate.contains(&key).await
 }
 
+/// Checks departure presence without discarding storage failures.
+#[implement(Service)]
+pub async fn is_left_checked(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	self.db
+		.userroomid_leftstate
+		.contains_checked(&(user_id, room_id))
+		.await
+}
+
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Result {
-	let prefix = (room_id, Interfix);
-	let mut txn = self.services.db.txn();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	txn.del_raw(&self.db.roomid_knockedcount, room_id);
+	let guard = self.membership_mutex.lock(room_id).await;
+	let mut txn = services_root.db.txn();
+	self.stage_membership_erasure(room_id, force, &mut txn)
+		.await?;
 
-	txn.del_raw(&self.db.roomid_invitedcount, room_id);
-
-	txn.del_raw(&self.db.roomid_inviteviaservers, room_id);
-
-	txn.del_raw(&self.db.roomid_joinedcount, room_id);
-
-	self.db
-		.roomserverids
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &ServerName)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomserverids, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.serverroomids, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_invitecount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_invitecount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_invitestate, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_joinedcount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_joinedcount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_joinedcount, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_knockedcount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_knockedcount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_knockedstate, reverse_key);
-		})
-		.await;
-
-	self.db
-		.roomuserid_leftcount
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.ready_filter(|(_, user_id): &(&RoomId, &UserId)| {
-			force || !self.services.globals.user_is_local(user_id)
-		})
-		.ready_for_each(|key: (&RoomId, &UserId)| {
-			trace!("Removing key: {key:?}");
-			txn.del(&self.db.roomuserid_leftcount, key);
-
-			let reverse_key = (key.1, key.0);
-
-			trace!("Removing reverse key: {reverse_key:?}");
-			txn.del(&self.db.userroomid_leftstate, reverse_key);
-		})
-		.await;
-
-	self.commit_membership(room_id, txn).await
+	self.commit_membership_erasure_locked(room_id, txn, &guard)
+		.await
 }
 
 /// A sibling conduwuit-lineage server writes the leave event itself into this

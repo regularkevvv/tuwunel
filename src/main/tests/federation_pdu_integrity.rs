@@ -17,6 +17,13 @@
 //!   even when its X-Matrix signature verifies for the request without a body,
 //!   and the event is never stored. The event handler refuses the same PDUs on
 //!   its own.
+//! - A correctly signed chain rooted in an unavailable auth event is refused
+//!   without storing its descendants as timeline events or outliers. An honest
+//!   join before and after the chain proves the refusal is specific to auth.
+//! - A bad event signature and a joined member's signed power-level escalation
+//!   are refused without storage or state changes. A normal message from that
+//!   member is accepted. A create event with an unsupported room version is
+//!   refused by the actual incoming-PDU parser and cannot become stored state.
 
 use std::{
 	env::temp_dir,
@@ -78,6 +85,9 @@ fn inbound_pdus_are_redacted_on_bad_hashes_and_refused_when_not_canonical() -> R
 		format!("port={port}"),
 		"listening=true".to_owned(),
 		"log=\"warn\"".to_owned(),
+		"dns_attempts=1".to_owned(),
+		"dns_timeout=1".to_owned(),
+		"federation_timeout=2".to_owned(),
 	]);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -138,6 +148,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		json!({"membership": "join", "displayname": "kept"}),
 		"an honest join must keep its content"
 	);
+	room_version_errors_refuse_invitation_fallback(services, &room_id, &honest).await?;
 
 	// A join whose content no longer matches its hash is stored redacted.
 	let mallory = remote_user("mallory")?;
@@ -170,6 +181,9 @@ async fn exercise(services: &Services, base: &str) -> Result {
 			.await,
 		"redaction keeps the membership"
 	);
+
+	missing_auth_chain_is_refused(services, base, &room_id, &remote).await?;
+	signature_power_and_version_refusals(services, base, &room_id, &remote, &trent).await?;
 
 	// A PDU that is not canonical JSON is refused with its transaction.
 	let oscar = remote_user("oscar")?;
@@ -214,6 +228,576 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"a PDU that is not canonical JSON took effect"
 	);
 
+	Ok(())
+}
+
+async fn room_version_errors_refuse_invitation_fallback(
+	services: &Services,
+	room: &RoomId,
+	pdu: &CanonicalJsonObject,
+) -> Result {
+	let raw = to_raw_value(pdu)?;
+	let user = &services.globals.server_user;
+	let invited = &services.db["roomuserid_invitecount"];
+	let states = &services.db["userroomid_invitestate"];
+	// A valid local invitation previously let the parser continue after a
+	// failed current-state lookup was disguised as a missing create event.
+	invited.put((room, user), b"").await?;
+	states
+		.put_raw(
+			(user, room),
+			serde_json::to_vec(&json!([{
+				"type":"m.room.create", "state_key":"", "sender":user,
+				"content":{"room_version":"11", "creator":user}
+			}]))?,
+		)
+		.await?;
+	assert_eq!(services.state.get_room_version(room).await?, RoomVersionId::V11);
+	services
+		.event_handler
+		.parse_incoming_pdu(&raw)
+		.await
+		.expect("healthy current state must parse the signed control PDU");
+	let hashes = &services.db["roomid_shortstatehash"];
+	let original = hashes.get(room).await?.to_vec();
+	hashes.remove(room).await?;
+	assert!(
+		services
+			.state
+			.get_room_version(room)
+			.await
+			.expect_err("a missing room snapshot permits invitation recovery")
+			.is_not_found()
+	);
+	services
+		.event_handler
+		.parse_incoming_pdu(&raw)
+		.await
+		.expect("the stored invitation must actually provide a usable version");
+	invitation_source_limits(services, room, &raw).await?;
+	invitation_state_limits(services, room, &raw).await?;
+	invitation_aggregate_limits(services, room, &raw).await?;
+	hashes.insert(room, &original).await?;
+	let missing_layer = u64::MAX.to_be_bytes();
+	let malformed: [&[u8]; 5] = [b"", b"short", b"123456789", b"invalid-count", &missing_layer];
+	for value in malformed {
+		hashes.insert(room, value).await?;
+		assert_eq!(
+			services
+				.state
+				.get_room_version(room)
+				.await
+				.expect_err("unreadable room state is not a missing room")
+				.status_code(),
+			tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR
+		);
+		assert_eq!(
+			services
+				.event_handler
+				.parse_incoming_pdu(&raw)
+				.await
+				.expect_err("a valid invitation cannot hide unreadable current state")
+				.status_code(),
+			tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR
+		);
+	}
+	hashes.insert(room, original).await?;
+	assert_eq!(services.state.get_room_version(room).await?, RoomVersionId::V11);
+	services
+		.event_handler
+		.parse_incoming_pdu(&raw)
+		.await
+		.expect("restored current state must parse the signed control PDU");
+	invited.del((room, user)).await?;
+	states.del((user, room)).await?;
+	Ok(())
+}
+
+async fn invitation_refused(
+	services: &Services,
+	raw: &RawJsonValue,
+	status: tuwunel_core::http::StatusCode,
+) {
+	let error = services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect_err("incomplete invitation input cannot provide a room version");
+	assert_eq!(error.status_code(), status);
+	if status == tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS {
+		assert!(matches!(
+			error.kind(),
+			tuwunel_core::ruma::api::error::ErrorKind::LimitExceeded(_)
+		));
+	}
+}
+
+async fn invitation_source_limits(
+	services: &Services,
+	room: &RoomId,
+	raw: &RawJsonValue,
+) -> Result {
+	use tuwunel_core::http::StatusCode;
+	let members = &services.db["roomuserid_invitecount"];
+	members.put((room, "not-a-user"), b"").await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	members.del((room, "not-a-user")).await?;
+	for index in 0..1023 {
+		members
+			.put((room, &format!("@invite-{index:04}:remote.test")), b"")
+			.await?;
+	}
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("the exact invited-ID row limit must permit recovery");
+	members
+		.put((room, "@overflow:remote.test"), b"")
+		.await?;
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	members
+		.del((room, "@overflow:remote.test"))
+		.await?;
+	for index in 0..1023 {
+		members
+			.del((room, &format!("@invite-{index:04}:remote.test")))
+			.await?;
+	}
+	for index in 0..600 {
+		members
+			.put((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))), b"")
+			.await?;
+	}
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	for index in 0..600 {
+		members
+			.del((room, &format!("@{}-{index:04}:remote.test", "x".repeat(220))))
+			.await?;
+	}
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("restored invited-ID input must permit recovery");
+	Ok(())
+}
+
+fn encoded_invitation(user: &UserId, events: usize, padding: usize) -> Result<Vec<u8>> {
+	let mut state = vec![json!({
+		"type":"m.room.create", "state_key":"", "sender":user,
+		"content":{"room_version":"11", "padding":"x".repeat(padding)}
+	})];
+	state.extend((1..events).map(|index| {
+		json!({
+			"type":format!("x{index}"), "state_key":"", "sender":"@a:x", "content":{}
+		})
+	}));
+	Ok(serde_json::to_vec(&state)?)
+}
+
+async fn invitation_state_limits(
+	services: &Services,
+	room: &RoomId,
+	raw: &RawJsonValue,
+) -> Result {
+	use tuwunel_core::http::StatusCode;
+	let user = &services.globals.server_user;
+	let states = &services.db["userroomid_invitestate"];
+	let original = states.qry(&(user, room)).await?.to_vec();
+	states.del((user, room)).await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	for value in [b"invalid".as_slice(), b"[{\"type\":\"m.room.create\"}]", b"[] trailing"] {
+		states.put_raw((user, room), value).await?;
+		invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	}
+	states
+		.put_raw((user, room), encoded_invitation(user, 128, 0)?)
+		.await?;
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("the exact stripped-event row limit must permit recovery");
+	states
+		.put_raw((user, room), encoded_invitation(user, 129, 0)?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	let padding = (64 * 1024_usize).saturating_sub(encoded_invitation(user, 1, 0)?.len());
+	let exact = encoded_invitation(user, 1, padding)?;
+	assert_eq!(exact.len(), 64 * 1024);
+	states.put_raw((user, room), &exact).await?;
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("the exact stored invitation byte limit must permit recovery");
+	states
+		.put_raw((user, room), encoded_invitation(user, 1, padding.saturating_add(1))?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+	let mut duplicates: Value = serde_json::from_slice(&original)?;
+	let create = duplicates[0].clone();
+	duplicates
+		.as_array_mut()
+		.expect("state array")
+		.push(create);
+	states
+		.put_raw((user, room), serde_json::to_vec(&duplicates)?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	states.put_raw((user, room), original).await?;
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("restored invitation state must permit recovery");
+	Ok(())
+}
+
+async fn invitation_aggregate_limits(
+	services: &Services,
+	room: &RoomId,
+	raw: &RawJsonValue,
+) -> Result {
+	use tuwunel_core::http::StatusCode;
+	let user = &services.globals.server_user;
+	let states = &services.db["userroomid_invitestate"];
+	let members = &services.db["roomuserid_invitecount"];
+	let original = states.qry(&(user, room)).await?.to_vec();
+	let padding = (64 * 1024_usize).saturating_sub(encoded_invitation(user, 1, 0)?.len());
+	for (extra_count, events, padding) in [(3_usize, 1, padding), (31, 128, 0)] {
+		let encoded = encoded_invitation(user, events, padding)?;
+		assert!(
+			encoded
+				.len()
+				.saturating_mul(extra_count.saturating_add(1))
+				<= 256 * 1024
+		);
+		states.put_raw((user, room), &encoded).await?;
+		let mut extra_users = Vec::new();
+		for index in 0..extra_count {
+			let extra = UserId::parse(format!(
+				"@invite-budget-{index}:{}",
+				services.globals.server_name()
+			))?;
+			members.put((room, &extra), b"").await?;
+			states.put_raw((&extra, room), &encoded).await?;
+			extra_users.push(extra);
+		}
+		services
+			.event_handler
+			.parse_incoming_pdu(raw)
+			.await
+			.expect("the exact aggregate invitation budget must permit recovery");
+		let overflow =
+			UserId::parse(format!("@invite-overflow:{}", services.globals.server_name()))?;
+		members.put((room, &overflow), b"").await?;
+		states
+			.put_raw((&overflow, room), &encoded)
+			.await?;
+		invitation_refused(services, raw, StatusCode::TOO_MANY_REQUESTS).await;
+		extra_users.push(overflow);
+		for extra in extra_users {
+			members.del((room, &extra)).await?;
+			states.del((&extra, room)).await?;
+		}
+	}
+	let conflicting =
+		UserId::parse(format!("@invite-conflict:{}", services.globals.server_name()))?;
+	members.put((room, &conflicting), b"").await?;
+	let mut state: Value = serde_json::from_slice(&original)?;
+	state[0]["content"]["room_version"] = json!("12");
+	states
+		.put_raw((&conflicting, room), serde_json::to_vec(&state)?)
+		.await?;
+	invitation_refused(services, raw, StatusCode::INTERNAL_SERVER_ERROR).await;
+	members.del((room, &conflicting)).await?;
+	states.del((&conflicting, room)).await?;
+	states.put_raw((user, room), original).await?;
+	services
+		.event_handler
+		.parse_incoming_pdu(raw)
+		.await
+		.expect("restored aggregate invitation input must permit recovery");
+	Ok(())
+}
+
+async fn signature_power_and_version_refusals(
+	services: &Services,
+	base: &str,
+	room_id: &RoomId,
+	remote: &Remote,
+	joined_user: &UserId,
+) -> Result {
+	let user = remote_user("invalid-signature")?;
+	let mut pdu = signed_join(services, room_id, &user, remote, "bad signature").await?;
+	let Some(CanonicalJsonValue::Object(signatures)) = pdu.get_mut("signatures") else {
+		return Err!("signed fixture has no signatures");
+	};
+	let Some(CanonicalJsonValue::Object(keys)) = signatures.get_mut(remote.name.as_str()) else {
+		return Err!("signed fixture has no origin signature");
+	};
+	let signature: Base64 = Base64::new(vec![0_u8; 64]);
+	keys.insert(KEY_ID.into(), CanonicalJsonValue::String(signature.encode()));
+	assert_refused_without_storage(services, base, room_id, remote, &pdu).await?;
+	assert!(
+		!services
+			.state_cache
+			.is_joined(&user, room_id)
+			.await
+	);
+
+	// All auth events exist and the sender has joined; the refusal must not
+	// be explained by the missing-auth fixture or an unjoined sender.
+	let mut power = signed_join(services, room_id, joined_user, remote, "power fixture").await?;
+	let mut auth = Vec::new();
+	for (kind, state_key) in [
+		(StateEventType::RoomCreate, ""),
+		(StateEventType::RoomPowerLevels, ""),
+		(StateEventType::RoomMember, joined_user.as_str()),
+	] {
+		let id = services
+			.state_accessor
+			.room_state_get_id(room_id, &kind, state_key)
+			.await?;
+		auth.push(CanonicalJsonValue::String(id.to_string()));
+	}
+	power.insert("auth_events".into(), CanonicalJsonValue::Array(auth));
+	power.insert("type".into(), CanonicalJsonValue::String("m.room.power_levels".into()));
+	power.insert("state_key".into(), CanonicalJsonValue::String(String::new()));
+	power.insert(
+		"content".into(),
+		serde_json::from_value(json!({"users": {joined_user.as_str(): 100}}))?,
+	);
+	resign(&mut power, remote)?;
+	let before_power = services
+		.state_accessor
+		.room_state_get_id(room_id, &StateEventType::RoomPowerLevels, "")
+		.await?;
+	assert_refused_without_storage(services, base, room_id, remote, &power).await?;
+	assert_eq!(
+		services
+			.state_accessor
+			.room_state_get_id(room_id, &StateEventType::RoomPowerLevels, "")
+			.await?,
+		before_power
+	);
+
+	let mut message = power;
+	message.insert("type".into(), CanonicalJsonValue::String("m.room.message".into()));
+	message.remove("state_key");
+	message.insert(
+		"content".into(),
+		serde_json::from_value(json!({"msgtype": "m.text", "body": "allowed at power zero"}))?,
+	);
+	resign(&mut message, remote)?;
+	let id = event_id(&message, remote)?;
+	let (status, reply) = send_pdus(services, base, remote, &message).await?;
+	assert_eq!(status, 200);
+	assert!(
+		reply["pdus"][id.as_str()].get("error").is_none(),
+		"honest power-zero control failed: {reply}"
+	);
+	assert_eq!(
+		stored_content(services, &id).await?,
+		json!({"msgtype": "m.text", "body": "allowed at power zero"})
+	);
+
+	let mut create = signed_join(services, room_id, &user, remote, "version fixture").await?;
+	create.insert("type".into(), CanonicalJsonValue::String("m.room.create".into()));
+	create.insert("state_key".into(), CanonicalJsonValue::String(String::new()));
+	create.remove("room_id");
+	create.insert(
+		"content".into(),
+		serde_json::from_value(json!({"room_version": "org.example.unsupported"}))?,
+	);
+	resign(&mut create, remote)?;
+	let raw = to_raw_value(&create)?;
+	assert!(
+		services
+			.event_handler
+			.parse_incoming_pdu(&raw)
+			.await
+			.is_err(),
+		"unsupported version was parsed"
+	);
+	let id = event_id(&create, remote)?;
+	let before = services
+		.timeline
+		.latest_pdu_in_room(room_id)
+		.await?
+		.event_id;
+	let (status, _) = send_pdus(services, base, remote, &create).await?;
+	assert_eq!(status, 200, "a canonical transaction should get its per-PDU verdict");
+	services
+		.timeline
+		.get_pdu_json(&id)
+		.await
+		.unwrap_err();
+	services
+		.timeline
+		.get_outlier_pdu_json(&id)
+		.await
+		.unwrap_err();
+	assert_eq!(
+		services
+			.timeline
+			.latest_pdu_in_room(room_id)
+			.await?
+			.event_id,
+		before
+	);
+	Ok(())
+}
+
+fn resign(pdu: &mut CanonicalJsonObject, remote: &Remote) -> Result {
+	pdu.remove("hashes");
+	pdu.remove("signatures");
+	hash_and_sign_event(remote.name.as_str(), &remote.keypair, pdu, &remote.rules.redaction)
+		.map_err(|error| err!("fixture signing failed: {error}"))?;
+	Ok(())
+}
+
+async fn assert_refused_without_storage(
+	services: &Services,
+	base: &str,
+	room_id: &RoomId,
+	remote: &Remote,
+	pdu: &CanonicalJsonObject,
+) -> Result {
+	let id = event_id(pdu, remote)?;
+	let before = services
+		.timeline
+		.latest_pdu_in_room(room_id)
+		.await?
+		.event_id;
+	let (status, reply) = send_pdus(services, base, remote, pdu).await?;
+	assert_eq!(status, 200, "signed transaction was refused: {reply}");
+	assert!(
+		reply["pdus"][id.as_str()]["error"].is_string(),
+		"invalid event was accepted: {reply}"
+	);
+	assert!(services.timeline.get_pdu_json(&id).await.is_err(), "invalid event was stored");
+	assert!(
+		services
+			.timeline
+			.get_outlier_pdu_json(&id)
+			.await
+			.is_err(),
+		"invalid event became an outlier"
+	);
+	assert_eq!(
+		services
+			.timeline
+			.latest_pdu_in_room(room_id)
+			.await?
+			.event_id,
+		before,
+		"invalid event changed timeline"
+	);
+	Ok(())
+}
+
+/// Unlike Complement's fetch-order expectations, this checks the actual
+/// acceptance boundary: missing auth must never become stored room state.
+async fn missing_auth_chain_is_refused(
+	services: &Services,
+	base: &str,
+	room_id: &RoomId,
+	remote: &Remote,
+) -> Result {
+	let missing_user = remote_user("missing-auth-root")?;
+	let missing = signed_join(services, room_id, &missing_user, remote, "not sent").await?;
+	let mut unavailable = event_id(&missing, remote)?;
+	let create = services
+		.state_accessor
+		.room_state_get_id(room_id, &StateEventType::RoomCreate, "")
+		.await?;
+	let before = services
+		.timeline
+		.latest_pdu_in_room(room_id)
+		.await?
+		.event_id;
+
+	for localpart in ["corrupt-chain-c", "corrupt-chain-d", "corrupt-chain-e"] {
+		let user = remote_user(localpart)?;
+		let mut pdu = signed_join(services, room_id, &user, remote, localpart).await?;
+		let Some(CanonicalJsonValue::Array(auth)) = pdu.get_mut("auth_events") else {
+			return Err!("the chain fixture has no auth events");
+		};
+		let required = CanonicalJsonValue::String(create.to_string());
+		let Some(index) = auth.iter().position(|event| *event == required) else {
+			return Err!("the chain fixture omitted its required create event");
+		};
+		auth[index] = CanonicalJsonValue::String(unavailable.to_string());
+		pdu.remove("hashes");
+		pdu.remove("signatures");
+		hash_and_sign_event(
+			remote.name.as_str(),
+			&remote.keypair,
+			&mut pdu,
+			&remote.rules.redaction,
+		)
+		.map_err(|error| err!("the chain fixture could not be signed: {error}"))?;
+		let id = event_id(&pdu, remote)?;
+		let (status, reply) = send_pdus(services, base, remote, &pdu).await?;
+		assert_eq!(status, 200, "the signed transaction was refused: {reply}");
+		assert!(
+			reply["pdus"][id.as_str()]["error"].is_string(),
+			"missing auth was accepted: {reply}"
+		);
+		assert!(
+			services.timeline.get_pdu_json(&id).await.is_err(),
+			"missing-auth descendant was stored"
+		);
+		assert!(
+			services
+				.timeline
+				.get_outlier_pdu_json(&id)
+				.await
+				.is_err(),
+			"missing-auth descendant became an outlier"
+		);
+		assert!(
+			!services
+				.state_cache
+				.is_joined(&user, room_id)
+				.await,
+			"missing-auth descendant changed membership"
+		);
+		assert_eq!(
+			services
+				.timeline
+				.latest_pdu_in_room(room_id)
+				.await?
+				.event_id,
+			before,
+			"missing-auth descendant changed the timeline"
+		);
+		unavailable = id;
+	}
+
+	let user = remote_user("after-corrupt-chain")?;
+	let honest = signed_join(services, room_id, &user, remote, "honest after refusal").await?;
+	let id = event_id(&honest, remote)?;
+	let (status, reply) = send_pdus(services, base, remote, &honest).await?;
+	assert_eq!(status, 200, "the honest control transaction was refused: {reply}");
+	assert!(
+		reply["pdus"][id.as_str()].get("error").is_none(),
+		"honest control join failed: {reply}"
+	);
+	assert!(
+		services
+			.state_cache
+			.is_joined(&user, room_id)
+			.await,
+		"honest control join did not take effect"
+	);
+	assert_eq!(
+		stored_content(services, &id).await?,
+		json!({"membership": "join", "displayname": "honest after refusal"})
+	);
 	Ok(())
 }
 

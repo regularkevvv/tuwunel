@@ -23,15 +23,26 @@ use super::{
 };
 use crate::Services;
 
-struct Fixture {
-	services: Arc<Services>,
+pub(super) struct Fixture {
+	pub(super) services: Arc<Services>,
 }
 
 impl Fixture {
-	async fn new() -> Result<Self> {
-		// Match the main runtime's per-process descriptor setup. A service
-		// graph is process-lifetime (OnceServices has strong references), so
-		// the outer test runner owns scratch cleanup after this process exits.
+	/// Queue identity controls use opaque canonical rows and never decode PDUs.
+	/// Retain the referenced row so they exercise the real admission
+	/// precondition.
+	pub(super) async fn retain_pdu(&self, event: &super::SendingEvent) -> Result {
+		if let Some(raw) = event.pdu_id() {
+			self.services.db["pduid_pdu"]
+				.insert(raw.as_ref(), b"{}".as_slice())
+				.await?;
+		}
+		Ok(())
+	}
+
+	pub(super) async fn new() -> Result<Self> {
+		// Match the main runtime's descriptor setup. The outer test runner
+		// owns scratch cleanup after this process exits.
 		sys::maximize_fd_limit()?;
 		let root =
 			std::env::temp_dir().join(format!("matrix-edu-reference-{}", rand::string(20)));
@@ -39,7 +50,37 @@ impl Fixture {
 		#[cfg(unix)]
 		directory.mode(0o700);
 		directory.create(&root)?;
-		let raw = Figment::new()
+		Self::open(&root).await
+	}
+
+	/// Open only a scratch root owned by the invoking fixture. Cold-start
+	/// controls reopen it in a new process after the preceding child exits.
+	pub(super) async fn open(root: &std::path::Path) -> Result<Self> {
+		Self::open_options(root, false).await
+	}
+
+	/// Exercise the real service startup order on a current-schema scratch DB.
+	/// No migration or outbound federation is part of this control.
+	pub(super) async fn open_startup(root: &std::path::Path) -> Result<Self> {
+		Self::open_options(root, true).await
+	}
+
+	async fn open_options(root: &std::path::Path, startup: bool) -> Result<Self> {
+		Self::open_config(root, startup, None).await
+	}
+
+	/// Open only the owned loopback bridge oracle for remote service controls.
+	pub(super) async fn open_remote(root: &std::path::Path, url: &str) -> Result<Self> {
+		Self::open_config(root, false, Some(url)).await
+	}
+
+	async fn open_config(
+		root: &std::path::Path,
+		startup: bool,
+		remote: Option<&str>,
+	) -> Result<Self> {
+		sys::maximize_fd_limit()?;
+		let mut raw = Figment::new()
 			.merge(("server_name", "localhost"))
 			.merge(("database_backend", "rocksdb"))
 			.merge(("database_path", root.join("database")))
@@ -47,6 +88,20 @@ impl Fixture {
 			.merge(("allow_outgoing_read_receipts", true))
 			.merge(("startup_netburst", true))
 			.merge(("startup_netburst_keep", -1));
+		if let Some(url) = remote {
+			raw = raw
+				.merge(("database_backend", "d1"))
+				.merge(("d1_bridge_url", url))
+				.merge(("d1_bridge_token", crate::bridge_fixture::TOKEN))
+				.merge(("d1_read_cache_mb", 1))
+				.merge(("d1_lease_ttl_ms", 15_000));
+		}
+		if startup {
+			raw = raw
+				.merge(("database_migrations", false))
+				.merge(("allow_federation", false))
+				.merge(("startup_netburst", false));
+		}
 		let config = Config::new(&raw)?;
 		let runtime = Handle::current();
 		let log = Logging {
@@ -62,10 +117,17 @@ impl Fixture {
 			Metrics::new(Some(&runtime)),
 		));
 		let services = Services::build(server).await?;
+		// This lower-level fixture does not run startup migrations. Declare the
+		// supported schema before exercising production active-row writers.
+		services
+			.globals
+			.db
+			.bump_database_version(crate::migrations::DATABASE_VERSION)
+			.await?;
 		Ok(Self { services })
 	}
 
-	async fn finish(self) { self.services.stop().await; }
+	pub(super) async fn finish(self) { self.services.stop().await; }
 }
 
 async fn assert_empty_outgoing(services: &Services, server: &ServerName) -> Result {

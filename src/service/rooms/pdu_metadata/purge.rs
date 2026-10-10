@@ -1,17 +1,14 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use ruma::{
 	EventId, RoomId,
 	events::{relation::RelationType, room::encrypted::Relation},
 };
 use tuwunel_core::{
-	PduId, Result,
+	Error, PduId, Result,
 	arrayvec::ArrayVec,
 	implement,
 	matrix::{Event, Pdu, PduCount, RawPduId},
-	utils::{
-		stream::{ReadyExt, TryIgnore, automatic_width},
-		u64_from_u8,
-	},
+	utils::{stream::automatic_width, u64_from_u8},
 };
 
 use super::{ExtractRelatesTo, Service};
@@ -19,70 +16,59 @@ use crate::rooms::short::ShortRoomId;
 
 type Prefix = ArrayVec<u8, 16>;
 
-/// Purges one event's metadata during a history purge.
-///
-/// Relation rows keyed by this event as parent or target are removed. Rows
-/// keyed by it as a surviving event's child remain dangling because relation
-/// reads discard IDs that no longer resolve. Soft-fail and policy decisions are
-/// cleared after the relation indexes.
+/// Stage the metadata owned by a purged parent alongside the canonical
+/// removal. Dangling child rows are retained, as in the existing reader
+/// contract. Scans close before the caller commits; storage and encoding
+/// errors refuse the entire event mutation.
 #[implement(Service)]
-pub async fn purge_event_relations(
+pub(crate) async fn append_purge_event_relations(
 	&self,
+	txn: &mut tuwunel_database::Txn,
 	shortroomid: ShortRoomId,
 	parent: PduCount,
 	room_id: &RoomId,
 	event_id: &EventId,
-) {
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let target = parent.to_be_bytes();
-
-	self.db
-		.tofrom_relation
-		.raw_keys_from(target.as_slice())
-		.ignore_err()
-		.ready_take_while(move |key| key.starts_with(&target))
-		.for_each(|key| async move {
-			self.db
-				.tofrom_relation
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
+	self.append_relation_removals(txn, &self.db.tofrom_relation, &target, false)
+		.await?;
 	let mut prefix = Prefix::new();
-
 	prefix.extend(shortroomid.to_be_bytes());
 	prefix.extend(parent.to_be_bytes());
+	self.append_relation_removals(txn, &self.db.relatesto_typed, &prefix, true)
+		.await?;
+	txn.del(&self.db.referencedevents, (room_id, event_id));
+	txn.del_raw(&services_root.db["eventid_policysigstate"], event_id);
+	txn.del_raw(&self.db.softfailedeventids, event_id);
+	crate::rooms::timeline::check_purge_batch(txn)
+}
 
-	self.db
-		.relatesto_typed
-		.raw_keys_from(prefix.as_slice())
-		.ignore_err()
-		.ready_take_while(move |key| key.starts_with(&prefix))
-		.for_each(|key| async move {
-			self.db
-				.relatesto_typed
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
-	self.db
-		.referencedevents
-		.del((room_id, event_id))
-		.await
-		.expect("database write error");
-
-	self.services
-		.event_handler
-		.clear_policy_signature_state(event_id)
-		.await
-		.expect("database write error");
-
-	self.clear_event_soft_failed(event_id)
-		.await
-		.expect("database write error");
+#[implement(Service)]
+async fn append_relation_removals(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	map: &std::sync::Arc<tuwunel_database::Map>,
+	prefix: &[u8],
+	typed: bool,
+) -> Result {
+	let mut after = None;
+	loop {
+		let keys = map
+			.raw_keys_prefix_after(prefix, after.as_deref(), 64)
+			.await?;
+		if keys.is_empty() {
+			return Ok(());
+		}
+		for key in &keys {
+			self.append_relation_key(txn, map, key, typed)
+				.await?;
+			crate::rooms::timeline::check_purge_batch(txn)?;
+		}
+		after = keys.last().cloned();
+	}
 }
 
 /// Rebuild `relatesto_typed` from every stored PDU. Run once at startup behind
@@ -90,42 +76,133 @@ pub async fn purge_event_relations(
 /// partial or stale index is replaced wholesale.
 #[implement(Service)]
 pub async fn rebuild_typed_relations(&self) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.db.relatesto_typed.clear().await?;
 
-	let pdus = self.services.db["pduid_pdu"].clone();
+	let pdus = services_root.db["pduid_pdu"].clone();
 
 	pdus.raw_stream()
-		.ignore_err()
-		.ready_filter_map(|(key, value)| {
-			let raw_pdu_id = RawPduId::from(key);
+		.map(|row| {
+			let (key, value) = row?;
+			let raw_pdu_id = RawPduId::from_bytes(key)?;
 			let pdu_id = PduId {
 				shortroomid: u64_from_u8(&raw_pdu_id.shortroomid()),
 				count: raw_pdu_id.pdu_count(),
 			};
-			let pdu = serde_json::from_slice::<Pdu>(value).ok()?;
+			let pdu = serde_json::from_slice::<Pdu>(value)
+				.map_err(|_| Error::bad_database("Invalid stored relation event"))?;
 
-			Some((pdu_id, pdu))
+			Ok((pdu_id, pdu))
 		})
-		.for_each_concurrent(automatic_width(), async |(pdu_id, pdu)| {
-			self.index_pdu_relations(pdu_id, &pdu).await;
+		.try_for_each_concurrent(automatic_width(), async |(pdu_id, pdu)| {
+			self.index_pdu_relations(pdu_id, &pdu).await
 		})
-		.await;
-
-	Ok(())
+		.await
 }
 
 #[implement(Service)]
-async fn index_pdu_relations(&self, pdu_id: PduId, pdu: &Pdu) {
+async fn index_pdu_relations(&self, pdu_id: PduId, pdu: &Pdu) -> Result {
 	let Ok(content) = pdu.get_content::<ExtractRelatesTo>() else {
-		return;
+		return Ok(());
 	};
 
 	let (rel_type, parent) = match content.relates_to {
 		| Relation::Replacement(replacement) => (RelationType::Replacement, replacement.event_id),
 		| Relation::Reference(reference) => (RelationType::Reference, reference.event_id),
-		| _ => return,
+		| _ => return Ok(()),
 	};
 
 	self.add_typed_relation(pdu_id.shortroomid, pdu_id.count, &parent, pdu, rel_type)
-		.await;
+		.await
+}
+
+#[implement(Service)]
+async fn append_relation_key(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	map: &std::sync::Arc<tuwunel_database::Map>,
+	key: &[u8],
+	typed: bool,
+) -> Result {
+	let value = map.get(key).await?;
+	let valid = if typed {
+		key.len() == super::typed_relations::KEY_LEN
+			&& matches!(key[16], 1 | 2)
+			&& value.len() == 8
+	} else {
+		key.len() == 16 && value.is_empty()
+	};
+	if !valid {
+		return Err(Error::bad_database("Invalid purge relation row"));
+	}
+	txn.del_raw(map, key);
+	Ok(())
+}
+
+#[implement(Service)]
+pub(crate) async fn append_history_relation_page(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	short: ShortRoomId,
+	parent: PduCount,
+	typed: bool,
+	after: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, bool)> {
+	let mut prefix = Vec::new();
+	if typed {
+		prefix.extend_from_slice(&short.to_be_bytes());
+	}
+	prefix.extend_from_slice(&parent.to_be_bytes());
+	let map = if typed {
+		&self.db.relatesto_typed
+	} else {
+		&self.db.tofrom_relation
+	};
+	let keys = map
+		.raw_keys_prefix_after(&prefix, after, 64)
+		.await?;
+	for key in &keys {
+		self.append_relation_key(txn, map, key, typed)
+			.await?;
+	}
+	Ok((keys.last().cloned(), keys.len() < 64))
+}
+
+#[implement(Service)]
+pub(crate) async fn append_history_points(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	short: ShortRoomId,
+	parent: PduCount,
+	room: &RoomId,
+	event: &EventId,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	for typed in [false, true] {
+		let mut prefix = Vec::new();
+		if typed {
+			prefix.extend_from_slice(&short.to_be_bytes());
+		}
+		prefix.extend_from_slice(&parent.to_be_bytes());
+		let map = if typed {
+			&self.db.relatesto_typed
+		} else {
+			&self.db.tofrom_relation
+		};
+		if !map
+			.raw_keys_prefix_after(&prefix, None, 1)
+			.await?
+			.is_empty()
+		{
+			return Err(Error::bad_database("History relation cleanup is unfinished"));
+		}
+	}
+	txn.del(&self.db.referencedevents, (room, event));
+	txn.del_raw(&self.db.softfailedeventids, event);
+	txn.del_raw(&services_root.db["eventid_policysigstate"], event);
+	Ok(())
 }

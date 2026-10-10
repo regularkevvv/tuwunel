@@ -106,6 +106,9 @@ async fn classify_extremities(
 	extremities: &[OwnedEventId],
 	trigger: Trigger,
 ) -> Vec<Candidate<OwnedEventId>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let partials: Vec<(OwnedEventId, Partial)> = extremities
 		.iter()
 		.stream()
@@ -134,8 +137,7 @@ async fn classify_extremities(
 		.into_iter()
 		.stream()
 		.broad_then(async |server| {
-			let verdict = self
-				.services
+			let verdict = services_root
 				.federation
 				.should_attempt(&server)
 				.await;
@@ -167,8 +169,10 @@ async fn classify_extremities(
 
 #[implement(super::Service)]
 async fn classify_leaf(&self, room_id: &RoomId, event_id: &EventId, trigger: Trigger) -> Partial {
-	let Ok(count) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(count) = services_root
 		.timeline
 		.get_pdu_count(event_id)
 		.await
@@ -176,13 +180,12 @@ async fn classify_leaf(&self, room_id: &RoomId, event_id: &EventId, trigger: Tri
 		return Partial::Dangling;
 	};
 
-	let Ok(pdu) = self.services.timeline.get_pdu(event_id).await else {
+	let Ok(pdu) = services_root.timeline.get_pdu(event_id).await else {
 		return Partial::Dangling;
 	};
 
 	if matches!(trigger, Trigger::Admin)
-		&& self
-			.services
+		&& services_root
 			.pdu_metadata
 			.is_event_referenced(room_id, event_id)
 			.await
@@ -191,7 +194,7 @@ async fn classify_leaf(&self, room_id: &RoomId, event_id: &EventId, trigger: Tri
 	}
 
 	let server = pdu.sender().server_name();
-	if server == self.services.globals.server_name() {
+	if server == services_root.globals.server_name() {
 		return Partial::Own;
 	}
 

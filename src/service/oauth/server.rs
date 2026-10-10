@@ -105,7 +105,10 @@ fn can_build(args: &crate::Args<'_>) -> bool {
 
 #[implement(Server)]
 pub fn issuer_url(&self) -> Result<String> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.config
 		.well_known
 		.client

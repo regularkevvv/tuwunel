@@ -61,24 +61,28 @@ fn replayed_receipts_hold_their_stream_position() -> Result {
 async fn exercise(services: &Services) -> Result {
 	let room = room_id!("!receipt-replay:localhost");
 	let user = user_id!("@receipt-replay:localhost");
+	services
+		.short
+		.get_or_create_shortroomid(room)
+		.await?;
 	let receipts = &services.read_receipt;
 	let first = receipt_event(room, user, event_id!("$receipt-replay-first:localhost"));
 	let second = receipt_event(room, user, event_id!("$receipt-replay-second:localhost"));
 
 	let stored = receipts
 		.readreceipt_update(user, room, &first)
-		.await;
+		.await?;
 
 	let after_store = receipt_counts(services, room).await;
 
 	let replayed = receipts
 		.readreceipt_update(user, room, &first)
-		.await;
+		.await?;
 
 	let after_replay = receipt_counts(services, room).await;
 	let advanced = receipts
 		.readreceipt_update(user, room, &second)
-		.await;
+		.await?;
 
 	let after_advance = receipt_counts(services, room).await;
 
@@ -129,12 +133,12 @@ async fn private_read_replay(services: &Services, room: &RoomId, user: &UserId) 
 			.await
 	};
 
-	let stored = set_private_read(services, room, user, 5, true).await;
+	let stored = set_private_read(services, room, user, 5, true).await?;
 	let after_store = token().await;
-	let replayed = set_private_read(services, room, user, 5, true).await;
-	let earlier = set_private_read(services, room, user, 4, true).await;
+	let replayed = set_private_read(services, room, user, 5, true).await?;
+	let earlier = set_private_read(services, room, user, 4, true).await?;
 	let after_replay = token().await;
-	let advanced = set_private_read(services, room, user, 6, true).await;
+	let advanced = set_private_read(services, room, user, 6, true).await?;
 	let after_advance = token().await;
 
 	if !stored || !advanced {
@@ -166,7 +170,7 @@ async fn private_read_unannounced(services: &Services, room: &RoomId, user: &Use
 		.private_read_sync_get_count(room, user)
 		.await?;
 
-	let stored = set_private_read(services, room, user, 7, false).await;
+	let stored = set_private_read(services, room, user, 7, false).await?;
 	let after = services
 		.read_receipt
 		.last_privateread_update(user, room)
@@ -194,7 +198,7 @@ async fn private_read_unannounced(services: &Services, room: &RoomId, user: &Use
 		return Err!("unannounced private marker changed the announced snapshot");
 	}
 
-	let announced = set_private_read(services, room, user, 8, true).await;
+	let announced = set_private_read(services, room, user, 8, true).await?;
 	let (published, _) = services
 		.read_receipt
 		.private_read_sync_get_count(room, user)
@@ -218,7 +222,7 @@ async fn private_read_premirror(services: &Services, room: &RoomId, user: &UserI
 	services
 		.short
 		.get_or_create_shortroomid(room)
-		.await;
+		.await?;
 
 	let gate = services
 		.read_receipt
@@ -241,7 +245,7 @@ async fn private_read_premirror(services: &Services, room: &RoomId, user: &UserI
 
 	let (admin_room, position) = admin_room_head(services).await?;
 
-	if !set_private_read(services, &admin_room, user, position, true).await {
+	if !set_private_read(services, &admin_room, user, position, true).await? {
 		return Err!("admin-room private marker did not store");
 	}
 
@@ -266,7 +270,7 @@ async fn private_read_premirror(services: &Services, room: &RoomId, user: &UserI
 }
 
 async fn private_read_dangling(services: &Services, room: &RoomId, user: &UserId) -> Result {
-	if !set_private_read(services, room, user, 9, true).await {
+	if !set_private_read(services, room, user, 9, true).await? {
 		return Err!("announced marker naming a fake event did not store");
 	}
 
@@ -287,7 +291,7 @@ async fn private_read_dangling(services: &Services, room: &RoomId, user: &UserId
 	let dangler = user_id!("@receipt-dangling:localhost");
 	let (admin_room, position) = admin_room_head(services).await?;
 
-	if !set_private_read(services, &admin_room, dangler, position, true).await {
+	if !set_private_read(services, &admin_room, dangler, position, true).await? {
 		return Err!("private marker naming a real event did not store");
 	}
 
@@ -302,7 +306,7 @@ async fn private_read_dangling(services: &Services, room: &RoomId, user: &UserId
 			thread: &ReceiptThread::Main,
 			announce: true,
 		})
-		.await;
+		.await?;
 
 	if !stored {
 		return Err!("private marker naming a missing event did not store");
@@ -363,7 +367,7 @@ async fn set_private_read(
 	user: &UserId,
 	count: u64,
 	announce: bool,
-) -> bool {
+) -> Result<bool> {
 	services
 		.read_receipt
 		.private_read_set(PrivateRead {

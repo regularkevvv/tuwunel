@@ -130,10 +130,10 @@ async fn matcher(
 
 		let result = services
 			.pusher
-			.last_notification_read(sender_user, &room_id)
+			.notification_update_count(sender_user, &room_id)
 			.await;
 
-		activity_probe(result, &room_id, "notification read", true)
+		activity_probe(result, &room_id, "notification change", true)
 	};
 
 	let last_timeline = async {

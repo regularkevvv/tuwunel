@@ -8,7 +8,7 @@ use std::{
 	},
 };
 
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::join};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, future::join};
 use ruma::{
 	EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
 	events::{StateEventType, TimelineEventType},
@@ -343,19 +343,22 @@ pub(super) async fn state_at_incoming_local<Pdu>(
 where
 	Pdu: Event,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let top_prevs = incoming_pdu
 		.prev_events()
 		.map(ToOwned::to_owned)
 		.collect();
 
-	let services = self.services.clone();
+	let services = self.services.get();
 	let room_id = room_id.to_owned();
 	let room_version = room_version.clone();
 	let create_event_id = create_event_id.to_owned();
 	let parent = Span::current();
 	let attempt = WalkAttempt::start(self.state_local.clone());
 
-	let task = self.services.server.runtime().spawn(
+	let task = services_root.server.runtime().spawn(
 		async move {
 			services
 				.event_handler
@@ -394,8 +397,10 @@ async fn walk_task(
 	top_prevs: PrevEvents,
 	attempt: WalkAttempt,
 ) -> Result<Option<StateIds>> {
-	let max_nodes = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let max_nodes = services_root
 		.server
 		.config
 		.resolve_state_locally_max;
@@ -458,17 +463,18 @@ pub fn state_local_metrics(&self) -> StateLocalMetrics { self.state_local.snapsh
 /// outcome, for the admin debug command.
 #[implement(super::Service)]
 pub async fn local_state_report(&self, event_id: &EventId) -> Result<LocalBuildReport> {
-	let pdu = self.services.timeline.get_pdu(event_id).await?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	let create_event = self
-		.services
+	let pdu = services_root.timeline.get_pdu(event_id).await?;
+
+	let create_event = services_root
 		.state_accessor
 		.room_state_get(pdu.room_id(), &StateEventType::RoomCreate, "")
 		.await?;
 
 	let room_version = from_create_event(&create_event)?;
-	let max_nodes = self
-		.services
+	let max_nodes = services_root
 		.server
 		.config
 		.resolve_state_locally_max;
@@ -511,6 +517,9 @@ pub(super) async fn compare_shadow(
 	local: &StateIds,
 	fetched: &StateIds,
 ) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let only_local = divergent(local, fetched);
 	let only_fetch = divergent(fetched, local);
 	let agreement = only_local.count == 0 && only_fetch.count == 0;
@@ -529,7 +538,7 @@ pub(super) async fn compare_shadow(
 	}
 
 	let resolve = |shortstatekey| {
-		self.services
+		services_root
 			.short
 			.get_statekey_from_short(shortstatekey)
 	};
@@ -604,6 +613,9 @@ async fn walk_state(&self, walk: &mut Walk<'_>) -> Result<Option<StateIds>> {
 /// cannot survive sets walk.fallback here, before any state materializes.
 #[implement(super::Service)]
 async fn walk_discover(&self, walk: &mut Walk<'_>) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut stack: Vec<(OwnedEventId, bool)> = walk
 		.top_prevs
 		.iter()
@@ -611,7 +623,7 @@ async fn walk_discover(&self, walk: &mut Walk<'_>) -> Result {
 		.collect();
 
 	while let Some((event_id, expanded)) = stack.pop() {
-		self.services.server.check_running()?;
+		services_root.server.check_running()?;
 
 		if expanded {
 			// Post-order emission: every prev of this node is fully classified.
@@ -629,8 +641,7 @@ async fn walk_discover(&self, walk: &mut Walk<'_>) -> Result {
 			continue;
 		}
 
-		if let Ok(shortstatehash) = self
-			.services
+		if let Ok(shortstatehash) = services_root
 			.state
 			.pdu_shortstatehash(&event_id)
 			.await
@@ -652,7 +663,7 @@ async fn walk_discover(&self, walk: &mut Walk<'_>) -> Result {
 			continue;
 		}
 
-		let Ok(pdu) = self.services.timeline.get_pdu(&event_id).await else {
+		let Ok(pdu) = services_root.timeline.get_pdu(&event_id).await else {
 			trace!(%event_id, "Ancestor is not held locally.");
 			walk.fallback = Some(Fallback::Absent);
 			return Ok(());
@@ -702,6 +713,9 @@ async fn walk_discover(&self, walk: &mut Walk<'_>) -> Result {
 /// rooms chain the create event implied by the room id.
 #[implement(super::Service)]
 async fn walk_auth_present(&self, walk: &Walk<'_>, pdu: &PduEvent) -> bool {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let is_hydra = !walk
 		.room_rules
 		.event_format
@@ -715,7 +729,7 @@ async fn walk_auth_present(&self, walk: &Walk<'_>, pdu: &PduEvent) -> bool {
 	pdu.auth_events()
 		.chain(hydra_create_id.as_deref())
 		.stream()
-		.all(|auth_id| self.services.timeline.pdu_exists(auth_id))
+		.all(|auth_id| services_root.timeline.pdu_exists(auth_id))
 		.await
 }
 
@@ -723,9 +737,12 @@ async fn walk_auth_present(&self, walk: &Walk<'_>, pdu: &PduEvent) -> bool {
 /// prevs resolve before it, then combine at the incoming event's own prevs.
 #[implement(super::Service)]
 async fn walk_build(&self, walk: &mut Walk<'_>) -> Result<Option<StateIds>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let order = take(&mut walk.order);
 	for index in order {
-		self.services.server.check_running()?;
+		services_root.server.check_running()?;
 
 		if !self.walk_node(walk, index).await {
 			return Ok(None);
@@ -744,8 +761,7 @@ async fn walk_build(&self, walk: &mut Walk<'_>) -> Result<Option<StateIds>> {
 
 	// Mirror fetch_state's canary: the original create event must still be in
 	// the built state.
-	let create_entry = self
-		.services
+	let create_entry = services_root
 		.short
 		.get_shortstatekey(&StateEventType::RoomCreate, "")
 		.await
@@ -856,10 +872,12 @@ async fn committed_state_after(
 	event_id: &EventId,
 	shortstatehash: ShortStateHash,
 ) -> Option<Arc<StateIds>> {
-	let pdu = self.services.timeline.get_pdu(event_id);
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	let state = self
-		.services
+	let pdu = services_root.timeline.get_pdu(event_id);
+
+	let state = services_root
 		.state_accessor
 		.state_full_ids_strict(shortstatehash)
 		.try_collect::<StateIds>();
@@ -881,11 +899,14 @@ async fn committed_state_after(
 
 	if let Some(state_key) = pdu.state_key() {
 		let event_type = pdu.event_type().to_cow_str().into();
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&event_type, state_key)
 			.await;
+		let Ok(shortstatekey) = shortstatekey else {
+			walk.fallback = Some(Fallback::Unevaluable);
+			return None;
+		};
 
 		state.insert(shortstatekey, event_id.to_owned());
 	}
@@ -902,12 +923,14 @@ async fn memoized_state_after(
 	walk: &mut Walk<'_>,
 	event_id: &EventId,
 ) -> Option<Arc<StateIds>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	walk.memo_hits = walk.memo_hits.saturating_add(1);
 
 	let state = self.cached_resolved_state(event_id);
 
-	let pdu = self
-		.services
+	let pdu = services_root
 		.timeline
 		.get_pdu(event_id)
 		.inspect_err(|e| debug_warn!(%event_id, %e, "Failed loading memoized event."));
@@ -964,8 +987,10 @@ async fn gated_fold(
 	pdu: &PduEvent,
 	before: &Arc<StateIds>,
 ) -> Result<Arc<StateIds>> {
-	let create_shortstatekey = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let create_shortstatekey = services_root
 		.short
 		.get_shortstatekey(&StateEventType::RoomCreate, "")
 		.await?;
@@ -975,8 +1000,7 @@ async fn gated_fold(
 	}
 
 	let state_fetch = async |k: StateEventType, s: StateKey| {
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_shortstatekey(&k, s.as_str())
 			.await?;
@@ -985,7 +1009,7 @@ async fn gated_fold(
 			.get(&shortstatekey)
 			.ok_or_else(|| err!(Request(NotFound("Not in state before event."))))?;
 
-		self.services
+		services_root
 			.timeline
 			.get_pdu(event_id)
 			.await
@@ -1011,11 +1035,10 @@ async fn gated_fold(
 	let state_key = pdu.state_key().expect("only state events fold");
 
 	let event_type = pdu.event_type().to_cow_str().into();
-	let shortstatekey = self
-		.services
+	let shortstatekey = services_root
 		.short
 		.get_or_create_shortstatekey(&event_type, state_key)
-		.await;
+		.await?;
 
 	let mut state = StateIds::clone(before);
 	state.insert(shortstatekey, pdu.event_id().to_owned());
@@ -1033,6 +1056,9 @@ async fn fork_resolve(
 	prevs: &[OwnedEventId],
 	memo_event_id: Option<&EventId>,
 ) -> Option<Arc<StateIds>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	walk.forks = walk.forks.saturating_add(1);
 
 	// Sequential: materializing a frontier prev writes the walk's accounting.
@@ -1097,33 +1123,40 @@ async fn fork_resolve(
 		return None;
 	};
 
-	let state: StateIds = resolved
+	let state: Result<StateIds> = resolved
 		.into_iter()
 		.stream()
 		.broad_then(async |((event_type, state_key), event_id)| {
-			self.services
+			services_root
 				.short
 				.get_or_create_shortstatekey(&event_type, &state_key)
-				.map(move |shortstatekey| (shortstatekey, event_id))
+				.map_ok(move |shortstatekey| (shortstatekey, event_id))
 				.await
 		})
-		.collect()
+		.try_collect()
 		.await;
+	let Ok(state) = state else {
+		walk.fallback = Some(Fallback::Unevaluable);
+		return None;
+	};
 
 	if let Some(event_id) = memo_event_id.filter(|_| walk.mode == WalkMode::Active) {
 		// Strict frontier loads and the polled-chain sentinel make this state
 		// transitively complete for later memo consumers.
-		let compressed: Arc<CompressedState> = self
-			.services
+		let compressed: Result<Arc<CompressedState>> = services_root
 			.state_compressor
 			.compress_state_events(
 				state
 					.iter()
 					.map(|(shortstatekey, event_id)| (shortstatekey, event_id.borrow())),
 			)
-			.collect()
-			.map(Arc::new)
+			.try_collect()
+			.map_ok(Arc::new)
 			.await;
+		let Ok(compressed) = compressed else {
+			walk.fallback = Some(Fallback::Unevaluable);
+			return None;
+		};
 
 		self.cache_resolved_state(walk.room_id, event_id, compressed)
 			.await;

@@ -1,12 +1,18 @@
-use std::{fmt, sync::Arc};
+use std::{
+	fmt,
+	sync::{Arc, Mutex as StdMutex},
+};
 
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tuwunel_core::{
-	Result, Server, debug, debug_info, implement, info, trace, utils::stream::IterStream,
+	Result, Server, debug, debug_info, err, implement, info, trace, utils::stream::IterStream,
 };
 use tuwunel_database::Database;
 
+mod lifecycle;
+
+use self::lifecycle::{CleanupOnDrop, Lifecycle};
 pub(crate) use crate::OnceServices;
 use crate::{
 	account_data, admin, appservice, client, config, deactivate, emergency, federation, fetcher,
@@ -73,6 +79,8 @@ pub struct Services {
 	pub profile: Arc<profile::Service>,
 
 	manager: Mutex<Option<Arc<Manager>>>,
+	lifecycle: Mutex<Lifecycle>,
+	cleanup: StdMutex<Option<JoinHandle<()>>>,
 	pub server: Arc<Server>,
 	pub db: Arc<Database>,
 }
@@ -80,6 +88,17 @@ pub struct Services {
 #[implement(Services)]
 pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 	let db = Database::open(&server).await?;
+	let result = Self::build_inner(server, db.clone());
+	if result.is_err() {
+		// No service worker has started yet. Finish closing the acquired
+		// backend rather than leaving its lease release to best-effort drop.
+		db.close().await;
+	}
+	result
+}
+
+#[implement(Services)]
+fn build_inner(server: Arc<Server>, db: Arc<Database>) -> Result<Arc<Self>> {
 	let services = Arc::new(OnceServices::default());
 	let args = Args {
 		db: &db,
@@ -140,11 +159,13 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		profile: profile::Service::build(&args)?,
 
 		manager: Mutex::new(None),
+		lifecycle: Mutex::new(Lifecycle::Built),
+		cleanup: StdMutex::new(None),
 		server,
 		db,
 	});
 
-	Ok(services.set(res))
+	Ok(services.set(&res))
 }
 
 #[implement(Services)]
@@ -216,35 +237,80 @@ impl fmt::Debug for Services {
 
 #[implement(Services)]
 pub async fn start(self: &Arc<Self>) -> Result<Arc<Self>> {
-	debug_info!("Starting services...");
-
-	super::migrations::migrations(self).await?;
-
-	self.manager
-		.lock()
-		.await
-		.insert(Manager::new(self))
-		.clone()
-		.start()
-		.await?;
-
-	debug_info!("Services startup complete.");
-
-	Ok(Arc::clone(self))
+	let mut lifecycle = self.lifecycle.lock().await;
+	if *lifecycle != Lifecycle::Built {
+		return Err(err!("Services cannot start from {lifecycle:?}"));
+	}
+	*lifecycle = Lifecycle::Starting;
+	let mut cleanup = CleanupOnDrop::new(self);
+	let result = self.start_inner().await;
+	if result.is_err() {
+		self.stop_inner().await;
+		*lifecycle = Lifecycle::Stopped;
+	} else {
+		*lifecycle = Lifecycle::Running;
+	}
+	cleanup.disarm();
+	result.map(|()| Arc::clone(self))
 }
 
 #[implement(Services)]
-pub async fn stop(&self) {
-	info!("Shutting down services...");
+async fn start_inner(self: &Arc<Self>) -> Result {
+	debug_info!("Starting services...");
 
-	self.interrupt().await;
-	if let Some(manager) = self.manager.lock().await.as_ref() {
-		manager.stop().await;
+	super::migrations::migrations(self).await?;
+	if !self.server.config.maintenance {
+		self.tasks.preflight_interrupted().await?;
+		self.pusher.restore_notifications().await?;
+		self.state_cache
+			.restore_pending_recounts()
+			.await?;
+		self.tasks.restore_interrupted().await?;
 	}
 
+	let manager = Manager::new(self);
+	_ = self.manager.lock().await.insert(manager.clone());
+	manager.start().await?;
+
+	debug_info!("Services startup complete.");
+
+	Ok(())
+}
+
+#[implement(Services)]
+pub async fn stop(self: &Arc<Self>) {
+	let mut cleanup = CleanupOnDrop::new(self);
+	{
+		let mut lifecycle = self.lifecycle.lock().await;
+		if *lifecycle != Lifecycle::Stopped {
+			*lifecycle = Lifecycle::Stopping;
+			self.stop_inner().await;
+			*lifecycle = Lifecycle::Stopped;
+		}
+	}
+	self.join_cleanup().await;
+	cleanup.disarm();
+}
+
+#[implement(Services)]
+async fn stop_inner(&self) {
+	info!("Shutting down services...");
+	// Shutdown is one-shot. A concurrent signal or cleanup owner may have
+	// claimed it already; either outcome leaves workers stopping.
+	self.server.shutdown().ok();
+
+	self.interrupt().await;
+	let mut manager = self.manager.lock().await;
+	if let Some(manager) = manager.as_ref() {
+		manager.stop().await;
+	}
+	manager.take();
+	drop(manager);
+
 	// Stops the writer-lease renewal and releases the lease on the remote
-	// backend, so a successor need not wait out its expiry (ADR-0003). A
-	// no-op on RocksDB.
+	// backend, so a successor need not wait out its expiry (ADR-0003).
+	// On RocksDB, waits for accepted offloaded reads to finish without closing
+	// the pool used by lazy queries retained by callers.
 	self.db.close().await;
 
 	debug_info!("Services shutdown complete.");
@@ -297,3 +363,9 @@ pub async fn memory_usage(&self) -> Result<String> {
 		})
 		.await
 }
+
+#[cfg(test)]
+pub(crate) mod startup_tests;
+
+#[cfg(test)]
+mod build_tests;

@@ -3,17 +3,20 @@ use std::{process::Command, str};
 use proc_macro::TokenStream;
 use quote::quote;
 
-use crate::utils::get_crate_name;
+use crate::{rustc_flags::normalize, utils::get_crate_name};
 
 pub(super) fn flags_capture(args: TokenStream) -> TokenStream {
 	let Some(crate_name) = get_crate_name() else {
 		return args;
 	};
 
-	let flag = std::env::args().collect::<Vec<_>>();
+	let arguments: Vec<_> = std::env::args().collect();
+	let flag = normalize(&arguments);
 	let flag_len = flag.len();
 	let ret = quote! {
-		/// Stores the compiler arguments captured while building this crate.
+		/// Stores compiler arguments, with build paths normalized according to
+		/// the compiler's explicit path remappings. Mapping sources are omitted
+		/// from this diagnostic copy so host paths cannot change the binary.
 		///
 		/// A load-time constructor registers the flags for build diagnostics. The
 		/// public static remains available for inspection while the crate is loaded.

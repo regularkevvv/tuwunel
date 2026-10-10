@@ -1,30 +1,31 @@
 mod data;
 mod dest;
+mod frozen;
 mod sender;
 #[cfg(test)]
 mod tests;
+mod wakes;
 
 use std::{
 	fmt::Debug,
 	hash::{DefaultHasher, Hash, Hasher},
 	io::Write,
 	iter::{once, repeat_with},
-	mem::take,
 	pin::pin,
-	sync::{Arc, Mutex as StdMutex},
+	sync::{
+		Arc, Mutex as StdMutex,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use async_trait::async_trait;
-use futures::{FutureExt, Stream, StreamExt};
-use loole::unbounded;
+use futures::{FutureExt, Stream, StreamExt, pin_mut};
+use loole::{TrySendError, bounded};
 use ruma::{DeviceId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::Serialize;
-use tokio::{
-	task,
-	task::{JoinError, JoinSet},
-};
+use tokio::{sync::Notify, task, task::JoinSet};
 use tuwunel_core::{
-	Result, Server, debug, debug_warn, err, error,
+	Result, Server, debug, debug_warn, err,
 	smallvec::SmallVec,
 	utils::{
 		IterStream, ReadyExt, TryReadyExt, available_parallelism, future::BoolExt,
@@ -33,11 +34,13 @@ use tuwunel_core::{
 	warn,
 };
 
+use self::wakes::PushWakes;
 pub use self::{
 	data::Data,
 	dest::Destination,
 	sender::{EDU_LIMIT, PDU_LIMIT},
 };
+pub(crate) use self::{data::parse_servercurrentevent, frozen::FrozenRequest};
 use crate::{appservice::RegistrationInfo, rooms::timeline::RawPduId};
 
 pub struct Service {
@@ -46,12 +49,15 @@ pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	channels: Vec<(loole::Sender<Msg>, loole::Receiver<Msg>)>,
 
-	// Aborted and joined when the service stops.
-	flushes: StdMutex<JoinSet<()>>,
+	// Hints only; a single owned worker scans one page per user turn.
+	push_wakes: StdMutex<PushWakes>,
+	push_wake_signal: Notify,
+	pub(super) federation_source_signal: Notify,
+	pub(super) federation_source_stopped: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Msg {
+pub(crate) struct Msg {
 	dest: Destination,
 	event: SendingEvent,
 	queue_id: Vec<u8>,
@@ -61,6 +67,7 @@ struct Msg {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SendingEvent {
 	Pdu(RawPduId),             // pduid
+	FrozenPush(RawPduId),      // Requires its committed push-decision receipt
 	Edu(EduBuf),               // edu json
 	ToDevice(EduBuf),          // msc4203 to-device
 	DeviceListChanged(EduBuf), // msc3202 device list
@@ -74,6 +81,11 @@ pub enum SendingEvent {
 pub type EduBuf = SmallVec<[u8; EDU_BUF_CAP]>;
 pub type EduVec = SmallVec<[EduBuf; EDU_VEC_CAP]>;
 
+const SENDER_HINT_LIMIT: usize = 128;
+// Every worker owns at most sixteen deliveries, plus bounded hint/timer pages.
+// A fixed process-wide cap prevents CPU count or config from multiplying those
+// inventories without limit. Default zero remains one sender.
+const MAX_SENDER_WORKERS: usize = 4;
 const EDU_BUF_CAP: usize = 128 - 16;
 const EDU_VEC_CAP: usize = 1;
 
@@ -82,9 +94,17 @@ const EDU_VEC_CAP: usize = 1;
 const TAG_TO_DEVICE: u8 = 0x01;
 const TAG_DEVICE_LIST_CHANGED: u8 = 0x02;
 const TAG_BADGE_REFRESH: u8 = 0x03;
+const TAG_FROZEN_PUSH: u8 = 0x04;
 const TAG_PREFIX_LEN: usize = 1 + size_of::<u64>();
 
 impl SendingEvent {
+	pub(super) const fn pdu_id(&self) -> Option<&RawPduId> {
+		match self {
+			| Self::Pdu(raw) | Self::FrozenPush(raw) => Some(raw),
+			| _ => None,
+		}
+	}
+
 	/// Return bytes written verbatim as the queue row value.
 	///
 	/// PDUs keep their ID in the row key and flushes are not persisted. EDU
@@ -93,6 +113,7 @@ impl SendingEvent {
 		match self {
 			| Self::Edu(bytes) | Self::ToDevice(bytes) | Self::DeviceListChanged(bytes) => bytes,
 			| Self::BadgeRefresh => &[TAG_BADGE_REFRESH],
+			| Self::FrozenPush(_) => &[TAG_FROZEN_PUSH],
 			| Self::Pdu(_) | Self::Flush => &[],
 		}
 	}
@@ -120,8 +141,13 @@ impl crate::Service for Service {
 			db: Data::new(args),
 			server: args.server.clone(),
 			services: args.services.clone(),
-			channels: repeat_with(unbounded).take(num_senders).collect(),
-			flushes: JoinSet::new().into(),
+			channels: repeat_with(|| bounded(SENDER_HINT_LIMIT))
+				.take(num_senders)
+				.collect(),
+			push_wakes: PushWakes::default().into(),
+			push_wake_signal: Notify::new(),
+			federation_source_signal: Notify::new(),
+			federation_source_stopped: AtomicBool::new(false),
 		}))
 	}
 
@@ -144,6 +170,15 @@ impl crate::Service for Service {
 					joinset
 				});
 
+		let sending = self.clone();
+		let _wake_worker = senders
+			.spawn_on(async move { sending.push_wake_worker().await }, self.server.runtime());
+		let sending = self.clone();
+		let _source_worker = senders.spawn_on(
+			async move { sending.federation_source_worker().await },
+			self.server.runtime(),
+		);
+
 		while let Some(ret) = senders.join_next_with_id().await {
 			match ret {
 				| Ok((id, Ok(()))) => {
@@ -156,18 +191,15 @@ impl crate::Service for Service {
 			}
 		}
 
-		let mut flushes = take(&mut *self.flushes.lock().expect("locked"));
-
-		flushes.abort_all();
-		while let Some(result) = flushes.join_next().await {
-			log_flush(result);
-		}
-
 		Ok(())
 	}
 
 	async fn interrupt(&self) {
-		self.flushes.lock().expect("locked").abort_all();
+		self.push_wakes.lock().expect("locked").stop();
+		self.push_wake_signal.notify_one();
+		self.federation_source_stopped
+			.store(true, Ordering::Release);
+		self.federation_source_signal.notify_one();
 
 		for (sender, _) in &self.channels {
 			if !sender.is_closed() {
@@ -182,6 +214,22 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	pub(crate) fn stage_frozen_push(
+		&self,
+		txn: &mut tuwunel_database::Txn,
+		raw: RawPduId,
+		user: &UserId,
+		pushkey: &str,
+	) -> Msg {
+		let dest = Destination::Push(user.to_owned(), pushkey.to_owned());
+		let event = SendingEvent::FrozenPush(raw);
+		let queue_id = dest.event_key(&raw);
+		self.db.stage_request(txn, &queue_id, &event);
+		Msg { dest, event, queue_id }
+	}
+
+	pub(crate) fn wake_frozen_push(&self, message: Msg) -> Result { self.dispatch(message) }
+
 	#[tracing::instrument(skip(self, pdu_id, user, pushkey), level = "debug")]
 	pub async fn send_pdu_push(
 		&self,
@@ -213,25 +261,51 @@ impl Service {
 		})
 	}
 
+	async fn queue_and_dispatch_batch(
+		&self,
+		requests: Vec<(Destination, SendingEvent)>,
+	) -> Result {
+		if requests.is_empty() {
+			return Ok(());
+		}
+		let keys = self
+			.db
+			.queue_requests(requests.iter().map(|(dest, event)| (event, dest)))
+			.await?;
+		for ((dest, _event), queue_id) in requests.into_iter().zip(keys) {
+			self.dispatch(Msg {
+				dest,
+				event: SendingEvent::BadgeRefresh,
+				queue_id,
+			})?;
+		}
+		Ok(())
+	}
+
 	/// Queue a counts-only push refresh for every pusher owned by a user.
 	///
 	/// Rows are durable, coalesced, and recomputed at send time.
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn refresh_push_badge(&self, user_id: &UserId) -> Result {
-		let pushkeys: Vec<String> = self
-			.services
-			.pusher
-			.get_pushkeys(user_id)
-			.map(ToOwned::to_owned)
-			.collect()
-			.await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
 
+		let pushkeys = services_root
+			.pusher
+			.notification_pushkeys(user_id)
+			.await?;
+		if pushkeys.is_empty() {
+			return Ok(());
+		}
+		let mut budget = self.db.queue_budget()?;
+		let mut requests = Vec::new();
 		for pushkey in pushkeys {
 			let dest = Destination::Push(user_id.to_owned(), pushkey);
-
-			self.queue_and_dispatch(dest, SendingEvent::BadgeRefresh)
-				.await?;
+			let event = SendingEvent::BadgeRefresh;
+			Data::admit_request(&mut budget, &event, &dest)?;
+			requests.push((dest, event));
 		}
+		self.queue_and_dispatch_batch(requests).await?;
 
 		Ok(())
 	}
@@ -247,11 +321,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self, room_id, pdu_id), level = "debug")]
 	pub async fn send_pdu_room(&self, room_id: &RoomId, pdu_id: &RawPduId) -> Result {
-		let servers = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let servers = services_root
 			.state_cache
 			.room_servers(room_id)
-			.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name));
+			.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name));
 
 		self.send_pdu_servers(servers, pdu_id).await
 	}
@@ -261,24 +337,8 @@ impl Service {
 	where
 		S: Stream<Item = &'a ServerName> + Send + 'a,
 	{
-		let requests = servers
-			.map(|server| {
-				(Destination::Federation(server.into()), SendingEvent::Pdu(pdu_id.to_owned()))
-			})
-			.collect::<Vec<_>>()
-			.await;
-
-		let _cork = self.db.db.cork();
-		let keys = self
-			.db
-			.queue_requests(requests.iter().map(|(o, e)| (e, o)))
-			.await?;
-
-		for ((dest, event), queue_id) in requests.into_iter().zip(keys) {
-			self.dispatch(Msg { dest, event, queue_id })?;
-		}
-
-		Ok(())
+		self.queue_federation(servers, SendingEvent::Pdu(*pdu_id))
+			.await
 	}
 
 	#[tracing::instrument(skip(self, server, serialized), level = "debug")]
@@ -292,11 +352,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self, room_id, serialized), level = "debug")]
 	pub async fn send_edu_room(&self, room_id: &RoomId, serialized: EduBuf) -> Result {
-		let servers = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let servers = services_root
 			.state_cache
 			.room_servers(room_id)
-			.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name));
+			.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name));
 
 		self.send_edu_servers(servers, serialized).await
 	}
@@ -327,11 +389,11 @@ impl Service {
 		F: Fn(&mut dyn Write) -> Result + Send + 'a,
 		&'a F: Send + Sync,
 	{
-		let appservice_ids = self
-			.services
-			.appservice
-			.read()
-			.await
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let registrations = services_root.appservice.read().await;
+		let appservice_ids = registrations
 			.values()
 			.stream()
 			.filter(|&appservice| async move {
@@ -343,13 +405,11 @@ impl Service {
 					return true;
 				}
 
-				let appservice_in_room = self
-					.services
+				let appservice_in_room = services_root
 					.state_cache
 					.appservice_in_room(room_id, appservice);
 
-				let matching_aliases = self
-					.services
+				let matching_aliases = services_root
 					.alias
 					.local_aliases_for_room(room_id)
 					.ready_any(|room_alias| appservice.aliases.is_match(room_alias.as_str()));
@@ -358,21 +418,27 @@ impl Service {
 					.or(pin!(matching_aliases))
 					.await
 			})
-			.map(|appservice| appservice.registration.id.clone())
-			.collect::<Vec<_>>()
-			.await;
-
-		for appservice_id in appservice_ids {
-			let mut buf = EduBuf::new();
-
-			serializer(&mut buf)?;
-			self.send_edu_appservice(appservice_id, buf)
-				.await
-				.log_err()
-				.ok();
+			.map(|appservice| appservice.registration.id.clone());
+		pin_mut!(appservice_ids);
+		let mut budget = None;
+		let mut requests = Vec::new();
+		while let Some(appservice_id) = appservice_ids.next().await {
+			let frozen::Body::Ready(bytes) = frozen::bounded_custom(
+				|writer| serializer(writer),
+				tuwunel_bridge::MAX_VALUE_BYTES.saturating_sub(10),
+			)?
+			else {
+				return Err(err!(Request(TooLarge("Appservice EDU payload limit"))));
+			};
+			let event = SendingEvent::Edu(EduBuf::from_slice(&bytes));
+			let dest = Destination::Appservice(appservice_id);
+			if budget.is_none() {
+				budget = Some(self.db.queue_budget()?);
+			}
+			Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
+			requests.push((dest, event));
 		}
-
-		Ok(())
+		self.queue_and_dispatch_batch(requests).await
 	}
 
 	/// Queue stored to-device events for delivery to interested appservices
@@ -397,26 +463,46 @@ impl Service {
 	where
 		I: Iterator<Item = (&'a DeviceId, u64)> + Clone + Send,
 	{
-		let registrations = self.services.appservice.read().await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let registrations = services_root.appservice.read().await;
 		let _cork = self.db.db.cork();
 
 		let mut payloads: Option<EduVec> = None;
+		let mut requests = Vec::new();
+		let mut budget = None;
 		for info in registrations.values() {
 			if !info.is_user_match(target_user) {
 				continue;
 			}
-
-			let payloads = payloads.get_or_insert_with(|| {
-				to_device_payloads(sender, target_user, deliveries.clone(), event_type, content)
-			});
-
-			for buf in &*payloads {
-				let dest = Destination::Appservice(info.registration.id.clone());
+			if payloads.is_none() {
+				payloads = Some(to_device_payloads(
+					sender,
+					target_user,
+					deliveries.clone(),
+					event_type,
+					content,
+				)?);
+			}
+			if payloads
+				.as_ref()
+				.expect("prepared payloads")
+				.is_empty()
+			{
+				continue;
+			}
+			if budget.is_none() {
+				budget = Some(self.db.queue_budget()?);
+			}
+			let dest = Destination::Appservice(info.registration.id.clone());
+			for buf in payloads.as_ref().expect("prepared payloads") {
 				let event = SendingEvent::ToDevice(buf.clone());
-
-				self.queue_and_dispatch(dest, event).await?;
+				Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
+				requests.push((dest.clone(), event));
 			}
 		}
+		self.queue_and_dispatch_batch(requests).await?;
 
 		Ok(())
 	}
@@ -433,7 +519,10 @@ impl Service {
 		),
 	)]
 	pub async fn send_device_list_appservices(&self, user_id: &UserId, count: u64) -> Result {
-		let registrations = self.services.appservice.read().await;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let registrations = services_root.appservice.read().await;
 
 		// Hot path: no bridge opted into transaction extensions.
 		if !registrations
@@ -446,6 +535,8 @@ impl Service {
 		let _cork = self.db.db.cork();
 
 		let mut payload = None;
+		let mut requests = Vec::new();
+		let mut budget = None;
 		for info in registrations.values() {
 			if !info.registration.msc3202_transaction_extensions {
 				continue;
@@ -461,33 +552,36 @@ impl Service {
 			let dest = Destination::Appservice(info.registration.id.clone());
 			let event = SendingEvent::DeviceListChanged(payload.clone());
 
-			self.queue_and_dispatch(dest, event).await?;
+			if budget.is_none() {
+				budget = Some(self.db.queue_budget()?);
+			}
+			Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
+			requests.push((dest, event));
 		}
-
-		Ok(())
+		self.queue_and_dispatch_batch(requests).await
 	}
 
 	/// Whether `user_id` shares a device-list-interesting room with `info`: a
 	/// joined room the appservice participates in that is encrypted, or any
 	/// such room when `device_key_update_encrypted_rooms_only` is off.
 	async fn shares_device_list_room(&self, user_id: &UserId, info: &RegistrationInfo) -> bool {
-		let update_all_rooms = !self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let update_all_rooms = !services_root
 			.config
 			.device_key_update_encrypted_rooms_only;
 
-		self.services
+		services_root
 			.state_cache
 			.rooms_joined(user_id)
 			.map(ToOwned::to_owned)
 			.any(async |room_id: OwnedRoomId| {
 				(update_all_rooms
-					|| self
-						.services
+					|| services_root
 						.state_accessor
 						.is_encrypted_room(&room_id)
-						.await) && self
-					.services
+						.await) && services_root
 					.state_cache
 					.appservice_in_room(&room_id, info)
 					.await
@@ -500,24 +594,36 @@ impl Service {
 	where
 		S: Stream<Item = &'a ServerName> + Send + 'a,
 	{
-		let requests = servers
-			.map(|server| {
-				(
-					Destination::Federation(server.to_owned()),
-					SendingEvent::Edu(serialized.clone()),
-				)
-			})
-			.collect::<Vec<_>>()
-			.await;
+		self.queue_federation(servers, SendingEvent::Edu(serialized))
+			.await
+	}
+
+	async fn queue_federation<'a, S>(&self, servers: S, event: SendingEvent) -> Result
+	where
+		S: Stream<Item = &'a ServerName> + Send + 'a,
+	{
+		let destinations = self
+			.db
+			.federation_destinations(servers, &event)
+			.await?;
 
 		let _cork = self.db.db.cork();
 		let keys = self
 			.db
-			.queue_requests(requests.iter().map(|(o, e)| (e, o)))
+			.queue_requests(
+				destinations
+					.iter()
+					.map(|destination| (&event, destination)),
+			)
 			.await?;
+		drop(event);
 
-		for ((dest, event), queue_id) in requests.into_iter().zip(keys) {
-			self.dispatch(Msg { dest, event, queue_id })?;
+		for (dest, queue_id) in destinations.into_iter().zip(keys) {
+			self.dispatch(Msg {
+				dest,
+				event: SendingEvent::BadgeRefresh,
+				queue_id,
+			})?;
 		}
 
 		Ok(())
@@ -525,11 +631,13 @@ impl Service {
 
 	#[tracing::instrument(skip(self, room_id), level = "debug")]
 	pub async fn flush_room(&self, room_id: &RoomId) -> Result {
-		let servers = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let servers = services_root
 			.state_cache
 			.room_servers(room_id)
-			.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name));
+			.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name));
 
 		self.flush_servers(servers).await
 	}
@@ -573,8 +681,10 @@ impl Service {
 		),
 	)]
 	pub async fn notify_peer_alive(&self, server: &ServerName) -> bool {
-		let sad = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let sad = services_root
 			.federation
 			.note_peer_alive(server)
 			.await;
@@ -621,7 +731,18 @@ impl Service {
 		Ok(())
 	}
 
-	fn dispatch(&self, msg: Msg) -> Result {
+	fn dispatch(&self, mut msg: Msg) -> Result {
+		// Flush callers also pass through admission: bounded hint counts must
+		// not retain arbitrarily wide destination identifiers.
+		if msg.dest.prefix_len() > tuwunel_bridge::MAX_KEY_BYTES {
+			return Err(err!(Request(TooLarge("Outgoing hint destination limit"))));
+		}
+		// The queue has already accepted the event. Hints never own a second
+		// payload/key copy; an empty-key flush remains an explicit retry.
+		if !msg.queue_id.is_empty() {
+			msg.queue_id = Vec::new();
+			msg.event = SendingEvent::BadgeRefresh;
+		}
 		let shard = self.shard_id(&msg.dest);
 		let sender = &self
 			.channels
@@ -629,9 +750,11 @@ impl Service {
 			.expect("missing sender worker channels")
 			.0;
 
-		debug_assert!(!sender.is_full(), "channel full");
-		debug_assert!(!sender.is_closed(), "channel closed");
-		sender.send(msg).map_err(|e| err!("{e}"))
+		match sender.try_send(msg) {
+			// Accepted rows and canonical EDU sources survive dropped hints.
+			| Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+			| Err(error @ TrySendError::Disconnected(_)) => Err(err!("{error}")),
+		}
 	}
 
 	pub(super) fn shard_id(&self, dest: &Destination) -> usize {
@@ -656,30 +779,39 @@ fn to_device_payloads<'a, I>(
 	deliveries: I,
 	event_type: &str,
 	content: &serde_json::Value,
-) -> EduVec
+) -> Result<EduVec>
 where
 	I: Iterator<Item = (&'a DeviceId, u64)>,
 {
-	deliveries
-		.map(|(to_device_id, count)| {
-			let mut buf = EduBuf::new();
-			buf.push(TAG_TO_DEVICE);
-			buf.extend_from_slice(&count.to_be_bytes());
-
-			let event = AsToDeviceEvent {
-				kind: event_type,
-				sender,
-				content,
-				to_user_id: target_user,
-				to_device_id,
-			};
-
-			serde_json::to_writer(&mut buf, &event)
-				.expect("to-device appservice event serializes");
-
-			buf
-		})
-		.collect()
+	let mut payloads = EduVec::new();
+	let mut bytes = 0_usize;
+	for (to_device_id, count) in deliveries {
+		if payloads.len() >= tuwunel_bridge::MAX_COMMIT_OPS {
+			return Err(err!(Request(TooLarge("Appservice to-device recipient limit"))));
+		}
+		let event = AsToDeviceEvent {
+			kind: event_type,
+			sender,
+			content,
+			to_user_id: target_user,
+			to_device_id,
+		};
+		let remaining = data::BODY_LIMIT
+			.saturating_sub(bytes)
+			.saturating_sub(TAG_PREFIX_LEN);
+		let limit =
+			remaining.min(tuwunel_bridge::MAX_VALUE_BYTES.saturating_sub(TAG_PREFIX_LEN + 10));
+		let frozen::Body::Ready(body) = frozen::bounded_json(&event, limit)? else {
+			return Err(err!(Request(TooLarge("Appservice to-device payload limit"))));
+		};
+		let mut buf = EduBuf::new();
+		buf.push(TAG_TO_DEVICE);
+		buf.extend_from_slice(&count.to_be_bytes());
+		buf.extend_from_slice(&body);
+		bytes = bytes.saturating_add(buf.len());
+		payloads.push(buf);
+	}
+	Ok(payloads)
 }
 
 fn device_list_payload(user_id: &UserId, count: u64) -> EduBuf {
@@ -692,35 +824,16 @@ fn device_list_payload(user_id: &UserId, count: u64) -> EduBuf {
 }
 
 fn num_senders(args: &crate::Args<'_>) -> usize {
-	const MIN_SENDERS: usize = 1;
-	// Limit the number of senders to the number of workers threads or number of
-	// cores, conservatively.
-	let max_senders = args
-		.server
-		.metrics
-		.num_workers()
-		.min(available_parallelism());
-
-	// If the user doesn't override the default 0, this is intended to then default
-	// to 1 for now as multiple senders is experimental.
-	args.server
-		.config
-		.sender_workers
-		.clamp(MIN_SENDERS, max_senders)
+	sender_count(
+		args.server.config.sender_workers,
+		args.server.metrics.num_workers(),
+		available_parallelism(),
+	)
 }
 
-fn reap_flushes(flushes: &mut JoinSet<()>) {
-	while let Some(result) = flushes.try_join_next() {
-		log_flush(result);
-	}
-}
-
-// A flush that panicked is reported here or nowhere; a cancelled one is the
-// shutdown path.
-fn log_flush(result: Result<(), JoinError>) {
-	if let Err(error) = result
-		&& error.is_panic()
-	{
-		error!(?error, "Suppressed push flush panicked");
-	}
+fn sender_count(configured: usize, runtime_workers: usize, parallelism: usize) -> usize {
+	let maximum = runtime_workers
+		.min(parallelism)
+		.clamp(1, MAX_SENDER_WORKERS);
+	configured.clamp(1, maximum)
 }

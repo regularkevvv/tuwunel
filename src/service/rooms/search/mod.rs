@@ -7,7 +7,6 @@ use tuwunel_core::{
 	arrayvec::ArrayVec,
 	implement,
 	matrix::event::{Event, Matches},
-	trace,
 	utils::{
 		ArrayVecExt, IterStream, ReadyExt, set,
 		stream::{TryIgnore, WidebandExt},
@@ -83,18 +82,31 @@ pub async fn deindex_pdu(
 	pdu_id: &RawPduId,
 	message_body: &str,
 ) -> Result {
-	let batch = tokenize(message_body).map(|word| {
-		let mut key = shortroomid.to_be_bytes().to_vec();
-		key.extend_from_slice(word.as_bytes());
-		key.push(0xFF);
-		key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
-		key
-	});
-
-	for token in batch {
-		self.db.tokenids.remove(&token).await?;
+	for word in tokenize(message_body) {
+		let key = deindex_tokenid(shortroomid, &word, pdu_id);
+		self.db.tokenids.remove(&key).await?;
 	}
+	Ok(())
+}
 
+/// Stage search removals alongside their owning PDU mutation. Duplicate words
+/// need only one deletion. The caller can add the remaining event indexes to
+/// this batch before deciding whether to commit it.
+#[implement(Service)]
+pub(crate) fn append_deindex_pdu(
+	&self,
+	txn: &mut Txn,
+	shortroomid: ShortRoomId,
+	pdu_id: &RawPduId,
+	message_body: &str,
+) -> Result {
+	let mut words = std::collections::BTreeSet::new();
+	for word in tokenize(message_body) {
+		if words.insert(word.clone()) {
+			txn.del_raw(&self.db.tokenids, deindex_tokenid(shortroomid, &word, pdu_id));
+			super::timeline::check_purge_batch(txn)?;
+		}
+	}
 	Ok(())
 }
 
@@ -103,31 +115,34 @@ pub async fn search_pdus<'a>(
 	&'a self,
 	query: &'a RoomQuery<'a>,
 ) -> Result<(usize, impl Stream<Item = impl Event + use<>> + Send + '_)> {
+	let services_guard = self.services.get();
 	let pdu_ids: Vec<_> = self.search_pdu_ids(query).await?.collect().await;
 
-	let filter = &query.criteria.filter;
 	let count = pdu_ids.len();
-	let pdus = pdu_ids
-		.into_iter()
-		.stream()
-		.wide_filter_map(async |result_pdu_id: RawPduId| {
-			self.services
-				.timeline
-				.get_pdu_from_id(&result_pdu_id)
-				.await
-				.ok()
-		})
-		.ready_filter(|pdu| !pdu.is_redacted())
-		.ready_filter(move |pdu| filter.matches(pdu))
-		.wide_filter_map(async |pdu| {
-			self.services
-				.state_accessor
-				.user_can_see_event(query.user_id?, pdu.room_id(), pdu.event_id())
-				.await
-				.then_some(pdu)
-		})
-		.skip(query.skip)
-		.take(query.limit);
+	let pdus = crate::once_services::services_stream!(services_guard, services_root, {
+		let filter = &query.criteria.filter;
+		pdu_ids
+			.into_iter()
+			.stream()
+			.wide_filter_map(async |result_pdu_id: RawPduId| {
+				services_root
+					.timeline
+					.get_pdu_from_id(&result_pdu_id)
+					.await
+					.ok()
+			})
+			.ready_filter(|pdu| !pdu.is_redacted())
+			.ready_filter(move |pdu| filter.matches(pdu))
+			.wide_filter_map(async |pdu| {
+				services_root
+					.state_accessor
+					.user_can_see_event(query.user_id?, pdu.room_id(), pdu.event_id())
+					.await
+					.then_some(pdu)
+			})
+			.skip(query.skip)
+			.take(query.limit)
+	});
 
 	Ok((count, pdus))
 }
@@ -139,8 +154,10 @@ pub async fn search_pdu_ids(
 	&self,
 	query: &RoomQuery<'_>,
 ) -> Result<impl Stream<Item = RawPduId> + Send + '_ + use<'_>> {
-	let shortroomid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid = services_root
 		.short
 		.get_shortroomid(query.room_id)
 		.await?;
@@ -205,29 +222,6 @@ fn search_pdu_ids_query_word(
 		.ready_take_while(move |key| key.starts_with(&prefix))
 }
 
-#[implement(Service)]
-pub async fn delete_all_search_tokenids_for_room(&self, room_id: &RoomId) -> Result {
-	let Ok(shortroomid) = self.services.short.get_shortroomid(room_id).await else {
-		return Ok(());
-	};
-
-	let txn = self
-		.db
-		.tokenids
-		.keys_prefix_raw(&shortroomid)
-		.ignore_err()
-		.ready_fold(self.services.db.txn(), |mut txn, key| {
-			trace!("Removing key: {key:?}");
-			txn.del_raw(&self.db.tokenids, key);
-			txn
-		})
-		.await;
-
-	txn.execute().await?;
-
-	Ok(())
-}
-
 /// Splits a string into tokens used as keys in the search inverted index
 ///
 /// This may be used to tokenize both message bodies (for indexing) or search
@@ -257,4 +251,46 @@ fn prefix_len(word: &str) -> usize {
 	size_of::<ShortRoomId>()
 		.saturating_add(word.len())
 		.saturating_add(1)
+}
+
+// Match the writer's variable-width token key, including Unicode lowercase
+// expansions beyond the original word's 50-byte tokenization limit.
+fn deindex_tokenid(shortroomid: ShortRoomId, word: &str, pdu_id: &RawPduId) -> Vec<u8> {
+	let mut key = shortroomid.to_be_bytes().to_vec();
+	key.extend_from_slice(word.as_bytes());
+	key.push(tuwunel_database::SEP);
+	key.extend_from_slice(pdu_id.as_ref());
+	key
+}
+
+/// A deterministic page from the immutable event body's token dictionary.
+/// The source value is bounded by the backend; only this page enters a commit.
+#[implement(Service)]
+pub(crate) fn append_deindex_page(
+	&self,
+	txn: &mut Txn,
+	short: ShortRoomId,
+	raw: &RawPduId,
+	body: &str,
+	after: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, bool)> {
+	let keys: std::collections::BTreeSet<Vec<u8>> = tokenize(body)
+		.map(|word| deindex_tokenid(short, &word, raw))
+		.collect();
+	if after.is_some_and(|after| !keys.contains(after)) {
+		return Err(tuwunel_core::Error::bad_database(
+			"History search cursor is outside frozen body",
+		));
+	}
+	let mut page = keys
+		.into_iter()
+		.filter(|key| after.is_none_or(|after| key.as_slice() > after))
+		.take(65)
+		.collect::<Vec<_>>();
+	let done = page.len() <= 64;
+	page.truncate(64);
+	for key in &page {
+		txn.del_raw(&self.db.tokenids, key);
+	}
+	Ok((page.last().cloned(), done))
 }

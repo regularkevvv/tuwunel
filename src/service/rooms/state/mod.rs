@@ -1,6 +1,7 @@
+mod frontier;
 mod prune;
 
-use std::{fmt::Write, iter::once, sync::Arc};
+use std::{fmt::Write, iter::once, pin::pin, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::join_all};
@@ -8,33 +9,33 @@ pub(crate) use prune::prune_goal;
 pub use prune::{PruneSummary, Trigger};
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId, UserId,
-	events::{AnyStrippedStateEvent, StateEventType, TimelineEventType},
+	api::error::{ErrorKind, LimitExceededErrorData},
+	events::{
+		AnyStrippedStateEvent, StateEventType, TimelineEventType,
+		room::power_levels::RoomPowerLevelsEventContent,
+	},
 	room_version_rules::AuthorizationRules,
 	serde::Raw,
 };
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Error, Event, PduEvent, Result, err,
-	error::inspect_debug_log,
-	implement,
+	Error, Event, PduEvent, Result, implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, room_version},
-	result::{AndThenRef, FlatOk},
+	result::AndThenRef,
 	smallvec::SmallVec,
-	trace,
 	utils::{
 		IterStream, MutexMap, MutexMapGuard, calculate_hash,
-		mutex_map::Guard,
-		stream::{BroadbandExt, TryBroadbandExt, TryIgnore, WidebandExt},
+		json::serialized_len,
+		stream::{TryIgnore, WidebandExt},
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
+use tuwunel_database::{Ignore, Interfix, Map, Txn, serialize_key};
 
 use crate::{
 	rooms::{
 		short::{ShortEventId, ShortStateHash},
-		state_cache::MembershipUpdate,
-		state_compressor::{CompressedState, parse_compressed_state_event},
+		state_compressor::CompressedState,
 		state_res::{StateMap, auth_types_for_event},
 	},
 	services::OnceServices,
@@ -92,7 +93,7 @@ impl crate::Service for Service {
 	level = "debug",
 	skip_all,
 	fields(
-		count = ?self.services.globals.pending_count(),
+		count = ?self.services.get().globals.pending_count(),
 		%shortstatehash,
 	)
 )]
@@ -100,75 +101,41 @@ pub async fn force_state(
 	&self,
 	room_id: &RoomId,
 	shortstatehash: u64,
-	statediffnew: Arc<CompressedState>,
+	_statediffnew: Arc<CompressedState>,
 	_statediffremoved: Arc<CompressedState>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	statediffnew
-		.iter()
-		.stream()
-		.map(|&new| parse_compressed_state_event(new).1)
-		.wide_filter_map(async |shorteventid| {
-			let event_id: OwnedEventId = self
-				.services
-				.short
-				.get_eventid_from_short(shorteventid)
-				.inspect_err(inspect_debug_log)
-				.await
-				.ok()?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-			self.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-		})
-		.map(Ok)
-		.try_for_each(async move |pdu| match pdu.kind {
-			| TimelineEventType::RoomMember => {
-				let Some(user_id) = pdu
-					.state_key
-					.as_ref()
-					.map(UserId::parse)
-					.flat_ok()
-				else {
-					return Ok(());
-				};
-
-				let Ok(membership_event) = pdu.get_content() else {
-					return Ok(());
-				};
-
-				let count = self.services.globals.next_count().await?;
-				self.services
-					.state_cache
-					.update_membership(MembershipUpdate {
-						room_id,
-						user_id: &user_id,
-						membership_event,
-						sender: &pdu.sender,
-						last_state: None,
-						invite_via: None,
-						update_joined_count: false,
-						count: PduCount::Normal(*count),
-					})
-					.await
-			},
-			| _ => Ok(()),
-		})
-		.boxed()
-		.await?;
-
-	self.services
+	services_root
 		.state_cache
-		.update_joined_count(room_id)
+		.resume_membership_projection(room_id, state_lock)
 		.await?;
-
-	self.set_room_state(room_id, shortstatehash, state_lock)
+	let count = services_root.globals.next_count().await?;
+	let mut txn = services_root.db.txn();
+	let projection = services_root
+		.state_cache
+		.stage_membership_projection(
+			&mut txn,
+			room_id,
+			Some(shortstatehash),
+			None,
+			PduCount::Normal(*count),
+			state_lock,
+		)
+		.await?;
+	self.set_room_state_txn(&mut txn, room_id, shortstatehash, state_lock);
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await?;
+	drop(projection);
+	services_root
+		.state_cache
+		.resume_membership_projection(room_id, state_lock)
 		.await?;
 
 	// Forced state may change this room's cached hierarchy summary.
-	self.services.spaces.cache_evict(room_id).await?;
+	services_root.spaces.cache_evict(room_id).await?;
 
 	Ok(())
 }
@@ -183,7 +150,7 @@ pub async fn force_state(
 	level = "debug",
 	skip(self, state_ids_compressed),
 	fields(
-		count = ?self.services.globals.pending_count(),
+		count = ?self.services.get().globals.pending_count(),
 	)
 )]
 pub async fn set_event_state(
@@ -195,16 +162,17 @@ pub async fn set_event_state(
 	const KEY_LEN: usize = size_of::<ShortEventId>();
 	const VAL_LEN: usize = size_of::<ShortStateHash>();
 
-	let shorteventid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shorteventid = services_root
 		.short
 		.get_or_create_shorteventid(event_id)
-		.await;
+		.await?;
 
 	let state_hash = calculate_hash(state_ids_compressed.iter().map(|s| &s[..]));
 
-	if let Ok(shortstatehash) = self
-		.services
+	if let Ok(shortstatehash) = services_root
 		.short
 		.get_shortstatehash(&state_hash)
 		.await
@@ -220,7 +188,7 @@ pub async fn set_event_state(
 	let previous_shortstatehash = self.get_room_shortstatehash(room_id).await;
 	let states_parents = match previous_shortstatehash {
 		| Ok(p) =>
-			self.services
+			services_root
 				.state_compressor
 				.load_shortstatehash_info(p)
 				.await?,
@@ -245,7 +213,7 @@ pub async fn set_event_state(
 	};
 
 	let save_statediff = |txn: &mut Txn, shortstatehash| {
-		self.services
+		services_root
 			.state_compressor
 			.save_state_from_diff(
 				txn,
@@ -257,8 +225,7 @@ pub async fn set_event_state(
 			)
 	};
 
-	let (shortstatehash, _) = self
-		.services
+	let (shortstatehash, _) = services_root
 		.short
 		.get_or_create_shortstatehash(&state_hash, save_statediff)
 		.await?;
@@ -283,18 +250,20 @@ pub async fn set_event_state(
 	level = "debug",
 	skip(self, new_pdu),
 	fields(
-		count = ?self.services.globals.pending_count(),
+		count = ?self.services.get().globals.pending_count(),
 	)
 )]
 pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 	const KEY_LEN: usize = size_of::<ShortEventId>();
 	const VAL_LEN: usize = size_of::<ShortStateHash>();
 
-	let shorteventid = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shorteventid = services_root
 		.short
 		.get_or_create_shorteventid(&new_pdu.event_id)
-		.await;
+		.await?;
 
 	let previous_shortstatehash = self
 		.get_room_shortstatehash(&new_pdu.room_id)
@@ -311,24 +280,22 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 		| Some(state_key) => {
 			let states_parents = match previous_shortstatehash {
 				| Ok(p) =>
-					self.services
+					services_root
 						.state_compressor
 						.load_shortstatehash_info(p)
 						.await?,
 				| _ => Vec::new(),
 			};
 
-			let shortstatekey = self
-				.services
+			let shortstatekey = services_root
 				.short
 				.get_or_create_shortstatekey(&new_pdu.kind.to_string().into(), state_key)
-				.await;
+				.await?;
 
-			let new = self
-				.services
+			let new = services_root
 				.state_compressor
 				.compress_state_event(shortstatekey, &new_pdu.event_id)
-				.await;
+				.await?;
 
 			let replaces = states_parents
 				.last()
@@ -344,8 +311,8 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 			}
 
 			// TODO: statehash with deterministic inputs
-			let shortstatehash = self.services.globals.next_count().await?;
-			let mut txn = self.services.db.txn();
+			let shortstatehash = services_root.globals.next_count().await?;
+			let mut txn = services_root.db.txn();
 
 			let mut statediffnew = CompressedState::new();
 			statediffnew.insert(new);
@@ -355,7 +322,7 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 				statediffremoved.insert(*replaces);
 			}
 
-			self.services
+			services_root
 				.state_compressor
 				.save_state_from_diff(
 					&mut txn,
@@ -426,6 +393,9 @@ where
 	StateEventType: Send + Sync,
 	StateKey: Send + Sync,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let shortstatehash = match self.get_room_shortstatehash(room_id).await {
 		| Ok(hash) => hash,
 		| Err(error) if error.is_not_found() && *kind == TimelineEventType::RoomCreate =>
@@ -435,93 +405,54 @@ where
 
 	let auth_types =
 		auth_types_for_event(kind, sender, state_key, content, auth_rules, include_create)?;
-	let selected = auth_types
-		.iter()
-		.stream()
-		.broad_then(async |key| {
-			let short = match self
-				.services
-				.short
-				.get_shortstatekey(&key.0, &key.1)
-				.await
-			{
-				| Ok(short) => Some(short),
-				| Err(error) if error.is_not_found() => None,
-				| Err(error) => return Err(error),
-			};
-			Ok((short, key))
-		})
-		.try_collect::<Vec<_>>()
-		.await?;
-	let check_all_keys = selected.iter().any(|(short, _)| short.is_none());
-
-	// Select from the actual snapshot. A missing forward key lookup cannot
-	// establish absence: the snapshot may still reference that state cell.
-	// Normally all auth keys are known, so only those cells need reverse reads.
-	// If any dictionary row is absent, inspect the snapshot's keys to distinguish
-	// a genuinely absent optional event from a torn forward mapping.
-	let (state_keys, event_ids) = self
-		.services
-		.state_accessor
-		.state_full_shortids(shortstatehash)
-		.try_fold((Vec::new(), Vec::new()), async |(mut keys, mut ids), (key, id)| {
-			if check_all_keys
-				|| selected
-					.iter()
-					.any(|(short, _)| *short == Some(key))
-			{
-				keys.push(key);
-				ids.push(id);
-			}
-			Ok((keys, ids))
-		})
-		.await?;
-
-	self.services
-		.short
-		.multi_get_statekey_from_short(state_keys.iter().copied().stream())
-		.zip(state_keys.iter().copied().stream())
-		.zip(event_ids.into_iter().stream())
-		.map(|((key, short), id)| {
-			let key = key
-				.map_err(|_| Error::bad_database("Incomplete current-state auth key mapping"))?;
-			if selected
-				.iter()
-				.any(|(known, expected)| *known == Some(short) && **expected != key)
-			{
-				return Err(Error::bad_database("Mismatched current-state auth key mapping"));
-			}
-			Ok((key, id))
-		})
-		.try_filter_map(async |(key, id)| Ok(auth_types.contains(&key).then_some((key, id))))
-		.broad_and_then(async |(key, id)| {
-			let event_id: OwnedEventId = self
-				.services
-				.short
-				.get_eventid_from_short(id)
-				.await?;
-			let pdu = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.map_err(|_| Error::bad_database("Incomplete current-state auth event"))?;
-			if pdu.room_id() != room_id
-				|| pdu.event_id() != event_id
-				|| pdu.event_type().to_cow_str() != key.0.to_cow_str()
-				|| pdu.state_key() != Some(key.1.as_str())
-			{
-				return Err(Error::bad_database("Mismatched current-state auth event"));
-			}
-			Ok((key, pdu))
-		})
-		.try_collect()
-		.await
+	// Derive optional auth cells from the complete immutable snapshot. Forward
+	// shortcuts cannot prove absence, and no malformed stored cell may disappear
+	// before auth checking or be blamed on the incoming event.
+	let mut state = pin!(
+		services_root
+			.state_accessor
+			.state_full_pdus_strict(shortstatehash)
+	);
+	let mut auth_events = StateMap::new();
+	let mut source_bytes = 0_usize;
+	while let Some((key, pdu)) = state.try_next().await? {
+		source_bytes = source_bytes.saturating_add(
+			serialized_len(pdu.as_pdu())
+				.map_err(|_| Error::bad_database("Invalid auth state serialization"))?,
+		);
+		if source_bytes > 512 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Auth state byte limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		if pdu.room_id() != room_id {
+			return Err(Error::bad_database("Mismatched current-state auth room"));
+		}
+		if !auth_types.contains(&key) {
+			continue;
+		}
+		if key.0 == StateEventType::RoomPowerLevels {
+			pdu.get_content::<RoomPowerLevelsEventContent>()
+				.map_err(|_| Error::bad_database("Invalid stored auth power levels"))?;
+		}
+		if auth_events
+			.insert(key, pdu.as_pdu().clone())
+			.is_some()
+		{
+			return Err(Error::bad_database("Duplicate current-state auth key"));
+		}
+	}
+	Ok(auth_events)
 }
 
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "debug")]
 pub async fn summary_stripped<Pdu: Event>(&self, event: &Pdu) -> Vec<Raw<AnyStrippedStateEvent>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let cells = [
 		(&StateEventType::RoomCreate, ""),
 		(&StateEventType::RoomJoinRules, ""),
@@ -534,7 +465,7 @@ pub async fn summary_stripped<Pdu: Event>(&self, event: &Pdu) -> Vec<Raw<AnyStri
 	];
 
 	let fetches = cells.into_iter().map(|(event_type, state_key)| {
-		self.services
+		services_root
 			.state_accessor
 			.room_state_get(event.room_id(), event_type, state_key)
 	});
@@ -560,6 +491,9 @@ pub async fn summary_pdus<Pdu: Event>(
 	event_json: &CanonicalJsonObject,
 	room_version: &RoomVersionId,
 ) -> Vec<Box<RawJsonValue>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let cells = [
 		(&StateEventType::RoomCreate, ""),
 		(&StateEventType::RoomJoinRules, ""),
@@ -571,8 +505,7 @@ pub async fn summary_pdus<Pdu: Event>(
 		(&StateEventType::RoomTopic, ""),
 	];
 
-	let membership = self
-		.services
+	let membership = services_root
 		.federation
 		.format_pdu_into(event_json.clone(), Some(room_version))
 		.boxed() // query-depth firewall
@@ -582,22 +515,20 @@ pub async fn summary_pdus<Pdu: Event>(
 		.into_iter()
 		.stream()
 		.wide_filter_map(async |(event_type, state_key)| {
-			let pdu = self
-				.services
+			let pdu = services_root
 				.state_accessor
 				.room_state_get(event.room_id(), event_type, state_key)
 				.await
 				.ok()?;
 
-			let pdu_json = self
-				.services
+			let pdu_json = services_root
 				.timeline
 				.get_pdu_json(pdu.event_id())
 				.await
 				.ok()?;
 
 			Some(
-				self.services
+				services_root
 					.federation
 					.format_pdu_into(pdu_json, Some(room_version))
 					.await,
@@ -625,14 +556,20 @@ pub async fn get_room_version_rules(&self, room_id: &RoomId) -> Result<RoomVersi
 	ret(level = "trace"),
 )]
 pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let hash = self.get_room_shortstatehash(room_id).await?;
+	let create = services_root
 		.state_accessor
-		.room_state_get_content(room_id, &StateEventType::RoomCreate, "")
-		.await
-		.as_ref()
-		.map(room_version::from_create_content)
-		.cloned()
-		.map_err(|e| err!(Request(NotFound("No create event found: {e:?}"))))
+		.state_get_optional(hash, &StateEventType::RoomCreate, "")
+		.await?
+		.ok_or_else(|| Error::bad_database("Missing known room create event"))?;
+	if create.room_id() != room_id {
+		return Err(Error::bad_database("Mismatched room create event"));
+	}
+	room_version::from_create_event(&create)
+		.map_err(|_| Error::bad_database("Invalid room create content"))
 }
 
 #[implement(Service)]
@@ -642,17 +579,18 @@ pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> 
 	ret(level = "trace"),
 )]
 pub async fn get_room_shortstatehash(&self, room_id: &RoomId) -> Result<ShortStateHash> {
-	self.db
-		.roomid_shortstatehash
-		.get(room_id)
-		.await
-		.deserialized()
+	let value = self.db.roomid_shortstatehash.get(room_id).await?;
+	tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid room state hash"))
 }
 
 /// Returns the state hash at this event.
 #[implement(Service)]
 pub async fn pdu_shortstatehash(&self, event_id: &EventId) -> Result<ShortStateHash> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.short
 		.get_shorteventid(event_id)
 		.and_then(|shorteventid| self.get_shortstatehash(shorteventid))
@@ -668,26 +606,13 @@ pub async fn pdu_shortstatehash(&self, event_id: &EventId) -> Result<ShortStateH
 )]
 pub async fn get_shortstatehash(&self, shorteventid: ShortEventId) -> Result<ShortStateHash> {
 	const BUFSIZE: usize = size_of::<ShortEventId>();
-
-	self.db
+	let value = self
+		.db
 		.shorteventid_shortstatehash
 		.aqry::<BUFSIZE, _>(&shorteventid)
-		.await
-		.deserialized()
-}
-
-#[implement(Service)]
-pub(super) async fn delete_room_shortstatehash(
-	&self,
-	room_id: &RoomId,
-	_mutex_lock: &Guard<OwnedRoomId, ()>,
-) -> Result {
-	self.db
-		.roomid_shortstatehash
-		.remove(room_id)
 		.await?;
-
-	Ok(())
+	tuwunel_core::utils::bytes::u64_from_bytes(value.as_ref())
+		.map_err(|_| Error::bad_database("Invalid historical state hash"))
 }
 
 /// Collapses the room to a single forward extremity, keeping the one furthest
@@ -703,6 +628,9 @@ pub async fn collapse_forward_extremities(
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> usize {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let extremities: ForwardExtremities = self
 		.get_forward_extremities(room_id)
 		.map(ToOwned::to_owned)
@@ -714,7 +642,7 @@ pub async fn collapse_forward_extremities(
 	}
 
 	let survivor = join_all(extremities.iter().map(async |event_id| {
-		self.services
+		services_root
 			.timeline
 			.get_pdu_count(event_id)
 			.await
@@ -762,7 +690,7 @@ pub fn get_forward_extremities<'a>(
 	fields(%room_id),
 )]
 pub async fn set_forward_extremities<'a, I>(
-	&'a self,
+	&self,
 	room_id: &'a RoomId,
 	event_ids: I,
 	_state_lock: &'a RoomMutexGuard,
@@ -800,7 +728,7 @@ pub async fn set_forward_extremities<'a, I>(
 /// written once, so no key is both deleted and written in one batch.
 #[implement(Service)]
 pub async fn set_forward_extremities_txn<'a, I>(
-	&'a self,
+	&self,
 	txn: &mut Txn,
 	room_id: &'a RoomId,
 	event_ids: I,
@@ -837,25 +765,4 @@ pub async fn set_forward_extremities_txn<'a, I>(
 	for (key, event_id) in &leaves {
 		txn.insert_raw(&self.db.roomid_pduleaves, key, event_id.as_bytes());
 	}
-}
-
-#[implement(Service)]
-pub(super) async fn delete_all_rooms_forward_extremities(&self, room_id: &RoomId) -> Result {
-	let prefix = (room_id, Interfix);
-
-	self.db
-		.roomid_pduleaves
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			trace!("Removing key: {key:?}");
-			self.db
-				.roomid_pduleaves
-				.remove(key)
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	Ok(())
 }

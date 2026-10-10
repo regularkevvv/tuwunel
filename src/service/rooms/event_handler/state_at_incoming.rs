@@ -36,6 +36,9 @@ pub(super) async fn state_at_incoming_degree_one<Pdu>(
 where
 	Pdu: Event,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_assert!(
 		incoming_pdu.prev_events().count() == 1,
 		"Incoming PDU must have one prev_event to make this call"
@@ -46,8 +49,7 @@ where
 		.next()
 		.expect("at least one prev_event");
 
-	let Ok(prev_event_sstatehash) = self
-		.services
+	let Ok(prev_event_sstatehash) = services_root
 		.state
 		.pdu_shortstatehash(prev_event_id)
 		.inspect_err(|e| debug_warn!(?prev_event_id, "Missing state at prev_event: {e}"))
@@ -58,14 +60,12 @@ where
 
 	debug!(?prev_event_id, ?prev_event_sstatehash, "Resolving state at prev_event.");
 
-	let prev_event = self
-		.services
+	let prev_event = services_root
 		.timeline
 		.get_pdu(prev_event_id)
 		.map_err(|e| err!(Database("Could not find prev_event, but we know the state: {e:?}")));
 
-	let state = self
-		.services
+	let state = services_root
 		.state_accessor
 		.state_full_ids_strict(prev_event_sstatehash)
 		.try_collect::<HashMap<_, _>>()
@@ -102,11 +102,10 @@ where
 	if let Some(state_key) = prev_event.state_key() {
 		let prev_event_type = prev_event.event_type().to_cow_str().into();
 
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&prev_event_type, state_key)
-			.await;
+			.await?;
 
 		state.insert(shortstatekey, prev_event.event_id().into());
 		// Now it's the state after the pdu
@@ -136,6 +135,9 @@ pub(super) async fn state_at_incoming_resolved<Pdu>(
 where
 	Pdu: Event,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_assert!(
 		incoming_pdu.prev_events().count() > 1,
 		"Incoming PDU should have more than one prev_event for this codepath"
@@ -146,12 +148,11 @@ where
 		.prev_events()
 		.try_stream()
 		.broad_and_then(|prev_event_id| {
-			let sstatehash = self
-				.services
+			let sstatehash = services_root
 				.state
 				.pdu_shortstatehash(prev_event_id);
 
-			let prev_event = self.services.timeline.get_pdu(prev_event_id);
+			let prev_event = services_root.timeline.get_pdu(prev_event_id);
 
 			try_join(sstatehash, prev_event).inspect_err(move |e| {
 				debug_warn!(?prev_event_id, "Missing state at prev_event: {e}");
@@ -211,16 +212,15 @@ where
 		.into_iter()
 		.stream()
 		.broad_then(async |((event_type, state_key), event_id)| {
-			self.services
+			services_root
 				.short
 				.get_or_create_shortstatekey(&event_type, &state_key)
-				.map(move |shortstatekey| (shortstatekey, event_id))
+				.map_ok(move |shortstatekey| (shortstatekey, event_id))
 				.await
 		})
-		.collect::<HashMap<_, _>>()
-		.inspect(|state| trace!(state = state.len(), "Created shortstatekeys."))
-		.map(Some)
-		.map(Ok)
+		.try_collect::<HashMap<_, _>>()
+		.inspect_ok(|state| trace!(state = state.len(), "Created shortstatekeys."))
+		.map_ok(Some)
 		.await
 }
 
@@ -244,6 +244,9 @@ async fn state_at_incoming_fork<Pdu>(
 where
 	Pdu: Event,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Every event holding a `shorteventid_shortstatehash` row passed spec check 5
 	// (auth against the state at its own position) as a hard reject; soft failure
 	// (spec check 6) still writes the row, so soft-failed events are valid fold
@@ -253,20 +256,18 @@ where
 		.map_stream(async |state_key| {
 			let event_id = prev_event.event_id();
 			let event_type = prev_event.kind().to_cow_str().into();
-			let shortstatekey = self
-				.services
+			let shortstatekey = services_root
 				.short
 				.get_or_create_shortstatekey(&event_type, state_key)
-				.await;
+				.await?;
 
-			(shortstatekey, event_id.to_owned())
+			Ok((shortstatekey, event_id.to_owned()))
 		});
 
-	let leaf_state_after_event: Vec<_> = self
-		.services
+	let leaf_state_after_event: Vec<_> = services_root
 		.state_accessor
 		.state_full_ids_strict(sstatehash)
-		.chain(leaf.map(Ok))
+		.chain(leaf)
 		.try_collect()
 		.await
 		.map_err(ForkError::State)?;
@@ -309,10 +310,13 @@ pub(super) async fn fork_state<'a, State>(
 where
 	State: Iterator<Item = (ShortStateKey, &'a OwnedEventId)> + Send + 'a,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	state
 		.stream()
 		.wide_then(|(k, id)| {
-			self.services
+			services_root
 				.short
 				.get_statekey_from_short(k)
 				.map_ok(|(ty, sk)| ((ty, sk), id.clone()))
@@ -336,7 +340,10 @@ pub(super) async fn fork_chain<'a, Events>(
 where
 	Events: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
 {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.auth_chain
 		.event_ids_iter(room_id, room_version, starting_events)
 		.try_collect()
@@ -359,7 +366,10 @@ pub(super) async fn fork_chain_strict<'a, Events>(
 where
 	Events: Iterator<Item = &'a EventId> + Clone + ExactSizeIterator + Send + 'a,
 {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.auth_chain
 		.event_ids_iter_strict(room_id, room_version, starting_events, complete)
 		.try_collect()

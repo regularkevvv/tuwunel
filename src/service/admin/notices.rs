@@ -6,7 +6,10 @@ use tuwunel_core::{Result, implement};
 /// responses use the unconditional notice().
 #[implement(super::Service)]
 pub async fn notify(&self, body: &str) {
-	if self.services.server.config.admin_room_notices {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.server.config.admin_room_notices {
 		self.notice(body).await;
 	}
 }
@@ -15,7 +18,10 @@ pub async fn notify(&self, body: &str) {
 /// responses use the unconditional send_text().
 #[implement(super::Service)]
 pub async fn notify_loud(&self, body: &str) {
-	if self.services.server.config.admin_room_notices {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root.server.config.admin_room_notices {
 		self.send_text(body).await;
 	}
 }
@@ -61,7 +67,10 @@ pub async fn send_message(&self, message_content: RoomMessageEventContent) -> Re
 
 #[implement(super::Service)]
 async fn send_to_room(&self, content: RoomMessageEventContent, room_id: &RoomId) -> Result {
-	let user_id = &self.services.globals.server_user;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let user_id = &services_root.globals.server_user;
 
 	self.respond_to_room(content, room_id, user_id)
 		.boxed()

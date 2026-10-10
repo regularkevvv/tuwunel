@@ -191,6 +191,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4100,9 +4122,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5332,6 +5354,7 @@ dependencies = [
  "sentry",
  "sentry-tower",
  "sentry-tracing",
+ "serde",
  "serde_json",
  "serde_urlencoded",
  "similar 3.2.0",
@@ -5343,6 +5366,7 @@ dependencies = [
  "tracing-subscriber",
  "tuwunel_admin",
  "tuwunel_api",
+ "tuwunel_bridge",
  "tuwunel_core",
  "tuwunel_database",
  "tuwunel_macros",
@@ -5405,6 +5429,7 @@ dependencies = [
  "serde_html_form",
  "serde_json",
  "sha1",
+ "subtle",
  "synapse-admin-api",
  "tokio",
  "tower",
@@ -5570,6 +5595,7 @@ dependencies = [
 name = "tuwunel_service"
 version = "1.9.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "aws-lc-rs",
  "axum",

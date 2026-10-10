@@ -3,16 +3,24 @@
 //! Counts operations, payload sizes, batch sizes, and scan lengths at the
 //! backend-neutral seam so the D1 feasibility envelope can be measured from
 //! real traffic. Only sizes and counts are recorded — never keys, values, or
-//! map contents. Recording uses relaxed atomics and is always on; the cost is
-//! a handful of uncontended fetch-adds per operation.
+//! map contents. Recording uses relaxed atomics under a shared gate; a
+//! snapshot briefly takes its exclusive side, so each record is either fully
+//! included or fully excluded, even while traffic continues.
 //!
 //! A JSON snapshot is written to the path in `TUWUNEL_DB_METRICS_FILE` when
 //! the database closes, and is available programmatically through
 //! [`snapshot`].
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{
+	RwLock,
+	atomic::{AtomicU64, Ordering::Relaxed},
+};
 
-/// Power-of-two size histogram: bucket i counts values in [2^i, 2^(i+1)).
+static SNAPSHOT_GATE: RwLock<()> = RwLock::new(());
+
+/// Power-of-two size histogram. Bucket zero includes zero and one; the last
+/// bucket includes every value at least 2^31 rather than claiming an upper
+/// bound.
 const BUCKETS: usize = 32;
 
 /// One counter set with a size histogram.
@@ -25,6 +33,13 @@ pub(crate) struct OpStat {
 
 impl OpStat {
 	pub(crate) fn record(&self, size: usize) {
+		let Ok(_guard) = SNAPSHOT_GATE.read() else {
+			return; // A poisoned snapshot is reported as unavailable, never valid zero.
+		};
+		self.record_locked(size);
+	}
+
+	fn record_locked(&self, size: usize) {
 		self.count.fetch_add(1, Relaxed);
 		self.bytes
 			.fetch_add(u64::try_from(size).unwrap_or(u64::MAX), Relaxed);
@@ -80,6 +95,16 @@ pub(crate) struct Stats {
 	/// Remote backend: drained scans truncated at the drain budget (rows
 	/// materialized before the budget ran out).
 	pub(crate) remote_drain_truncated: OpStat,
+	/// Every commit-drain call, including empty scans, failures and
+	/// cancellation; histogram and total are elapsed microseconds, not payload
+	/// bytes.
+	pub(crate) remote_drain_call_us: OpStat,
+	/// Subset of calls that found at least one unfinished scan.
+	pub(crate) remote_drain_active_us: OpStat,
+	/// Successfully completed calls that found no unfinished scan.
+	pub(crate) remote_drain_empty_us: OpStat,
+	/// Subset of calls that failed or were cancelled before completing.
+	pub(crate) remote_drain_failed_us: OpStat,
 	/// Remote backend: point reads answered from the process-local read cache
 	/// (result size; a cached absence records 0).
 	pub(crate) remote_cache_hit: OpStat,
@@ -100,9 +125,30 @@ pub(crate) static STATS: Stats = Stats {
 	remote_page: OpStat::new(),
 	remote_drain: OpStat::new(),
 	remote_drain_truncated: OpStat::new(),
+	remote_drain_call_us: OpStat::new(),
+	remote_drain_active_us: OpStat::new(),
+	remote_drain_empty_us: OpStat::new(),
+	remote_drain_failed_us: OpStat::new(),
 	remote_cache_hit: OpStat::new(),
 	remote_cache_miss: OpStat::new(),
 };
+
+/// Record related drain counters together so a snapshot cannot split the
+/// call from its active/failed subsets.
+pub(crate) fn record_drain(micros: usize, active: bool, completed: bool) {
+	let Ok(_guard) = SNAPSHOT_GATE.read() else {
+		return;
+	};
+	STATS.remote_drain_call_us.record_locked(micros);
+	if active {
+		STATS.remote_drain_active_us.record_locked(micros);
+	} else if completed {
+		STATS.remote_drain_empty_us.record_locked(micros);
+	}
+	if !completed {
+		STATS.remote_drain_failed_us.record_locked(micros);
+	}
+}
 
 impl OpStat {
 	const fn new() -> Self {
@@ -119,6 +165,9 @@ impl OpStat {
 /// Returns the current backend-operation statistics as JSON.
 #[must_use]
 pub(crate) fn snapshot() -> serde_json::Value {
+	let Ok(_guard) = SNAPSHOT_GATE.write() else {
+		return serde_json::json!({"unavailable": "poisoned_metrics"});
+	};
 	serde_json::json!({
 		"get": STATS.get.json(),
 		"get_cached": STATS.get_cached.json(),
@@ -131,6 +180,10 @@ pub(crate) fn snapshot() -> serde_json::Value {
 		"remote_page": STATS.remote_page.json(),
 		"remote_drain": STATS.remote_drain.json(),
 		"remote_drain_truncated": STATS.remote_drain_truncated.json(),
+		"remote_drain_call_us": STATS.remote_drain_call_us.json(),
+		"remote_drain_active_us": STATS.remote_drain_active_us.json(),
+		"remote_drain_empty_us": STATS.remote_drain_empty_us.json(),
+		"remote_drain_failed_us": STATS.remote_drain_failed_us.json(),
 		"remote_cache_hit": STATS.remote_cache_hit.json(),
 		"remote_cache_miss": STATS.remote_cache_miss.json(),
 	})
@@ -150,5 +203,76 @@ pub(crate) fn dump_on_close() {
 	let json = snapshot();
 	if let Err(error) = std::fs::write(&path, json.to_string()) {
 		tuwunel_core::error!(%error, path, "failed writing database metrics snapshot");
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		sync::{Arc, Barrier},
+		thread,
+	};
+
+	use super::{OpStat, SNAPSHOT_GATE};
+
+	#[test]
+	fn concurrent_snapshot_cannot_split_a_record() {
+		let stat = Arc::new(OpStat::new());
+		let start = Arc::new(Barrier::new(5));
+		let finish = Arc::new(Barrier::new(5));
+		let workers: Vec<_> = std::iter::repeat_with(|| {
+			let stat = Arc::clone(&stat);
+			let start = Arc::clone(&start);
+			let finish = Arc::clone(&finish);
+			thread::spawn(move || {
+				for _ in 0..100 {
+					start.wait();
+					for _ in 0..100 {
+						stat.record(8);
+					}
+					finish.wait();
+				}
+			})
+		})
+		.take(4)
+		.collect();
+		// Each phase races a snapshot with one recording batch. Workers cannot
+		// start the next batch or exit before that snapshot has been collected,
+		// even if the scheduler lets every recorder finish its batch first.
+		let mut snapshots = Vec::with_capacity(100);
+		for _ in 0..100 {
+			start.wait();
+			let value = {
+				let _guard = SNAPSHOT_GATE.write().expect("snapshot gate");
+				stat.json()
+			};
+			snapshots.push(value);
+			finish.wait();
+		}
+		for worker in workers {
+			worker.join().expect("metric recorder");
+		}
+		// Assert after releasing the barriers and joining every recorder, so a
+		// failed consistency check cannot strand workers or poison the gate.
+		for value in &snapshots {
+			let count = value["count"].as_u64().expect("count");
+			assert_eq!(value["bytes"].as_u64(), Some(count * 8));
+			let sum: u64 = value["log2_hist"]
+				.as_array()
+				.expect("histogram")
+				.iter()
+				.map(|bucket| bucket.as_u64().expect("bucket"))
+				.sum();
+			assert_eq!(sum, count);
+		}
+		assert_eq!(stat.json()["count"], 40_000);
+		assert_eq!(snapshots.len(), 100);
+		assert!(
+			snapshots.iter().any(|value| {
+				let count = value["count"].as_u64().expect("count");
+				count > 0 && count < 40_000
+			}),
+			"in-progress recording was never sampled"
+		);
 	}
 }

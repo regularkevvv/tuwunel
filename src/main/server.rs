@@ -20,6 +20,8 @@ pub struct Server {
 
 	pub services: Mutex<Option<Arc<tuwunel_service::Services>>>,
 
+	pub(crate) cleanup: tuwunel_core::tasks::Tasks,
+
 	_tracing_flame_guard: TracingFlameGuard,
 
 	#[cfg(feature = "sentry_telemetry")]
@@ -77,6 +79,7 @@ pub fn new(args: Option<&Args>, runtime: Option<&Runtime>) -> Result<Arc<Self>, 
 		server: Arc::new(CoreServer::new(config, config_sources, handle, logger, metrics)),
 
 		services: None.into(),
+		cleanup: tuwunel_core::tasks::Tasks::default(),
 
 		_tracing_flame_guard: tracing_flame_guard,
 

@@ -1,8 +1,8 @@
-use std::{collections::HashSet, iter::once};
+use std::iter::once;
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	OwnedEventId, OwnedServerName, RoomId, UserId,
+	OwnedEventId, RoomId, UserId,
 	events::{
 		TimelineEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
@@ -11,15 +11,11 @@ use ruma::{
 use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{
-		event::Event,
-		pdu::{PduBuilder, PduEvent, RawPduId},
-		room_version,
-	},
-	utils::{IterStream, ReadyExt},
+	matrix::{event::Event, pdu::PduBuilder, room_version},
+	utils::ReadyExt,
 };
 
-use super::{Effect, RoomMutexGuard};
+use super::RoomMutexGuard;
 
 /// Creates a new persisted data unit and adds it to a room. This function
 /// takes a roomid_mutex_state, meaning that only this function is able to
@@ -60,6 +56,9 @@ pub async fn build_and_append_pdu_with_txnid(
 	txnid: Option<&[u8]>,
 	state_lock: &RoomMutexGuard,
 ) -> Result<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if pdu_builder.event_type == TimelineEventType::RoomMember {
 		self.sanitize_member_authorisation(&mut pdu_builder, room_id)
 			.boxed()
@@ -72,15 +71,13 @@ pub async fn build_and_append_pdu_with_txnid(
 
 	//TODO: Use proper room version here
 	if *pdu.kind() == TimelineEventType::RoomCreate && pdu.room_id().server_name().is_none() {
-		let _short_id = self
-			.services
+		let _short_id = services_root
 			.short
 			.get_or_create_shortroomid(pdu.room_id())
-			.await;
+			.await?;
 	}
 
-	if self
-		.services
+	if services_root
 		.admin
 		.is_admin_room(pdu.room_id())
 		.await
@@ -92,8 +89,7 @@ pub async fn build_and_append_pdu_with_txnid(
 
 	// If redaction event is not authorized, do not append it to the timeline
 	if *pdu.kind() == TimelineEventType::RoomRedaction {
-		let room_version = self
-			.services
+		let room_version = services_root
 			.state
 			.get_room_version(pdu.room_id())
 			.await?;
@@ -103,8 +99,7 @@ pub async fn build_and_append_pdu_with_txnid(
 		let redacts_id = pdu.redacts_id(&room_rules);
 
 		if let Some(redacts_id) = &redacts_id
-			&& !self
-				.services
+			&& !services_root
 				.state_accessor
 				.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
 				.await?
@@ -115,7 +110,7 @@ pub async fn build_and_append_pdu_with_txnid(
 
 	// MSC4284: ask the room's policy server (if any) to sign this event before
 	// federating it. Refusal aborts; fail-open on transport errors.
-	self.services
+	services_root
 		.event_handler
 		.sign_outgoing_pdu(&mut pdu_json, &pdu)
 		.boxed()
@@ -124,68 +119,26 @@ pub async fn build_and_append_pdu_with_txnid(
 	// The state after the pdu is built first but made current only by the commit
 	// that stores the pdu, so a failed append leaves it unreferenced, never
 	// current beside a pdu that was not stored.
-	let statehashid = self.services.state.append_to_state(&pdu).await?;
+	let statehashid = services_root.state.append_to_state(&pdu).await?;
 
 	// The append stores the pdu and makes `statehashid` the room's current state
 	// in one commit, before its count retires, so a sync never delivers the pdu
 	// without the state it produced.
-	let pdu_id = self
-		.append_pdu_with_txnid(
-			&pdu,
-			pdu_json,
-			// Since this PDU references all pdu_leaves we can update the leaves
-			// of the room
-			once(pdu.event_id()),
-			txnid,
-			Some(statehashid),
-			state_lock,
-		)
-		.boxed()
-		.await?;
-
-	// The append returns once the pdu is durable, whatever its effects did, so
-	// the pdu goes to the room's servers even when one of them failed.
-	self.federate_local_pdu(&pdu, &pdu_id).await;
+	self.append_pdu_with_delivery(
+		&pdu,
+		pdu_json,
+		// Since this PDU references all pdu_leaves we can update the leaves
+		// of the room
+		once(pdu.event_id()),
+		txnid,
+		Some(statehashid),
+		true,
+		state_lock,
+	)
+	.boxed()
+	.await?;
 
 	Ok(pdu.event_id().to_owned())
-}
-
-/// Queues a durable local pdu for the room's other servers.
-///
-/// It follows the append, so the pdu's count has retired and the room's
-/// servers reflect any recount the append repaired. A failure is logged like
-/// any effect of a durable pdu, not returned: the pdu is sent, and its sender
-/// has to hear so (`Effect`).
-#[implement(super::Service)]
-async fn federate_local_pdu(&self, pdu: &PduEvent, pdu_id: &RawPduId) {
-	let mut servers: HashSet<OwnedServerName> = self
-		.services
-		.state_cache
-		.room_servers(pdu.room_id())
-		.map(ToOwned::to_owned)
-		.collect()
-		.await;
-
-	// In case we are kicking or banning a user, we need to inform their server of
-	// the change
-	if *pdu.kind() == TimelineEventType::RoomMember
-		&& let Some(state_key_uid) = &pdu
-			.state_key
-			.as_ref()
-			.and_then(|state_key| UserId::parse(state_key.as_str()).ok())
-	{
-		servers.insert(state_key_uid.server_name().to_owned());
-	}
-
-	// Remove our server from the server list since it will be added to it by
-	// room_servers() and/or the if statement above
-	servers.remove(self.services.globals.server_name());
-
-	self.services
-		.sending
-		.send_pdu_servers(servers.iter().map(AsRef::as_ref).stream(), pdu_id)
-		.await
-		.effect("federation", pdu.event_id());
 }
 
 #[implement(super::Service)]
@@ -195,6 +148,9 @@ async fn sanitize_member_authorisation(
 	pdu_builder: &mut PduBuilder,
 	room_id: &RoomId,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let content: RoomMemberEventContent = pdu_builder.content.deserialize_as_unchecked()?;
 
 	let Some(authorising_user) = &content.join_authorized_via_users_server else {
@@ -212,8 +168,7 @@ async fn sanitize_member_authorisation(
 		.state_key
 		.as_deref()
 		.and_then(|key| UserId::parse(key).ok())
-		&& self
-			.services
+		&& services_root
 			.state_cache
 			.user_membership(&target, room_id)
 			.await
@@ -226,8 +181,7 @@ async fn sanitize_member_authorisation(
 		return Ok(());
 	}
 
-	if !self
-		.services
+	if !services_root
 		.globals
 		.user_is_local(authorising_user)
 	{
@@ -245,6 +199,9 @@ async fn check_pdu_for_admin_room<Pdu>(&self, pdu: &Pdu, sender: &UserId) -> Res
 where
 	Pdu: Event,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	match pdu.kind() {
 		| TimelineEventType::RoomEncryption => {
 			return Err!(Request(Forbidden(error!("Encryption not supported in admins room."))));
@@ -255,7 +212,7 @@ where
 				.filter(|v| v.starts_with('@'))
 				.unwrap_or(sender.as_str());
 
-			let server_user = &self.services.globals.server_user.to_string();
+			let server_user = &services_root.globals.server_user.to_string();
 
 			let content: RoomMemberEventContent = pdu.get_content()?;
 			match content.membership {
@@ -266,8 +223,7 @@ where
 						))));
 					}
 
-					let count = self
-						.services
+					let count = services_root
 						.state_cache
 						.local_users_in_room(pdu.room_id())
 						.ready_filter(|user| *user != target)
@@ -289,8 +245,7 @@ where
 						))));
 					}
 
-					let count = self
-						.services
+					let count = services_root
 						.state_cache
 						.local_users_in_room(pdu.room_id())
 						.ready_filter(|user| *user != target)

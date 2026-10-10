@@ -141,7 +141,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let before = services
 		.pusher
 		.notification_count(&author, &room)
-		.await;
+		.await?;
 
 	// Positive control. Every other assertion here is a negative, which a
 	// wedged or merely slow evaluator would satisfy for the wrong reason, so
@@ -168,7 +168,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let baseline = services
 		.pusher
 		.notification_count(&author, &room)
-		.await;
+		.await?;
 
 	reader
 		.send(

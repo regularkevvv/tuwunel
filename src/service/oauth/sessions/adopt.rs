@@ -72,6 +72,9 @@ impl Counts {
 /// idempotent retry.
 #[tracing::instrument(level = "debug", skip(self, provider))]
 pub async fn adopt_foreign_subjects(&self, provider: &Provider) -> Result<Counts> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	unique_id_sub((provider, ""))?;
 
 	let Some(subjects) = self
@@ -82,7 +85,7 @@ pub async fn adopt_foreign_subjects(&self, provider: &Provider) -> Result<Counts
 		return Ok(Counts::default());
 	};
 
-	let server_name = self.services.globals.server_name();
+	let server_name = services_root.globals.server_name();
 	let cork = self.db.database.cork_and_sync();
 	let counts = Counts {
 		foreign_column: true,
@@ -126,11 +129,14 @@ async fn adopt_foreign_subject(
 	localpart: &str,
 	server_name: &ruma::ServerName,
 ) -> Result<Adoption> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(user_id) = local_user_id(localpart, server_name) else {
 		return Ok(Adoption::Absent);
 	};
 
-	if user_id == self.services.globals.server_user || !self.services.users.exists(&user_id).await
+	if user_id == services_root.globals.server_user || !services_root.users.exists(&user_id).await
 	{
 		return Ok(Adoption::Absent);
 	}

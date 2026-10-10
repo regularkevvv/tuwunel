@@ -32,6 +32,9 @@ pub async fn direct_rooms(&self, user_id: &UserId) -> BTreeSet<OwnedRoomId> {
 /// so repeated calls settle on one entry.
 #[implement(super::Service)]
 pub async fn mark_direct(&self, user_id: &UserId, target: &UserId, room_id: &RoomId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut content = self
 		.direct_content(user_id)
 		.await
@@ -57,7 +60,7 @@ pub async fn mark_direct(&self, user_id: &UserId, target: &UserId, room_id: &Roo
 		.to_string()
 		.into();
 
-	self.services
+	services_root
 		.account_data
 		.update(None, user_id, event_type, &event)
 		.await
@@ -69,7 +72,10 @@ pub async fn mark_direct(&self, user_id: &UserId, target: &UserId, room_id: &Roo
 /// the record deserializes as an event and the content comes off it.
 #[implement(super::Service)]
 async fn direct_content(&self, user_id: &UserId) -> Result<DirectEventContent> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.account_data
 		.get_global(user_id, GlobalAccountDataEventType::Direct)
 		.await

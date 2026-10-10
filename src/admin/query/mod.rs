@@ -118,3 +118,49 @@ pub(super) enum QueryCommand {
 	#[command(subcommand)]
 	Raw(RawCommand),
 }
+
+/// Production diagnostics must have an audited finite source. New diagnostic
+/// variants default to refusal on D1 until their bounds have been reviewed.
+pub(super) fn remote_scan_allowed(command: &QueryCommand) -> bool {
+	match command {
+		| QueryCommand::Raw(command) => match command {
+			| RawCommand::Maps
+			| RawCommand::Sequence
+			| RawCommand::Get { .. }
+			| RawCommand::Put { .. }
+			| RawCommand::Del { .. }
+			| RawCommand::Flush => true,
+			| RawCommand::Keys { limit: Some(limit), .. }
+			| RawCommand::Iter { limit: Some(limit), .. } => (1..=16).contains(limit),
+			| _ => false,
+		},
+		| QueryCommand::Globals(_)
+		| QueryCommand::Short(_)
+		| QueryCommand::AccountData(AccountDataCommand::AccountDataGet { .. })
+		| QueryCommand::Presence(PresenceCommand::GetPresence { .. })
+		| QueryCommand::Appservice(AppserviceCommand::GetRegistration { .. })
+		| QueryCommand::Sending(SendingCommand::GetLatestEduCount { .. }) => true,
+		| QueryCommand::Users(command) => matches!(
+			command,
+			UsersCommand::CountUsers
+				| UsersCommand::IterUsers { .. }
+				| UsersCommand::ListDevices { .. }
+				| UsersCommand::ListDevicesMetadata { .. }
+				| UsersCommand::PasswordHash { .. }
+				| UsersCommand::GetDeviceMetadata { .. }
+				| UsersCommand::GetDevicesVersion { .. }
+				| UsersCommand::GetDeviceKeys { .. }
+				| UsersCommand::GetUserSigningKey { .. }
+				| UsersCommand::GetMasterKey { .. }
+		),
+		| QueryCommand::Oauth(command) => matches!(
+			command,
+			OauthCommand::ListProviders | OauthCommand::ShowProvider { .. }
+			| OauthCommand::ShowSession { .. } | OauthCommand::TokenInfo { .. }
+			// Required immediate operator revocation is an audited behavior flow,
+			// not a diagnostic dump. Its service bounds need separate review.
+			| OauthCommand::RevokeSessions { .. } | OauthCommand::Associate { .. }
+		),
+		| _ => false,
+	}
+}

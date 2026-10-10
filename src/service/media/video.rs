@@ -100,7 +100,10 @@ pub(super) async fn video_frame(
 	dim: &Dim,
 	media: &Media,
 ) -> Option<Vec<u8>> {
-	let config = &self.services.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.config;
 
 	let is_video = media
 		.content_type
@@ -144,7 +147,10 @@ pub(super) fn remember_failure(&self, mxc: &Mxc<'_>) {
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self, content))]
 async fn extract_frame(&self, mxc: &Mxc<'_>, dim: &Dim, content: &[u8]) -> Result<Vec<u8>> {
-	let config = &self.services.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.config;
 	let timeout = Duration::from_secs(config.media_video_thumbnail_timeout);
 
 	// one deadline spans the wait for a slot, the staging write and the program,

@@ -29,7 +29,10 @@ where
 	for<'a> T::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
 	for<'a> T::PathBuilder: PathBuilder<Input<'a> = ()>,
 {
-	let client = &self.services.client.appservice;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let client = &services_root.client.appservice;
 
 	let Some(dest) = registration.url else {
 		return Ok(None);
@@ -79,7 +82,7 @@ where
 			.expect("http::response::Builder is usable"),
 	);
 
-	let limit = self.services.config.max_response_size;
+	let limit = services_root.config.max_response_size;
 	let body = read_response_capped(response, limit)
 		.await
 		.map_err(|e| {

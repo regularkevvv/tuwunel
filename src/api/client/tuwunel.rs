@@ -1,9 +1,9 @@
 use std::time::Instant;
 
 use axum::{Json, extract::State, response::IntoResponse};
-use futures::StreamExt;
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use ruma::api::{client::tuwunel::get_remote_version, federation::discovery::get_server_version};
+use subtle::ConstantTimeEq;
 use tuwunel_core::Result;
 
 use crate::Ruma;
@@ -27,7 +27,7 @@ pub(crate) async fn tuwunel_server_version() -> Result<impl IntoResponse> {
 pub(crate) async fn tuwunel_local_user_count(
 	State(services): State<crate::State>,
 ) -> Result<impl IntoResponse> {
-	let user_count = services.users.list_local_users().count().await;
+	let user_count = services.users.bounded_local_user_count().await?;
 
 	Ok(Json(serde_json::json!({
 		"count": user_count
@@ -107,4 +107,118 @@ pub(crate) async fn tuwunel_readiness(State(services): State<crate::State>) -> i
 			"lease": lease,
 		})),
 	)
+}
+
+/// # `GET /_tuwunel/operation_metrics`
+///
+/// Bounded aggregate snapshot for the operator's measurement harness. The
+/// Worker restricts this route to the admin hostname; the Container also
+/// requires the existing runtime bridge credential. No Matrix token grants
+/// access. Readiness stays unauthenticated and never contains these counters.
+pub(crate) async fn tuwunel_operation_metrics(
+	State(services): State<crate::State>,
+	headers: HeaderMap,
+) -> impl IntoResponse {
+	let expected = services
+		.server
+		.config
+		.d1_bridge_token
+		.as_deref()
+		.filter(|token| !token.is_empty())
+		.map(str::to_owned)
+		.or_else(|| std::env::var("BRIDGE_TOKEN").ok());
+	if services.db.backend() != "d1" || !metrics_request_authorized(&headers, expected.as_deref())
+	{
+		return (
+			StatusCode::NOT_FOUND,
+			[(http::header::CACHE_CONTROL, "no-store")],
+			Json(serde_json::json!({"errcode": "M_NOT_FOUND", "error": "Not found"})),
+		);
+	}
+	let counters = services.db.operation_metrics();
+	let status = if counters.get("unavailable").is_some() {
+		StatusCode::SERVICE_UNAVAILABLE
+	} else {
+		StatusCode::OK
+	};
+	(
+		status,
+		[(http::header::CACHE_CONTROL, "no-store")],
+		Json(serde_json::json!({
+			"schema": 1,
+			"backend": "d1",
+			"writer_epoch": services.db.lease_status().map(|lease| lease.epoch),
+			"consistency": "completed metric records",
+			"counters": counters,
+		})),
+	)
+}
+
+fn metrics_request_authorized(headers: &HeaderMap, expected: Option<&str>) -> bool {
+	if headers
+		.get_all(http::header::AUTHORIZATION)
+		.iter()
+		.count()
+		!= 1
+	{
+		return false;
+	}
+	let presented = headers
+		.get(http::header::AUTHORIZATION)
+		.and_then(|value| value.to_str().ok());
+	let Some(expected) = expected.filter(|token| !token.is_empty()) else {
+		return false;
+	};
+	let Some((scheme, token)) = presented.and_then(|header| header.split_once(' ')) else {
+		return false;
+	};
+	scheme.eq_ignore_ascii_case("bearer")
+		&& bool::from(token.trim().as_bytes().ct_eq(expected.as_bytes()))
+}
+
+#[cfg(test)]
+mod metrics_tests {
+	use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+	use super::metrics_request_authorized;
+
+	fn metrics_authorized(presented: Option<&str>, expected: Option<&str>) -> bool {
+		let mut headers = HeaderMap::new();
+		if let Some(value) = presented {
+			headers.insert(AUTHORIZATION, HeaderValue::from_str(value).expect("test header"));
+		}
+		metrics_request_authorized(&headers, expected)
+	}
+
+	#[test]
+	fn metrics_require_the_runtime_credential() {
+		for header in [
+			None,
+			Some(""),
+			Some("Basic operator"),
+			Some("Bearer matrix-token"),
+			Some("Bearer bridge-token-prefix"),
+			Some("Bearer bridge-toke"),
+		] {
+			assert!(!metrics_authorized(header, Some("bridge-token")));
+		}
+		assert!(!metrics_authorized(Some("Bearer bridge-token"), None));
+		assert!(!metrics_authorized(Some("Bearer "), Some("")));
+		assert!(metrics_authorized(Some("Bearer bridge-token"), Some("bridge-token")));
+		assert!(metrics_authorized(Some("bearer bridge-token"), Some("bridge-token")));
+	}
+
+	#[test]
+	fn metrics_refuse_duplicate_and_invalid_credentials() {
+		let mut headers = HeaderMap::new();
+		headers.append(AUTHORIZATION, HeaderValue::from_static("Bearer bridge-token"));
+		headers.append(AUTHORIZATION, HeaderValue::from_static("Bearer bridge-token"));
+		assert!(!metrics_request_authorized(&headers, Some("bridge-token")));
+		headers.clear();
+		headers.insert(
+			AUTHORIZATION,
+			HeaderValue::from_bytes(b"Bearer \xff").expect("opaque header"),
+		);
+		assert!(!metrics_request_authorized(&headers, Some("bridge-token")));
+	}
 }

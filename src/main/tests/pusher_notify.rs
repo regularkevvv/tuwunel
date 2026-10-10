@@ -2,7 +2,7 @@
 
 use std::{
 	env::var, fs::remove_dir_all, path::PathBuf, process::id as process_id, str::from_utf8,
-	time::Duration,
+	sync::Arc, time::Duration,
 };
 
 use futures::TryStreamExt;
@@ -114,7 +114,7 @@ fn pusher_notify() -> Result {
 		let services = Services::build(server.server.clone()).await?;
 		let mut recovery = prepare_badge_recovery(&services).await?;
 		let mut push_retry = prepare_push_retry(&services).await?;
-		let services = services.start().await?;
+		drop(services.start().await?);
 		_ = server
 			.services
 			.lock()
@@ -132,10 +132,14 @@ fn pusher_notify() -> Result {
 		.await;
 
 		server.server.shutdown()?;
+		let stopped_services = Arc::downgrade(&services);
+		let stopped_database = Arc::downgrade(&services.db);
 		drop(services);
 
 		async_run(&server).await?;
 		async_stop(&server).await?;
+		assert_eq!(stopped_services.strong_count(), 0, "push shutdown releases its service root");
+		assert_eq!(stopped_database.strong_count(), 0, "push shutdown releases its database");
 
 		outcome
 	});
@@ -199,6 +203,7 @@ async fn prepare_push_retry(services: &Services) -> Result<PushRetry> {
 	let user = UserId::parse_with_server_name("push-retry", server_name)?;
 	let pushkey = "pk-push-retry";
 	let room_id = OwnedRoomId::from_parts('!', "push-retry", Some(server_name.as_str()))?;
+	prepare_room_membership(services, &room_id, &user).await?;
 
 	let listener = TcpListener::bind("127.0.0.1:0").await?;
 	let url = format!("http://{}{NOTIFY_PATH}", listener.local_addr()?);
@@ -504,6 +509,7 @@ async fn verify_permanent_push_error(services: &Services) -> Result {
 	let user = UserId::parse_with_server_name("push-permanent", server_name)?;
 	let pushkey = "pk-push-permanent";
 	let room_id = OwnedRoomId::from_parts('!', "push-permanent", Some(server_name.as_str()))?;
+	prepare_room_membership(services, &room_id, &user).await?;
 	let action =
 		pusher_action(pushkey, "ftp://127.0.0.1/_matrix/push/v1/notify".to_owned(), false, false);
 
@@ -598,6 +604,7 @@ async fn run_cases(services: &Services) -> Result {
 	let unread = services.db.get("userroomid_notificationcount")?;
 
 	for room_id in [&room_id, &other_room_id] {
+		prepare_room_membership(services, room_id, &user).await?;
 		joined.put((&user, room_id), 1_u64).await?;
 		unread.put((&user, room_id), 1_u64).await?;
 	}
@@ -615,6 +622,7 @@ async fn run_cases(services: &Services) -> Result {
 	};
 
 	reject_bad_url(&fixture).await?;
+	count_read_failure_refuses_gateway_and_preserves_badge(&fixture, &room_id).await?;
 	full_format_delivery(&fixture).await?;
 	event_id_only_delivery(&fixture).await?;
 	gateway_url_paths(&fixture).await?;
@@ -626,6 +634,93 @@ async fn run_cases(services: &Services) -> Result {
 	badge_count_opt_out(&fixture).await?;
 	badge_delivery_memo(&fixture, &room_id).await?;
 	badge_bypasses_suppression(&fixture).await
+}
+
+/// A failed badge source must send nothing, leave its sent-value memo alone,
+/// and permit the identical send after storage repair.
+async fn count_read_failure_refuses_gateway_and_preserves_badge(
+	fixture: &Fixture<'_>,
+	room: &RoomId,
+) -> Result {
+	let config = StubPusherConfig::new(r#"{"rejected":[]}"#);
+	let (pusher, _action, mut rx, _stub) =
+		stub_pusher(fixture, "pk-corrupt-count", config).await?;
+	let service = &fixture.services.pusher;
+	let map = &fixture.services.db["userroomid_notificationcount"];
+	let key = tuwunel_database::serialize_key((fixture.user, room))?;
+	let saved = map.get(&key).await?.to_vec();
+	service
+		.send_badge_notice(fixture.user, &pusher)
+		.await?;
+	let (_, body) = recv(&mut rx).await?;
+	let baseline: Value = serde_json::from_slice(&body)?;
+	let baseline = baseline["notification"]["counts"]["unread"].clone();
+	for corrupt in [vec![], vec![0; 7], vec![0; 9], u64::MAX.to_be_bytes().to_vec()] {
+		map.insert(&key, &corrupt).await?;
+		service
+			.send_badge_notice(fixture.user, &pusher)
+			.await
+			.expect_err("corrupt badge cannot return cache success");
+		service
+			.send_push_notice(fixture.user, &pusher, fixture.ruleset, fixture.pdu)
+			.await
+			.expect_err("corrupt total cannot send a fabricated badge");
+		assert!(
+			matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+			"failed reader must not contact gateway"
+		);
+		assert_eq!(map.get(&key).await?.as_ref(), corrupt);
+	}
+	map.insert(&key, &saved).await?;
+	service
+		.send_badge_notice(fixture.user, &pusher)
+		.await?;
+	assert!(
+		matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+		"refused reads do not replace the accepted badge memo"
+	);
+	service
+		.send_push_notice(fixture.user, &pusher, fixture.ruleset, fixture.pdu)
+		.await?;
+	let (_, body) = recv(&mut rx).await?;
+	let retry: Value = serde_json::from_slice(&body)?;
+	assert_eq!(
+		retry["notification"]["counts"]["unread"], baseline,
+		"repaired retry sends actual count"
+	);
+	Ok(())
+}
+
+/// Synthetic group rooms still need a consistent push-rule count context.
+/// Three members preserve the low-priority group-message case exercised below.
+/// Reconcile the count from their indexes instead of inventing it.
+async fn prepare_room_membership(
+	services: &Services,
+	room_id: &RoomId,
+	recipient: &UserId,
+) -> Result {
+	let sender = UserId::parse(SENDER)?;
+	let peer = UserId::parse("@bob:remote.example")?;
+	for member in [recipient, &sender, &peer] {
+		services.db["roomuserid_joined"]
+			.put((room_id, member), 1_u64)
+			.await?;
+		services.db["userroomid_joined"]
+			.put((member, room_id), 1_u64)
+			.await?;
+	}
+	services
+		.state_cache
+		.update_joined_count(room_id)
+		.await?;
+	assert_eq!(
+		services
+			.state_cache
+			.room_joined_count_uint(room_id)
+			.await?,
+		UInt::from(3_u8)
+	);
+	Ok(())
 }
 
 fn message_event(room_id: &str, event_id: &str) -> Result<Pdu> {
@@ -872,15 +967,15 @@ async fn counts_only_delivery(
 
 	pusher
 		.reset_notification_counts(fixture.user, room_id)
-		.await;
+		.await?;
 
 	pusher
 		.reset_notification_counts(fixture.user, other_room_id)
-		.await;
+		.await?;
 
 	let remaining = pusher
 		.global_notification_count(fixture.user)
-		.await;
+		.await?;
 
 	if remaining != 0 {
 		return Err!("reset left an account-wide unread total of {remaining}");
@@ -929,7 +1024,7 @@ async fn account_wide_count_delivery(fixture: &Fixture<'_>, room_id: &RoomId) ->
 	assert_eq!(thread_notification.get("counts"), Some(&json!({"unread": 7})));
 
 	unread
-		.put((fixture.user, room_id), u64::MAX)
+		.put((fixture.user, room_id), u64::from(UInt::MAX).saturating_sub(7))
 		.await?;
 
 	let (_, body) = deliver(fixture, "pk-badge-max", false, true, r#"{"rejected":[]}"#).await?;

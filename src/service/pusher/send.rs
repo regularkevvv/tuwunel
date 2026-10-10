@@ -1,6 +1,6 @@
 use futures::{
 	FutureExt,
-	future::{join, join4},
+	future::{join, join3},
 };
 use ruma::{
 	UInt, UserId,
@@ -14,7 +14,7 @@ use ruma::{
 	push::{Action, HighlightTweakValue, HttpPusherData, PushFormat, Ruleset, Tweak},
 };
 use serde_json::Value;
-use tuwunel_core::{Result, err, error, implement, matrix::Event, trace, utils::BoolExt};
+use tuwunel_core::{Result, err, error, implement, matrix::Event, trace};
 use url::Url;
 
 use super::Evaluate;
@@ -31,8 +31,10 @@ pub async fn send_push_notice<E>(
 where
 	E: Event,
 {
-	let power_levels = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let power_levels = services_root
 		.state_accessor
 		.get_power_levels(event.room_id())
 		.map(Result::ok);
@@ -49,8 +51,39 @@ where
 			room_id: event.room_id(),
 			related_events: related_events.as_ref(),
 		})
-		.await;
+		.await?;
 
+	self.send_push_actions(user_id, pusher, actions, services_root.config.push_everything, event)
+		.await
+}
+
+#[implement(super::Service)]
+pub(crate) async fn send_frozen_push_notice(
+	&self,
+	user: &UserId,
+	pusher: &Pusher,
+	raw: &tuwunel_core::matrix::pdu::RawPduId,
+	event: &tuwunel_core::matrix::pdu::Pdu,
+) -> Result {
+	let (actions, push_everything, canceled) = self
+		.frozen_push_decision(raw, user, event)
+		.await?;
+	if canceled {
+		return Ok(());
+	}
+	self.send_push_actions(user, pusher, &actions, push_everything, event)
+		.await
+}
+
+#[implement(super::Service)]
+async fn send_push_actions<E: Event>(
+	&self,
+	user_id: &UserId,
+	pusher: &Pusher,
+	actions: &[Action],
+	push_everything: bool,
+	event: &E,
+) -> Result {
 	let notify = actions.iter().any(Action::should_notify);
 	let tweak_count = actions
 		.iter()
@@ -66,7 +99,7 @@ where
 		"Push notice decision",
 	);
 
-	if notify || self.services.config.push_everything {
+	if notify || push_everything {
 		let tweaks: Vec<Tweak> = actions
 			.iter()
 			.filter_map(|action| match action {
@@ -98,7 +131,7 @@ pub async fn send_badge_notice(&self, user_id: &UserId, pusher: &Pusher) -> Resu
 		return Ok(());
 	}
 
-	let unread = UInt::new(self.global_notification_count(user_id).await).unwrap_or(UInt::MAX);
+	let unread = super::count_uint(self.global_notification_count(user_id).await?)?;
 
 	if self.sent_badge(user_id, &pusher.ids.pushkey) == Some(unread) {
 		return Ok(());
@@ -141,6 +174,9 @@ async fn send_http_event_notice<Pdu: Event>(
 	tweaks: Vec<Tweak>,
 	event: &Pdu,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut device = self.prepare_http_pusher(pusher, http)?;
 
 	// TODO (timo): can pusher/devices have conflicting formats
@@ -155,13 +191,13 @@ async fn send_http_event_notice<Pdu: Event>(
 	notify.event_id = Some(event.event_id().to_owned());
 	notify.room_id = Some(event.room_id().to_owned());
 
-	let unread = badge_count_disabled(http)
-		.is_false()
-		.then_async(async || {
-			UInt::new(self.global_notification_count(user_id).await).unwrap_or(UInt::MAX)
-		});
+	let unread = if badge_count_disabled(http) {
+		None
+	} else {
+		Some(super::count_uint(self.global_notification_count(user_id).await?)?)
+	};
 
-	let unread = if !event_id_only {
+	if !event_id_only {
 		if *event.kind() == TimelineEventType::RoomEncrypted
 			|| tweaks.iter().any(|t| {
 				matches!(t, Tweak::Highlight(HighlightTweakValue::Yes) | Tweak::Sound(_))
@@ -178,26 +214,21 @@ async fn send_http_event_notice<Pdu: Event>(
 			notify.user_is_target = event.state_key() == Some(event.sender().as_str());
 		}
 
-		let (display_name, room_name, room_alias, unread) = join4(
-			self.services.profile.displayname(event.sender()),
-			self.services
+		let (display_name, room_name, room_alias) = join3(
+			services_root.profile.displayname(event.sender()),
+			services_root
 				.state_accessor
 				.get_name(event.room_id()),
-			self.services
+			services_root
 				.state_accessor
 				.get_canonical_alias(event.room_id()),
-			unread,
 		)
 		.await;
 
 		notify.sender_display_name = display_name.ok();
 		notify.room_name = room_name.ok();
 		notify.room_alias = room_alias.ok();
-
-		unread
-	} else {
-		unread.await
-	};
+	}
 
 	if let Some(unread) = unread {
 		notify.counts = NotificationCounts::new_explicit(Some(unread), None);

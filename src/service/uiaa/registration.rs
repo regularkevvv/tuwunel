@@ -19,6 +19,9 @@ pub(super) async fn complete_registration_token(
 	info: &UiaaInfo,
 	token: &str,
 ) -> Result<UiaaInfo> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let session = info
 		.session
 		.as_deref()
@@ -27,7 +30,7 @@ pub(super) async fn complete_registration_token(
 	progress
 		.completed
 		.push(AuthType::RegistrationToken);
-	self.services
+	services_root
 		.registration_tokens
 		.consume_with(token, || self.prepare_progress(user, device, session, &progress))
 		.await?;

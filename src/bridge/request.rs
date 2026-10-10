@@ -8,7 +8,7 @@
 use minicbor::{Decoder, data::Type, encode::Write};
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Request};
+use super::{Error, Lease, Request};
 
 /// Maximum encoded KV request: 4 MiB, including CBOR fields and framing.
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -16,6 +16,202 @@ pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DEPTH: usize = 32;
 /// Maximum CBOR items/chunks, checked before container-length allocation hints.
 pub const MAX_ITEMS: usize = 65_536;
+
+/// Incremental admission for one atomic batch of puts to a catalog map.
+///
+/// Counts the existing commit encoding, including the supplied writer identity,
+/// without owning keys, values or an encoded body. Key contents do not affect
+/// their CBOR size, so callers may check a prospective key before allocating
+/// it. Refusal leaves the budget unchanged; it never splits a logical batch.
+#[derive(Clone, Copy, Debug)]
+pub struct PutBatchBudget {
+	map: u16,
+	envelope: usize,
+	operations: usize,
+	operation_bytes: usize,
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum BorrowedMutation<'a> {
+	Put {
+		map: u16,
+		key: &'a serde_bytes::Bytes,
+		val: &'a serde_bytes::Bytes,
+	},
+	Delete {
+		map: u16,
+		key: &'a serde_bytes::Bytes,
+	},
+}
+
+#[derive(Serialize)]
+enum BorrowedCommit<'a> {
+	Commit {
+		request_id: &'a serde_bytes::Bytes,
+		lease: &'a Lease,
+		digest: &'a serde_bytes::Bytes,
+		ops: &'a [BorrowedMutation<'a>],
+	},
+}
+
+impl PutBatchBudget {
+	/// Starts an empty budget using the identity that will fence the commit.
+	pub fn new(map: u16, lease: &Lease) -> Result<Self, Error> {
+		super::check_map(map)?;
+		let empty = BorrowedCommit::Commit {
+			request_id: serde_bytes::Bytes::new(&[0; super::REQUEST_ID_LEN]),
+			lease,
+			digest: serde_bytes::Bytes::new(&[0; super::DIGEST_LEN]),
+			ops: &[],
+		};
+		Ok(Self {
+			map,
+			envelope: serialized_size(&empty)?.saturating_sub(1),
+			operations: 0,
+			operation_bytes: 0,
+		})
+	}
+
+	/// Admits a prospective put only if all widths and the whole batch fit.
+	pub fn try_put(&mut self, key_len: usize, value: &[u8]) -> Result<(), Error> {
+		static KEY: [u8; super::MAX_KEY_BYTES] = [0; super::MAX_KEY_BYTES];
+		if self.operations >= super::MAX_COMMIT_OPS {
+			return Err(too_large("ops", super::MAX_COMMIT_OPS));
+		}
+		if key_len == 0 || key_len > super::MAX_KEY_BYTES {
+			return Err(too_large("key", super::MAX_KEY_BYTES));
+		}
+		if value.len() > super::MAX_VALUE_BYTES {
+			return Err(too_large("value", super::MAX_VALUE_BYTES));
+		}
+		let put = BorrowedMutation::Put {
+			map: self.map,
+			key: serde_bytes::Bytes::new(&KEY[..key_len]),
+			val: serde_bytes::Bytes::new(value),
+		};
+		let operation_bytes = self
+			.operation_bytes
+			.saturating_add(serialized_size(&put)?);
+		let operations = self.operations.saturating_add(1);
+		let size = self
+			.envelope
+			.saturating_add(array_header_size(operations)?)
+			.saturating_add(operation_bytes);
+		if size > MAX_BYTES {
+			return Err(too_large("request bytes", MAX_BYTES));
+		}
+		self.operations = operations;
+		self.operation_bytes = operation_bytes;
+		Ok(())
+	}
+
+	/// Number of puts admitted so far.
+	#[must_use]
+	pub const fn operations(&self) -> usize { self.operations }
+
+	/// Exact encoded commit size for the admitted puts and supplied identity.
+	pub fn encoded_size(&self) -> Result<usize, Error> {
+		Ok(self
+			.envelope
+			.saturating_add(array_header_size(self.operations)?)
+			.saturating_add(self.operation_bytes))
+	}
+}
+
+/// Admission for one atomic commit containing puts and deletes across maps.
+///
+/// Borrows encoded inputs and counts the complete existing CBOR wire format,
+/// including the actual writer identity. A refused operation spends no budget.
+/// This check does not reserve capacity, split a commit or acknowledge a write.
+#[derive(Clone, Copy, Debug)]
+pub struct CommitBudget {
+	envelope: usize,
+	operations: usize,
+	operation_bytes: usize,
+}
+
+impl CommitBudget {
+	/// Starts an empty budget with the identity that will fence the commit.
+	pub fn new(lease: &Lease) -> Result<Self, Error> {
+		let empty = BorrowedCommit::Commit {
+			request_id: serde_bytes::Bytes::new(&[0; super::REQUEST_ID_LEN]),
+			lease,
+			digest: serde_bytes::Bytes::new(&[0; super::DIGEST_LEN]),
+			ops: &[],
+		};
+		Ok(Self {
+			envelope: serialized_size(&empty)?.saturating_sub(1),
+			operations: 0,
+			operation_bytes: 0,
+		})
+	}
+
+	/// Checks a borrowed put, including its catalog ID, key and value widths.
+	pub fn try_put(&mut self, map: u16, key: &[u8], value: &[u8]) -> Result<(), Error> {
+		if value.len() > super::MAX_VALUE_BYTES {
+			return Err(too_large("value", super::MAX_VALUE_BYTES));
+		}
+		self.admit(map, key, BorrowedMutation::Put {
+			map,
+			key: serde_bytes::Bytes::new(key),
+			val: serde_bytes::Bytes::new(value),
+		})
+	}
+
+	/// Checks a borrowed deletion, including its catalog ID and key width.
+	pub fn try_delete(&mut self, map: u16, key: &[u8]) -> Result<(), Error> {
+		self.admit(map, key, BorrowedMutation::Delete { map, key: serde_bytes::Bytes::new(key) })
+	}
+
+	fn admit(
+		&mut self,
+		map: u16,
+		key: &[u8],
+		operation: BorrowedMutation<'_>,
+	) -> Result<(), Error> {
+		super::check_map(map)?;
+		if key.is_empty() || key.len() > super::MAX_KEY_BYTES {
+			return Err(too_large("key", super::MAX_KEY_BYTES));
+		}
+		if self.operations >= super::MAX_COMMIT_OPS {
+			return Err(too_large("ops", super::MAX_COMMIT_OPS));
+		}
+		let operations = self.operations.saturating_add(1);
+		let operation_bytes = self
+			.operation_bytes
+			.saturating_add(serialized_size(&operation)?);
+		let size = self
+			.envelope
+			.saturating_add(array_header_size(operations)?)
+			.saturating_add(operation_bytes);
+		if size > MAX_BYTES {
+			return Err(too_large("request bytes", MAX_BYTES));
+		}
+		self.operations = operations;
+		self.operation_bytes = operation_bytes;
+		Ok(())
+	}
+
+	/// Number of admitted mutations, including deletions.
+	#[must_use]
+	pub const fn operations(&self) -> usize { self.operations }
+
+	/// Exact encoded commit size with the supplied writer identity.
+	pub fn encoded_size(&self) -> Result<usize, Error> {
+		Ok(self
+			.envelope
+			.saturating_add(array_header_size(self.operations)?)
+			.saturating_add(self.operation_bytes))
+	}
+}
+
+fn array_header_size(items: usize) -> Result<usize, Error> {
+	let mut length = Length(0);
+	minicbor::Encoder::new(&mut length)
+		.array(u64::try_from(items).unwrap_or(u64::MAX))
+		.map_err(|_| too_large("request bytes", MAX_BYTES))?;
+	Ok(length.0)
+}
 
 fn too_large(what: &str, limit: usize) -> Error {
 	Error::TooLarge {
@@ -84,10 +280,15 @@ pub(super) fn check_size(request: &Request) -> Result<(), Error> {
 }
 
 pub(crate) fn check_serialized_size<T: Serialize>(value: &T) -> Result<(), Error> {
+	serialized_size(value).map(drop)
+}
+
+fn serialized_size<T: Serialize>(value: &T) -> Result<usize, Error> {
 	let mut length = Length(0);
 	value
 		.serialize(&mut minicbor_serde::Serializer::new(&mut length))
-		.map_err(|_| too_large("request bytes", MAX_BYTES))
+		.map_err(|_| too_large("request bytes", MAX_BYTES))?;
+	Ok(length.0)
 }
 
 struct Length(usize);
@@ -197,6 +398,293 @@ fn container(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn commit(lease: &Lease, ops: Vec<super::super::Mutation>) -> Request {
+		Request::Commit {
+			request_id: serde_bytes::ByteBuf::from(vec![0; super::super::REQUEST_ID_LEN]),
+			lease: lease.clone(),
+			digest: serde_bytes::ByteBuf::from(super::super::digest(&ops).to_vec()),
+			ops,
+		}
+	}
+
+	#[test]
+	fn mixed_commit_admission_matches_owned_wire_and_counts_deletions() {
+		use serde_bytes::ByteBuf;
+
+		use super::super::Mutation;
+		for lease in [Lease { holder: String::new(), epoch: 0 }, Lease {
+			holder: "h".repeat(128),
+			epoch: u64::MAX,
+		}] {
+			let mut budget = CommitBudget::new(&lease).expect("budget");
+			let mut ops = Vec::new();
+			for at in 0..super::super::MAX_COMMIT_OPS {
+				let map = [0, 23, 24, 148][at % 4];
+				let key = vec![42; [1, 23, 24, 255, 256, super::super::MAX_KEY_BYTES][at % 6]];
+				if at % 3 == 0 {
+					budget
+						.try_delete(map, &key)
+						.expect("supported delete");
+					ops.push(Mutation::Delete { map, key: ByteBuf::from(key) });
+				} else {
+					let value = vec![42; at % 257];
+					budget
+						.try_put(map, &key, &value)
+						.expect("supported put");
+					ops.push(Mutation::Put {
+						map,
+						key: ByteBuf::from(key),
+						val: ByteBuf::from(value),
+					});
+				}
+				if [1, 23, 24, 255, 256, 900].contains(&ops.len()) {
+					assert_eq!(
+						budget.encoded_size().expect("size"),
+						encode(&commit(&lease, ops.clone()))
+							.expect("owned wire")
+							.len()
+					);
+				}
+			}
+			let before = budget.encoded_size().expect("prefix");
+			budget
+				.try_delete(0, b"extra")
+				.expect_err("deletion 901");
+			budget
+				.try_put(0, b"extra", b"")
+				.expect_err("put 901");
+			assert_eq!(budget.operations(), super::super::MAX_COMMIT_OPS);
+			assert_eq!(budget.encoded_size().expect("unchanged size"), before);
+		}
+	}
+
+	#[test]
+	fn mixed_commit_admission_keeps_exact_request_limit_and_refuses_one_extra_byte() {
+		use serde_bytes::ByteBuf;
+
+		use super::super::Mutation;
+		for lease in [Lease { holder: String::new(), epoch: 0 }, Lease {
+			holder: "h".repeat(128),
+			epoch: u64::MAX,
+		}] {
+			let value = vec![0; super::super::MAX_VALUE_BYTES];
+			let mut prefix = CommitBudget::new(&lease).expect("budget");
+			prefix
+				.try_put(0, b"a", &value)
+				.expect("first map");
+			prefix
+				.try_put(24, b"b", &value)
+				.expect("second map");
+			prefix
+				.try_delete(148, b"obsolete")
+				.expect("delete");
+			let mut initial = prefix;
+			initial
+				.try_put(23, b"tail", &vec![0; 65_536])
+				.expect("initial tail");
+			let tail_len = 65_536 + MAX_BYTES - initial.encoded_size().expect("initial size");
+			let mut exact = prefix;
+			exact
+				.try_put(23, b"tail", &vec![0; tail_len])
+				.expect("exact limit");
+			assert_eq!(exact.encoded_size().expect("size"), MAX_BYTES);
+			let ops = vec![
+				Mutation::Put {
+					map: 0,
+					key: ByteBuf::from(b"a".to_vec()),
+					val: ByteBuf::from(value.clone()),
+				},
+				Mutation::Put {
+					map: 24,
+					key: ByteBuf::from(b"b".to_vec()),
+					val: ByteBuf::from(value),
+				},
+				Mutation::Delete {
+					map: 148,
+					key: ByteBuf::from(b"obsolete".to_vec()),
+				},
+				Mutation::Put {
+					map: 23,
+					key: ByteBuf::from(b"tail".to_vec()),
+					val: ByteBuf::from(vec![0; tail_len]),
+				},
+			];
+			assert_eq!(
+				encode(&commit(&lease, ops))
+					.expect("owned exact wire")
+					.len(),
+				MAX_BYTES
+			);
+			let before = prefix.encoded_size().expect("prefix");
+			prefix
+				.try_put(23, b"tail", &vec![0; tail_len + 1])
+				.expect_err("one byte over");
+			assert_eq!(prefix.operations(), 3);
+			assert_eq!(prefix.encoded_size().expect("unchanged prefix"), before);
+			prefix
+				.try_put(23, b"tail", &vec![0; tail_len])
+				.expect("exact retry after refusal");
+		}
+	}
+
+	#[test]
+	fn mixed_commit_admission_refuses_invalid_maps_and_widths_without_spending() {
+		let lease = Lease { holder: "writer".into(), epoch: 3 };
+		let mut budget = CommitBudget::new(&lease).expect("budget");
+		let foreign = super::super::catalog::MAP_IDS
+			.iter()
+			.map(|(_, map)| map.0)
+			.max()
+			.expect("catalog")
+			.checked_add(1)
+			.expect("unused map");
+		let before = budget.encoded_size().expect("empty budget");
+		budget
+			.try_put(foreign, b"k", b"v")
+			.expect_err("foreign put");
+		budget
+			.try_delete(foreign, b"k")
+			.expect_err("foreign delete");
+		for key in [Vec::new(), vec![0; super::super::MAX_KEY_BYTES + 1]] {
+			budget
+				.try_put(0, &key, b"v")
+				.expect_err("invalid put key");
+			budget
+				.try_delete(0, &key)
+				.expect_err("invalid delete key");
+		}
+		budget
+			.try_put(0, b"k", &vec![0; super::super::MAX_VALUE_BYTES + 1])
+			.expect_err("invalid value");
+		assert_eq!(budget.operations(), 0);
+		assert_eq!(budget.encoded_size().expect("unchanged size"), before);
+		budget.try_delete(0, b"k").expect("valid retry");
+		assert_eq!(budget.operations(), 1);
+	}
+
+	#[test]
+	fn put_admission_matches_owned_wire_at_cbor_count_and_width_boundaries() {
+		use serde_bytes::ByteBuf;
+
+		use super::super::Mutation;
+		for lease in [
+			Lease { holder: String::new(), epoch: 0 },
+			Lease { holder: "exact-owner".into(), epoch: 24 },
+			Lease { holder: "h".repeat(128), epoch: u64::MAX },
+		] {
+			for map in [0, 23, 24] {
+				let mut budget = PutBatchBudget::new(map, &lease).expect("catalog map");
+				let mut ops = Vec::new();
+				for at in 0..super::super::MAX_COMMIT_OPS {
+					let width = [1, 23, 24, 255, 256, super::super::MAX_KEY_BYTES][at % 6];
+					let key = vec![42; width];
+					let value = vec![42; at % 257];
+					budget
+						.try_put(key.len(), &value)
+						.expect("supported put");
+					ops.push(Mutation::Put {
+						map,
+						key: ByteBuf::from(key),
+						val: ByteBuf::from(value),
+					});
+					if [1, 23, 24, 255, 256, 900].contains(&ops.len()) {
+						let bytes =
+							encode(&commit(&lease, ops.clone())).expect("supported commit");
+						assert_eq!(budget.encoded_size().expect("size"), bytes.len());
+					}
+				}
+				let size = budget.encoded_size().expect("size");
+				budget.try_put(1, &[]).expect_err("operation 901");
+				assert_eq!(budget.operations(), super::super::MAX_COMMIT_OPS);
+				assert_eq!(budget.encoded_size().expect("unchanged size"), size);
+			}
+		}
+	}
+
+	#[test]
+	fn put_admission_preserves_exact_request_limit_and_refuses_one_extra_byte() {
+		use serde_bytes::ByteBuf;
+
+		use super::super::Mutation;
+		for lease in [Lease { holder: String::new(), epoch: 0 }, Lease {
+			holder: "h".repeat(128),
+			epoch: u64::MAX,
+		}] {
+			let value = vec![0; super::super::MAX_VALUE_BYTES];
+			let mut prefix = PutBatchBudget::new(0, &lease).expect("budget");
+			prefix.try_put(1, &value).expect("first");
+			prefix.try_put(1, &value).expect("second");
+			let mut initial = prefix;
+			initial
+				.try_put(4, &vec![0; 65_536])
+				.expect("initial tail");
+			let tail_len = 65_536 + MAX_BYTES - initial.encoded_size().expect("initial size");
+			let tail = vec![0; tail_len];
+			let mut exact = prefix;
+			exact.try_put(4, &tail).expect("exact byte limit");
+			assert_eq!(exact.encoded_size().expect("exact size"), MAX_BYTES);
+			let ops = vec![
+				Mutation::Put {
+					map: 0,
+					key: ByteBuf::from(vec![0]),
+					val: ByteBuf::from(value.clone()),
+				},
+				Mutation::Put {
+					map: 0,
+					key: ByteBuf::from(vec![1]),
+					val: ByteBuf::from(value),
+				},
+				Mutation::Put {
+					map: 0,
+					key: ByteBuf::from(vec![2; 4]),
+					val: ByteBuf::from(tail),
+				},
+			];
+			assert_eq!(
+				encode(&commit(&lease, ops))
+					.expect("owned exact wire")
+					.len(),
+				MAX_BYTES
+			);
+			let before = prefix.encoded_size().expect("prefix size");
+			prefix
+				.try_put(4, &vec![0; tail_len + 1])
+				.expect_err("one byte over");
+			assert_eq!(prefix.operations(), 2);
+			assert_eq!(
+				prefix
+					.encoded_size()
+					.expect("unchanged prefix size"),
+				before
+			);
+			prefix
+				.try_put(4, &vec![0; tail_len])
+				.expect("retry exact after refusal");
+		}
+	}
+
+	#[test]
+	fn put_admission_refuses_bad_map_and_widths_without_spending_budget() {
+		let lease = Lease { holder: "width-owner".into(), epoch: 1 };
+		PutBatchBudget::new(u16::MAX, &lease).expect_err("unknown map");
+		let mut budget = PutBatchBudget::new(0, &lease).expect("budget");
+		let before = budget.encoded_size().expect("empty size");
+		for (key_len, value_len) in [
+			(0, 1),
+			(super::super::MAX_KEY_BYTES + 1, 1),
+			(1, super::super::MAX_VALUE_BYTES + 1),
+		] {
+			budget
+				.try_put(key_len, &vec![0; value_len])
+				.expect_err("bad width");
+			assert_eq!(budget.operations(), 0);
+			assert_eq!(budget.encoded_size().expect("unchanged size"), before);
+		}
+		budget
+			.try_put(super::super::MAX_KEY_BYTES, &vec![0; super::super::MAX_VALUE_BYTES])
+			.expect("both widths at supported limit");
+	}
 
 	#[test]
 	fn read_chunking_preserves_normal_batches_and_bounds_large_keys() {

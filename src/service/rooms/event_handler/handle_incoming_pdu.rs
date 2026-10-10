@@ -32,6 +32,59 @@ type PrevSplit = SmallVec<[OwnedEventId; MAX_PREV_EVENTS]>;
 
 type Handled = Option<(RawPduId, bool)>;
 
+/// Ordinary federation transactions do not rebroadcast their received events.
+#[implement(super::Service)]
+pub async fn handle_incoming_pdu<'a>(
+	&'a self,
+	origin: &'a ServerName,
+	room: &'a RoomId,
+	event: &'a EventId,
+	pdu: CanonicalJsonObject,
+	timeline: bool,
+) -> Result<Handled> {
+	self.handle_incoming_pdu_with_delivery(origin, room, event, pdu, timeline, false)
+		.await
+}
+
+/// Membership handshake roles accept the event and its complete delivery
+/// obligation together. A queue fault after acceptance cannot lose the fanout.
+#[implement(super::Service)]
+pub async fn handle_incoming_pdu_and_federate<'a>(
+	&'a self,
+	origin: &'a ServerName,
+	room: &'a RoomId,
+	event: &'a EventId,
+	pdu: CanonicalJsonObject,
+) -> Result<Handled> {
+	self.handle_incoming_pdu_with_delivery(origin, room, event, pdu, true, true)
+		.await
+}
+
+#[implement(super::Service)]
+pub(super) async fn known_timeline_pdu(
+	&self,
+	room: &RoomId,
+	event: &EventId,
+	federate: bool,
+	state_lock: Option<&crate::rooms::state::RoomMutexGuard>,
+) -> Result<Option<RawPduId>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let raw = match services_root.timeline.get_pdu_id(event).await {
+		| Ok(raw) => raw,
+		| Err(error) if error.is_not_found() => return Ok(None),
+		| Err(error) => return Err(error),
+	};
+	if federate {
+		services_root
+			.timeline
+			.federate_existing_pdu(raw, room, event, state_lock)
+			.await?;
+	}
+	debug!(?raw, "Exists.");
+	Ok(Some(raw))
+}
+
 /// When receiving an event one needs to:
 /// 0. Check the server is in the room
 /// 1. Skip the PDU if we already know about it
@@ -68,24 +121,29 @@ type Handled = Option<(RawPduId, bool)>;
 	fields(%room_id, %event_id),
 	ret(level = "debug"),
 )]
-pub async fn handle_incoming_pdu<'a>(
+async fn handle_incoming_pdu_with_delivery<'a>(
 	&'a self,
 	origin: &'a ServerName,
 	room_id: &'a RoomId,
 	event_id: &'a EventId,
 	pdu: CanonicalJsonObject,
 	is_timeline_event: bool,
+	federate: bool,
 ) -> Result<Handled> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// 1. Skip the PDU if we already have it as a timeline event
-	if let Ok(pdu_id) = self.services.timeline.get_pdu_id(event_id).await {
-		debug!(?pdu_id, "Exists.");
+	if let Some(pdu_id) = self
+		.known_timeline_pdu(room_id, event_id, federate, None)
+		.await?
+	{
 		return Ok(Some((pdu_id, false)));
 	}
 
 	// 1.0 Refuse an event already rejected during authorization. The verdict is
 	//     definitive, so the event is neither refetched nor reprocessed.
-	if self
-		.services
+	if services_root
 		.timeline
 		.is_pdu_rejected(event_id)
 		.await
@@ -94,11 +152,10 @@ pub async fn handle_incoming_pdu<'a>(
 	}
 
 	// 1.1 Check the server is in the room
-	let meta_exists = self.services.metadata.exists(room_id).map(Ok);
+	let meta_exists = services_root.metadata.exists(room_id).map(Ok);
 
 	// 1.2 Check if the room is disabled
-	let is_disabled = self
-		.services
+	let is_disabled = services_root
 		.metadata
 		.is_disabled(room_id)
 		.map(Ok);
@@ -118,8 +175,7 @@ pub async fn handle_incoming_pdu<'a>(
 		.then_async(|| self.acl_check(sender.server_name(), room_id));
 
 	// Fetch create event; absent when we are not resident in the room.
-	let create_event = self
-		.services
+	let create_event = services_root
 		.state_accessor
 		.room_state_get(room_id, &StateEventType::RoomCreate, "")
 		.map(|result| Ok(result.ok()));
@@ -158,8 +214,7 @@ pub async fn handle_incoming_pdu<'a>(
 
 	// Whether an outlier was stored before this delivery, so a refusal below
 	// forgets only the outlier this delivery stored.
-	let was_outlier = self
-		.services
+	let was_outlier = services_root
 		.timeline
 		.outlier_pdu_exists(event_id)
 		.await
@@ -179,8 +234,7 @@ pub async fn handle_incoming_pdu<'a>(
 	}
 
 	// Skip old events
-	let first_ts_in_room = self
-		.services
+	let first_ts_in_room = services_root
 		.timeline
 		.first_pdu_in_room(room_id)
 		.await?
@@ -212,7 +266,7 @@ pub async fn handle_incoming_pdu<'a>(
 	// A pushed event refused for its history leaves no outlier behind, so a later
 	// event citing it still opens the gap it names.
 	if fetched.is_err() && !was_outlier {
-		self.services
+		services_root
 			.timeline
 			.remove_pdu_outlier(event_id)
 			.await?;
@@ -243,6 +297,7 @@ pub async fn handle_incoming_pdu<'a>(
 		&room_version,
 		recursion_level,
 		create_event.event_id(),
+		federate,
 	)
 	.boxed()
 	.await
@@ -264,6 +319,9 @@ async fn handle_rescinded_invite(
 	room_id: &RoomId,
 	pdu: &CanonicalJsonObject,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if pdu
 		.get("type")
 		.and_then(CanonicalJsonValue::as_str)
@@ -288,7 +346,7 @@ async fn handle_rescinded_invite(
 		return Ok(false);
 	};
 
-	if sender == target || !self.services.globals.user_is_local(&target) {
+	if sender == target || !services_root.globals.user_is_local(&target) {
 		return Ok(false);
 	}
 
@@ -305,8 +363,7 @@ async fn handle_rescinded_invite(
 		return Ok(false);
 	}
 
-	if self
-		.services
+	if services_root
 		.state_cache
 		.user_membership(&target, room_id)
 		.await != Some(MembershipState::Invite)
@@ -315,8 +372,7 @@ async fn handle_rescinded_invite(
 	}
 
 	// Recover the inviter and the room version from the stored stripped state.
-	let invite_state = self
-		.services
+	let invite_state = services_root
 		.state_cache
 		.invite_state(&target, room_id)
 		.await?;
@@ -339,7 +395,7 @@ async fn handle_rescinded_invite(
 	};
 
 	// Verify the kick is signed by the sender's server before acting on it.
-	self.services
+	services_root
 		.server_keys
 		.verify_event(pdu, Some(&room_version_id))
 		.await
@@ -347,8 +403,8 @@ async fn handle_rescinded_invite(
 			err!(Request(InvalidParam("Invite rescission signature is invalid: {e}")))
 		})?;
 
-	let count = self.services.globals.next_count().await?;
-	self.services
+	let count = services_root.globals.next_count().await?;
+	services_root
 		.state_cache
 		.update_membership(MembershipUpdate {
 			room_id,
@@ -461,7 +517,10 @@ async fn upgrade_prev_event(
 	prev_id: OwnedEventId,
 	create_event_id: &EventId,
 ) -> Result<PrevHandled> {
-	self.services.server.check_running()?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root.server.check_running()?;
 	match self
 		.handle_prev_pdu(
 			origin,

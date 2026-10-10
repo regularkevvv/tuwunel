@@ -1,5 +1,4 @@
 use axum::extract::State;
-use futures::{FutureExt, future::try_join};
 use ruma::{
 	OwnedServerName, OwnedUserId,
 	api::federation::membership::{RawStrippedState, create_knock_event},
@@ -148,25 +147,19 @@ pub(crate) async fn create_knock_event_v1_route(
 		.lock(&body.room_id)
 		.await;
 
-	let pdu_id = services
+	let _accepted = services
 		.event_handler
-		.handle_incoming_pdu(&origin, &body.room_id, &event_id, value.clone(), true)
+		.handle_incoming_pdu_and_federate(&origin, &body.room_id, &event_id, value.clone())
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;
 
 	drop(mutex_lock);
 
-	let broadcast = services
-		.sending
-		.send_pdu_room(&body.room_id, &pdu_id);
-
 	let knock_room_state = services
 		.state
 		.summary_pdus(&pdu, &value, &room_version_id)
-		.map(Ok);
-
-	let (knock_room_state, ()) = try_join(knock_room_state, broadcast).await?;
+		.await;
 
 	Ok(create_knock_event::v1::Response {
 		knock_room_state: knock_room_state

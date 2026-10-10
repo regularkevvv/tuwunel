@@ -93,13 +93,22 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		let mut signals = self.services.server.signal.subscribe();
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let mut signals = services_root.server.signal.subscribe();
 		let (sender, mut receiver) = mpsc::channel(COMMAND_QUEUE_LIMIT);
 		_ = self
 			.channel
 			.write()
 			.expect("locked for writing")
 			.insert(sender);
+		// Shutdown may precede this worker's first poll, so the earlier
+		// interruption may have found no channel. Close the newly installed
+		// sender as well; the receiver can drain and exit without a lost signal.
+		if services_root.server.is_stopping() {
+			self.interrupt().await;
+		}
 
 		self.console_auto_start().await;
 
@@ -137,6 +146,14 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	#[cfg(test)]
+	pub(crate) fn worker_ready(&self) -> bool {
+		self.channel
+			.read()
+			.expect("locked for reading")
+			.is_some()
+	}
+
 	/// Posts a command to the command processor queue and returns. Processing
 	/// will take place on the service worker's task asynchronously. Errors if
 	/// the queue is full.
@@ -204,12 +221,15 @@ impl Service {
 			.clone()
 			.expect("Admin module is not loaded");
 
-		processor::handle_command(root, Arc::clone(self.services.get()), command).await
+		processor::handle_command(root, self.services.get(), command).await
 	}
 
 	/// Checks whether a given user is an admin of this server
 	pub async fn user_is_admin(&self, user_id: &UserId) -> bool {
-		if user_id == self.services.globals.server_user {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if user_id == services_root.globals.server_user {
 			return true;
 		}
 
@@ -217,7 +237,7 @@ impl Service {
 			return false;
 		};
 
-		self.services
+		services_root
 			.state_cache
 			.is_joined(user_id, &admin_room)
 			.await
@@ -228,24 +248,50 @@ impl Service {
 	/// Errors are propagated from the database, and will have None if there is
 	/// no admin room
 	pub async fn get_admin_room(&self) -> Result<OwnedRoomId> {
-		let room_id = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let room_id = services_root
 			.alias
 			.resolve_local_alias(&self.admin_alias)
 			.await?;
 
-		self.services
+		services_root
 			.state_cache
-			.is_joined(&self.services.globals.server_user, &room_id)
-			.await
+			.is_joined_checked(&services_root.globals.server_user, &room_id)
+			.await?
 			.then_some(room_id)
 			.ok_or_else(|| err!(Request(NotFound("Admin user not joined to admin room"))))
+	}
+
+	/// Checks administrator membership while preserving storage and decoding
+	/// failures. An absent admin room or membership means `false`; an unknown
+	/// read outcome cannot classify a user as a non-administrator.
+	pub async fn user_is_admin_checked(&self, user_id: &UserId) -> Result<bool> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if user_id == services_root.globals.server_user {
+			return Ok(true);
+		}
+		let admin_room = match self.get_admin_room().await {
+			| Ok(room) => room,
+			| Err(error) if error.is_not_found() => return Ok(false),
+			| Err(error) => return Err(error),
+		};
+		services_root
+			.state_cache
+			.is_joined_checked(user_id, &admin_room)
+			.await
 	}
 
 	/// Gets the room reports are posted to: the configured report room when set
 	/// and usable, otherwise the admin room.
 	pub async fn get_report_room(&self) -> Result<OwnedRoomId> {
-		let Some(report_room) = self.services.server.config.report_room.as_ref() else {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let Some(report_room) = services_root.server.config.report_room.as_ref() else {
 			return self.get_admin_room().await;
 		};
 
@@ -259,15 +305,17 @@ impl Service {
 	}
 
 	async fn resolve_report_room(&self, report_room: &RoomOrAliasId) -> Result<OwnedRoomId> {
-		let room_id = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let room_id = services_root
 			.alias
 			.maybe_resolve(report_room)
 			.await?;
 
-		self.services
+		services_root
 			.state_cache
-			.is_joined(&self.services.globals.server_user, &room_id)
+			.is_joined(&services_root.globals.server_user, &room_id)
 			.await
 			.then_some(room_id)
 			.ok_or_else(|| err!("server user is not joined to the configured report room"))
@@ -277,6 +325,9 @@ impl Service {
 	where
 		Pdu: Event,
 	{
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let body = body.trim_start();
 
 		// Server-side command-escape with public echo
@@ -287,7 +338,7 @@ impl Service {
 				.starts_with("!admin");
 
 		// Admin command with public echo (in admin room)
-		let server_user = &self.services.globals.server_user;
+		let server_user = &services_root.globals.server_user;
 		let is_public_prefix =
 			body.starts_with("!admin") || body.starts_with(server_user.as_str());
 
@@ -296,8 +347,7 @@ impl Service {
 			return false;
 		}
 
-		let user_is_local = self
-			.services
+		let user_is_local = services_root
 			.globals
 			.user_is_local(event.sender());
 
@@ -307,7 +357,7 @@ impl Service {
 		}
 
 		// Check if server-side command-escape is disabled by configuration
-		if is_public_escape && !self.services.server.config.admin_escape_commands {
+		if is_public_escape && !services_root.server.config.admin_escape_commands {
 			return false;
 		}
 
@@ -323,8 +373,7 @@ impl Service {
 
 		// This will evaluate to false if the emergency password is set up so that
 		// the administrator can execute commands as the server user
-		let emergency_password_set = self
-			.services
+		let emergency_password_set = services_root
 			.server
 			.config
 			.emergency_password

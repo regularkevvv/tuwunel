@@ -144,9 +144,11 @@ impl Service {
 	}
 
 	pub async fn get_config_tokens(&self) -> Result<HashSet<String>> {
-		let inline = self.services.config.registration_token.clone();
-		let Some(path) = self
-			.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let inline = services_root.config.registration_token.clone();
+		let Some(path) = services_root
 			.config
 			.registration_token_file
 			.clone()

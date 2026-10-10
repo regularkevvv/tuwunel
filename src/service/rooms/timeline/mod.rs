@@ -4,6 +4,7 @@ mod build;
 mod create;
 mod pdus;
 mod purge;
+mod purge_resume;
 mod redact;
 
 use std::{fmt::Write, sync::Arc};
@@ -19,14 +20,16 @@ use futures::{
 };
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId,
-	UserId, api::Direction, events::room::encrypted::Relation,
+	UserId,
+	api::{Direction, error::ErrorKind},
+	events::room::encrypted::Relation,
 };
 use serde::Deserialize;
 pub use tuwunel_core::matrix::pdu::{PduId, RawPduId};
 use tuwunel_core::{
-	Err, Result, at, err, implement,
+	Err, Error, Result, at, err, implement,
 	matrix::{
-		ShortEventId,
+		Event, ShortEventId,
 		pdu::{PduCount, PduEvent},
 	},
 	utils::{
@@ -37,8 +40,8 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Database, Deserialized, Json, Map};
 
-pub(crate) use self::append::Effect;
 pub use self::pdus::{PdusIterItem, bias_count};
+pub(crate) use self::{append::Effect, purge::check_purge_batch};
 use crate::rooms::short::{ShortRoomId, ShortStateHash};
 
 pub struct Service {
@@ -237,8 +240,10 @@ pub async fn prev_shortstatehash(
 	room_id: &RoomId,
 	before: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -253,7 +258,7 @@ pub async fn prev_shortstatehash(
 
 	let shorteventid = self.get_shorteventid_from_pdu_id(&prev).await?;
 
-	self.services
+	services_root
 		.state
 		.get_shortstatehash(shorteventid)
 		.await
@@ -269,8 +274,10 @@ pub async fn next_shortstatehash(
 	room_id: &RoomId,
 	after: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -285,7 +292,7 @@ pub async fn next_shortstatehash(
 
 	let shorteventid = self.get_shorteventid_from_pdu_id(&next).await?;
 
-	self.services
+	services_root
 		.state
 		.get_shortstatehash(shorteventid)
 		.await
@@ -299,8 +306,10 @@ pub async fn get_shortstatehash(
 	room_id: &RoomId,
 	count: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -310,7 +319,7 @@ pub async fn get_shortstatehash(
 
 	let shorteventid = self.get_shorteventid_from_pdu_id(&pdu_id).await?;
 
-	self.services
+	services_root
 		.state
 		.get_shortstatehash(shorteventid)
 		.await
@@ -445,8 +454,10 @@ async fn count_to_id(
 	count: PduCount,
 	dir: Direction,
 ) -> Result<RawPduId> {
-	let shortroomid: ShortRoomId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid: ShortRoomId = services_root
 		.short
 		.get_shortroomid(room_id)
 		.await
@@ -470,8 +481,10 @@ fn pdu_count_to_id(shortroomid: ShortRoomId, count: PduCount, dir: Direction) ->
 /// Checks the `eventid_outlierpdu` Tree if not found in the timeline.
 #[implement(Service)]
 pub async fn get_pdu_from_shorteventid(&self, shorteventid: ShortEventId) -> Result<PduEvent> {
-	let event_id: OwnedEventId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let event_id: OwnedEventId = services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await?;
@@ -541,13 +554,21 @@ pub async fn get<T>(&self, event_id: &EventId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	let accepted = self.get_non_outlier(event_id);
-	let outlier = self.get_outlier(event_id);
-
-	pin_mut!(accepted, outlier);
-	select_ok([Left(accepted), Right(outlier)])
-		.await
-		.map(at!(0))
+	// Accepted records are canonical. An outlier is a fallback only when no
+	// accepted index exists; it cannot mask a failed/corrupt accepted read.
+	match self.get_pdu_id(event_id).await {
+		| Ok(pdu_id) => self.get_from_id(&pdu_id).await.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Missing accepted event record")
+			} else if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+				Error::bad_database("Invalid accepted event record")
+			} else {
+				error
+			}
+		}),
+		| Err(error) if error.kind() == ErrorKind::NotFound => self.get_outlier(event_id).await,
+		| Err(error) => Err(error),
+	}
 }
 
 /// Returns the pdu into T.
@@ -586,7 +607,40 @@ pub async fn get_from_id<T>(&self, pdu_id: &RawPduId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	self.db.pduid_pdu.get(pdu_id).await.deserialized()
+	let mut remaining = usize::MAX;
+	self.get_from_id_budgeted(pdu_id, &mut remaining)
+		.await?
+		.ok_or_else(|| Error::bad_database("Stored accepted event exceeds read budget"))
+}
+
+/// Refuse oversized stored values before decoding or retaining their objects.
+/// `None` requests a smaller complete delivery batch without consuming budget.
+#[implement(Service)]
+pub(crate) async fn get_from_id_budgeted<T>(
+	&self,
+	pdu_id: &RawPduId,
+	remaining: &mut usize,
+) -> Result<Option<T>>
+where
+	T: for<'de> Deserialize<'de>,
+{
+	let value = self.db.pduid_pdu.get(pdu_id).await?;
+	let length = value.len();
+	if length > tuwunel_bridge::MAX_VALUE_BYTES {
+		return Err(Error::bad_database("Stored accepted event exceeds value limit"));
+	}
+	if length > *remaining {
+		return Ok(None);
+	}
+	let decoded = (&value).deserialized().map_err(|error| {
+		if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+			Error::bad_database("Invalid stored accepted event record")
+		} else {
+			error
+		}
+	})?;
+	*remaining = remaining.saturating_sub(length);
+	Ok(Some(decoded))
 }
 
 /// Checks if pdu exists
@@ -642,9 +696,12 @@ pub async fn get_pdu_count(&self, event_id: &EventId) -> Result<PduCount> {
 /// Returns the `shorteventid` from the `pdu_id`
 #[implement(Service)]
 pub async fn get_shorteventid_from_pdu_id(&self, pdu_id: &PduId) -> Result<ShortEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = self.get_event_id_from_pdu_id(pdu_id).await?;
 
-	self.services
+	services_root
 		.short
 		.get_shorteventid(&event_id)
 		.await
@@ -663,8 +720,10 @@ pub async fn get_event_id_from_pdu_id(&self, pdu_id: &PduId) -> Result<OwnedEven
 /// Returns the `pdu_id` from the `shorteventid`
 #[implement(Service)]
 pub async fn get_pdu_id_from_shorteventid(&self, shorteventid: ShortEventId) -> Result<RawPduId> {
-	let event_id: OwnedEventId = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let event_id: OwnedEventId = services_root
 		.short
 		.get_eventid_from_short(shorteventid)
 		.await?;
@@ -675,9 +734,51 @@ pub async fn get_pdu_id_from_shorteventid(&self, shorteventid: ShortEventId) -> 
 /// Returns the pdu's id.
 #[implement(Service)]
 pub async fn get_pdu_id(&self, event_id: &EventId) -> Result<RawPduId> {
-	self.db
-		.eventid_pduid
-		.get(event_id)
+	let handle = self.db.eventid_pduid.get(event_id).await?;
+	let encoded: &[u8] = handle.as_ref();
+	RawPduId::from_bytes(encoded)
+}
+
+/// Reads the last canonical room event at or before a membership pagination
+/// boundary. This seeks one row; malformed keys, payloads or reverse indexes
+/// refuse the lookup instead of selecting another event or current state.
+#[implement(Service)]
+pub async fn member_snapshot_boundary(
+	&self,
+	room_id: &RoomId,
+	count: PduCount,
+) -> Result<(PduCount, PduEvent)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortroomid = services_root
+		.short
+		.get_shortroomid(room_id)
+		.await?;
+	let start: RawPduId = PduId { shortroomid, count }.into();
+	let stream = self.db.pduid_pdu.rev_raw_stream_from(&start);
+	pin_mut!(stream);
+	let Some((key, value)) = stream.try_next().await? else {
+		return Err(err!(Request(NotFound("No event at membership boundary"))));
+	};
+	if !key.starts_with(&shortroomid.to_be_bytes()) {
+		return Err(err!(Request(NotFound("No room event at membership boundary"))));
+	}
+	let position = RawPduId::from_bytes(key)?.pdu_count();
+	let event = serde_json::from_slice::<PduEvent>(value)
+		.map_err(|_| Error::bad_database("Invalid membership boundary event"))?;
+	let canonical = self
+		.get_pdu_id(event.event_id())
 		.await
-		.map(|handle| RawPduId::from(&*handle))
+		.map_err(|error| {
+			if error.kind() == ErrorKind::NotFound {
+				Error::bad_database("Missing membership boundary reverse index")
+			} else {
+				error
+			}
+		})?;
+	if event.room_id() != room_id || canonical.as_ref() != key || position > count {
+		return Err(Error::bad_database("Mismatched membership boundary event"));
+	}
+	Ok((position, event))
 }

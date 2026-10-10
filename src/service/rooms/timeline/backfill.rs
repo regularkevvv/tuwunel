@@ -18,10 +18,7 @@ use tuwunel_core::{
 		event::Event,
 		pdu::{PduCount, PduId, RawPduId},
 	},
-	utils::{
-		BoolExt, IterStream, ReadyExt,
-		future::{BoolExt as FutureBoolExt, TryExtExt},
-	},
+	utils::{BoolExt, IterStream, ReadyExt},
 	validated, warn,
 };
 use tuwunel_database::Json;
@@ -51,6 +48,9 @@ struct TimestampHit {
 #[implement(super::Service)]
 #[tracing::instrument(name = "backfill", level = "debug", skip(self))]
 pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let (first_pdu_count, first_pdu) = self.first_item_in_room(room_id).await?;
 
 	if first_pdu_count < from {
@@ -62,20 +62,18 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 		return Ok(());
 	}
 
-	let empty_room = self
-		.services
+	let empty_room = services_root
 		.state_cache
-		.room_joined_count(room_id)
-		.map_ok_or(true, |count| count <= 1);
+		.room_joined_count(room_id);
 
-	let not_world_readable = self
-		.services
+	let not_world_readable = services_root
 		.state_accessor
 		.is_world_readable(room_id)
 		.map(is_false!());
 
 	// Room is empty (1 user or none), there is no one that can backfill
-	if empty_room.and(not_world_readable).await {
+	let (joined_count, not_world_readable) = join(empty_room, not_world_readable).await;
+	if joined_count? <= 1 && not_world_readable {
 		return Ok(());
 	}
 
@@ -100,7 +98,7 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 			.attempt_limit(BACKFILL_ATTEMPT_LIMIT)
 			.backfill_limit(BACKFILL_LIMIT);
 
-		let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
+		let Ok(outcome) = services_root.fetcher.fetch(opts).await else {
 			return no_backfill();
 		};
 
@@ -145,13 +143,14 @@ pub async fn backfill_if_required(&self, room_id: &RoomId, from: PduCount) -> Re
 
 #[implement(super::Service)]
 async fn backfill_candidates(&self, room_id: &RoomId) -> Candidates {
-	let canonical_alias = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let canonical_alias = services_root
 		.state_accessor
 		.get_canonical_alias(room_id);
 
-	let power_levels = self
-		.services
+	let power_levels = services_root
 		.state_accessor
 		.get_power_levels(room_id);
 
@@ -173,7 +172,7 @@ async fn backfill_candidates(&self, room_id: &RoomId) -> Candidates {
 				.filter_map(|(user_id, level)| level.gt(&power.users_default).then_some(user_id))
 		}))
 		.filter_map(|user_id| {
-			self.services
+			services_root
 				.globals
 				.user_is_local(user_id)
 				.is_false()
@@ -196,8 +195,7 @@ async fn backfill_candidates(&self, room_id: &RoomId) -> Candidates {
 		.map(|alias| alias.server_name().to_owned())
 		.stream();
 
-	let trusted_servers = self
-		.services
+	let trusted_servers = services_root
 		.server
 		.config
 		.trusted_servers
@@ -208,9 +206,9 @@ async fn backfill_candidates(&self, room_id: &RoomId) -> Candidates {
 	power_servers
 		.chain(canonical_room_alias_server)
 		.chain(trusted_servers)
-		.ready_filter(|server_name| !self.services.globals.server_is_ours(server_name))
+		.ready_filter(|server_name| !services_root.globals.server_is_ours(server_name))
 		.filter_map(async |server_name| {
-			self.services
+			services_root
 				.state_cache
 				.server_in_room(&server_name, room_id)
 				.await
@@ -227,6 +225,9 @@ pub async fn get_event_id_near_ts_with_fallback(
 	ts: MilliSecondsSinceUnixEpoch,
 	dir: Direction,
 ) -> Result<(MilliSecondsSinceUnixEpoch, OwnedEventId)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let local = self.get_event_id_near_ts(room_id, ts, dir).await;
 
 	// Federate on a local miss, or a forward hit at the start edge of our history.
@@ -251,7 +252,7 @@ pub async fn get_event_id_near_ts_with_fallback(
 		.candidates(candidates)
 		.checks(false);
 
-	let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
+	let Ok(outcome) = services_root.fetcher.fetch(opts).await else {
 		return local;
 	};
 
@@ -303,12 +304,15 @@ async fn backfill_event(
 	event_id: &EventId,
 	origin: &ServerName,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let opts = Opts::new(Op::Backfill, room_id.to_owned())
 		.event_id(event_id.to_owned())
 		.candidates([origin.to_owned()])
 		.backfill_limit(BACKFILL_LIMIT);
 
-	let outcome = self.services.fetcher.fetch(opts).await?;
+	let outcome = services_root.fetcher.fetch(opts).await?;
 
 	let pdus: Vec<Box<RawJsonValue>> = serde_json::from_slice(&outcome.bytes)?;
 
@@ -332,11 +336,14 @@ async fn backfill_event(
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub async fn fetch_remote_event(&self, room_id: &RoomId, event_id: &EventId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let opts = Opts::new(Op::Event, room_id.to_owned())
 		.event_id(event_id.to_owned())
 		.checks(false);
 
-	let outcome = self.services.fetcher.fetch(opts).await?;
+	let outcome = services_root.fetcher.fetch(opts).await?;
 
 	let pdu: Box<RawJsonValue> = serde_json::from_slice(&outcome.bytes)?;
 
@@ -350,8 +357,10 @@ pub async fn fetch_remote_event(&self, room_id: &RoomId, event_id: &EventId) -> 
 /// it, stored as an outlier but not yet placed in the timeline.
 #[implement(super::Service)]
 async fn is_unplaced_room_create(&self, room_id: &RoomId, event_id: &EventId) -> bool {
-	let is_create = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let is_create = services_root
 		.state_accessor
 		.room_state_get_id(room_id, &StateEventType::RoomCreate, "")
 		.await
@@ -370,14 +379,15 @@ pub async fn backfill_pdu(
 	origin: &ServerName,
 	pdu: Box<RawJsonValue>,
 ) -> Result<bool> {
-	let parsed = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let parsed = services_root
 		.event_handler
 		.parse_incoming_pdu(&pdu);
 
 	// Lock so we cannot backfill the same pdu twice at the same time
-	let mutex_lock = self
-		.services
+	let mutex_lock = services_root
 		.event_handler
 		.mutex_federation
 		.lock(room_id)
@@ -385,8 +395,7 @@ pub async fn backfill_pdu(
 
 	let ((_, event_id, value), mutex_lock) = try_join(parsed, mutex_lock).await?;
 
-	let handled = match self
-		.services
+	let handled = match services_root
 		.event_handler
 		.handle_incoming_pdu(origin, room_id, &event_id, value, false)
 		.await
@@ -421,7 +430,7 @@ pub async fn backfill_pdu(
 
 	let value = self.get_pdu_json(&event_id);
 
-	let shortroomid = self.services.short.get_shortroomid(room_id);
+	let shortroomid = services_root.short.get_shortroomid(room_id);
 
 	let insert_lock = self.mutex_insert.lock(room_id).map(Ok);
 
@@ -430,7 +439,7 @@ pub async fn backfill_pdu(
 
 	// A pdu_id is not returned from handle_incoming_pdu() when accepting a new
 	// event on this codepath. The pdu_id is instead created here in ℤ−
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 	let count: i64 = (*count).try_into()?;
 	let pdu_id: RawPduId = PduId {
 		shortroomid,
@@ -452,7 +461,7 @@ pub async fn backfill_pdu(
 	match pdu.kind {
 		| TimelineEventType::RoomMessage => {
 			if let Ok(ExtractBody { body: Some(body) }) = pdu.get_content() {
-				self.services
+				services_root
 					.search
 					.index_pdu(shortroomid, &pdu_id, &body)
 					.await?;
@@ -460,7 +469,7 @@ pub async fn backfill_pdu(
 		},
 		| TimelineEventType::RoomTopic =>
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
-				self.services
+				services_root
 					.search
 					.index_pdu(shortroomid, &pdu_id, &topic)
 					.await?;
@@ -484,6 +493,12 @@ async fn prepend_backfill_pdu(
 	json: &CanonicalJsonObject,
 ) -> Result {
 	let mut txn = self.db.db.txn();
+	self.services
+		.get()
+		.as_ref()
+		.sending
+		.db
+		.stage_federation_role(&mut txn, pdu_id, room_id, event_id, false);
 
 	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(json));
 	txn.insert_raw(&self.db.eventid_pduid, event_id, pdu_id);
@@ -493,5 +508,6 @@ async fn prepend_backfill_pdu(
 	let key = (room_id, origin_server_ts, count_key);
 	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
 
-	txn.execute().await
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await
 }

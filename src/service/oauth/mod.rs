@@ -88,14 +88,17 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		if self.services.globals.is_read_only() {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if services_root.globals.is_read_only() {
 			return Ok(());
 		}
 
 		loop {
 			self.maintain().await;
 
-			let shutdown = self.services.server.until_shutdown();
+			let shutdown = services_root.server.until_shutdown();
 			if tokio::time::timeout(MAINTENANCE_INTERVAL, shutdown)
 				.await
 				.is_ok()
@@ -130,7 +133,10 @@ const DEVICE_RC_BURST: f64 = 60.0;
 /// unless both `oidc_rc_per_second` and `oidc_rc_burst_count` are configured.
 #[implement(Service)]
 pub fn check_rate_limit(&self, client: IpAddr) -> Result {
-	let config = &self.services.config;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let config = &services_root.config;
 	let rate = f64::from(config.oidc_rc_per_second);
 	let burst = f64::from(config.oidc_rc_burst_count);
 
@@ -286,6 +292,9 @@ pub async fn request_tokeninfo(
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn revoke_token(&self, (provider, session): (&Provider, &Session)) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	#[derive(Serialize)]
 	struct RevokeQuery<'a> {
 		client_id: &'a str,
@@ -313,7 +322,7 @@ pub async fn revoke_token(&self, (provider, session): (&Provider, &Session)) -> 
 		token_type_hint,
 	})?;
 
-	self.services
+	services_root
 		.client
 		.oauth
 		.post(url)
@@ -389,8 +398,10 @@ pub async fn request<Body>(
 where
 	Body: Serialize,
 {
-	let mut request = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let mut request = services_root
 		.client
 		.oauth
 		.request(method, url)
@@ -408,7 +419,7 @@ where
 		request = request.bearer_auth(access_token);
 	}
 
-	let limit = self.services.config.max_response_size;
+	let limit = services_root.config.max_response_size;
 	let http_response = request.send().await?.error_for_status()?;
 
 	let body = read_response_capped(http_response, limit).await?;
@@ -870,8 +881,10 @@ async fn clear_grant(&self, provider: Option<&Provider>, sess_id: &str) -> Resul
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn revoke_user_sessions(&self, user_id: &UserId) -> usize {
-	let devices: Vec<OwnedDeviceId> = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let devices: Vec<OwnedDeviceId> = services_root
 		.users
 		.all_device_ids(user_id)
 		.map(ToOwned::to_owned)
@@ -879,7 +892,7 @@ pub async fn revoke_user_sessions(&self, user_id: &UserId) -> usize {
 		.await;
 
 	for device_id in &devices {
-		self.services
+		services_root
 			.users
 			.remove_device(user_id, device_id)
 			.await;
@@ -986,6 +999,9 @@ pub async fn bind_login_device(
 /// are not their identity's association record, which is never deleted.
 #[implement(Service)]
 async fn maintain(&self) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let current_kid = self.sessions.current_kid().map(ToOwned::to_owned);
 	let (mut resealed, mut cleared, mut deleted) = (0_usize, 0_usize, 0_usize);
 
@@ -1014,7 +1030,7 @@ async fn maintain(&self) {
 		}
 
 		match next {
-			| Some(next) if self.services.server.is_running() => after = Some(next),
+			| Some(next) if services_root.server.is_running() => after = Some(next),
 			| _ => break,
 		}
 	}
@@ -1034,6 +1050,9 @@ enum Upkeep {
 
 #[implement(Service)]
 async fn upkeep(&self, session: Session, current_kid: Option<&str>) -> Result<Upkeep> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(sess_id) = session.sess_id.clone() else {
 		return Ok(Upkeep::Kept);
 	};
@@ -1050,7 +1069,7 @@ async fn upkeep(&self, session: Session, current_kid: Option<&str>) -> Result<Up
 		return Ok(Upkeep::Kept);
 	}
 
-	let grace = Duration::from_millis(self.services.config.login_token_ttl)
+	let grace = Duration::from_millis(services_root.config.login_token_ttl)
 		.saturating_add(UNREDEEMED_GRACE);
 
 	let unredeemed = session.login_token_hash.is_some()
@@ -1062,8 +1081,7 @@ async fn upkeep(&self, session: Session, current_kid: Option<&str>) -> Result<Up
 
 	let device_gone = match (&session.user_id, &session.device_id) {
 		| (Some(user_id), Some(device_id)) =>
-			!self
-				.services
+			!services_root
 				.users
 				.device_exists(user_id, device_id)
 				.await,

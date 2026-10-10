@@ -1,39 +1,47 @@
-use std::{
-	ops::Deref,
-	sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::Services;
 
+macro_rules! services_stream {
+	($guard:ident, $root:ident, $body:block) => {
+		async_stream::stream! {
+			let $root = $guard.as_ref();
+			// Keep early returns inside stream construction.
+			let build_stream = || $body;
+			let stream = build_stream();
+			futures::pin_mut!(stream);
+			while let Some(item) = futures::StreamExt::next(&mut stream).await {
+				yield item;
+			}
+		}
+	};
+}
+
+pub(crate) use services_stream;
+
 #[derive(Default)]
 pub(crate) struct OnceServices {
-	lock: OnceLock<Arc<Services>>,
+	lock: OnceLock<Weak<Services>>,
 }
 
 impl OnceServices {
-	pub(super) fn set(&self, services: Arc<Services>) -> Arc<Services> {
-		self.lock.get_or_init(move || services).clone()
-	}
-
-	#[inline]
-	pub(crate) fn get(&self) -> &Arc<Services> {
+	pub(super) fn set(&self, services: &Arc<Services>) -> Arc<Services> {
 		self.lock
-			.get()
-			.expect("services must be initialized")
+			.get_or_init(|| Arc::downgrade(services))
+			.upgrade()
+			.expect("services root must be owned during initialization")
 	}
 
-	/// Borrow the services if they are initialized, without panicking on the
-	/// pre-init window. Returns `None` only before `set` runs, a state reached
-	/// by unit harnesses that build a service without an initialized graph.
 	#[inline]
-	pub(crate) fn try_get(&self) -> Option<&Arc<Services>> { self.lock.get() }
-}
+	pub(crate) fn get(&self) -> Arc<Services> {
+		self.try_get()
+			.expect("services must be initialized and alive")
+	}
 
-impl Deref for OnceServices {
-	type Target = Arc<Services>;
-
+	/// Own the root for the current operation. Before initialization and after
+	/// the root has been released, there is no graph to upgrade.
 	#[inline]
-	fn deref(&self) -> &Self::Target { self.get() }
+	pub(crate) fn try_get(&self) -> Option<Arc<Services>> { self.lock.get()?.upgrade() }
 }
 
 #[cfg(not(tuwunel_always_prove_sendness))]

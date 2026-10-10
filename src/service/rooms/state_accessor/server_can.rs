@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use ruma::{
 	EventId, RoomId, ServerName, UserId,
+	api::error::ErrorKind,
 	events::{StateEventType, room::history_visibility::HistoryVisibility},
 };
 use tuwunel_core::{implement, utils::stream::ReadyExt};
@@ -15,19 +16,24 @@ pub async fn server_can_see_event(
 	room_id: &RoomId,
 	event_id: &EventId,
 ) -> bool {
-	let shortstatehash = match self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shortstatehash = match services_root
 		.state
 		.pdu_shortstatehash(event_id)
 		.await
 	{
 		| Ok(shortstatehash) => Some(shortstatehash),
-		| Err(_)
-			if self
-				.is_initial_room_create(room_id, event_id)
-				.await =>
+		| Err(error)
+			if error.kind() == ErrorKind::NotFound
+				&& self
+					.is_initial_room_create(room_id, event_id)
+					.await =>
 			return true,
-		| Err(_) => self.snapshotless_state(room_id, event_id).await,
+		| Err(error) if error.kind() == ErrorKind::NotFound =>
+			self.snapshotless_state(room_id, event_id).await,
+		| Err(_) => return false,
 	};
 
 	let Some(shortstatehash) = shortstatehash else {
@@ -41,8 +47,7 @@ pub async fn server_can_see_event(
 		return false;
 	};
 
-	let current_server_members = self
-		.services
+	let current_server_members = services_root
 		.state_cache
 		.room_members(room_id)
 		.ready_filter(|member| member.server_name() == origin);
@@ -70,8 +75,10 @@ pub async fn server_can_see_event(
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "trace")]
 pub async fn server_joined_at_pdu(&self, origin: &ServerName, event_id: &EventId) -> bool {
-	let Ok(shortstatehash) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(shortstatehash) = services_root
 		.state
 		.pdu_shortstatehash(event_id)
 		.await

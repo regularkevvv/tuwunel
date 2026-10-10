@@ -26,6 +26,10 @@
 
 pub(crate) mod cache;
 pub(crate) mod client;
+#[cfg(test)]
+mod close_tests;
+#[cfg(test)]
+pub(crate) use crate::bridge_fixture as fixture;
 pub(crate) mod lease;
 mod outcome;
 pub(crate) mod scan;
@@ -36,7 +40,10 @@ use std::{
 	collections::BTreeSet,
 	sync::{
 		Arc, Mutex, PoisonError,
-		atomic::{AtomicU64, Ordering::SeqCst},
+		atomic::{
+			AtomicBool, AtomicU64,
+			Ordering::{Relaxed, SeqCst},
+		},
 	},
 	time::{Duration, Instant},
 };
@@ -104,6 +111,13 @@ pub struct Backend {
 
 	/// The background renewal task, aborted when the backend closes.
 	renewals: Mutex<Option<JoinHandle<()>>>,
+	closing: tokio::sync::Mutex<CloseState>,
+}
+
+enum CloseState {
+	Open,
+	Closing(JoinHandle<()>),
+	Closed,
 }
 
 impl Backend {
@@ -142,6 +156,7 @@ impl Backend {
 			scan_page,
 			commits: AtomicU64::new(0),
 			renewals: Mutex::new(None),
+			closing: tokio::sync::Mutex::new(CloseState::Open),
 		});
 
 		let server = server.clone();
@@ -467,11 +482,23 @@ impl Backend {
 	/// Called with the exclusive barrier held, so no page fetch is in flight
 	/// and no scan's state lock can be held by a stream.
 	async fn drain(&self, maps: &BTreeSet<u16>) -> Result {
+		let started = Instant::now();
+		let active = AtomicBool::new(false);
+		let completed = AtomicBool::new(false);
+		tuwunel_core::defer!({
+			let micros = usize::try_from(started.elapsed().as_micros()).unwrap_or(usize::MAX);
+			crate::backend::metrics::record_drain(
+				micros,
+				active.load(Relaxed),
+				completed.load(Relaxed),
+			);
+		});
 		let scans = self.scans.touching(maps);
 		let mut open = Vec::with_capacity(scans.len());
 		for scan in &scans {
 			let state = scan.state.lock().await;
 			if !state.exhausted {
+				active.store(true, Relaxed);
 				open.push((scan, state, 0_usize));
 			}
 		}
@@ -508,6 +535,7 @@ impl Backend {
 			STATS.remote_drain_truncated.record(rows);
 		}
 
+		completed.store(true, Relaxed);
 		Ok(())
 	}
 
@@ -539,9 +567,41 @@ impl Backend {
 	/// Stops renewals and releases the lease so a successor need not wait
 	/// out its expiry.
 	pub async fn close(&self) {
-		self.scans.close();
-		self.abort_renewals();
-		self.lease.release().await;
+		let mut closing = self.closing.lock().await;
+		if matches!(*closing, CloseState::Open) {
+			self.scans.close();
+			let renewals = self
+				.renewals
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take();
+			if let Some(handle) = &renewals {
+				handle.abort();
+			}
+			let lease = self.lease.clone();
+			// Mark unheld before spawning so backend drop cannot issue a second
+			// release. The task owns both completions without retaining Backend.
+			let identity = lease.releasable();
+			*closing = CloseState::Closing(self.server.runtime().spawn(async move {
+				if let Some(handle) = renewals
+					&& let Err(error) = handle.await
+					&& !error.is_cancelled()
+				{
+					error!(%error, "writer lease renewal task failed during close");
+				}
+				if let Some(identity) = identity {
+					lease.release_identity(identity).await;
+				}
+			}));
+		}
+		// Borrow the stored handle across await: cancellation releases this
+		// mutex but retains the completion for the next close caller to join.
+		if let CloseState::Closing(handle) = &mut *closing {
+			if let Err(error) = handle.await {
+				error!(%error, "writer lease cleanup task failed");
+			}
+			*closing = CloseState::Closed;
+		}
 	}
 
 	/// One bridge call, with the stale-lease reaction applied.
@@ -571,7 +631,7 @@ impl Backend {
 	}
 
 	/// The lease identity to fence a commit with, or the fail-fast error.
-	fn writable_lease(&self) -> Result<bridge::Lease> {
+	pub(crate) fn writable_lease(&self) -> Result<bridge::Lease> {
 		if !self.lease.writable() {
 			let status = self.lease.status();
 			return Err!(Database(
@@ -607,44 +667,62 @@ impl Backend {
 
 	/// Aborts the renewal task if it is still running.
 	///
-	/// The guard is released before the task is aborted so nothing holds the
-	/// lock across the abort.
+	/// Retain its handle so an explicit close can still join the aborted task.
 	fn abort_renewals(&self) {
-		let handle = self
+		let slot = self
 			.renewals
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
-			.take();
+			.unwrap_or_else(PoisonError::into_inner);
 
-		if let Some(handle) = handle {
+		if let Some(handle) = slot.as_ref() {
 			handle.abort();
 		}
 	}
 }
 
 impl Drop for Backend {
-	/// Best-effort close: renewals always stop, and the lease is released
-	/// when a runtime is still available to carry the call. A missed release
-	/// only makes a successor wait out the natural expiry.
+	/// Retain renewal and release completions for the server's shutdown join.
 	fn drop(&mut self) {
-		self.abort_renewals();
-
-		let Ok(handle) = tokio::runtime::Handle::try_current() else {
+		self.scans.close();
+		let renewals = self
+			.renewals
+			.get_mut()
+			.unwrap_or_else(PoisonError::into_inner)
+			.take();
+		if let Some(task) = &renewals {
+			task.abort();
+		}
+		let closing = match std::mem::replace(self.closing.get_mut(), CloseState::Closed) {
+			| CloseState::Closing(task) => Some(task),
+			| CloseState::Open | CloseState::Closed => None,
+		};
+		let identity = self.lease.releasable();
+		if renewals.is_none() && closing.is_none() && identity.is_none() {
+			return;
+		}
+		let Some(runtime) = self
+			.server
+			.runtime
+			.clone()
+			.or_else(|| tokio::runtime::Handle::try_current().ok())
+		else {
 			return;
 		};
-
-		let Some(lease) = self.lease.releasable() else {
-			return;
-		};
-
-		let client = self.client.clone();
-		handle.spawn(async move {
-			match client
-				.call(&Request::LeaseRelease { lease }, None)
-				.await
+		let lease = self.lease.clone();
+		self.server.cleanup.spawn(&runtime, async move {
+			if let Some(task) = renewals
+				&& let Err(error) = task.await
+				&& !error.is_cancelled()
 			{
-				| Ok(_) => debug!("released the writer lease"),
-				| Err(error) => warn!(%error, "lease release failed; it expires on its own"),
+				error!(%error, "Dropped backend renewal join failed");
+			}
+			if let Some(task) = closing
+				&& let Err(error) = task.await
+			{
+				error!(%error, "Dropped backend close join failed");
+			}
+			if let Some(identity) = identity {
+				lease.release_identity(identity).await;
 			}
 		});
 	}

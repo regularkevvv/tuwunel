@@ -7,7 +7,7 @@ use std::{
 	},
 };
 
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Stream, TryFutureExt, TryStreamExt};
 use ruma::{OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
 	Error, Result, err, implement,
@@ -36,16 +36,17 @@ pub async fn resolve_state(
 	room_version: &RoomVersionId,
 	incoming_state: HashMap<u64, OwnedEventId>,
 ) -> Result<Arc<CompressedState>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	trace!("Loading current room state ids");
-	let current_sstatehash = self
-		.services
+	let current_sstatehash = services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.map_err(|e| err!(Database(error!("No state for {room_id:?}: {e:?}"))))
 		.await?;
 
-	let current_state_ids: HashMap<_, _> = self
-		.services
+	let current_state_ids: HashMap<_, _> = services_root
 		.state_accessor
 		.state_full_ids_strict(current_sstatehash)
 		.try_collect()
@@ -98,25 +99,24 @@ pub async fn resolve_state(
 		.iter()
 		.stream()
 		.wide_then(|((event_type, state_key), event_id)| {
-			self.services
+			services_root
 				.short
 				.get_or_create_shortstatekey(event_type, state_key)
-				.map(move |shortstatekey| (shortstatekey, event_id))
+				.map_ok(move |shortstatekey| (shortstatekey, event_id))
 		})
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	trace!("Compressing state...");
-	let new_room_state: CompressedState = self
-		.services
+	let new_room_state: CompressedState = services_root
 		.state_compressor
 		.compress_state_events(
 			state_events
 				.iter()
 				.map(|(ssk, eid)| (ssk, (*eid).borrow())),
 		)
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	Ok(Arc::new(new_room_state))
 }
@@ -134,13 +134,16 @@ where
 	StateSets: Stream<Item = StateMap<OwnedEventId>> + Send,
 	AuthSets: Stream<Item = AuthSet<OwnedEventId>> + Send,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	state_res::resolve(
 		&room_version::rules(room_version)?,
 		state_sets,
 		auth_chains,
 		&async |event_id: OwnedEventId| self.event_fetch(&event_id).await,
 		&async |event_id: OwnedEventId| self.event_exists(&event_id).await,
-		self.services.server.config.hydra_backports,
+		services_root.server.config.hydra_backports,
 	)
 	.map_err(|e| err!(error!("State resolution failed: {e:?}")))
 	.await
