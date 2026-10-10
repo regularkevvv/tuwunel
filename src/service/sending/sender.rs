@@ -13,7 +13,7 @@ use std::{
 
 use futures::{
 	FutureExt, StreamExt, TryStreamExt,
-	future::{BoxFuture, join, join3, try_join3},
+	future::{BoxFuture, join3, try_join3},
 	pin_mut,
 };
 use ruma::{
@@ -54,7 +54,7 @@ use tuwunel_core::{
 	utils::{
 		BoolExt, ReadyExt,
 		rand::secs as rand_secs,
-		stream::{BroadbandExt, IterStream, WidebandExt},
+		stream::{IterStream, WidebandExt},
 	},
 	warn,
 };
