@@ -607,18 +607,40 @@ pub async fn get_from_id<T>(&self, pdu_id: &RawPduId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	self.db
-		.pduid_pdu
-		.get(pdu_id)
-		.await
-		.deserialized()
-		.map_err(|error| {
-			if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
-				Error::bad_database("Invalid stored accepted event record")
-			} else {
-				error
-			}
-		})
+	let mut remaining = usize::MAX;
+	self.get_from_id_budgeted(pdu_id, &mut remaining)
+		.await?
+		.ok_or_else(|| Error::bad_database("Stored accepted event exceeds read budget"))
+}
+
+/// Refuse oversized stored values before decoding or retaining their objects.
+/// `None` requests a smaller complete delivery batch without consuming budget.
+#[implement(Service)]
+pub(crate) async fn get_from_id_budgeted<T>(
+	&self,
+	pdu_id: &RawPduId,
+	remaining: &mut usize,
+) -> Result<Option<T>>
+where
+	T: for<'de> Deserialize<'de>,
+{
+	let value = self.db.pduid_pdu.get(pdu_id).await?;
+	let length = value.len();
+	if length > tuwunel_bridge::MAX_VALUE_BYTES {
+		return Err(Error::bad_database("Stored accepted event exceeds value limit"));
+	}
+	if length > *remaining {
+		return Ok(None);
+	}
+	let decoded = (&value).deserialized().map_err(|error| {
+		if matches!(error, Error::Json(..) | Error::CanonicalJson(..)) {
+			Error::bad_database("Invalid stored accepted event record")
+		} else {
+			error
+		}
+	})?;
+	*remaining = remaining.saturating_sub(length);
+	Ok(Some(decoded))
 }
 
 /// Checks if pdu exists

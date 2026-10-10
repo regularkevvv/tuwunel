@@ -235,3 +235,90 @@ async fn oversized_flush_hint_is_not_retained() -> Result {
 	fixture.finish().await;
 	Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stored_pdu_input_is_checked_before_decode_and_preserves_refused_rows() -> Result {
+	let fixture = Fixture::new().await?;
+	let mut bytes = [0_u8; 16];
+	bytes[7] = 1;
+	bytes[15] = 1;
+	let id = crate::rooms::timeline::RawPduId::from_bytes(&bytes)?;
+	let map = &fixture.services.db["pduid_pdu"];
+	// Invalid JSON deliberately distinguishes predecode refusal from a decode
+	// error.
+	let oversized = vec![b'x'; tuwunel_bridge::MAX_VALUE_BYTES + 1];
+	map.insert(id.as_ref(), oversized.as_slice())
+		.await?;
+	let error = fixture
+		.services
+		.timeline
+		.get_from_id::<String>(&id)
+		.await
+		.unwrap_err();
+	assert!(error.to_string().contains("exceeds value limit"));
+	assert_eq!(map.get(id.as_ref()).await?.as_ref(), oversized.as_slice());
+
+	let exact = serde_json::to_vec(&"x".repeat(tuwunel_bridge::MAX_VALUE_BYTES - 2))?;
+	assert_eq!(exact.len(), tuwunel_bridge::MAX_VALUE_BYTES);
+	map.insert(id.as_ref(), exact.as_slice()).await?;
+	let mut remaining = exact.len().saturating_sub(1);
+	assert!(
+		fixture
+			.services
+			.timeline
+			.get_from_id_budgeted::<String>(&id, &mut remaining)
+			.await?
+			.is_none()
+	);
+	assert_eq!(remaining, exact.len().saturating_sub(1));
+	remaining = exact.len();
+	assert!(
+		fixture
+			.services
+			.timeline
+			.get_from_id_budgeted::<String>(&id, &mut remaining)
+			.await?
+			.is_some()
+	);
+	assert_eq!(remaining, 0);
+	assert_eq!(map.get(id.as_ref()).await?.as_ref(), exact.as_slice());
+	fixture.finish().await;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_pdu_composition_budget_preserves_normal_full_batch_boundary() -> Result {
+	let fixture = Fixture::new().await?;
+	let mut bytes = [0_u8; 16];
+	bytes[7] = 1;
+	bytes[15] = 1;
+	let id = crate::rooms::timeline::RawPduId::from_bytes(&bytes)?;
+	let raw = serde_json::to_vec(&"x".repeat(tuwunel_core::matrix::pdu::MAX_PDU_BYTES - 2))?;
+	assert_eq!(raw.len(), 65_535);
+	fixture.services.db["pduid_pdu"]
+		.insert(id.as_ref(), raw.as_slice())
+		.await?;
+	let mut remaining = super::super::data::BODY_LIMIT;
+	for _ in 0..48 {
+		assert!(
+			fixture
+				.services
+				.timeline
+				.get_from_id_budgeted::<String>(&id, &mut remaining)
+				.await?
+				.is_some()
+		);
+	}
+	assert_eq!(remaining, 48);
+	assert!(
+		fixture
+			.services
+			.timeline
+			.get_from_id_budgeted::<String>(&id, &mut remaining)
+			.await?
+			.is_none()
+	);
+	assert_eq!(remaining, 48);
+	fixture.finish().await;
+	Ok(())
+}

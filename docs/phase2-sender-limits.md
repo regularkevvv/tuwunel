@@ -37,6 +37,21 @@ refused; a legacy accepted singleton remains owed and raises an explicit local
 error. This is a fail-closed retention policy, not a promise to deliver invalid
 historical payloads or a protocol for splitting one Matrix event.
 
+Stored timeline values are checked against the bridge value limit before PDU
+decoding, including legacy RocksDB reference rows. Federation and appservice
+composition share a 3 MiB raw stored-PDU input budget across the selected batch.
+An input overflow requests the existing whole-delivery split before decoding
+the next record. Forty-eight maximum-size canonical PDUs (65,535 bytes each)
+fit this raw budget. Decoded object overhead still requires workload measurement.
+
+Durable queued, active and immutable-attempt obligations remain until matching
+acknowledgement, cancellation or canonical erasure. The Phase 2 contract does
+not specify a delivery TTL or global queue quota; its 24-hour bounded retention
+applies to bridge commit-deduplication records. Per-commit producer admission
+does not cap cumulative queue growth. Queue/database growth and deployment
+headroom therefore remain measured release checks; no arbitrary expiry silently
+deletes owed deliveries.
+
 Push retry metadata has one fixed thirteen-byte record per failed destination,
 owned by its physical active admissions. It survives restart and is retired by
 matching acknowledgement, cancellation or canonical erasure. Age does not erase

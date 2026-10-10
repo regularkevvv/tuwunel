@@ -48,14 +48,10 @@ use tokio::time::Instant as TokioInstant;
 use tuwunel_core::{
 	Error, Event, Result, debug, error,
 	error::error_chain,
-	extract_variant, implement,
+	implement,
 	smallvec::SmallVec,
 	trace,
-	utils::{
-		BoolExt,
-		rand::secs as rand_secs,
-		stream::{IterStream, WidebandExt},
-	},
+	utils::{BoolExt, rand::secs as rand_secs},
 	warn,
 };
 
@@ -1846,6 +1842,7 @@ impl Service {
 		let mut edu_jsons: Vec<Raw<EphemeralData>> = Vec::with_capacity(edu_count);
 		let mut to_device = Vec::with_capacity(to_device_count);
 		let mut changed = Vec::with_capacity(device_list_count);
+		let mut input_remaining = super::data::BODY_LIMIT;
 
 		// MSC3202 one-time-key scope: the appservice sender plus (below) the
 		// namespace-matched PDU senders and to-device recipients of this txn.
@@ -1860,10 +1857,14 @@ impl Service {
 				| SendingEvent::Pdu(pdu_id) => {
 					let pdu = match services_root
 						.timeline
-						.get_pdu_from_id(pdu_id)
+						.get_from_id_budgeted::<tuwunel_core::matrix::PduEvent>(
+							pdu_id,
+							&mut input_remaining,
+						)
 						.await
 					{
-						| Ok(pdu) => pdu,
+						| Ok(Some(pdu)) => pdu,
+						| Ok(None) => return Ok(frozen::Body::TooLarge),
 						// Canonical erasure can remove a queued PDU. Failed or
 						// corrupt reads must retain its delivery obligation.
 						| Err(error) if error.is_not_found() => continue,
@@ -2373,38 +2374,35 @@ impl Service {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
-		let pdus = events
-			.iter()
-			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
-			.stream()
-			.wide_then(|pdu_id| async move {
+		let mut pdus = Vec::new();
+		let mut input_remaining = super::data::BODY_LIMIT;
+		for event in events {
+			if let SendingEvent::Pdu(pdu_id) = event {
 				let pdu = match services_root
 					.timeline
-					.get_pdu_json_from_id(pdu_id)
+					.get_from_id_budgeted::<ruma::CanonicalJsonObject>(
+						pdu_id,
+						&mut input_remaining,
+					)
 					.await
 				{
-					| Ok(pdu) => pdu,
-					| Err(error) if error.is_not_found() => return Ok(None),
+					| Ok(Some(pdu)) => pdu,
+					| Ok(None) => return Ok(frozen::Body::TooLarge),
+					| Err(error) if error.is_not_found() => continue,
 					| Err(error) => return Err(error),
 				};
 				let pdu = services_root
 					.state_accessor
 					.erased_for_server(server, pdu)
 					.await;
-				Ok::<_, Error>(Some(
+				pdus.push(
 					services_root
 						.federation
 						.format_pdu_into(pdu, None)
 						.await,
-				))
-			})
-			.try_filter_map(|pdu| async move { Ok(pdu) })
-			.try_collect::<Vec<_>>()
-			.await;
-		let pdus = match pdus {
-			| Ok(pdus) => pdus,
-			| Err(error) => return Err(error),
-		};
+				);
+			}
+		}
 
 		let edus = events
 			.iter()
