@@ -313,13 +313,14 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 	let user = UserId::parse("@inventory:localhost")?;
 	let unrelated = UserId::parse("@unrelated:localhost")?;
 	map.clear().await?;
-	map.put((anchor, &user), &user).await?;
+	// Production serializes the (MXC, user) key and stores raw UserId bytes.
+	map.put_raw((anchor, &user), &user).await?;
 	assert_eq!(services.media.user_media(&user).await?.len(), 1);
 	let orphan = Mxc {
 		server_name: services.globals.server_name(),
 		media_id: "stale-uploader",
 	};
-	map.put((&orphan, &user), &user).await?;
+	map.put_raw((&orphan, &user), &user).await?;
 	assert_eq!(
 		services.media.user_media(&user).await?.len(),
 		1,
@@ -358,11 +359,11 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 		.await?;
 	map.clear().await?;
 	for index in 0..4096 {
-		map.put((&format!("mxc://localhost/unrelated-{index:04}"), &unrelated), &unrelated)
+		map.put_raw((&format!("mxc://localhost/unrelated-{index:04}"), &unrelated), &unrelated)
 			.await?;
 	}
 	assert!(services.media.user_media(&user).await?.is_empty());
-	map.put(("mxc://localhost/overflow", &unrelated), &unrelated)
+	map.put_raw(("mxc://localhost/overflow", &unrelated), &unrelated)
 		.await?;
 	assert_eq!(
 		services
@@ -375,7 +376,8 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 	);
 	assert_eq!(services.media.get(anchor, None).await?.content, bytes);
 	map.clear().await?;
-	map.put((anchor, &user), b"not-a-user").await?;
+	map.put_raw((anchor, &user), b"not-a-user")
+		.await?;
 	services
 		.media
 		.user_media(&user)
@@ -384,7 +386,8 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 	map.clear().await?;
 	for index in 0..27 {
 		let mxc = format!("mxc://localhost/{}-{index:02}", "x".repeat(40_000));
-		map.put((&mxc, &unrelated), &unrelated).await?;
+		map.put_raw((&mxc, &unrelated), &unrelated)
+			.await?;
 	}
 	assert_eq!(
 		services
