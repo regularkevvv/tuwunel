@@ -384,8 +384,9 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 		.await
 		.expect_err("corrupt uploader records cannot become a partial successful list");
 	map.clear().await?;
-	for index in 0..27 {
-		let mxc = format!("mxc://localhost/{}-{index:02}", "x".repeat(40_000));
+	// Cross the aggregate byte budget with individually legal-width keys.
+	for index in 0..600 {
+		let mxc = format!("mxc://localhost/{}-{index:03}", "x".repeat(2048));
 		map.put_raw((&mxc, &unrelated), &unrelated)
 			.await?;
 	}
@@ -398,15 +399,16 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
+	assert_eq!(services.media.get(anchor, None).await?.content, bytes);
 	map.clear().await?;
-	// Legacy reference-backend metadata can be much larger than current
-	// bridge keys. The retained metadata guard is independent of the small
-	// uploader inventory, and refusal must preserve all owned objects.
-	let content_type = "x".repeat(400_000);
-	for id in ["metadata-a", "metadata-b", "metadata-c"] {
+	// Individually legal-width metadata keys exceed the retained aggregate
+	// budget while the uploader inventory remains below both source caps.
+	let content_type = "x".repeat(2000);
+	for index in 0..600 {
+		let id = format!("metadata-{index:03}");
 		let mxc = Mxc {
 			server_name: services.globals.server_name(),
-			media_id: id,
+			media_id: &id,
 		};
 		services
 			.media
@@ -422,10 +424,12 @@ async fn uploader_inventory(services: &Services, anchor: &Mxc<'_>, bytes: &[u8])
 			.status_code(),
 		http::StatusCode::TOO_MANY_REQUESTS
 	);
-	for id in ["metadata-a", "metadata-b", "metadata-c"] {
+	assert_eq!(services.media.get(anchor, None).await?.content, bytes);
+	for index in 0..600 {
+		let id = format!("metadata-{index:03}");
 		let mxc = Mxc {
 			server_name: services.globals.server_name(),
-			media_id: id,
+			media_id: &id,
 		};
 		assert_eq!(services.media.get(&mxc, None).await?.content, bytes);
 		services.media.delete(&mxc).await?;
