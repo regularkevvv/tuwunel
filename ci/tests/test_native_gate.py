@@ -140,5 +140,96 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
         self.assertFalse((self.base / "receipt.json").exists())
 
 
+class PredecessorIsolation(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory(prefix="predecessor-isolation-")
+        self.addCleanup(scratch.cleanup)
+        self.base = Path(scratch.name)
+        self.root = self.base / "source"
+        (self.root / "ci").mkdir(parents=True)
+        shutil.copy2(ROOT / "ci/native-gate.sh", self.root / "ci/native-gate.sh")
+        self.tools = self.base / "tools"
+        self.tools.mkdir()
+        stub = r'''import io, json, os, pathlib, sys, tarfile
+args = sys.argv[1:]
+if pathlib.Path(sys.argv[0]).name == "git":
+    if args[0] == "merge-base":
+        sys.exit(0)
+    assert args[0] == "archive", args
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+        content = b"committed predecessor"
+        info = tarfile.TarInfo("Cargo.toml")
+        info.size = len(content)
+        archive.addfile(info, io.BytesIO(content))
+    sys.exit(0)
+with open(os.environ["TEST_CARGO_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\n")
+target = pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+target.mkdir(exist_ok=True)
+members = ["path+file:///predecessor/core#tuwunel_core@1.9.0",
+           "path+file:///predecessor/database#tuwunel_database@1.9.0",
+           "path+file:///predecessor/main#tuwunel@1.9.0"]
+external = "registry+https://github.com/rust-lang/crates.io-index#rocksdb@1.0.0"
+if args[0] == "metadata":
+    packages = [{"id": package} for package in members + [external]]
+    if os.environ.get("TEST_INCOMPLETE_METADATA") == "1":
+        packages.pop(0)
+    print(json.dumps({"workspace_members": members, "packages": packages}))
+elif "--no-run" in args:
+    assert pathlib.Path("Cargo.toml").read_text() == "committed predecessor"
+    binary = target / "admin_task_journal"
+    binary.write_text("frozen predecessor executable")
+    binary.chmod(0o755)
+    (target / "workspace-stale").write_text("old library")
+    (target / "external-cache").write_text("keep native dependencies")
+    print(json.dumps({"reason": "compiler-artifact", "target": {"name": "admin_task_journal", "kind": ["test"]},
+                      "profile": {"test": True}, "executable": str(binary)}))
+elif args[0] == "clean":
+    assert args[1::2] == ["--package"] * len(members), args
+    assert args[2::2] == members, args
+    frozen = pathlib.Path.cwd().parent / "older-journal"
+    assert frozen.is_file() and frozen.read_text() == "frozen predecessor executable"
+    assert frozen.stat().st_mode & 0o777 == 0o500
+    (target / "admin_task_journal").unlink()
+    (target / "workspace-stale").unlink()
+elif args[0] == "test":
+    assert not (target / "workspace-stale").exists(), "candidate saw predecessor library"
+    assert (target / "external-cache").read_text() == "keep native dependencies"
+    assert pathlib.Path(os.environ["TUWUNEL_HISTORY_OLDER_JOURNAL_BINARY"]).read_text() == "frozen predecessor executable"
+    print("test older_journal_refuses_schema_and_record_changes_without_mutation ... ok")
+    print("test result: ok. 1 passed; 0 failed; 0 ignored;")
+else:
+    raise AssertionError(args)
+'''
+        for name in ("cargo", "git"):
+            path = self.tools / name
+            path.write_text(f"#!{sys.executable}\n" + stub)
+            path.chmod(0o755)
+        self.env = {**os.environ, "PATH": f"{self.tools}:{os.environ['PATH']}",
+                    "TEST_CARGO_LOG": str(self.base / "cargo.jsonl"),
+                    "CARGO_TARGET_DIR": str(self.base / "shared-target"), "RUNNER_TEMP": str(self.base)}
+
+    def run_gate(self):
+        result = subprocess.run(["bash", "ci/native-gate.sh", "compatibility"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True)
+        commands = [json.loads(line) for line in (self.base / "cargo.jsonl").read_text().splitlines()]
+        return result, commands
+
+    def test_old_workspace_outputs_retire_after_freezing_before_candidate_without_cleaning_dependencies(self):
+        result, commands = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([command[0] for command in commands], ["test", "metadata", "clean", "test"])
+        self.assertTrue((self.base / "shared-target/external-cache").is_file())
+        self.assertFalse((self.base / "shared-target/workspace-stale").exists())
+
+    def test_incomplete_workspace_inventory_refuses_cleanup_and_candidate(self):
+        self.env["TEST_INCOMPLETE_METADATA"] = "1"
+        result, commands = self.run_gate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([command[0] for command in commands], ["test", "metadata"])
+        self.assertTrue((self.base / "shared-target/external-cache").is_file())
+        self.assertTrue((self.base / "shared-target/workspace-stale").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

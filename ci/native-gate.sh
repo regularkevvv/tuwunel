@@ -50,6 +50,33 @@ PY
   )
   cp -- "$executable" "$test_root/older-journal"
   chmod 500 "$test_root/older-journal"
+  # Equal-version workspace crates from the archived tree can share Cargo
+  # artifact identities with this checkout. A later narrower feature graph
+  # must not select those old libraries after the candidate workspace passed.
+  # Retire only the old workspace outputs, keeping external/native dependency
+  # caches and the already-frozen predecessor executable intact.
+  (
+    cd "$test_root/predecessor"
+    cargo metadata --no-deps --locked --format-version=1 > "$test_root/predecessor-metadata.json"
+    python3 - "$test_root/predecessor-metadata.json" > "$test_root/predecessor-packages" <<'PY_PACKAGES'
+import json, sys
+from pathlib import Path
+
+metadata = json.loads(Path(sys.argv[1]).read_text())
+members = set(metadata['workspace_members'])
+packages = [package['id'] for package in metadata['packages'] if package['id'] in members]
+if not members or len(packages) != len(members) or len(set(packages)) != len(packages):
+    sys.exit('Expected the complete predecessor workspace package inventory')
+print('\n'.join(packages))
+PY_PACKAGES
+    local package
+    local -a clean_packages=()
+    while IFS= read -r package; do
+      clean_packages+=(--package "$package")
+    done < "$test_root/predecessor-packages"
+    CARGO_TARGET_DIR="$target_directory" cargo clean "${clean_packages[@]}"
+  )
+  test -x "$test_root/older-journal"
   export TUWUNEL_HISTORY_OLDER_JOURNAL_BINARY="$test_root/older-journal"
   unset TUWUNEL_HISTORY_RESUME_PHASE TUWUNEL_HISTORY_RESUME_DIRECTORY
   unset TUWUNEL_ADMIN_JOURNAL_PHASE TUWUNEL_ADMIN_JOURNAL_DIRECTORY
