@@ -14,7 +14,7 @@ use ruma::{
 use tuwunel_core::{
 	Err, Event, PduCount, Result, async_noinline, at, debug, debug_info, debug_warn, err,
 	implement, info,
-	matrix::event::gen_event_id,
+	matrix::{event::gen_event_id, room_version},
 	pdu::{PduBuilder, PduEvent},
 	trace, utils, warn,
 };
@@ -525,6 +525,10 @@ async fn ingest_send_knock_state(
 
 	info!("Going through send_knock response knock state events");
 
+	if send_knock_response.knock_room_state.len() > 64 {
+		return Err!(BadServerResponse("Knock state exceeds the supported inventory"));
+	}
+
 	let verdict = self
 		.validate_stripped_create(&send_knock_response.knock_room_state, room_id, room_version_id)
 		.await?;
@@ -539,56 +543,54 @@ async fn ingest_send_knock_state(
 		debug_warn!(?verdict, %room_id, drop_create, "MSC4311 knock create-event validation failed");
 	}
 
-	let state = send_knock_response
-		.knock_room_state
-		.iter()
-		.filter_map(|event| match event {
-			| RawStrippedState::Pdu(raw) =>
-				serde_json::from_str::<CanonicalJsonObject>(raw.get()).ok(),
-			| RawStrippedState::Stripped(raw) =>
-				serde_json::from_str::<CanonicalJsonObject>(raw.json().get()).ok(),
-		});
-
-	let mut state_map: HashMap<u64, OwnedEventId> = HashMap::new();
-
-	for event in state {
-		let Some(state_key) = event.get("state_key") else {
-			debug_warn!("send_knock stripped state event missing state_key: {event:?}");
-			continue;
+	let rules = room_version::rules(room_version_id)?;
+	// Full federation PDUs omit local fields (notably event_id in v3+).
+	// Validate every record before writing any, then retain the normalized
+	// stored representation used by strict state and membership projection.
+	let mut state = Vec::new();
+	let mut bytes = 0_usize;
+	for raw in &send_knock_response.knock_room_state {
+		let RawStrippedState::Pdu(raw) = raw else {
+			return Err!(BadServerResponse(
+				"Legacy stripped knock state cannot establish canonical room state"
+			));
 		};
-		let Some(event_type) = event.get("type") else {
-			debug_warn!("send_knock stripped state event missing event type: {event:?}");
-			continue;
-		};
+		bytes = bytes.saturating_add(raw.get().len());
+		if bytes > 512 * 1024 {
+			return Err!(BadServerResponse("Knock state exceeds the supported inventory"));
+		}
+		let event: CanonicalJsonObject = serde_json::from_str(raw.get())?;
+		event
+			.get("type")
+			.and_then(CanonicalJsonValue::as_str)
+			.ok_or_else(|| err!(BadServerResponse("Knock state event has no valid type")))?;
+		let event_id = gen_event_id(&event, room_version_id)?;
+		let (pdu, stored) = PduEvent::from_object_federation(room_id, &event_id, event, &rules)?;
+		let state_key = pdu
+			.state_key
+			.as_deref()
+			.ok_or_else(|| err!(BadServerResponse("Knock state event has no state_key")))?;
+		let event_type: StateEventType = pdu.kind.to_string().into();
 
-		let Ok(state_key) = serde_json::from_value::<String>(state_key.clone().into()) else {
-			debug_warn!("send_knock stripped state event has invalid state_key: {event:?}");
-			continue;
-		};
-		let Ok(event_type) = serde_json::from_value::<StateEventType>(event_type.clone().into())
-		else {
-			debug_warn!("send_knock stripped state event has invalid event type: {event:?}");
-			continue;
-		};
-
-		// MSC4311: drop a create event that failed validation when policy enforces.
+		// Preserve MSC4311 create-event validation on the original wire object.
 		if drop_create && event_type == StateEventType::RoomCreate && state_key.is_empty() {
 			debug_warn!(%room_id, "dropping unvalidated create event from knock state");
 			continue;
 		}
+		state.push((event_type, state_key.to_owned(), event_id, stored));
+	}
 
-		let event_id = gen_event_id(&event, room_version_id)?;
+	let mut state_map: HashMap<u64, OwnedEventId> = HashMap::new();
+	for (event_type, state_key, event_id, stored) in state {
 		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&event_type, &state_key)
 			.await?;
-
 		services_root
 			.timeline
-			.add_pdu_outlier(&event_id, &event)
+			.add_pdu_outlier(&event_id, &stored)
 			.await?;
-
-		state_map.insert(shortstatekey, event_id.clone());
+		state_map.insert(shortstatekey, event_id);
 	}
 
 	Ok(state_map)
@@ -695,3 +697,7 @@ async fn make_knock_request(
 
 	make_knock_response_and_server
 }
+
+#[cfg(test)]
+#[path = "knock_tests.rs"]
+mod tests;
