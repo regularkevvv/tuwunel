@@ -16,7 +16,8 @@ uses its existing bounded drain and joins cancelled delivery tasks.
 Appservice device/key metadata is complete or refused: 128 device IDs per user,
 256 devices and 64 KiB of retained user/device IDs per transaction; one shared
 4,096-row and 1 MiB encoded-input work budget for key metadata; at most sixteen
-algorithms per device. This sender read does not prune one-time keys. Storage,
+observed one-time-key algorithms per device plus the required zero-count
+`signed_curve25519` seed when absent, and at most sixteen fallback algorithms. This sender read does not prune one-time keys. Storage,
 corruption and inventory-limit errors propagate instead of shortening output.
 
 Appservice to-device serialization stops before an oversized payload allocation.
