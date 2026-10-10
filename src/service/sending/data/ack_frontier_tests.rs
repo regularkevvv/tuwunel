@@ -108,11 +108,15 @@ async fn exercise(services: &Services) -> Result {
 			.expect("fixture counter fits"),
 	)?;
 	active_rows.insert(&keys[0], &future).await?;
-	assert!(data.active_batch(&destination).await.is_err());
+	data.active_batch(&destination)
+		.await
+		.expect_err("a future active identity must not become a dispatchable batch");
 	assert_eq!(active_rows.get(&keys[0]).await?.as_ref(), future);
 	let malformed = &valid[..9];
 	active_rows.insert(&keys[0], malformed).await?;
-	assert!(data.active_batch(&destination).await.is_err());
+	data.active_batch(&destination)
+		.await
+		.expect_err("a truncated active identity must not become a dispatchable batch");
 	assert_eq!(active_rows.get(&keys[0]).await?.as_ref(), malformed);
 	active_rows.remove(&keys[0]).await?;
 	drop(held);

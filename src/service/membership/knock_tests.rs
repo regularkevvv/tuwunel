@@ -94,36 +94,30 @@ async fn exercise(services: &Services) -> Result {
 	let member_id = gen_event_id(&join, &version)?;
 	let outliers = &services.db["eventid_outlierpdu"];
 
-	assert!(
-		services
-			.membership
-			.ingest_send_knock_state(room, &response(&vec![create.clone(); 65])?, &version,)
-			.await
-			.is_err()
-	);
+	services
+		.membership
+		.ingest_send_knock_state(room, &response(&vec![create.clone(); 65])?, &version)
+		.await
+		.expect_err("the examined-record bound rejects 65 full wire records");
 	assert_eq!(outliers.count().await, 0);
 
 	// All preflight failures preserve storage; a valid record preceding the bad
 	// one cannot be persisted as partial state.
 	let mut malformed = join.clone();
 	malformed.remove("auth_events");
-	assert!(
-		services
-			.membership
-			.ingest_send_knock_state(room, &response(&[create.clone(), malformed])?, &version,)
-			.await
-			.is_err()
-	);
+	services
+		.membership
+		.ingest_send_knock_state(room, &response(&[create.clone(), malformed])?, &version)
+		.await
+		.expect_err("missing canonical auth_events rejects the whole state inventory");
 	assert_eq!(outliers.count().await, 0);
 	let mut wrong_room = join.clone();
 	wrong_room.insert("room_id".into(), "!other:localhost".into());
-	assert!(
-		services
-			.membership
-			.ingest_send_knock_state(room, &response(&[create.clone(), wrong_room])?, &version,)
-			.await
-			.is_err()
-	);
+	services
+		.membership
+		.ingest_send_knock_state(room, &response(&[create.clone(), wrong_room])?, &version)
+		.await
+		.expect_err("a canonical event bound to another room rejects the whole state inventory");
 	assert_eq!(outliers.count().await, 0);
 	#[expect(
 		deprecated,
@@ -137,13 +131,11 @@ async fn exercise(services: &Services) -> Result {
 			}))?,
 		))],
 	};
-	assert!(
-		services
-			.membership
-			.ingest_send_knock_state(room, &stripped, &version)
-			.await
-			.is_err()
-	);
+	services
+		.membership
+		.ingest_send_knock_state(room, &stripped, &version)
+		.await
+		.expect_err("a legacy stripped summary cannot replace full canonical state");
 	assert_eq!(outliers.count().await, 0);
 
 	let state = services
