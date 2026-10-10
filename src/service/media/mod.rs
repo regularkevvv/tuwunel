@@ -10,7 +10,6 @@ mod thumbnail;
 mod video;
 use std::{
 	collections::{HashMap, HashSet},
-	mem::size_of,
 	path::PathBuf,
 	sync::{Arc, Mutex, OnceLock},
 	time::{Duration, Instant, SystemTime},
