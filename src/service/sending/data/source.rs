@@ -321,7 +321,18 @@ impl Data {
 		let value = self.db["global"]
 			.get(&role_key(raw))
 			.await
-			.map_err(|error| if error.is_not_found() { bad() } else { error })?;
+			.map_err(|error| {
+				if error.is_not_found() {
+					Error::bad_database(
+						"Canonical federation delivery role is missing. Databases predating \
+						 schema 24 did not retain historical forwarding receipts; do not infer \
+						 a role or requeue this event. Preserve the database for explicit \
+						 legacy recovery. On new data this indicates missing ownership metadata.",
+					)
+				} else {
+					error
+				}
+			})?;
 		if value.len() != 38 || value[5] > 1 {
 			return Err(bad());
 		}
@@ -345,6 +356,14 @@ impl Data {
 		self.require_active_schema().await?;
 		self.require_deliverable_pdu(&raw).await?;
 		if self.federation_role_owned(&raw, pdu).await? {
+			// A duplicate handshake still validates any outstanding obligation.
+			// Completed roles have no plan; a corrupt retained plan is not an
+			// acknowledged acceptance merely because its role is already owned.
+			if let Some(plan) = self.source_plan(&raw).await?
+				&& (plan.room != pdu.room_id || plan.event != pdu.event_id)
+			{
+				return Err(bad());
+			}
 			return Ok(());
 		}
 		let mut txn = self.db.txn();

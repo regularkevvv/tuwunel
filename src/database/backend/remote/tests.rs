@@ -906,6 +906,63 @@ async fn a_second_writer_is_refused_the_lease() -> Result {
 	Ok(())
 }
 
+/// A request accepted by the old transport can arrive after a successor has
+/// erased canonical data. The server-side epoch fence must reject the entire
+/// stale batch, including its delivery rows and immutable attempted body.
+#[tokio::test]
+async fn successor_erasure_fences_an_already_dispatched_independent_writer() -> Result {
+	let (fake, _first_server, first) = rig(4, 1).await?;
+	let canonical = Map::open_remote(&first, "pduid_pdu");
+	let pending = Map::open_remote(&first, "servernameevent_data");
+	let attempts = Map::open_remote(&first, "sendingtransaction_record");
+	let key = b"owned-erasure-target";
+	let mut original = Txn::new_with_sink(Sink::Remote(first.clone()));
+	for map in [&canonical, &pending, &attempts] {
+		original.insert_raw(map, key, b"before-erasure");
+	}
+	original.execute().await?;
+	let first_epoch = first.lease_status().epoch;
+	let gate = fake.pause_commit_on(map_id(), CommitStage::BeforeApply);
+	let mut delayed = Txn::new_with_sink(Sink::Remote(first.clone()));
+	for map in [&canonical, &pending, &attempts] {
+		delayed.insert_raw(map, key, b"stale-resurrection");
+	}
+	let delayed = tokio::spawn(delayed.execute());
+	tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+		.await
+		.expect("old writer dispatched its owned batch");
+	fake.expire_lease();
+	let successor_server = remote_server(&fake.url, 4, 1)?;
+	let successor = Backend::open(&successor_server).await?;
+	let mut erase = Txn::new_with_sink(Sink::Remote(successor.clone()));
+	for name in ["pduid_pdu", "servernameevent_data", "sendingtransaction_record"] {
+		let map = Map::open_remote(&successor, name);
+		erase.del_raw(&map, key);
+		erase.insert_raw(&map, b"unrelated", b"preserved");
+	}
+	erase.execute().await?;
+	let applied = fake.applied();
+	// Always release the owned request before checking its result. No accepted
+	// task survives cleanup, even if this control exposes a regression.
+	gate.release.notify_one();
+	let refused = tokio::time::timeout(std::time::Duration::from_secs(10), delayed)
+		.await
+		.expect("stale batch receives the successor's epoch refusal")
+		.expect("owned stale writer joined");
+	first.close().await;
+	successor.close().await;
+	refused.expect_err("an independent old writer cannot resurrect erased data");
+	assert!(successor.lease_status().epoch > first_epoch);
+	assert_eq!(fake.applied(), applied, "the stale atomic batch never applied");
+	for name in ["pduid_pdu", "servernameevent_data", "sendingtransaction_record"] {
+		let map = crate::backend::ids::map_id(name)
+			.expect("catalog map")
+			.0;
+		assert_eq!(fake.rows(map), vec![(b"unrelated".to_vec(), b"preserved".to_vec())]);
+	}
+	Ok(())
+}
+
 #[tokio::test]
 async fn a_saturated_bound_refuses_unsent_and_the_lease_still_renews() -> Result {
 	// The request timeout bounds how long a data call waits for a slot.

@@ -227,6 +227,22 @@ impl Fake {
 		gate
 	}
 
+	/// Expire the oracle's lease while an incumbent still believes it owns it.
+	/// This models a provider-side expiry/handover; it does not modify either
+	/// backend's local lease or bypass the protocol's epoch fence.
+	pub fn expire_lease(&self) {
+		if let Some(lease) = self
+			.shared
+			.tables
+			.lock()
+			.expect("owned lease")
+			.lease
+			.as_mut()
+		{
+			lease.expires_at_ms = 0;
+		}
+	}
+
 	/// Number of commits the fake actually applied.
 	pub fn applied(&self) -> u32 {
 		self.shared

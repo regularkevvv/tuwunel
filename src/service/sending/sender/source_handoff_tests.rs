@@ -290,6 +290,20 @@ fn completed_local_role_is_not_replayed_by_a_handshake_after_restart() -> Result
 }
 
 #[test]
+fn duplicate_handshake_refuses_corrupt_pending_plan_without_acknowledging_it() -> Result {
+	run("duplicate_handshake_refuses_corrupt_pending_plan_without_acknowledging_it", &[
+		"owned-plan-corrupt",
+	])
+}
+
+#[test]
+fn duplicate_handshake_refuses_a_rebound_plan_with_a_valid_witness() -> Result {
+	run("duplicate_handshake_refuses_a_rebound_plan_with_a_valid_witness", &[
+		"owned-plan-rebound",
+	])
+}
+
+#[test]
 fn missing_completed_role_refuses_duplicate_delivery() -> Result {
 	run("missing_completed_role_refuses_duplicate_delivery", &["owned-corrupt"])
 }
@@ -917,6 +931,9 @@ async fn known_first(services: &Services, root: &Path, phase: &str) -> Result {
 		&RoomMemberEventContent::new(MembershipState::Leave),
 	);
 	let event = if phase.starts_with("owned-") {
+		if phase.starts_with("owned-plan-") {
+			tuwunel_database::refusal::refuse_next("servernameevent_data");
+		}
 		let event = services
 			.timeline
 			.build_and_append_pdu(builder, alice, room, &lock)
@@ -1077,6 +1094,9 @@ async fn concurrent_known(
 
 async fn finish_owned_role(services: &Services, event: &EventId, phase: &str) -> Result {
 	let room = room_id!("!source-handoff:localhost");
+	if phase.starts_with("owned-plan-") {
+		return refuse_corrupt_owned_plan(services, event, phase).await;
+	}
 	ack_known(services).await?;
 	if phase == "owned-corrupt" {
 		let raw = services.timeline.get_pdu_id(event).await?;
@@ -1091,6 +1111,105 @@ async fn finish_owned_role(services: &Services, event: &EventId, phase: &str) ->
 			.expect_err("missing role cannot recreate acknowledged delivery");
 		assert!(!owns(services, event).await?);
 	}
+	Ok(())
+}
+
+#[expect(
+	clippy::arithmetic_side_effects,
+	reason = "fixed codec offsets in an owned valid fixture"
+)]
+async fn refuse_corrupt_owned_plan(services: &Services, event: &EventId, phase: &str) -> Result {
+	let raw = services.timeline.get_pdu_id(event).await?;
+	assert_eq!(tuwunel_database::refusal::pending(), 0, "queue refusal retained the plan");
+	let mut key = vec![0x08];
+	key.extend_from_slice(raw.as_ref());
+	let original = services.db["pduid_federationplan"]
+		.get(raw.as_ref())
+		.await?
+		.as_ref()
+		.to_vec();
+	let mut witness = services.db["global"]
+		.get(&key)
+		.await?
+		.as_ref()
+		.to_vec();
+	let mut plan = original.clone();
+	if phase == "owned-plan-rebound" {
+		// Keep a valid codec and integrity hash while rebinding the event ID.
+		let offset = 5 + 8;
+		let room_length = usize::from(u16::from_be_bytes(
+			plan[offset..offset + 2]
+				.try_into()
+				.expect("owned length width"),
+		));
+		let offset = offset + 2 + room_length;
+		let event_length = usize::from(u16::from_be_bytes(
+			plan[offset..offset + 2]
+				.try_into()
+				.expect("owned length width"),
+		));
+		let last = offset + 2 + event_length - 1;
+		plan[last] = if plan[last] == b'a' { b'b' } else { b'a' };
+		witness[4..].copy_from_slice(&tuwunel_core::utils::hash::sha256::hash(&plan));
+		services.db["pduid_federationplan"]
+			.insert(raw.as_ref(), &plan)
+			.await?;
+	} else {
+		witness[4] ^= 1;
+	}
+	services.db["global"]
+		.insert(&key, &witness)
+		.await?;
+	let count = services.globals.current_count();
+	let json = services.timeline.get_pdu_json(event).await?;
+	services
+		.event_handler
+		.handle_incoming_pdu_and_federate(
+			services.globals.server_name(),
+			room_id!("!source-handoff:localhost"),
+			event,
+			json,
+		)
+		.await
+		.expect_err("owned role cannot hide a corrupt outstanding obligation");
+	assert_eq!(services.globals.current_count(), count);
+	assert_eq!(
+		services.db["pduid_federationplan"]
+			.get(raw.as_ref())
+			.await?
+			.as_ref(),
+		plan
+	);
+	assert_eq!(services.db["global"].get(&key).await?.as_ref(), witness);
+	let destination = Destination::Federation(server_name!("handoff.invalid").to_owned());
+	assert!(
+		services
+			.sending
+			.db
+			.queued_requests(&destination)
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty(),
+		"refusal does not materialize queue work"
+	);
+	// Repair only the exclusively owned corrupt fixture, then prove its saved
+	// source still transfers once; no canonical event is reaccepted.
+	let mut original_witness = u32::try_from(original.len())
+		.expect("owned bounded plan")
+		.to_be_bytes()
+		.to_vec();
+	original_witness.extend_from_slice(&tuwunel_core::utils::hash::sha256::hash(&original));
+	services.db["pduid_federationplan"]
+		.insert(raw.as_ref(), &original)
+		.await?;
+	services.db["global"]
+		.insert(&key, original_witness)
+		.await?;
+	services
+		.sending
+		.resume_federation_source(raw)
+		.await?;
+	assert!(owns(services, event).await?);
 	Ok(())
 }
 

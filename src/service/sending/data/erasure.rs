@@ -3,7 +3,7 @@
 use tuwunel_core::{Error, Result, matrix::RawPduId, utils::hash::sha256::hash};
 use tuwunel_database::Txn;
 
-use super::{Data, decode_queued, parse_servercurrentevent};
+use super::{Data, Destination, decode_queued, parse_servercurrentevent};
 
 const PREFIX: u8 = 0x0A;
 const MAGIC: &[u8] = b"MSFE\x01";
@@ -106,6 +106,19 @@ impl Data {
 			if active {
 				self.stage_erased_attempt(txn, &destination, key)
 					.await?;
+				if matches!(destination, Destination::Push(..)) {
+					// A retry belongs to active physical admissions. Once its
+					// last owner is erased, it must not delay later pending work.
+					// Two keys suffice to prove sole ownership without scanning
+					// or decoding the destination's complete inventory.
+					let owners = self
+						.servercurrentevent_data
+						.raw_keys_prefix_after(&destination.get_prefix(), None, 2)
+						.await?;
+					if owners.len() == 1 && owners[0] == *key {
+						self.stage_clear_push_backoff(txn, &destination)?;
+					}
+				}
 			}
 			txn.del_raw(map, key);
 			crate::rooms::timeline::check_purge_batch(txn)?;

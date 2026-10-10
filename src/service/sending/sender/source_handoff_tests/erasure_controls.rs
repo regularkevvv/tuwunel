@@ -27,6 +27,14 @@ fn active_erasure_preserves_unrelated_deliveries_and_fences_old_ack() -> Result 
 }
 
 #[test]
+fn erasure_retires_only_orphaned_push_backoff_and_fences_late_failures() -> Result {
+	run(
+		"erasure_controls::erasure_retires_only_orphaned_push_backoff_and_fences_late_failures",
+		&["erasure-push-backoff"],
+	)
+}
+
+#[test]
 fn paged_erasure_blocks_late_admissions_and_resumes_after_cold_restart() -> Result {
 	run(
 		"erasure_controls::paged_erasure_blocks_late_admissions_and_resumes_after_cold_restart",
@@ -247,6 +255,71 @@ async fn active(services: &Services) -> Result {
 	verify_retired(services, raw).await
 }
 
+async fn push_backoff(services: &Services) -> Result {
+	let (_, raw, keep) = message(services).await?;
+	let data = &services.sending.db;
+	let orphan = Destination::Push(user_id!("@source:localhost").to_owned(), "erase-only".into());
+	let shared =
+		Destination::Push(user_id!("@source:localhost").to_owned(), "erase-shared".into());
+	let backoff = crate::sending::data::PushBackoff::failed(3)?;
+	let mut old = Vec::new();
+	for destination in [&orphan, &shared] {
+		data.queue_requests(std::iter::once((&SendingEvent::Pdu(raw), destination)))
+			.await?;
+		let queued = data
+			.queued_requests(destination)
+			.try_collect::<Vec<_>>()
+			.await?;
+		data.mark_as_active(queued.iter()).await?;
+		if destination == &shared {
+			data.queue_requests(std::iter::once((&SendingEvent::Pdu(keep), destination)))
+				.await?;
+			let queued = data
+				.queued_requests(destination)
+				.try_collect::<Vec<_>>()
+				.await?;
+			data.mark_as_active(queued.iter()).await?;
+		}
+		let (_, rows) = data.active_batch(destination).await?;
+		assert!(
+			data.persist_push_backoff(destination, &rows, backoff)
+				.await?
+		);
+		old.push(rows);
+	}
+	let before = snapshot(services).await?;
+	tuwunel_database::refusal::refuse_next("pduid_pdu");
+	purge(services)
+		.await
+		.expect_err("erasure commit refuses atomically");
+	assert_eq!(tuwunel_database::refusal::pending(), 0);
+	assert_eq!(&snapshot(services).await?[..5], &before[..5]);
+	for destination in [&orphan, &shared] {
+		assert_eq!(data.push_backoff(destination).await?, Some(backoff));
+	}
+	assert_eq!(purge(services).await?, 1);
+	assert!(data.push_backoff(&orphan).await?.is_none(), "erased last owner retires backoff");
+	assert_eq!(
+		data.push_backoff(&shared).await?,
+		Some(backoff),
+		"unrelated active work keeps delay"
+	);
+	for (destination, rows) in [&orphan, &shared].into_iter().zip(&old) {
+		assert!(
+			!data
+				.persist_push_backoff(destination, rows, backoff)
+				.await?,
+			"late failure is fenced"
+		);
+	}
+	assert!(data.push_backoff(&orphan).await?.is_none());
+	let (events, rows) = data.active_batch(&shared).await?;
+	assert_eq!(events, [SendingEvent::Pdu(keep)]);
+	data.acknowledge_active(&shared, &rows).await?;
+	assert!(data.push_backoff(&shared).await?.is_none());
+	Ok(())
+}
+
 async fn step(services: &Services, history: History) -> Result<History> {
 	let room = room_id!("!source-handoff:localhost");
 	let _state = services.state.mutex.lock(room).await;
@@ -355,6 +428,7 @@ async fn restart(services: &Services, root: &Path) -> Result {
 pub(super) async fn child(services: &Services, root: &Path, phase: &str) -> Result {
 	match phase {
 		| "erasure-active" => active(services).await,
+		| "erasure-push-backoff" => push_backoff(services).await,
 		| "erasure-page" => page(services, root).await,
 		| "erasure-restart" => restart(services, root).await,
 		| "erasure-marker-loss" => marker_loss(services, root).await,
