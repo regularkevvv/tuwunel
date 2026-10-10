@@ -509,11 +509,6 @@ async fn execute_send_knock(
 }
 
 #[implement(Service)]
-#[expect(
-	deprecated,
-	reason = "Matrix 1.16 still permits receiving the legacy stripped variant for backwards \
-	          compatibility."
-)]
 async fn ingest_send_knock_state(
 	&self,
 	room_id: &RoomId,
