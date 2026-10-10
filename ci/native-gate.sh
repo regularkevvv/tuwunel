@@ -8,7 +8,7 @@ export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true
 # Cap simultaneous fixture construction while retaining each test's own tasks.
 export RUST_TEST_THREADS=${RUST_TEST_THREADS:-2}
 
-mode=${1:?usage: native-gate.sh lint|regressions|test|compatibility|traces|release}
+mode=${1:?usage: native-gate.sh lint|regressions|test|compatibility|traces|release|container-lifecycle}
 test_root=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tuwunel-native-gate.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT
 export TMPDIR="$test_root" TUWUNEL_DATABASE_PATH="$test_root/default-database"
@@ -125,6 +125,30 @@ case "$mode" in
       echo "$backend=$digest"
       if [[ -n ${GITHUB_OUTPUT:-} ]]; then echo "$backend=$digest" >> "$GITHUB_OUTPUT"; fi
     done
+    ;;
+  container-lifecycle)
+    # Qualify the actual non-systemd, non-io_uring Container feature closure.
+    # A native macOS run or an arm64 Linux run must not claim this gate.
+    [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
+      echo 'Container lifecycle requires native Linux/x86_64 execution' >&2
+      exit 1
+    }
+    features=$(python3 ci/check-container-lifecycle.py --features)
+    workspace_features="tuwunel/${features//,/,tuwunel/}"
+    [[ -n "$features" && "$features" != *$'\n'* ]]
+    unset TUWUNEL_QUEUE_RESTART_PHASE TUWUNEL_QUEUE_RESTART_DIRECTORY TUWUNEL_QUEUE_RESTART_SCENARIO
+    unset TUWUNEL_CANCELLATION_CASE
+    # --no-default-features applies to every selected workspace package.
+    # These are the production release optimizer and feature choices, not a
+    # fault-injection image or the default systemd/io_uring build.
+    cargo test --locked --release --no-default-features --features "$workspace_features" \
+      -p tuwunel -p tuwunel_core -p tuwunel_database -p tuwunel_service -p tuwunel_router \
+      --lib -- --color never | tee "$test_root/container-lifecycle.log"
+    cargo test --locked --release --no-default-features --features "$features" \
+      -p tuwunel --test cancellation_lifecycle --test fatal_lifecycle --test sending_queue_restart \
+      -- --color never | tee -a "$test_root/container-lifecycle.log"
+    python3 ci/check-container-lifecycle.py "$test_root/container-lifecycle.log" \
+      "${TUWUNEL_LIFECYCLE_REPORT:-$test_root/container-lifecycle.json}"
     ;;
   release)
     cargo test --locked --release -p tuwunel_database --lib de_record_ -- --nocapture \

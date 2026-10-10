@@ -12,6 +12,9 @@ on:
       - "rustfmt.toml"
       - "clippy.toml"
       - "ci/native-gate.sh"
+      - "ci/container-features.txt"
+      - "ci/check-container-lifecycle.py"
+      - "ci/tests/test_native_gate.py"
       - ".github/workflows/ci-native.yml"
 
 permissions:
@@ -55,6 +58,8 @@ jobs:
           shared-key: native-gate-v1
           cache-workspace-crates: true
           cache-on-failure: true
+      - name: Gate driver controls
+        run: python3 -m unittest discover -s ci/tests -p test_native_gate.py
       - name: Format and clippy
         run: bash ci/native-gate.sh lint
       - name: Focused regressions
@@ -64,6 +69,18 @@ jobs:
       - name: RocksDB and remote traces
         id: traces
         run: bash ci/native-gate.sh traces
+      - name: Container lifecycle (linux/amd64 release)
+        env:
+          TUWUNEL_LIFECYCLE_REPORT: ${{ runner.temp }}/container-lifecycle.json
+        run: bash ci/native-gate.sh container-lifecycle
+      - name: Retain Container lifecycle receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-lifecycle
+          path: ${{ runner.temp }}/container-lifecycle.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Release record decoding
         run: bash ci/native-gate.sh release
 
