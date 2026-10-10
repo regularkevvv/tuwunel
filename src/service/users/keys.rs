@@ -407,8 +407,8 @@ impl OutgoingKeyBudget {
 		if self.rows == 0 || bytes > self.bytes {
 			return Err(err!(Request(TooLarge("Outgoing key metadata inventory limit"))));
 		}
-		self.rows -= 1;
-		self.bytes -= bytes;
+		self.rows = self.rows.saturating_sub(1);
+		self.bytes = self.bytes.saturating_sub(bytes);
 		Ok(())
 	}
 }
@@ -470,7 +470,7 @@ pub(crate) async fn outgoing_key_metadata(
 		if examined >= 16 || bytes.len() > 64 * 1024 {
 			return Err(err!(Request(TooLarge("Outgoing fallback metadata inventory limit"))));
 		}
-		examined += 1;
+		examined = examined.saturating_add(1);
 		let entry: FallbackEntry = serde_json::from_slice(bytes)?;
 		if !entry.used {
 			fallbacks.push(algorithm);

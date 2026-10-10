@@ -188,7 +188,7 @@ mod tests {
 		assert_eq!(backoff.remaining_at(22_000, 3, 60), None);
 		assert_eq!(backoff.remaining_at(u64::MAX, 3, 60), None);
 		let maximum = PushBackoff { tries: u32::MAX, failed_at_ms: 10_000 };
-		assert_eq!(maximum.remaining_at(0, u64::MAX, 60), Some(Duration::from_secs(60)));
+		assert_eq!(maximum.remaining_at(0, u64::MAX, 60), Some(Duration::from_mins(1)));
 		assert_eq!(maximum.remaining_at(10_000, 0, 0), None);
 	}
 }

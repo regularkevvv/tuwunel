@@ -124,7 +124,7 @@ async fn appservice_fanout_refusal_preserves_every_queue_and_counter() -> Result
 		.send_to_device_appservices(
 			user,
 			user,
-			[(device, 1)].into_iter(),
+			std::iter::once((device, 1)),
 			"example",
 			&serde_json::json!({"ok":true}),
 		)

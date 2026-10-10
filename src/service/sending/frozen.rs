@@ -96,9 +96,8 @@ where
 		exceeded: false,
 	};
 	match serialize(&mut writer) {
-		| Ok(()) if writer.exceeded => Ok(Body::TooLarge),
+		| Ok(()) | Err(_) if writer.exceeded => Ok(Body::TooLarge),
 		| Ok(()) => Ok(Body::Ready(writer.bytes)),
-		| Err(_) if writer.exceeded => Ok(Body::TooLarge),
 		| Err(error) => Err(error),
 	}
 }
