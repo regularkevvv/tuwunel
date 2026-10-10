@@ -377,6 +377,35 @@ where
 	});
 }
 
+/// Whether the last queued operation for this raw key deletes it.
+///
+/// This inspects only the pending batch; it neither reads storage nor executes
+/// a mutation. A later insertion supersedes an earlier deletion. Map ownership
+/// is checked as for mutation methods.
+///
+/// # Panics
+///
+/// Panics when the map belongs to another database backend.
+#[implement(Txn)]
+#[must_use]
+pub fn is_deleted_raw(&self, map: &Map, key: &[u8]) -> bool {
+	self.assert_map(map);
+	self.ops
+		.iter()
+		.rev()
+		.find_map(|(pending, op)| {
+			if pending.name() != map.name() {
+				return None;
+			}
+			match op {
+				| Op::Delete { key: pending } if pending.as_ref() == key => Some(true),
+				| Op::Put { key: pending, .. } if pending.as_ref() == key => Some(false),
+				| _ => None,
+			}
+		})
+		.unwrap_or(false)
+}
+
 /// Commits the batch atomically, flushes unless corked, and notifies
 /// matching watchers.
 ///

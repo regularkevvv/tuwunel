@@ -35,6 +35,14 @@ fn erasure_retires_only_orphaned_push_backoff_and_fences_late_failures() -> Resu
 }
 
 #[test]
+fn whole_room_erasure_retires_backoff_after_multiple_staged_active_deletions() -> Result {
+	run(
+		"erasure_controls::whole_room_erasure_retires_backoff_after_multiple_staged_active_deletions",
+		&["erasure-room-backoff"],
+	)
+}
+
+#[test]
 fn paged_erasure_blocks_late_admissions_and_resumes_after_cold_restart() -> Result {
 	run(
 		"erasure_controls::paged_erasure_blocks_late_admissions_and_resumes_after_cold_restart",
@@ -320,6 +328,78 @@ async fn push_backoff(services: &Services) -> Result {
 	Ok(())
 }
 
+async fn room_backoff(services: &Services) -> Result {
+	let (_, first, _) = message(services).await?;
+	crate::admin::create_admin_room(services).await?;
+	let room = room_id!("!source-handoff:localhost");
+	let lock = services.state.mutex.lock(room).await;
+	let event = services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::timeline(
+				&ruma::events::room::message::RoomMessageEventContent::text_plain(
+					"second erased push",
+				),
+			),
+			user_id!("@source:localhost"),
+			room,
+			&lock,
+		)
+		.await?;
+	drop(lock);
+	let second = services.timeline.get_pdu_id(&event).await?;
+	let data = &services.sending.db;
+	let destination =
+		Destination::Push(user_id!("@source:localhost").to_owned(), "erase-two".into());
+	let events = [SendingEvent::Pdu(first), SendingEvent::Pdu(second)];
+	data.queue_requests(events.iter().map(|event| (event, &destination)))
+		.await?;
+	let queued = data
+		.queued_requests(&destination)
+		.try_collect::<Vec<_>>()
+		.await?;
+	data.mark_as_active(queued.iter()).await?;
+	let (_, rows) = data.active_batch(&destination).await?;
+	assert_eq!(rows.selected_rows().len(), 2);
+	let backoff = crate::sending::data::PushBackoff::failed(2)?;
+	assert!(
+		data.persist_push_backoff(&destination, &rows, backoff)
+			.await?
+	);
+	tuwunel_database::refusal::refuse_next("roomid_shortroomid");
+	let lock = services.state.mutex.lock(room).await;
+	services
+		.delete
+		.delete_room(room, true, lock)
+		.await
+		.expect_err("whole-room erase refused");
+	assert_eq!(tuwunel_database::refusal::pending(), 0);
+	assert_eq!(data.push_backoff(&destination).await?, Some(backoff));
+	assert_eq!(data.active_batch(&destination).await?.1, rows);
+	let lock = services.state.mutex.lock(room).await;
+	services
+		.delete
+		.delete_room(room, true, lock)
+		.await?;
+	assert!(
+		data.active_requests_for(&destination)
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty()
+	);
+	assert!(
+		data.push_backoff(&destination).await?.is_none(),
+		"all staged owners retired with their retry record"
+	);
+	assert!(
+		!data
+			.persist_push_backoff(&destination, &rows, backoff)
+			.await?,
+		"late failure cannot resurrect the retired record"
+	);
+	Ok(())
+}
+
 async fn step(services: &Services, history: History) -> Result<History> {
 	let room = room_id!("!source-handoff:localhost");
 	let _state = services.state.mutex.lock(room).await;
@@ -429,6 +509,7 @@ pub(super) async fn child(services: &Services, root: &Path, phase: &str) -> Resu
 	match phase {
 		| "erasure-active" => active(services).await,
 		| "erasure-push-backoff" => push_backoff(services).await,
+		| "erasure-room-backoff" => room_backoff(services).await,
 		| "erasure-page" => page(services, root).await,
 		| "erasure-restart" => restart(services, root).await,
 		| "erasure-marker-loss" => marker_loss(services, root).await,

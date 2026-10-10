@@ -30,6 +30,37 @@ const MAPS: &[&str] = &["alias_roomid", "pduid_pdu", "global"];
 const SCAN_PAGE: u32 = 3;
 
 #[tokio::test]
+async fn contract_staged_deletion_query_respects_latest_operation_and_map() -> Result {
+	let rig = rig("contract-staged-deletion-query").await?;
+	for (index, name) in BACKENDS.into_iter().enumerate() {
+		let mut txn = match index {
+			| 0 => rig.rocks_db.txn(),
+			| 1 => Txn::new_with_sink(Sink::Mem(rig.store.clone())),
+			| _ => Txn::new_with_sink(Sink::Remote(rig.backend.clone())),
+		};
+		let map = rig.trios[0].all()[index];
+		let other = rig.trios[1].all()[index];
+		map.insert(b"owned", b"original").await?;
+		assert!(!txn.is_deleted_raw(map, b"owned"), "{name}: untouched key");
+		txn.del_raw(map, b"owned");
+		assert!(txn.is_deleted_raw(map, b"owned"), "{name}: staged deletion");
+		assert!(!txn.is_deleted_raw(other, b"owned"), "{name}: same key in another map");
+		txn.insert_raw(map, b"owned", b"replacement");
+		assert!(!txn.is_deleted_raw(map, b"owned"), "{name}: insertion supersedes deletion");
+		txn.del_raw(map, b"owned");
+		assert!(txn.is_deleted_raw(map, b"owned"), "{name}: last deletion wins");
+		drop(txn);
+		assert_eq!(
+			map.get(b"owned").await?.as_ref(),
+			b"original",
+			"{name}: inspection never mutates"
+		);
+	}
+	rig.backend.close().await;
+	Ok(())
+}
+
+#[tokio::test]
 async fn contract_mixed_commit_admission_counts_all_maps_and_deletions_before_mutation() -> Result
 {
 	let rig = rig("contract-mixed-admission").await?;

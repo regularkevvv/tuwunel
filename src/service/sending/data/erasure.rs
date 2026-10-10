@@ -106,25 +106,56 @@ impl Data {
 			if active {
 				self.stage_erased_attempt(txn, &destination, key)
 					.await?;
-				if matches!(destination, Destination::Push(..)) {
-					// A retry belongs to active physical admissions. Once its
-					// last owner is erased, it must not delay later pending work.
-					// Two keys suffice to prove sole ownership without scanning
-					// or decoding the destination's complete inventory.
-					let owners = self
-						.servercurrentevent_data
-						.raw_keys_prefix_after(&destination.get_prefix(), None, 2)
-						.await?;
-					if owners.len() == 1 && owners[0] == *key {
-						self.stage_clear_push_backoff(txn, &destination)?;
-					}
-				}
+				self.stage_erased_push_backoff(txn, &destination, key)
+					.await?;
 			}
 			txn.del_raw(map, key);
 			crate::rooms::timeline::check_purge_batch(txn)?;
 			return Ok((cursor, exhausted && index.saturating_add(1) == keys.len()));
 		}
 		Ok((cursor, exhausted))
+	}
+
+	// Whole-room erasure may remove several active rows for this destination
+	// in one transaction. Exclude earlier staged deletions when proving the
+	// failed retry has no remaining owner. Inspect at most two keys per page,
+	// 900 total keys / 512 KiB; refuse before mutation beyond that budget.
+	async fn stage_erased_push_backoff(
+		&self,
+		txn: &mut Txn,
+		destination: &Destination,
+		erased: &[u8],
+	) -> Result {
+		if !matches!(destination, Destination::Push(..)) {
+			return Ok(());
+		}
+		let map = &self.servercurrentevent_data;
+		let prefix = destination.get_prefix();
+		let mut after = None;
+		let mut examined = 0_usize;
+		let mut bytes = 0_usize;
+		loop {
+			let owners = map
+				.raw_keys_prefix_after(&prefix, after.as_deref(), 2)
+				.await?;
+			let done = owners.len() < 2;
+			for key in owners {
+				examined = examined.saturating_add(1);
+				bytes = bytes.saturating_add(key.len());
+				if examined > 900 || bytes > 512 * 1024 {
+					return Err(Error::bad_database(
+						"Push erasure ownership inventory exceeds its budget",
+					));
+				}
+				if key != erased && !txn.is_deleted_raw(map, &key) {
+					return Ok(());
+				}
+				after = Some(key);
+			}
+			if done {
+				return self.stage_clear_push_backoff(txn, destination);
+			}
+		}
 	}
 
 	/// Synchronous erasure is one atomic commit. Refuse before writing if a
