@@ -5,7 +5,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use futures::{FutureExt, Stream, StreamExt, future::join};
+use futures::{Stream, StreamExt};
 use ruma::{
 	DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::device::Device, events::AnyToDeviceEvent, serde::Raw,
@@ -17,7 +17,7 @@ use tuwunel_core::{
 	utils::{
 		self, BoolExt, ReadyExt, random_string,
 		result::LogErr,
-		stream::{IterStream, TryIgnore},
+		stream::TryIgnore,
 		string::to_small_string,
 		time::{
 			duration_since_epoch, timepoint_from_epoch, timepoint_from_now, timepoint_has_passed,
@@ -80,89 +80,9 @@ fn resolve_device_id(device_id: Option<&DeviceId>) -> OwnedDeviceId {
 /// Removes a device from a user.
 #[implement(super::Service)]
 #[tracing::instrument(level = "info", skip(self))]
-pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
-	let services_guard = self.services.get();
-	let services_root = services_guard.as_ref();
-
-	// Remove access tokens
-	self.remove_tokens(user_id, device_id).await;
-
-	// Remove todevice events
-	let prefix = (user_id, device_id, Interfix);
-	self.db
-		.todeviceid_events
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			self.db
-				.todeviceid_events
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
-	// Remove pushers
-	services_root
-		.pusher
-		.get_device_pushkeys(user_id, device_id)
-		.map(Vec::into_iter)
-		.map(IterStream::stream)
-		.flatten_stream()
-		.for_each(|pushkey| async move {
-			services_root
-				.pusher
-				.delete_pusher(user_id, &pushkey)
-				.await;
-		})
-		.await;
-
-	// Removes the dehydrated device if the ID matches, otherwise no-op
-	self.remove_dehydrated_device(user_id, Some(device_id))
+pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	self.remove_devices(user_id, &[device_id.to_owned()])
 		.await
-		.ok();
-
-	// TODO: Remove onetimekeys
-
-	// MSC2732: drop fallback keys for this device.
-	let prefix = (user_id, device_id, Interfix);
-	self.db
-		.userdeviceidalgorithm_fallback
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			self.db
-				.userdeviceidalgorithm_fallback
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
-	// MSC3890: drop this device's local notification settings.
-	let event_type = format!("org.matrix.msc3890.local_notification_settings.{device_id}").into();
-	services_root
-		.account_data
-		.delete(None, user_id, event_type)
-		.await
-		.ok();
-
-	let userdeviceid = (user_id, device_id);
-	self.db
-		.userdeviceid_metadata
-		.del(userdeviceid)
-		.await
-		.expect("database write error");
-	self.db
-		.oidcdevice_userdeviceid
-		.del(userdeviceid)
-		.await
-		.expect("database write error");
-
-	self.mark_device_key_update(user_id).await;
-	increment(&self.db.userid_devicelistversion, user_id.as_bytes())
-		.await
-		.expect("database write error");
 }
 
 /// Returns an iterator over all device ids of this user.
@@ -203,16 +123,13 @@ pub async fn find_from_token(
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn remove_tokens(&self, user_id: &UserId, device_id: &DeviceId) {
-	let remove_access = self
-		.remove_access_token(user_id, device_id)
-		.map(Result::ok);
-
-	let remove_refresh = self
-		.remove_refresh_token(user_id, device_id)
-		.map(Result::ok);
-
-	join(remove_access, remove_refresh).await;
+pub async fn remove_tokens(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	self.append_token_removal(user_id, device_id, true, true, &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// Replaces the access token of one device.
@@ -239,6 +156,11 @@ pub async fn set_access_token(
 			.await?;
 	}
 
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
 	let expires_at = expires_in
 		.map(timepoint_from_now)
 		.transpose()?
@@ -249,13 +171,17 @@ pub async fn set_access_token(
 	let userdeviceid = (user_id, device_id);
 
 	// Fold the prior pointer token into the index for pre-index upgrades.
-	let previous = self
+	let previous = match self
 		.db
 		.userdeviceid_token
 		.qry(&userdeviceid)
 		.await
 		.deserialized::<String>()
-		.ok();
+	{
+		| Ok(previous) => Some(previous),
+		| Err(error) if error.is_not_found() => None,
+		| Err(error) => return Err(error),
+	};
 
 	let mut txn = services_root.db.txn();
 
@@ -281,76 +207,55 @@ pub async fn set_access_token(
 /// care to not leave dangling devices if using this method.
 #[implement(super::Service)]
 pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
-	let services_guard = self.services.get();
-	let services_root = services_guard.as_ref();
-
-	let prefix = (user_id, device_id, Interfix);
-	self.db
-		.userdeviceidtoken_index
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.for_each(|(_, _, token): (Ignore, Ignore, &str)| async move {
-			self.db
-				.token_userdeviceid
-				.remove(token)
-				.await
-				.expect("database write error");
-			self.db
-				.userdeviceidtoken_index
-				.del((user_id, device_id, token))
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	// Cover any pre-index token still recorded only in the legacy pointer.
-	let token = self
-		.db
-		.userdeviceid_token
-		.qry(&(user_id, device_id))
-		.await
-		.deserialized::<String>()
-		.ok();
-
-	let mut txn = services_root.db.txn();
-
-	if let Some(token) = token.as_deref() {
-		txn.del_raw(&self.db.token_userdeviceid, token);
-	}
-
-	txn.del(&self.db.userdeviceid_token, (user_id, device_id));
-
-	txn.execute().await?;
-
-	Ok(())
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	self.append_token_removal(user_id, device_id, true, false, &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// Revoke a single access token by value, leaving the device and any other
 /// tokens it holds intact.
 #[implement(super::Service)]
-pub async fn remove_access_token_value(&self, access_token: &str) {
+pub async fn remove_access_token_value(&self, access_token: &str) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
-
-	let owner = self
+	let owner = match self
 		.db
 		.token_userdeviceid
 		.get(access_token)
 		.await
 		.deserialized::<(OwnedUserId, OwnedDeviceId, Option<u64>)>()
-		.ok();
-
-	let mut txn = services_root.db.txn();
-
-	if let Some((user_id, device_id, _)) = owner {
-		let user_device_token = (&*user_id, &*device_id, access_token);
-
-		txn.del(&self.db.userdeviceidtoken_index, user_device_token);
+	{
+		| Ok(owner) => owner,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
+	};
+	let _guard = self
+		.device_mutation_locks
+		.lock::<UserId>(&owner.0)
+		.await;
+	let current = match self
+		.db
+		.token_userdeviceid
+		.get(access_token)
+		.await
+		.deserialized::<(OwnedUserId, OwnedDeviceId, Option<u64>)>()
+	{
+		| Ok(owner) => owner,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
+	};
+	if current != owner {
+		return Err(tuwunel_core::Error::bad_database(
+			"Token ownership changed during revocation",
+		));
 	}
-
+	let mut txn = services_root.db.txn();
+	txn.del(&self.db.userdeviceidtoken_index, (&*owner.0, &*owner.1, access_token));
 	txn.del_raw(&self.db.token_userdeviceid, access_token);
-
-	txn.execute().await.expect("database write error");
+	txn.execute().await
 }
 
 #[implement(super::Service)]
@@ -380,6 +285,11 @@ pub async fn set_refresh_token(
 
 	debug_assert!(refresh_token.starts_with("refresh_"), "refresh_token missing prefix");
 
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
 	let config = &services_root.server.config;
 	let ttl = config.refresh_token_ttl;
 	let idle_only = config.refresh_token_idle_only;
@@ -401,9 +311,8 @@ pub async fn set_refresh_token(
 		.ok();
 
 	// Also drops the prior spent entry.
-	self.remove_refresh_token(user_id, device_id)
-		.await
-		.ok();
+	self.remove_refresh_token_unlocked(user_id, device_id)
+		.await?;
 
 	let expires_at = match (ttl, prior_expires_at) {
 		| (0, _) => None,
@@ -474,53 +383,18 @@ async fn find_refresh_token_expires_at(
 /// dangling devices if using this method.
 #[implement(super::Service)]
 pub async fn remove_refresh_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
-	let services_guard = self.services.get();
-	let services_root = services_guard.as_ref();
-
-	let userdeviceid = (user_id, device_id);
-	let refresh_token = self
-		.db
-		.userdeviceid_refresh
-		.qry(&userdeviceid)
-		.await;
-
-	let mut txn = services_root.db.txn();
-
-	if let Ok(refresh_token) = refresh_token {
-		txn.del_raw(&self.db.token_userdeviceid, &refresh_token);
-	}
-
-	txn.del(&self.db.userdeviceid_refresh, userdeviceid);
-
-	self.forget_spent_refresh_token(user_id, device_id, &mut txn)
-		.await;
-
-	txn.execute().await?;
-
-	Ok(())
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.remove_refresh_token_unlocked(user_id, device_id)
+		.await
 }
 
-/// Drop the spent (previous-generation) refresh token retained for reuse
-/// detection, if any.
 #[implement(super::Service)]
-async fn forget_spent_refresh_token(
-	&self,
-	user_id: &UserId,
-	device_id: &DeviceId,
-	txn: &mut Txn,
-) {
-	let userdeviceid = (user_id, device_id);
-
-	if let Ok(spent) = self
-		.db
-		.userdeviceid_spentrefresh
-		.qry(&userdeviceid)
-		.await
-	{
-		txn.del_raw(&self.db.spentrefresh_userdeviceid, &spent);
-	}
-
-	txn.del(&self.db.userdeviceid_spentrefresh, userdeviceid);
+async fn remove_refresh_token_unlocked(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	self.append_token_removal(user_id, device_id, false, true, &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// Classification of a refresh token presented for rotation at a token
@@ -631,6 +505,23 @@ pub async fn add_to_device_event(
 	event_type: &str,
 	content: &serde_json::Value,
 ) -> u64 {
+	let _guard = self
+		.device_mutation_locks
+		.lock(target_user_id)
+		.await;
+
+	// A delivery that waited behind revocation must not recreate an inbox.
+	match self
+		.db
+		.userdeviceid_metadata
+		.qry(&(target_user_id, target_device_id))
+		.await
+	{
+		| Ok(_) => {},
+		| Err(error) if error.is_not_found() => return 0,
+		| Err(error) => panic!("Cannot check recipient device: {error}"),
+	}
+
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
@@ -677,6 +568,21 @@ pub async fn deliver_to_device(
 	targets: &[ToDeviceTarget],
 	txnid: Option<&[u8]>,
 ) -> Result {
+	let mut recipients = targets
+		.iter()
+		.map(|target| target.user_id.clone())
+		.collect::<Vec<_>>();
+	recipients.sort_unstable();
+	recipients.dedup();
+	let mut guards = Vec::new();
+	for user in &recipients {
+		guards.push(
+			self.device_mutation_locks
+				.lock::<UserId>(user)
+				.await,
+		);
+	}
+
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
@@ -701,6 +607,17 @@ pub async fn deliver_to_device(
 
 		let mut deliveries = Vec::with_capacity(device_ids.len());
 		for device_id in device_ids {
+			match self
+				.db
+				.userdeviceid_metadata
+				.qry(&(&*target.user_id, &*device_id))
+				.await
+			{
+				| Ok(_) => {},
+				| Err(error) if error.is_not_found() => continue,
+				| Err(error) => return Err(error),
+			}
+
 			deliveries.push((device_id, services_root.globals.next_count().await?));
 		}
 
@@ -718,6 +635,9 @@ pub async fn deliver_to_device(
 	self.to_device_txn(sender, event_type, rows, txnid)
 		.execute()
 		.await?;
+
+	// Only durable inbox admission requires user mutation exclusion.
+	drop(guards);
 
 	trace!(
 		%sender,
@@ -884,7 +804,11 @@ pub async fn put_device_metadata(
 	notify: bool,
 	device: &Device,
 ) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
 	let key = (user_id, &device.device_id);
+	if !notify {
+		self.db.userdeviceid_metadata.qry(&key).await?;
+	}
 	self.db
 		.userdeviceid_metadata
 		.put(key, Json(device))
@@ -955,6 +879,12 @@ pub async fn mark_oidc_device(
 	device_id: &DeviceId,
 	idp_id: &str,
 ) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+
 	self.db
 		.oidcdevice_userdeviceid
 		.put((user_id, device_id), Json(idp_id))

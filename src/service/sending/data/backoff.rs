@@ -145,7 +145,7 @@ impl Data {
 
 	// Caller holds active_write; acknowledgement stages this in its row-removal
 	// transaction, while cancellation calls it after retiring all owned rows.
-	pub(super) fn stage_clear_push_backoff(
+	pub(in crate::sending) fn stage_clear_push_backoff(
 		&self,
 		txn: &mut Txn,
 		destination: &Destination,

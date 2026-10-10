@@ -1,5 +1,7 @@
 mod data;
 mod dest;
+mod device_cleanup;
+pub(crate) use device_cleanup::PreparedPushCleanup;
 mod frozen;
 mod sender;
 #[cfg(test)]
@@ -40,8 +42,18 @@ pub use self::{
 	dest::Destination,
 	sender::{EDU_LIMIT, PDU_LIMIT},
 };
-pub(crate) use self::{data::parse_servercurrentevent, frozen::FrozenRequest};
-use crate::{appservice::RegistrationInfo, rooms::timeline::RawPduId};
+pub(crate) use self::{
+	data::{DeviceListAdmission, parse_servercurrentevent},
+	frozen::FrozenRequest,
+};
+use crate::rooms::timeline::RawPduId;
+
+/// Complete destination selection, retaining registry exclusion before sender
+/// exclusion so unregister cannot finish its queue cleanup ahead of admission.
+pub(crate) struct PreparedDeviceListTargets {
+	ids: Vec<String>,
+	registrations: crate::appservice::RegistrationReadGuard,
+}
 
 pub struct Service {
 	pub db: Data,
@@ -507,86 +519,105 @@ impl Service {
 		Ok(())
 	}
 
-	/// Queue a `device_lists.changed` marker (MSC3202) for delivery to
-	/// appservices that opted into transaction extensions and are interested
-	/// in `user_id`. Called from `mark_device_key_update`, reusing the count it
-	/// already allocated so the marker uniquifies the transaction hash.
-	#[tracing::instrument(
-		skip(self),
-		level = "debug",
-		fields(
-			%user_id,
-		),
-	)]
-	pub async fn send_device_list_appservices(&self, user_id: &UserId, count: u64) -> Result {
+	/// Complete appservice destination inventory before a device mutation.
+	/// The caller supplies the already checked encryption-filtered room
+	/// inventory.
+	pub(crate) async fn prepare_device_list_appservices(
+		&self,
+		user_id: &UserId,
+		rooms: &[OwnedRoomId],
+	) -> Result<PreparedDeviceListTargets> {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
-
-		let registrations = services_root.appservice.read().await;
-
-		// Hot path: no bridge opted into transaction extensions.
-		if !registrations
-			.values()
-			.any(|info| info.registration.msc3202_transaction_extensions)
-		{
-			return Ok(());
-		}
-
-		let _cork = self.db.db.cork();
-
-		let mut payload = None;
-		let mut requests = Vec::new();
-		let mut budget = None;
+		let registrations = services_root.appservice.read_owned().await;
+		let mut ids = Vec::new();
+		let mut examined = 0_usize;
+		let mut bytes = 0_usize;
+		let mut members = None;
 		for info in registrations.values() {
+			examined = examined.saturating_add(1);
+			bytes = bytes.saturating_add(info.registration.id.len());
+			if examined > 128 || bytes > 128 * 1024 {
+				return Err(err!(Request(TooLarge(
+					"Device-list appservice inventory limit reached"
+				))));
+			}
 			if !info.registration.msc3202_transaction_extensions {
 				continue;
 			}
-
-			if !info.is_user_match(user_id) && !self.shares_device_list_room(user_id, info).await
-			{
-				continue;
+			let interested = if info.is_user_match(user_id) {
+				true
+			} else {
+				if members.is_none() {
+					let mut all_members = Vec::new();
+					let mut member_bytes = 0_usize;
+					for room in rooms {
+						let room_members = services_root
+							.state_cache
+							.bounded_room_members_with_budget(
+								room,
+								1024_usize.saturating_sub(all_members.len()),
+								(128_usize * 1024).saturating_sub(member_bytes),
+							)
+							.await?;
+						member_bytes = member_bytes.saturating_add(
+							room_members
+								.iter()
+								.map(|member| member.as_bytes().len())
+								.sum::<usize>(),
+						);
+						all_members.extend(room_members);
+					}
+					members = Some(all_members);
+				}
+				members.as_ref().is_some_and(|members| {
+					members
+						.iter()
+						.any(|member| member == &info.sender || info.is_user_match(member))
+				})
+			};
+			if interested {
+				ids.push(info.registration.id.clone());
 			}
-
-			let payload = payload.get_or_insert_with(|| device_list_payload(user_id, count));
-
-			let dest = Destination::Appservice(info.registration.id.clone());
-			let event = SendingEvent::DeviceListChanged(payload.clone());
-
-			if budget.is_none() {
-				budget = Some(self.db.queue_budget()?);
-			}
-			Data::admit_request(budget.as_mut().expect("producer budget"), &event, &dest)?;
-			requests.push((dest, event));
 		}
-		self.queue_and_dispatch_batch(requests).await
+		Ok(PreparedDeviceListTargets { ids, registrations })
 	}
 
-	/// Whether `user_id` shares a device-list-interesting room with `info`: a
-	/// joined room the appservice participates in that is encrypted, or any
-	/// such room when `device_key_update_encrypted_rooms_only` is off.
-	async fn shares_device_list_room(&self, user_id: &UserId, info: &RegistrationInfo) -> bool {
-		let services_guard = self.services.get();
-		let services_root = services_guard.as_ref();
-
-		let update_all_rooms = !services_root
-			.config
-			.device_key_update_encrypted_rooms_only;
-
-		services_root
-			.state_cache
-			.rooms_joined(user_id)
-			.map(ToOwned::to_owned)
-			.any(async |room_id: OwnedRoomId| {
-				(update_all_rooms
-					|| services_root
-						.state_accessor
-						.is_encrypted_room(&room_id)
-						.await) && services_root
-					.state_cache
-					.appservice_in_room(&room_id, info)
-					.await
+	/// Validate exact pending queue ownership and complete wire admission
+	/// before device changes. The caller appends these rows to its mutation
+	/// transaction.
+	pub(crate) async fn prepare_device_list_admission(
+		&self,
+		user_id: &UserId,
+		count: u64,
+		targets: PreparedDeviceListTargets,
+	) -> Result<DeviceListAdmission> {
+		let payload = device_list_payload(user_id, count);
+		let requests = targets
+			.ids
+			.into_iter()
+			.map(|id| {
+				(Destination::Appservice(id), SendingEvent::DeviceListChanged(payload.clone()))
 			})
+			.collect();
+		self.db
+			.prepare_device_list_admission(count, requests, targets.registrations)
 			.await
+	}
+
+	/// Only wake durable pending rows after the device transaction commits.
+	pub(crate) fn dispatch_device_list_admission(
+		&self,
+		admission: DeviceListAdmission,
+	) -> Result {
+		for (dest, _event, queue_id) in admission.requests {
+			self.dispatch(Msg {
+				dest,
+				event: SendingEvent::BadgeRefresh,
+				queue_id,
+			})?;
+		}
+		Ok(())
 	}
 
 	#[tracing::instrument(skip(self, servers, serialized), level = "debug")]

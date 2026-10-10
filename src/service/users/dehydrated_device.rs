@@ -1,5 +1,5 @@
 use ruma::{
-	DeviceId, OwnedDeviceId, UserId,
+	OwnedDeviceId, UserId,
 	api::client::dehydrated_device::{
 		DehydratedDeviceData, put_dehydrated_device::unstable::Request,
 	},
@@ -46,7 +46,7 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 	}
 
 	if let Ok(existing_id) = existing_id {
-		self.remove_device(user_id, &existing_id).await;
+		self.remove_device(user_id, &existing_id).await?;
 	}
 
 	let device_id = self
@@ -60,6 +60,11 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 		)
 		.await?;
 
+	let guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, &*device_id))
+		.await?;
 	trace!(device_data = ?request.device_data);
 	self.db
 		.userid_dehydrateddevice
@@ -71,10 +76,11 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 			}),
 		)
 		.await?;
+	drop(guard);
 
 	trace!(device_keys = ?request.device_keys);
 	self.add_device_keys(user_id, &device_id, &request.device_keys)
-		.await;
+		.await?;
 
 	trace!(one_time_keys = ?request.one_time_keys);
 	self.add_one_time_keys(
@@ -98,47 +104,6 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 	.await?;
 
 	Ok(())
-}
-
-/// Removes a user's dehydrated device.
-///
-/// Calling this directly will remove the dehydrated data but leak the frontage
-/// device. Thus this is called by the regular device interface such that the
-/// dehydrated data will not leak instead.
-///
-/// If device_id is given, the user's dehydrated device must match or this is a
-/// no-op, but an Err is still returned to indicate that. Otherwise returns the
-/// removed dehydrated device_id.
-#[implement(super::Service)]
-#[tracing::instrument(
-	level = "debug",
-	skip_all,
-	fields(
-		%user_id,
-		device_id = ?maybe_device_id,
-	)
-)]
-pub(super) async fn remove_dehydrated_device(
-	&self,
-	user_id: &UserId,
-	maybe_device_id: Option<&DeviceId>,
-) -> Result<OwnedDeviceId> {
-	let Ok(device_id) = self.get_dehydrated_device_id(user_id).await else {
-		return Err!(Request(NotFound("No dehydrated device for this user.")));
-	};
-
-	if let Some(maybe_device_id) = maybe_device_id
-		&& maybe_device_id != device_id
-	{
-		return Err!(Request(NotFound("Not the user's dehydrated device.")));
-	}
-
-	self.db
-		.userid_dehydrateddevice
-		.remove(user_id)
-		.await?;
-
-	Ok(device_id)
 }
 
 /// Get the device_id of the user's dehydrated device.

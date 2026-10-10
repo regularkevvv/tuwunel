@@ -61,7 +61,7 @@ pub(super) fn record_sent_badge(&self, user_id: &UserId, pushkey: &str, unread: 
 /// A deleted or replaced pusher leaves the device state unknown, so the next
 /// refresh must send unconditionally.
 #[implement(super::Service)]
-pub(super) fn forget_sent_badge(&self, user_id: &UserId, pushkey: &str) {
+pub(crate) fn forget_sent_badge(&self, user_id: &UserId, pushkey: &str) {
 	let mut badges = self.sent_badges.lock();
 	let Some(pushkeys) = badges.get_mut(user_id) else {
 		return;

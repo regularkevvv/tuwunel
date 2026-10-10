@@ -16,14 +16,14 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, TryStreamExt};
 use ruma::{RoomAliasId, RoomId, UserId, api::appservice::Registration};
-use tokio::sync::{RwLock, RwLockReadGuard, SetOnce};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, SetOnce};
 use tuwunel_core::{Err, Result, defer, err, utils::stream::IterStream};
 use tuwunel_database::Map;
 
 pub use self::{namespace_regex::NamespaceRegex, registration_info::RegistrationInfo};
 
 pub struct Service {
-	registration_info: RwLock<Registrations>,
+	registration_info: Arc<RwLock<Registrations>>,
 	loaded: SetOnce<()>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
@@ -35,11 +35,21 @@ struct Data {
 
 type Registrations = BTreeMap<String, RegistrationInfo>;
 
+/// Retains one registration incarnation through a coupled queue admission.
+/// Registration removal takes the registry write lock before sender exclusion.
+pub(crate) struct RegistrationReadGuard(OwnedRwLockReadGuard<Registrations>);
+
+impl std::ops::Deref for RegistrationReadGuard {
+	type Target = BTreeMap<String, RegistrationInfo>;
+
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			registration_info: RwLock::new(BTreeMap::new()),
+			registration_info: Arc::new(RwLock::new(BTreeMap::new())),
 			loaded: SetOnce::new(),
 			services: args.services.clone(),
 			db: Data {
@@ -308,6 +318,11 @@ impl Service {
 
 	pub fn read(&self) -> impl Future<Output = RwLockReadGuard<'_, Registrations>> + Send {
 		self.registration_info.read()
+	}
+
+	/// Owned exclusion for queue plans that outlive a borrowed service lookup.
+	pub(crate) async fn read_owned(&self) -> RegistrationReadGuard {
+		RegistrationReadGuard(self.registration_info.clone().read_owned().await)
 	}
 
 	/// Waits for the boot-time registration load to finish.

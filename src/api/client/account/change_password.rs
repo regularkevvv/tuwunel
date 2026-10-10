@@ -1,5 +1,4 @@
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::{
 	OwnedUserId,
 	api::client::{
@@ -8,7 +7,7 @@ use ruma::{
 	},
 	thirdparty::Medium,
 };
-use tuwunel_core::{Err, Error, Result, info, utils::ReadyExt};
+use tuwunel_core::{Err, Error, Result, info};
 
 use crate::{ClientIp, Ruma, router::auth_uiaa};
 
@@ -52,12 +51,18 @@ pub(crate) async fn change_password_route(
 
 	if body.logout_devices {
 		// A logged-out reset has no current device to preserve.
+		let devices = services
+			.users
+			.bounded_device_ids(&sender_user)
+			.await?;
+		let removed: Vec<_> = devices
+			.into_iter()
+			.filter(|id| Some(&**id) != body.sender_device.as_deref())
+			.collect();
 		services
 			.users
-			.all_device_ids(&sender_user)
-			.ready_filter(|&id| Some(id) != body.sender_device.as_deref())
-			.for_each(|id| services.users.remove_device(&sender_user, id))
-			.await;
+			.remove_devices(&sender_user, &removed)
+			.await?;
 	}
 
 	info!("User {sender_user} changed their password.");

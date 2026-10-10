@@ -24,7 +24,7 @@ use reqwest::{
 	header::{ACCEPT, CONTENT_TYPE},
 };
 use ruma::{
-	DeviceId, OwnedDeviceId, UserId,
+	DeviceId, UserId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 };
 use serde::Serialize;
@@ -199,14 +199,8 @@ fn check_bucket(table: &Ratelimiter, client: IpAddr, rate: f64, burst: f64) -> R
 /// re-registrations.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn delete_user_sessions(&self, user_id: &UserId) {
-	self.user_sessions(user_id)
-		.ready_filter_map(Result::ok)
-		.ready_filter_map(|(_, session)| session.sess_id)
-		.for_each(|sess_id| async move {
-			self.sessions.delete(&sess_id).await;
-		})
-		.await;
+pub async fn delete_user_sessions(&self, user_id: &UserId) -> Result {
+	self.sessions.delete_user(user_id).await
 }
 
 /// Revoke all session tokens for a user.
@@ -781,54 +775,61 @@ pub async fn request_refresh(
 /// the account and the next login would register a new one.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn clear_user_grants(&self, user_id: &UserId) {
-	self.clear_grants(user_id, None).await;
+pub async fn clear_user_grants(&self, user_id: &UserId) -> Result {
+	self.clear_grants(user_id, None).await
 }
 
-/// Clear the upstream grants bound to one device, as its logout or revocation
-/// requires. Grants of the user's other devices are untouched.
+/// Clear the upstream grants bound to one device.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn clear_device_grants(&self, user_id: &UserId, device_id: &DeviceId) {
-	self.clear_grants(user_id, Some(device_id)).await;
+pub async fn clear_device_grants(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	self.clear_grants(user_id, Some(device_id)).await
 }
 
 #[implement(Service)]
-async fn clear_grants(&self, user_id: &UserId, device_id: Option<&DeviceId>) {
-	let records: Vec<Result<Session>> = self.sessions.get_by_user(user_id).collect().await;
-	let mut cleared = 0_usize;
+async fn clear_grants(&self, user_id: &UserId, device_id: Option<&DeviceId>) -> Result {
+	let plan = self.sessions.lock_user_sessions(user_id).await?;
+	let upstream = self.prepare_grant_revocations(&plan).await?;
+	let services_guard = self.services.get();
+	let mut txn = services_guard.as_ref().db.txn();
+	let cleared = self
+		.sessions
+		.append_cleared_grants(&plan, device_id, &mut txn)?;
+	txn.execute().await?;
+	self.revoke_prepared_grants(&upstream, device_id)
+		.await;
+	info!(audit = "grants_cleared", %user_id, ?device_id, cleared, "Cleared stored upstream grants.");
+	Ok(())
+}
 
-	for record in records {
-		let session = match record {
-			| Ok(session) => session,
-			| Err(error) => {
-				warn!(%user_id, "An upstream grant could not be read to clear it: {error}");
-				continue;
-			},
-		};
+#[implement(Service)]
+async fn prepare_grant_revocations(
+	&self,
+	plan: &sessions::LockedUserSessions,
+) -> Result<Vec<(Provider, Session)>> {
+	let mut upstream = Vec::new();
+	for record in plan.records() {
+		upstream.push((self.sessions.provider(record).await?, record.clone()));
+	}
+	Ok(upstream)
+}
 
-		if device_id.is_some_and(|device_id| session.device_id.as_deref() != Some(device_id)) {
-			continue;
-		}
-
-		let Some(sess_id) = session.sess_id.as_deref() else {
-			continue;
-		};
-
-		let provider = self.sessions.provider(&session).await.ok();
-		match self.clear_grant(provider.as_ref(), sess_id).await {
-			| Ok(()) => cleared = cleared.saturating_add(1),
-			| Err(error) => warn!(%user_id, "An upstream grant could not be cleared: {error}"),
+#[implement(Service)]
+async fn revoke_prepared_grants(
+	&self,
+	upstream: &[(Provider, Session)],
+	device_id: Option<&DeviceId>,
+) {
+	for (provider, session) in upstream.iter().filter(|(_, session)| {
+		device_id.is_none_or(|id| session.device_id.as_deref() == Some(id))
+	}) {
+		if !session.grant_unreadable {
+			self.revoke_token((provider, session))
+				.await
+				.log_err()
+				.ok();
 		}
 	}
-
-	info!(
-		audit = "grants_cleared",
-		%user_id,
-		device_id = ?device_id,
-		cleared,
-		"Cleared stored upstream grants.",
-	);
 }
 
 /// Drop the grant of one record that nothing will use — the one a
@@ -880,34 +881,55 @@ async fn clear_grant(&self, provider: Option<&Provider>, sess_id: &str) -> Resul
 /// kept. Returns the number of devices removed.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn revoke_user_sessions(&self, user_id: &UserId) -> usize {
+pub async fn revoke_user_sessions(&self, user_id: &UserId) -> Result<usize> {
+	self.revoke_sessions(user_id, None).await
+}
+
+/// Immediately revoke one Matrix device and its stored upstream grants.
+#[implement(Service)]
+pub async fn revoke_device_session(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	self.revoke_sessions(user_id, Some(device_id))
+		.await
+		.map(|_| ())
+}
+
+#[implement(Service)]
+async fn revoke_sessions(&self, user_id: &UserId, device_id: Option<&DeviceId>) -> Result<usize> {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
-
-	let devices: Vec<OwnedDeviceId> = services_root
+	let grants = self.sessions.lock_user_sessions(user_id).await?;
+	let upstream = self.prepare_grant_revocations(&grants).await?;
+	let devices = match device_id {
+		| Some(id) =>
+			services_root
+				.users
+				.prepare_device_removals(user_id, &[id.to_owned()])
+				.await?,
+		| None =>
+			services_root
+				.users
+				.prepare_all_device_removals(user_id)
+				.await?,
+	};
+	let grant_device = if devices.is_last_device() { None } else { device_id };
+	let mut txn = services_root.db.txn();
+	let cleared = self
+		.sessions
+		.append_cleared_grants(&grants, grant_device, &mut txn)?;
+	services_root
 		.users
-		.all_device_ids(user_id)
-		.map(ToOwned::to_owned)
-		.collect()
+		.append_device_removals(&devices, &mut txn)?;
+	let removed = devices.len();
+	txn.execute().await?;
+	info!(audit = "grants_cleared", %user_id, ?device_id, cleared, "Cleared stored upstream grants.");
+	services_root
+		.users
+		.finish_device_removals(user_id, devices)
+		.await?;
+	self.revoke_prepared_grants(&upstream, grant_device)
 		.await;
-
-	for device_id in &devices {
-		services_root
-			.users
-			.remove_device(user_id, device_id)
-			.await;
-	}
-
-	self.clear_user_grants(user_id).await;
-
-	warn!(
-		audit = "sessions_revoked",
-		%user_id,
-		devices = devices.len(),
-		"Revoked every session of the account.",
-	);
-
-	devices.len()
+	warn!(audit = "sessions_revoked", %user_id, ?device_id, devices = removed, "Revoked account sessions.");
+	Ok(removed)
 }
 
 /// Bind the grant a login token was issued with to the device its redemption
@@ -937,21 +959,19 @@ pub async fn bind_login_device(
 	let superseded: Vec<Session> = self
 		.sessions
 		.get_by_user(user_id)
-		.ready_filter_map(Result::ok)
-		.ready_filter(|session| {
+		.try_collect::<Vec<_>>()
+		.await?
+		.into_iter()
+		.filter(|session| {
 			session.device_id.as_deref() == Some(device_id)
 				&& session.sess_id.as_deref() != Some(sess_id.as_str())
 		})
-		.collect()
-		.await;
+		.collect();
 
 	for session in superseded {
 		if let Some(old) = session.sess_id.as_deref() {
-			let provider = self.sessions.provider(&session).await.ok();
-			self.clear_grant(provider.as_ref(), old)
-				.await
-				.log_err()
-				.ok();
+			let provider = self.sessions.provider(&session).await?;
+			self.clear_grant(Some(&provider), old).await?;
 		}
 	}
 
@@ -1062,7 +1082,7 @@ async fn upkeep(&self, session: Session, current_kid: Option<&str>) -> Result<Up
 			.authorize_expires_at
 			.is_some_and(timepoint_has_passed)
 		{
-			self.sessions.delete(&sess_id).await;
+			self.sessions.delete(&sess_id).await?;
 			return Ok(Upkeep::Deleted);
 		}
 
@@ -1097,7 +1117,7 @@ async fn upkeep(&self, session: Session, current_kid: Option<&str>) -> Result<Up
 			return Ok(Upkeep::Cleared);
 		}
 
-		self.sessions.delete(&sess_id).await;
+		self.sessions.delete(&sess_id).await?;
 		return Ok(Upkeep::Deleted);
 	}
 
@@ -1106,7 +1126,7 @@ async fn upkeep(&self, session: Session, current_kid: Option<&str>) -> Result<Up
 			return Ok(Upkeep::Kept);
 		}
 
-		self.sessions.delete(&sess_id).await;
+		self.sessions.delete(&sess_id).await?;
 		return Ok(Upkeep::Deleted);
 	}
 

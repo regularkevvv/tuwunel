@@ -640,6 +640,21 @@ impl Data {
 		self.resume_cancellation(destination).await
 	}
 
+	/// Atomic device cleanup must not drain an unrelated cancellation while
+	/// preparing its all-or-nothing admission. The normal worker owns that
+	/// drain.
+	pub(super) async fn require_uncancelled_destination(
+		&self,
+		destination: &Destination,
+	) -> Result {
+		if let Some((_, record)) = self.read_attempt_header(destination).await?
+			&& record.kind == AttemptKind::Cancelled
+		{
+			return Err(Error::bad_database("Device-list destination cancellation is pending"));
+		}
+		Ok(())
+	}
+
 	/// Called under active_write before admitting appservice/federation work.
 	pub(super) async fn resume_cancellation(&self, destination: &Destination) -> Result {
 		if AttemptKind::for_destination(destination).is_none() {

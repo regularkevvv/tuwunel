@@ -53,6 +53,15 @@ impl Fixture {
 		Self::open(&root).await
 	}
 
+	async fn new_key_fanout() -> Result<Self> {
+		let root = std::env::temp_dir().join(format!("matrix-key-fanout-{}", rand::string(20)));
+		let mut directory = fs::DirBuilder::new();
+		#[cfg(unix)]
+		directory.mode(0o700);
+		directory.create(&root)?;
+		Self::open_config(&root, false, None, true).await
+	}
+
 	/// Open only a scratch root owned by the invoking fixture. Cold-start
 	/// controls reopen it in a new process after the preceding child exits.
 	pub(super) async fn open(root: &std::path::Path) -> Result<Self> {
@@ -66,24 +75,26 @@ impl Fixture {
 	}
 
 	async fn open_options(root: &std::path::Path, startup: bool) -> Result<Self> {
-		Self::open_config(root, startup, None).await
+		Self::open_config(root, startup, None, false).await
 	}
 
 	/// Open only the owned loopback bridge oracle for remote service controls.
 	pub(super) async fn open_remote(root: &std::path::Path, url: &str) -> Result<Self> {
-		Self::open_config(root, false, Some(url)).await
+		Self::open_config(root, false, Some(url), false).await
 	}
 
 	async fn open_config(
 		root: &std::path::Path,
 		startup: bool,
 		remote: Option<&str>,
+		all_key_rooms: bool,
 	) -> Result<Self> {
 		sys::maximize_fd_limit()?;
 		let mut raw = Figment::new()
 			.merge(("server_name", "localhost"))
 			.merge(("database_backend", "rocksdb"))
 			.merge(("database_path", root.join("database")))
+			.merge(("device_key_update_encrypted_rooms_only", !all_key_rooms))
 			.merge(("allow_outgoing_presence", true))
 			.merge(("allow_outgoing_read_receipts", true))
 			.merge(("startup_netburst", true))
@@ -410,6 +421,324 @@ async fn startup_reconstructs_an_empty_window_wake_from_the_durable_cursor() -> 
 	);
 	assert!(futures.is_empty());
 	drop(futures);
+	fixture.finish().await;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_key_fanout_proves_complete_sources_before_marking_change() -> Result {
+	for source in ["corrupt_room", "corrupt_server", "server_overflow", "server_bytes_overflow"] {
+		let fixture = Fixture::new_key_fanout().await?;
+		let services = &fixture.services;
+		let user = user_id!("@fanout:localhost");
+		let room = room_id!("!fanout:localhost");
+		services.db["userroomid_joinedcount"]
+			.put_raw((user, room), 1_u64.to_be_bytes())
+			.await?;
+		match source {
+			| "corrupt_room" =>
+				services.db["userroomid_joinedcount"]
+					.put_raw((user, "not-a-room"), [])
+					.await?,
+			| "corrupt_server" =>
+				services.db["roomserverids"]
+					.put_raw((room, "not a server"), [])
+					.await?,
+			| "server_overflow" => {
+				let mut txn = services.db.txn();
+				for index in 0..4097 {
+					txn.put_raw(
+						&services.db["roomserverids"],
+						(room, format!("s{index}.example")),
+						[],
+					);
+				}
+				txn.execute().await?;
+			},
+			| "server_bytes_overflow" => {
+				let mut txn = services.db.txn();
+				for index in 0..1100 {
+					let server = format!(
+						"s{index:04}.{}.{}.{}.{}",
+						"a".repeat(60),
+						"b".repeat(60),
+						"c".repeat(60),
+						"d".repeat(60)
+					);
+					txn.put_raw(&services.db["roomserverids"], (room, server), []);
+				}
+				txn.execute().await?;
+			},
+			| _ => unreachable!("declared source"),
+		}
+		services
+			.users
+			.mark_device_key_update(user)
+			.await
+			.expect_err("incomplete fanout must refuse");
+		assert!(
+			services.db["keychangeid_userid"]
+				.raw_stream()
+				.map_ok(|_| ())
+				.try_collect::<Vec<_>>()
+				.await?
+				.is_empty()
+		);
+		assert!(
+			services.db["servernameevent_data"]
+				.raw_stream()
+				.map_ok(|_| ())
+				.try_collect::<Vec<_>>()
+				.await?
+				.is_empty()
+		);
+		fixture.finish().await;
+	}
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_key_fanout_and_appservice_queue_share_mutation_transaction() -> Result {
+	let fixture = Fixture::new_key_fanout().await?;
+	let services = &fixture.services;
+	let user = user_id!("@fanout:localhost");
+	let room = room_id!("!fanout:localhost");
+	services.db["userroomid_joinedcount"]
+		.put_raw((user, room), 1_u64.to_be_bytes())
+		.await?;
+	let plan = services
+		.users
+		.prepare_device_key_update(user)
+		.await?;
+	let mut txn = services.db.txn();
+	services
+		.users
+		.append_device_key_update(user, &plan, &mut txn);
+	// An abandoned cleanup transaction cannot publish any notification marker.
+	drop(txn);
+	assert!(
+		services.db["keychangeid_userid"]
+			.raw_stream()
+			.map_ok(|_| ())
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty()
+	);
+	let mut txn = services.db.txn();
+	services
+		.users
+		.append_device_key_update(user, &plan, &mut txn);
+	txn.check_bridge_admission()?;
+	txn.execute().await?;
+	assert_eq!(
+		services.db["keychangeid_userid"]
+			.raw_stream()
+			.map_ok(|_| ())
+			.try_collect::<Vec<_>>()
+			.await?
+			.len(),
+		2
+	);
+	drop(plan);
+	let count = services.globals.next_count().await?;
+	let admission = services
+		.sending
+		.prepare_device_list_admission(user, *count, crate::sending::PreparedDeviceListTargets {
+			ids: vec!["bridge".to_owned()],
+			registrations: services.appservice.read_owned().await,
+		})
+		.await?;
+	let mut txn = services.db.txn();
+	admission.append(&services.db, &mut txn);
+	drop(txn);
+	assert!(
+		services.db["servernameevent_data"]
+			.raw_stream()
+			.map_ok(|_| ())
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty()
+	);
+	let mut txn = services.db.txn();
+	admission.append(&services.db, &mut txn);
+	txn.check_bridge_admission()?;
+	txn.execute().await?;
+	assert_eq!(
+		services.db["servernameevent_data"]
+			.raw_stream()
+			.map_ok(|_| ())
+			.try_collect::<Vec<_>>()
+			.await?
+			.len(),
+		1
+	);
+	drop(admission);
+	drop(count);
+	let count = services.globals.next_count().await?;
+	match services
+		.sending
+		.prepare_device_list_admission(user, *count, crate::sending::PreparedDeviceListTargets {
+			ids: vec!["a".repeat(tuwunel_bridge::MAX_KEY_BYTES)],
+			registrations: services.appservice.read_owned().await,
+		})
+		.await
+	{
+		| Ok(_) => panic!("over-width queue identity must be refused before cleanup"),
+		| Err(_) => {},
+	}
+	drop(count);
+	fixture.finish().await;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_device_cannot_readmit_key_material() -> Result {
+	let fixture = Fixture::new_key_fanout().await?;
+	let services = &fixture.services;
+	let user = user_id!("@removed:localhost");
+	let device = ruma::device_id!("REMOVED");
+	let keys: ruma::serde::Raw<ruma::encryption::DeviceKeys> = serde_json::from_str("{}")?;
+	services
+		.users
+		.add_device_keys(user, device, &keys)
+		.await
+		.expect_err("removed metadata must prevent key reinsertion");
+	services
+		.users
+		.add_one_time_keys(user, device, &std::collections::BTreeMap::new(), 0)
+		.await
+		.expect_err("removed metadata must prevent one-time admission");
+	services
+		.users
+		.add_fallback_keys(
+			user,
+			device,
+			std::iter::empty::<(
+				&ruma::OneTimeKeyId,
+				&ruma::serde::Raw<ruma::encryption::OneTimeKey>,
+			)>(),
+		)
+		.await
+		.expect_err("removed metadata must prevent fallback admission");
+	for map in [
+		"keyid_key",
+		"onetimekeyid4225_otk",
+		"userdeviceidalgorithm_fallback",
+		"keychangeid_userid",
+	] {
+		assert!(
+			services.db[map]
+				.raw_stream()
+				.map_ok(|_| ())
+				.try_collect::<Vec<_>>()
+				.await?
+				.is_empty()
+		);
+	}
+	fixture.finish().await;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_key_admission_excludes_appservice_unregister_until_commit() -> Result {
+	use std::time::Duration;
+
+	use ruma::api::appservice::{Namespaces, Registration, RegistrationInit};
+	use tokio::{sync::oneshot, time::timeout};
+
+	let fixture = Fixture::new_key_fanout().await?;
+	let services = &fixture.services;
+	<crate::appservice::Service as crate::Service>::worker(services.appservice.clone()).await?;
+	let make_registration = |suffix: &str| -> Result<Registration> {
+		let mut registration: Registration = RegistrationInit {
+			id: "key-admission-owner".into(),
+			url: Some("http://127.0.0.1:1".into()),
+			as_token: format!("disposable-key-admission-as-{suffix}"),
+			hs_token: format!("disposable-key-admission-hs-{suffix}"),
+			sender_localpart: "key-admission-owner".into(),
+			namespaces: serde_json::from_value::<Namespaces>(serde_json::json!({
+				"users": [{"exclusive": false, "regex": "^@fanout:localhost$"}]
+			}))?,
+			rate_limited: None,
+			protocols: None,
+		}
+		.into();
+		registration.msc3202_transaction_extensions = true;
+		Ok(registration)
+	};
+	services
+		.appservice
+		.register_appservice(make_registration("first")?)
+		.await?;
+	let user = user_id!("@fanout:localhost");
+	let targets = services
+		.sending
+		.prepare_device_list_appservices(user, &[])
+		.await?;
+	let (entered_tx, entered_rx) = oneshot::channel();
+	let appservice = services.appservice.clone();
+	let mut removal = tokio::spawn(async move {
+		entered_tx
+			.send(())
+			.expect("owned entry observation");
+		appservice
+			.unregister_appservice("key-admission-owner")
+			.await
+	});
+	entered_rx.await.expect("unregister task entered");
+	timeout(Duration::from_millis(50), &mut removal)
+		.await
+		.expect_err("unregister must wait for the selected registration's admission");
+	let count = services.globals.next_count().await?;
+	let admission = services
+		.sending
+		.prepare_device_list_admission(user, *count, targets)
+		.await?;
+	let mut txn = services.db.txn();
+	admission.append(&services.db, &mut txn);
+	txn.check_bridge_admission()?;
+	txn.execute().await?;
+	assert_eq!(
+		services.db["servernameevent_data"]
+			.raw_stream()
+			.map_ok(|_| ())
+			.try_collect::<Vec<_>>()
+			.await?
+			.len(),
+		1
+	);
+	timeout(Duration::from_millis(50), &mut removal)
+		.await
+		.expect_err("unregister must remain excluded through the coupled commit");
+	drop(admission);
+	drop(count);
+	timeout(Duration::from_secs(10), removal)
+		.await
+		.expect("unregister completes after admission releases")
+		.expect("unregister task completed")?;
+	assert!(
+		services.db["servernameevent_data"]
+			.raw_stream()
+			.map_ok(|_| ())
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty()
+	);
+	services
+		.appservice
+		.register_appservice(make_registration("replacement")?)
+		.await?;
+	let destination = Destination::Appservice("key-admission-owner".into());
+	assert!(
+		services
+			.sending
+			.db
+			.queued_requests(&destination)
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty(),
+		"replacement registration must not inherit a stale device-list marker"
+	);
 	fixture.finish().await;
 	Ok(())
 }

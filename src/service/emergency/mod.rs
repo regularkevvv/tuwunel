@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use ruma::{
-	OwnedDeviceId,
 	events::{
 		GlobalAccountDataEvent, GlobalAccountDataEventType, push_rules::PushRulesEventContent,
 	},
@@ -73,18 +71,19 @@ impl Service {
 		let services_root = services_guard.as_ref();
 
 		let server_user = &services_root.globals.server_user;
-		let has_password = services_root
+		let has_password = match services_root
 			.users
 			.password_hash(server_user)
 			.await
-			.is_ok_and(|hash| !hash.is_empty());
-
-		let devices: Vec<OwnedDeviceId> = services_root
+		{
+			| Ok(hash) => !hash.is_empty(),
+			| Err(error) if error.is_not_found() => false,
+			| Err(error) => return Err(error),
+		};
+		let devices = services_root
 			.users
-			.all_device_ids(server_user)
-			.map(ToOwned::to_owned)
-			.collect()
-			.await;
+			.bounded_device_ids(server_user)
+			.await?;
 
 		if !has_password && devices.is_empty() {
 			return Ok(());
@@ -96,12 +95,10 @@ impl Service {
 			.set_password(server_user, None)
 			.await?;
 
-		for device in &devices {
-			services_root
-				.users
-				.remove_device(server_user, device)
-				.await;
-		}
+		services_root
+			.oauth
+			.revoke_user_sessions(server_user)
+			.await?;
 
 		Ok(())
 	}

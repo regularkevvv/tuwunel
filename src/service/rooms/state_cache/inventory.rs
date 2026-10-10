@@ -1,6 +1,6 @@
 use futures::{StreamExt, pin_mut};
 use ruma::{
-	OwnedRoomId, OwnedUserId, RoomId, UserId,
+	OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId,
 	api::error::{ErrorKind, LimitExceededErrorData},
 };
 use tuwunel_core::{Error, Result};
@@ -63,6 +63,40 @@ impl Service {
 			rooms.push(room.to_owned());
 		}
 		Ok(rooms)
+	}
+
+	/// Complete room-server inventory within the caller's remaining aggregate
+	/// budget. Every source key consumes work, including local and repeated
+	/// servers.
+	pub(crate) async fn bounded_room_servers_with_budget(
+		&self,
+		room: &RoomId,
+		rows: usize,
+		byte_limit: usize,
+	) -> Result<Vec<OwnedServerName>> {
+		let rows = rows.min(4096);
+		let byte_limit = byte_limit.min(256 * 1024);
+		let prefix = (room, Interfix);
+		let keys = self
+			.db
+			.roomserverids
+			.keys_prefix_capped::<(Ignore, &ServerName), _>(&prefix, rows.saturating_add(1));
+		pin_mut!(keys);
+		let mut servers = Vec::new();
+		let mut bytes = 0_usize;
+		while let Some(key) = keys.next().await {
+			let (_, server) = key?;
+			bytes = bytes.saturating_add(server.as_bytes().len());
+			if servers.len() >= rows || bytes > byte_limit {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"Device-key server fanout inventory limit reached".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			servers.push(server.to_owned());
+		}
+		Ok(servers)
 	}
 
 	/// Complete invited-member IDs with the joined inventory's row/byte

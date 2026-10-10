@@ -102,7 +102,7 @@ async fn run_cases(services: &Arc<Services>) -> Result {
 	services
 		.users
 		.mark_device_key_update(&on_ghost)
-		.await;
+		.await?;
 	let (_, body) = recv_txn(&mut rx).await?;
 	let txn = parse(&body)?;
 	assert_device_lists_changed(&txn, &on_ghost)?;

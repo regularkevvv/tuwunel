@@ -1,5 +1,8 @@
 mod dehydrated_device;
 pub mod device;
+mod device_removal;
+#[cfg(test)]
+pub(crate) mod device_removal_tests;
 mod keys;
 mod ldap;
 mod local_activity;
@@ -9,8 +12,8 @@ mod register;
 
 use std::sync::Arc;
 
-use futures::{Stream, StreamExt, TryFutureExt};
-pub(crate) use keys::OutgoingKeyBudget;
+use futures::{Stream, TryFutureExt};
+pub(crate) use keys::{DeviceKeyUpdatePlan, OutgoingKeyBudget};
 use ruma::{
 	MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
@@ -32,6 +35,7 @@ use tuwunel_database::{Deserialized, Json, Map};
 pub use self::{
 	dehydrated_device::DehydratedDevice,
 	device::ToDeviceTarget,
+	device_removal::DeviceRemovalPlan,
 	keys::parse_master_key,
 	local_activity::{
 		DeviceMetadataInventory, LocalUserActivity, MAX_ADMIN_DEVICE_BYTES, MAX_ADMIN_DEVICE_ROWS,
@@ -54,6 +58,7 @@ pub struct Moderation {
 }
 
 pub struct Service {
+	device_mutation_locks: MutexMap<OwnedUserId, ()>,
 	services: Arc<crate::services::OnceServices>,
 	/// Serializes one-time-key pool reads and mutations per device. The guard
 	/// must cover the durable deletion, not just selection of a candidate key.
@@ -97,6 +102,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
+			device_mutation_locks: MutexMap::new(),
 			one_time_key_locks: MutexMap::new(),
 			db: Data {
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
@@ -234,13 +240,8 @@ impl Service {
 		// stays, so the identity cannot provision a second account (ADR-0004).
 		services_root
 			.oauth
-			.clear_user_grants(user_id)
-			.await;
-
-		// Remove all associated devices
-		self.all_device_ids(user_id)
-			.for_each(|device_id| self.remove_device(user_id, device_id))
-			.await;
+			.revoke_user_sessions(user_id)
+			.await?;
 
 		// Set the password to "" to indicate a deactivated account. Hashes will never
 		// result in an empty string, so the user will not be able to log in again.

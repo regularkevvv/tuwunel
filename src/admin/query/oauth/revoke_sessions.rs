@@ -22,7 +22,7 @@ pub(super) async fn oauth_revoke_sessions(&self, user_id: OwnedUserId) -> Result
 		.services
 		.oauth
 		.revoke_user_sessions(&user_id)
-		.await;
+		.await?;
 
 	self.write_str(&format!(
 		"Revoked {devices} device session(s) for {user_id} and cleared every stored upstream \

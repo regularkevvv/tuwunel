@@ -518,7 +518,11 @@ pub(crate) async fn sso_callback_route(
 			.await
 			.is_ok_and(|old| !old.has_grant() && old.device_id.is_none())
 	{
-		services.oauth.sessions.delete(old_sess_id).await;
+		services
+			.oauth
+			.sessions
+			.delete(old_sess_id)
+			.await?;
 	}
 
 	if !services.users.is_active_local(&user_id).await {
@@ -900,7 +904,7 @@ async fn decide_user_id(
 		.oauth
 		.sessions
 		.find_user_association_pending(provider.id(), userinfo)
-		.await
+		.await?
 	{
 		debug_info!(provider = ?provider.id(), ?user_id, "Matched pending association");
 

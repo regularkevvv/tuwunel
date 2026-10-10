@@ -2,7 +2,6 @@ mod adopt;
 pub mod association;
 
 use std::{
-	iter::once,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -13,16 +12,18 @@ use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{OwnedDeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
-	Err, Result, at, err, implement, redacted_debug,
+	Err, Error, Result, err, implement, redacted_debug,
 	utils::{
-		MutexMap,
+		MutexMap, MutexMapGuard,
 		hash::sha256,
-		stream::{IterStream, ReadyExt, TryExpect},
+		stream::{IterStream, TryExpect},
 		timepoint_from_now,
 	},
 	warn,
 };
-use tuwunel_database::{Cbor, Database, Deserialized, Handle, Map, deserialize_from_slice};
+use tuwunel_database::{
+	Cbor, Database, Deserialized, Handle, Map, Txn, deserialize_from_slice, serialize_to_vec,
+};
 use url::Url;
 
 pub use self::adopt::Counts;
@@ -45,6 +46,9 @@ pub struct Sessions {
 	/// on a rotating upstream refresh token, and a re-check that read a grant
 	/// cannot restore it after a logout cleared it.
 	write_locks: MutexMap<String, ()>,
+
+	user_write_locks: MutexMap<OwnedUserId, ()>,
+	pending_locks: MutexMap<String, ()>,
 
 	providers: Arc<Providers>,
 	keys: Keys,
@@ -278,6 +282,8 @@ pub(super) fn build(args: &crate::Args<'_>, providers: Arc<Providers>) -> Result
 	Ok(Self {
 		services: args.services.clone(),
 		write_locks: MutexMap::new(),
+		user_write_locks: MutexMap::new(),
+		pending_locks: MutexMap::new(),
 		providers,
 		keys,
 		db: Data {
@@ -295,81 +301,44 @@ pub(super) fn build(args: &crate::Args<'_>, providers: Arc<Providers>) -> Result
 #[must_use]
 pub fn current_kid(&self) -> Option<&str> { self.keys.current_kid() }
 
-/// Delete database state for the session.
-///
-/// The canonical session and every association index that still refers to it
-/// commit together. A failed write is logged, never a panic.
+/// Delete a session and its still-current indexes in one checked commit.
 #[implement(Sessions)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn delete(&self, sess_id: &str) {
-	let (session, unique_id, _write_guard) = loop {
-		let Ok(snapshot) = self.get(sess_id).await else {
-			return;
-		};
-
-		let unique_id = self.identity_of(&snapshot).await;
-		let write_guard = match unique_id.as_deref() {
-			| Some(unique_id) => Some(self.write_locks.lock(unique_id).await),
-			| None => None,
-		};
-
-		let Ok(session) = self.get(sess_id).await else {
-			return;
-		};
-
-		if session.idp_id.as_deref() != snapshot.idp_id.as_deref() {
-			continue;
-		}
-
-		if self.identity_of(&session).await == unique_id {
-			break (session, unique_id, write_guard);
-		}
+pub async fn delete(&self, sess_id: &str) -> Result {
+	let snapshot = match self.get(sess_id).await {
+		| Ok(session) => session,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
 	};
-
-	// Preserve a unique identity association updated to a newer session.
-	let unique_id = async {
-		let unique_id = unique_id.as_deref()?;
-		let assoc_id = self
-			.get_sess_id_by_unique_id(unique_id)
-			.map(Result::ok)
-			.await?;
-
-		(assoc_id == sess_id).then_some(unique_id)
-	}
-	.await;
-
-	let user_sessions = async {
-		let user_id = session.user_id.as_deref()?;
-		let sess_ids: Vec<_> = self
-			.get_sess_id_by_user(user_id)
-			.ready_filter_map(Result::ok)
-			.ready_filter(|assoc_id| assoc_id != sess_id)
-			.collect()
-			.await;
-
-		Some((user_id, sess_ids))
-	}
-	.await;
-
-	let mut txn = self.db.database.txn();
-
-	if let Some((user_id, sess_ids)) = user_sessions {
-		if !sess_ids.is_empty() {
-			txn.raw_put(&self.db.userid_oauthid, user_id, sess_ids);
-		} else {
-			txn.del_raw(&self.db.userid_oauthid, user_id);
+	if let Some(user_id) = snapshot.user_id.as_deref() {
+		let plan = self.lock_user_sessions(user_id).await?;
+		let records = plan
+			.records
+			.iter()
+			.filter(|session| session.sess_id.as_deref() == Some(sess_id))
+			.cloned()
+			.collect::<Vec<_>>();
+		if records.is_empty() {
+			return Err(Error::bad_database(
+				"Canonical OAuth session is absent from its user index",
+			));
 		}
+		let mut txn = self.db.database.txn();
+		self.append_deleted_sessions(&plan, &records, &mut txn)
+			.await?;
+		return txn.execute().await;
 	}
-
-	if let Some(unique_id) = unique_id {
-		txn.del_raw(&self.db.oauthuniqid_oauthid, unique_id);
+	let key = self.mutation_key(&snapshot).await?;
+	let _guard = self.write_locks.lock(&key).await;
+	let current = match self.get(sess_id).await {
+		| Ok(session) => session,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
+	};
+	if current.user_id.is_some() || self.mutation_key(&current).await? != key {
+		return Err(Error::bad_database("OAuth session association changed during deletion"));
 	}
-
-	txn.del_raw(&self.db.oauthid_session, sess_id);
-
-	if let Err(error) = txn.execute().await {
-		warn!(%sess_id, "Upstream grant record could not be deleted: {error}");
-	}
+	self.db.oauthid_session.remove(sess_id).await
 }
 
 /// Create or overwrite database state for the session.
@@ -380,11 +349,8 @@ pub async fn delete(&self, sess_id: &str) {
 #[tracing::instrument(level = "info", skip(self))]
 pub async fn put(&self, session: &Session) -> Result {
 	let unique_id = self.identity_of(session).await;
-
-	let _write_guard = match unique_id.as_deref() {
-		| Some(unique_id) => Some(self.write_locks.lock(unique_id).await),
-		| None => None,
-	};
+	let mutation_key = self.mutation_key(session).await?;
+	let _write_guard = self.write_locks.lock(&mutation_key).await;
 
 	self.put_locked(session, unique_id.as_deref())
 		.await
@@ -448,11 +414,8 @@ where
 			| Err(e) => return Err(e),
 		};
 
-		let unique_id = self.identity_of(&snapshot).await;
-		let write_guard = match unique_id.as_deref() {
-			| Some(unique_id) => Some(self.write_locks.lock(unique_id).await),
-			| None => None,
-		};
+		let unique_id = self.mutation_key(&snapshot).await?;
+		let write_guard = self.write_locks.lock(&unique_id).await;
 
 		let session = match self.get(sess_id).await {
 			| Ok(session) => session,
@@ -460,7 +423,7 @@ where
 			| Err(e) => return Err(e),
 		};
 
-		if self.identity_of(&session).await == unique_id {
+		if self.mutation_key(&session).await? == unique_id {
 			break (session, write_guard);
 		}
 	};
@@ -540,23 +503,42 @@ async fn put_locked(&self, session: &Session, unique_id: Option<&str>) -> Result
 
 	let stored = self.sealed_form(sess_id, session)?;
 
-	let user_sessions = async {
-		let user_id = session.user_id.as_deref()?;
-		let sess_ids = self
-			.get_sess_id_by_user(user_id)
-			.ready_filter_map(Result::ok)
-			.chain(once(sess_id.to_owned()).stream())
-			.collect::<Vec<_>>()
-			.map(|mut ids| {
-				ids.sort_unstable();
-				ids.dedup();
-				ids
-			})
-			.await;
-
-		Some((user_id, sess_ids))
+	let _user_guard = match session.user_id.as_deref() {
+		| Some(user_id) => Some(self.user_write_locks.lock(user_id).await),
+		| None => None,
+	};
+	let user_sessions = match session.user_id.as_deref() {
+		| Some(user_id) => {
+			let mut ids: Vec<String> = self
+				.get_sess_id_by_user(user_id)
+				.try_collect()
+				.await?;
+			ids.push(sess_id.to_owned());
+			ids.sort_unstable();
+			ids.dedup();
+			check_session_index(&ids)?;
+			Some((user_id, ids))
+		},
+		| None => None,
+	};
+	let stored_bytes = serialize_to_vec(Cbor(&stored))?.len();
+	if stored_bytes > MAX_SESSION_BYTES {
+		return Err(session_limit());
 	}
-	.await;
+	if let Some((user_id, ids)) = &user_sessions {
+		let mut bytes = stored_bytes;
+		for id in ids.iter().filter(|id| id.as_str() != sess_id) {
+			let raw = self.db.oauthid_session.get(id).await?;
+			bytes = bytes.saturating_add(raw.len());
+			if bytes > MAX_USER_SESSION_BYTES {
+				return Err(session_limit());
+			}
+			let existing = self.get(id).await?;
+			if existing.user_id.as_deref() != Some(*user_id) {
+				return Err(Error::bad_database("OAuth user index binding differs"));
+			}
+		}
+	}
 
 	let mut txn = self.db.database.txn();
 
@@ -570,9 +552,211 @@ async fn put_locked(&self, session: &Session, unique_id: Option<&str>) -> Result
 		txn.raw_put(&self.db.userid_oauthid, user_id, sess_ids);
 	}
 
+	txn.check_bridge_admission()?;
 	txn.execute().await?;
 
 	Ok(())
+}
+
+/// Complete bounded user inventory held stable against session writes.
+pub struct LockedUserSessions {
+	user_id: OwnedUserId,
+	records: Vec<Session>,
+	_identity_guards: Vec<MutexMapGuard<String, ()>>,
+	_user_guard: MutexMapGuard<OwnedUserId, ()>,
+}
+
+impl LockedUserSessions {
+	#[must_use]
+	pub fn records(&self) -> &[Session] { &self.records }
+}
+
+const MAX_USER_SESSIONS: usize = 128;
+const MAX_SESSION_INDEX_BYTES: usize = 128 * 1024;
+const MAX_SESSION_BYTES: usize = 128 * 1024;
+const MAX_USER_SESSION_BYTES: usize = 1024 * 1024;
+
+fn session_limit() -> Error {
+	Error::Request(
+		ruma::api::error::ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData {
+			retry_after: None,
+		}),
+		"OAuth session inventory limit reached".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	)
+}
+
+fn check_session_index(ids: &[String]) -> Result {
+	if ids.len() > MAX_USER_SESSIONS
+		|| ids
+			.iter()
+			.any(|id| id.is_empty() || id.len() > tuwunel_bridge::MAX_KEY_BYTES)
+		|| serialize_to_vec(ids)?.len() > MAX_SESSION_INDEX_BYTES
+	{
+		return Err(session_limit());
+	}
+	let mut seen = std::collections::HashSet::new();
+	if ids.iter().any(|id| !seen.insert(id)) {
+		return Err(Error::bad_database("Duplicate OAuth session index entry"));
+	}
+	Ok(())
+}
+
+#[implement(Sessions)]
+async fn mutation_key(&self, session: &Session) -> Result<String> {
+	if session.user_info.is_some() {
+		let provider = self.provider(session).await?;
+		return session_unique_id((&provider, session));
+	}
+	let id = session
+		.sess_id
+		.as_deref()
+		.ok_or_else(|| Error::bad_database("OAuth session id missing"))?;
+	Ok(format!("session:{id}"))
+}
+
+#[implement(Sessions)]
+pub async fn lock_user_sessions(&self, user_id: &UserId) -> Result<LockedUserSessions> {
+	for _ in 0..8 {
+		let ids: Vec<String> = self
+			.get_sess_id_by_user(user_id)
+			.try_collect()
+			.await?;
+		let mut keys = Vec::new();
+		for id in &ids {
+			keys.push(self.mutation_key(&self.get(id).await?).await?);
+		}
+		keys.sort_unstable();
+		keys.dedup();
+		let mut guards = Vec::new();
+		for key in &keys {
+			guards.push(self.write_locks.lock(key).await);
+		}
+		let user_guard = self.user_write_locks.lock(user_id).await;
+		let current: Vec<String> = self
+			.get_sess_id_by_user(user_id)
+			.try_collect()
+			.await?;
+		if current != ids {
+			continue;
+		}
+		let mut records = Vec::new();
+		let mut bytes = 0_usize;
+		let mut changed = false;
+		for id in current {
+			let value = self.db.oauthid_session.get(&id).await?;
+			bytes = bytes.saturating_add(value.len());
+			if bytes > MAX_USER_SESSION_BYTES {
+				return Err(session_limit());
+			}
+			let record = self.get(&id).await?;
+			if record.user_id.as_deref() != Some(user_id) {
+				return Err(Error::bad_database("OAuth user index binding differs"));
+			}
+			if !keys.contains(&self.mutation_key(&record).await?) {
+				changed = true;
+				break;
+			}
+			records.push(record);
+		}
+		if changed {
+			continue;
+		}
+		return Ok(LockedUserSessions {
+			user_id: user_id.to_owned(),
+			records,
+			_identity_guards: guards,
+			_user_guard: user_guard,
+		});
+	}
+	Err(Error::bad_database(
+		"OAuth session inventory changed repeatedly; retry the operation",
+	))
+}
+
+#[implement(Sessions)]
+pub fn append_cleared_grants(
+	&self,
+	plan: &LockedUserSessions,
+	device_id: Option<&ruma::DeviceId>,
+	txn: &mut Txn,
+) -> Result<usize> {
+	let mut cleared = 0_usize;
+	for record in plan
+		.records()
+		.iter()
+		.filter(|record| device_id.is_none_or(|id| record.device_id.as_deref() == Some(id)))
+	{
+		let id = record
+			.sess_id
+			.as_deref()
+			.ok_or_else(|| Error::bad_database("OAuth session id missing"))?;
+		let stored = self.sealed_form(id, &record.clone().cleared())?;
+		txn.raw_put(&self.db.oauthid_session, id, Cbor(&stored));
+		cleared = cleared.checked_add(1).ok_or_else(session_limit)?;
+	}
+	txn.check_bridge_admission()?;
+	Ok(cleared)
+}
+
+#[implement(Sessions)]
+async fn append_deleted_sessions(
+	&self,
+	plan: &LockedUserSessions,
+	deleted: &[Session],
+	txn: &mut Txn,
+) -> Result {
+	let removed: std::collections::HashSet<&str> = deleted
+		.iter()
+		.filter_map(|session| session.sess_id.as_deref())
+		.collect();
+	let remaining: Vec<&str> = plan
+		.records
+		.iter()
+		.filter_map(|session| session.sess_id.as_deref())
+		.filter(|id| !removed.contains(id))
+		.collect();
+	for record in deleted {
+		let id = record
+			.sess_id
+			.as_deref()
+			.ok_or_else(|| Error::bad_database("OAuth session id missing"))?;
+		if record.user_info.is_some() {
+			let unique_id = self.mutation_key(record).await?;
+			match self.get_sess_id_by_unique_id(&unique_id).await {
+				| Ok(current) if current == id =>
+					txn.del_raw(&self.db.oauthuniqid_oauthid, unique_id),
+				| Ok(current) => {
+					let replacement = self.get(&current).await?;
+					if replacement.user_id != record.user_id
+						|| self.mutation_key(&replacement).await? != unique_id
+					{
+						return Err(Error::bad_database(
+							"Replacement OAuth identity index binding differs",
+						));
+					}
+				},
+				| Err(error) if error.is_not_found() => (),
+				| Err(error) => return Err(error),
+			}
+		}
+		txn.del_raw(&self.db.oauthid_session, id);
+	}
+	if remaining.is_empty() {
+		txn.del_raw(&self.db.userid_oauthid, &plan.user_id);
+	} else {
+		txn.raw_put(&self.db.userid_oauthid, &plan.user_id, remaining);
+	}
+	txn.check_bridge_admission().map(|_| ())
+}
+
+#[implement(Sessions)]
+pub async fn delete_user(&self, user_id: &UserId) -> Result {
+	let plan = self.lock_user_sessions(user_id).await?;
+	let mut txn = self.db.database.txn();
+	self.append_deleted_sessions(&plan, plan.records(), &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// The persisted form of `session`: token material sealed under the current
@@ -659,13 +843,15 @@ pub fn get_by_user(&self, user_id: &UserId) -> impl Stream<Item = Result<Session
 #[implement(Sessions)]
 #[tracing::instrument(level = "debug", skip(self), ret(level = "debug"))]
 pub async fn get(&self, sess_id: &str) -> Result<Session> {
-	self.db
-		.oauthid_session
-		.get(sess_id)
-		.await
-		.deserialized::<Cbor<_>>()
-		.map(at!(0))
-		.map(|session| self.opened(sess_id, session))
+	let value = self.db.oauthid_session.get(sess_id).await?;
+	if value.len() > MAX_SESSION_BYTES {
+		return Err(session_limit());
+	}
+	let session: Cbor<Session> = deserialize_from_slice(value.as_ref())?;
+	if session.0.sess_id.as_deref() != Some(sess_id) {
+		return Err(Error::bad_database("OAuth session key binding differs"));
+	}
+	Ok(self.opened(sess_id, session.0))
 }
 
 /// Resolve the `sess_id` associations with a `user_id`.
@@ -685,10 +871,25 @@ pub fn get_sess_id_by_user(&self, user_id: &UserId) -> impl Stream<Item = Result
 /// Missing referenced sessions/providers and undecodable or unreadable index
 /// values are failures, not evidence that the user is exempt from rechecking.
 pub(super) fn association_ids(result: Result<Handle<'_>>) -> Result<Vec<String>> {
-	match result {
-		| Err(error) if error.is_not_found() => Ok(Vec::new()),
-		| result => result.deserialized(),
+	let value = match result {
+		| Err(error) if error.is_not_found() => return Ok(Vec::new()),
+		| result => result?,
+	};
+	if value.len() > MAX_SESSION_INDEX_BYTES {
+		return Err(session_limit());
 	}
+	// The compact string-vector codec separates UTF-8 records with 0xFF.
+	// Count source records before allocating any decoded strings.
+	let source_records = value
+		.split(|byte| *byte == tuwunel_database::SEP)
+		.take(MAX_USER_SESSIONS.saturating_add(1))
+		.count();
+	if source_records > MAX_USER_SESSIONS {
+		return Err(session_limit());
+	}
+	let ids: Vec<String> = deserialize_from_slice(value.as_ref())?;
+	check_session_index(&ids)?;
+	Ok(ids)
 }
 
 /// Resolve the `sess_id` from an associated provider issuer and subject hash.
@@ -769,4 +970,36 @@ pub async fn provider(&self, session: &Session) -> Result<Provider> {
 	};
 
 	self.providers.get(idp_id).await
+}
+
+#[cfg(test)]
+mod inventory_tests {
+	use tuwunel_core::Result;
+	use tuwunel_database::{Handle, serialize_to_vec};
+
+	use super::{MAX_SESSION_INDEX_BYTES, MAX_USER_SESSIONS, association_ids};
+
+	#[test]
+	fn complete_index_budget_refuses_excess_records_before_decoding() -> Result {
+		let ids = (0..MAX_USER_SESSIONS)
+			.map(|n| format!("grant-{n}"))
+			.collect::<Vec<_>>();
+		assert_eq!(association_ids(Ok(Handle::from(serialize_to_vec(&ids)?)))?, ids);
+		let mut overflow = ids;
+		overflow.push("last".into());
+		association_ids(Ok(Handle::from(serialize_to_vec(&overflow)?)))
+			.expect_err("overflow probe must refuse the complete inventory");
+		association_ids(Ok(Handle::from(vec![0xFE; MAX_SESSION_INDEX_BYTES + 1])))
+			.expect_err("raw width refuses before decoding invalid strings");
+		Ok(())
+	}
+
+	#[test]
+	fn corrupt_duplicate_or_empty_index_entries_are_not_absent_grants() -> Result {
+		for ids in [vec!["one", "one"], vec!["one", ""], vec![""]] {
+			association_ids(Ok(Handle::from(serialize_to_vec(ids)?)))
+				.expect_err("invalid indexes must fail closed");
+		}
+		Ok(())
+	}
 }

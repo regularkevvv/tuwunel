@@ -34,14 +34,31 @@ pub(super) type QueueItem = (Key, SendingEvent);
 pub(super) type Key = Vec<u8>;
 pub(super) const ACTIVE_PROMOTION_LIMIT: usize = 48;
 
+/// A validated destination-owned admission, excluded from cancellation until
+/// the caller commits the pending rows alongside its device mutation.
+pub(crate) struct DeviceListAdmission {
+	// Field order releases sender exclusion before registry exclusion.
+	_guard: tokio::sync::OwnedMutexGuard<()>,
+	_registrations: crate::appservice::RegistrationReadGuard,
+	pub(super) requests: Vec<(Destination, SendingEvent, Vec<u8>)>,
+}
+
+impl DeviceListAdmission {
+	pub(crate) fn append(&self, db: &Database, txn: &mut Txn) {
+		for (_, event, key) in &self.requests {
+			txn.insert_raw(&db["servernameevent_data"], key, event.value_bytes());
+		}
+	}
+}
+
 pub struct Data {
-	servercurrentevent_data: Arc<Map>,
-	servernameevent_data: Arc<Map>,
+	pub(super) servercurrentevent_data: Arc<Map>,
+	pub(super) servernameevent_data: Arc<Map>,
 	servername_educount: Arc<Map>,
 	sendingtransaction_record: Arc<Map>,
 	pub(super) db: Arc<Database>,
 	services: Arc<crate::services::OnceServices>,
-	active_write: Arc<Mutex<()>>,
+	pub(super) active_write: Arc<Mutex<()>>,
 }
 
 impl Data {
@@ -273,6 +290,38 @@ impl Data {
 		budget
 			.try_put(key_len, event.value_bytes())
 			.map_err(|error| admission_error(&error))
+	}
+
+	pub(super) async fn prepare_device_list_admission(
+		&self,
+		count: u64,
+		requests: Vec<(Destination, SendingEvent)>,
+		registrations: crate::appservice::RegistrationReadGuard,
+	) -> Result<DeviceListAdmission> {
+		let guard = self.active_write.clone().lock_owned().await;
+		let mut budget = self.queue_budget()?;
+		let mut prepared = Vec::new();
+		for (destination, event) in requests {
+			Self::admit_request(&mut budget, &event, &destination)?;
+			self.require_uncancelled_destination(&destination)
+				.await?;
+			let mut key = destination.get_prefix_with_capacity(8);
+			key.extend_from_slice(&count.to_be_bytes());
+			// A newly persisted count is unique, but storage corruption must not
+			// silently replace someone else's pending work.
+			match self.servernameevent_data.get(&key).await {
+				| Ok(_) =>
+					return Err(Error::bad_database("Device-list queue identity already exists")),
+				| Err(error) if error.is_not_found() => {},
+				| Err(error) => return Err(error),
+			}
+			prepared.push((destination, event, key));
+		}
+		Ok(DeviceListAdmission {
+			_guard: guard,
+			_registrations: registrations,
+			requests: prepared,
+		})
 	}
 
 	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>

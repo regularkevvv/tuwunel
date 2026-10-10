@@ -165,13 +165,24 @@ pub async fn set_pusher(
 	sender_device: &DeviceId,
 	pusher: &PusherAction,
 ) -> Result {
+	let services = self.services.get();
+	let _guard = services
+		.as_ref()
+		.users
+		.lock_device_mutations(sender)
+		.await;
+
 	match pusher {
 		| PusherAction::Delete(ids) =>
 			self.set_pusher_delete(sender, ids.pushkey.as_str())
 				.await,
-		| PusherAction::Post(data) =>
+		| PusherAction::Post(data) => {
+			services.db["userdeviceid_metadata"]
+				.qry(&(sender, sender_device))
+				.await?;
 			self.set_pusher_post(sender, sender_device, pusher, &data.pusher)
-				.await?,
+				.await?;
+		},
 	}
 
 	Ok(())

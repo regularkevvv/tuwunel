@@ -46,6 +46,7 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt, layer::SubscriberExt};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_admin::{fini, init};
 use tuwunel_core::{Err, Result, err, ruma::OwnedUserId};
+use tuwunel_database::{refusal, serialize_to_vec};
 use tuwunel_service::Services;
 
 /// 32 bytes of 0x07, URL-safe base64 without padding.
@@ -393,6 +394,18 @@ async fn operator_revocation(
 	}
 
 	init(&services.admin);
+	let preflight = operator_inventory_refusals(services, user_id).await;
+	if let Err(error) = preflight {
+		fini(&services.admin);
+		return Err(error);
+	}
+	for token in &tokens {
+		assert_eq!(
+			whoami(client, base, token).await?.0,
+			200,
+			"refused revocations must preserve every live token"
+		);
+	}
 	let revocation = admin(services, format!("query oauth revoke-sessions {user_id}")).await;
 	fini(&services.admin);
 	revocation?;
@@ -422,6 +435,225 @@ async fn operator_revocation(
 		"operator revocation must revoke both grants upstream"
 	);
 
+	// Successful forced Associate deletes the complete committed inventory
+	// atomically and preserves a durable claim for the next real SSO login.
+	init(&services.admin);
+	let association = admin(
+		services,
+		format!(
+			"query oauth associate test-client {user_id} --claim sub=fixture-subject --force"
+		),
+	)
+	.await;
+	fini(&services.admin);
+	association?;
+	assert!(
+		services
+			.oauth
+			.sessions
+			.get_by_user(user_id)
+			.try_collect::<Vec<_>>()
+			.await?
+			.is_empty()
+	);
+	let userinfo = tuwunel_service::oauth::UserInfo {
+		sub: "fixture-subject".into(),
+		..Default::default()
+	};
+	assert_eq!(
+		services
+			.oauth
+			.sessions
+			.find_user_association_pending("test-client", &userinfo)
+			.await?,
+		Some(user_id.clone())
+	);
+	Ok(())
+}
+
+type OperatorRows = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+async fn operator_rows(services: &Services) -> Result<OperatorRows> {
+	let mut rows = Vec::new();
+	for name in [
+		"oauthid_session",
+		"userid_oauthid",
+		"oauthuniqid_oauthid",
+		"oauthidpuserid_pendingclaims",
+		"token_userdeviceid",
+		"userdeviceid_metadata",
+		"userdeviceid_token",
+		"userdeviceidtoken_index",
+		"userdeviceid_refresh",
+		"userdeviceid_spentrefresh",
+	] {
+		rows.push((
+			name,
+			services.db[name]
+				.raw_rows_after(None, 4096)
+				.await?,
+		));
+	}
+	Ok(rows)
+}
+
+async fn seed_raw(services: &Services, map: &str, key: &[u8], bytes: &[u8]) -> Result {
+	let mut txn = services.db.txn();
+	txn.insert_raw(&services.db[map], key, bytes);
+	txn.execute().await
+}
+
+async fn operator_inventory_refusals(services: &Services, user_id: &OwnedUserId) -> Result {
+	let original_index = services.db["userid_oauthid"]
+		.get(user_id)
+		.await?
+		.as_ref()
+		.to_vec();
+	let before = operator_rows(services).await?;
+	admin(
+		services,
+		format!("query oauth associate test-client {user_id} --claim sub=fixture-subject"),
+	)
+	.await
+	.expect_err("Associate must refuse to shadow committed sessions without force");
+	assert_eq!(operator_rows(services).await?, before);
+
+	// Corruption and overflow refuse before device/token or upstream grant writes.
+	for malformed in [
+		vec![0xFE],
+		serialize_to_vec(
+			(0..129)
+				.map(|n| format!("missing-{n}"))
+				.collect::<Vec<_>>(),
+		)?,
+	] {
+		seed_raw(services, "userid_oauthid", user_id.as_bytes(), &malformed).await?;
+		let seeded = operator_rows(services).await?;
+		services
+			.oauth
+			.revoke_user_sessions(user_id)
+			.await
+			.expect_err("invalid complete index must refuse revocation");
+		services
+			.oauth
+			.sessions
+			.associate_user(
+				"test-client",
+				user_id,
+				std::collections::BTreeMap::from([("sub".into(), "fixture-subject".into())]),
+				true,
+			)
+			.await
+			.expect_err("invalid complete index must refuse Associate");
+		assert_eq!(
+			operator_rows(services).await?,
+			seeded,
+			"inventory refusal cannot partially mutate state"
+		);
+		seed_raw(services, "userid_oauthid", user_id.as_bytes(), &original_index).await?;
+	}
+
+	let ids: Vec<String> = services
+		.oauth
+		.sessions
+		.get_sess_id_by_user(user_id)
+		.try_collect()
+		.await?;
+	let id = ids
+		.last()
+		.expect("fixture retains multiple sessions");
+	let canonical = services.db["oauthid_session"]
+		.get(id)
+		.await?
+		.as_ref()
+		.to_vec();
+	seed_raw(services, "oauthid_session", id.as_bytes(), &[0xFE]).await?;
+	let seeded = operator_rows(services).await?;
+	services
+		.oauth
+		.revoke_user_sessions(user_id)
+		.await
+		.expect_err("a corrupt later session must refuse the complete operation");
+	assert_eq!(operator_rows(services).await?, seeded);
+	seed_raw(services, "oauthid_session", id.as_bytes(), &canonical).await?;
+
+	let associations = services.db["oauthuniqid_oauthid"]
+		.raw_rows_after(None, 128)
+		.await?;
+	let (identity_key, identity_value) = associations
+		.first()
+		.expect("fixture keeps a current identity index");
+	seed_raw(services, "oauthuniqid_oauthid", identity_key, b"missing-canonical-grant").await?;
+	let seeded = operator_rows(services).await?;
+	services
+		.oauth
+		.sessions
+		.associate_user(
+			"test-client",
+			user_id,
+			std::collections::BTreeMap::from([("sub".into(), "fixture-subject".into())]),
+			true,
+		)
+		.await
+		.expect_err("a dangling replacement identity must refuse complete deletion");
+	assert_eq!(operator_rows(services).await?, seeded);
+	seed_raw(services, "oauthuniqid_oauthid", identity_key, identity_value).await?;
+
+	let pending_key = serialize_to_vec(("test-client", user_id))?;
+	seed_raw(services, "oauthidpuserid_pendingclaims", &pending_key, b"invalid-json").await?;
+	let seeded = operator_rows(services).await?;
+	let userinfo = tuwunel_service::oauth::UserInfo {
+		sub: "fixture-subject".into(),
+		..Default::default()
+	};
+	services
+		.oauth
+		.sessions
+		.find_user_association_pending("test-client", &userinfo)
+		.await
+		.expect_err("corrupt pending claims cannot mean an absent association");
+	services
+		.oauth
+		.sessions
+		.associate_user(
+			"test-client",
+			user_id,
+			std::collections::BTreeMap::from([("sub".into(), "fixture-subject".into())]),
+			true,
+		)
+		.await
+		.expect_err("Associate must not replace unreadable claims");
+	assert_eq!(operator_rows(services).await?, seeded);
+	let mut txn = services.db.txn();
+	txn.del_raw(&services.db["oauthidpuserid_pendingclaims"], &pending_key);
+	txn.execute().await?;
+
+	let before = operator_rows(services).await?;
+	refusal::refuse_next("oauthidpuserid_pendingclaims");
+	admin(
+		services,
+		format!(
+			"query oauth associate test-client {user_id} --claim sub=fixture-subject --force"
+		),
+	)
+	.await
+	.expect_err("refused atomic Associate must report failure");
+	assert_eq!(refusal::pending(), 0);
+	assert_eq!(
+		operator_rows(services).await?,
+		before,
+		"failed claim commit cannot delete existing sessions"
+	);
+	refusal::refuse_next("oauthid_session");
+	admin(services, format!("query oauth revoke-sessions {user_id}"))
+		.await
+		.expect_err("refused atomic revocation must report failure");
+	assert_eq!(refusal::pending(), 0);
+	assert_eq!(
+		operator_rows(services).await?,
+		before,
+		"failed grant commit cannot delete devices or tokens"
+	);
 	Ok(())
 }
 

@@ -243,7 +243,7 @@ async fn expired_token(services: &Services, access_token: &str) -> Result<Auth> 
 	services
 		.users
 		.remove_access_token_value(access_token)
-		.await;
+		.await?;
 
 	Err(Error::BadRequest(
 		ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: true }),
