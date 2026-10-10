@@ -189,8 +189,10 @@ impl Data {
 		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
+		// Identities are persisted before dispatch. A different earlier write
+		// may still hold the retired visibility frontier below this admission.
 		if active::identity(value)?
-			.is_some_and(|identity| identity > services_root.globals.current_count())
+			.is_some_and(|identity| identity > services_root.globals.pending_count().end)
 		{
 			return Err(Error::bad_database(
 				"Active delivery identity exceeds the committed counter",
@@ -199,3 +201,7 @@ impl Data {
 		Ok(())
 	}
 }
+
+#[cfg(test)]
+#[path = "ack_frontier_tests.rs"]
+mod frontier_tests;

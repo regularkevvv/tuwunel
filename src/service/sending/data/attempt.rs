@@ -248,7 +248,10 @@ impl Data {
 			.await
 		{
 			| Ok(value) => {
-				let record = decode(&value, destination, services_root.globals.current_count())?;
+				// Journal generations are persisted dispatches, independent of
+				// earlier unrelated writes holding the retirement frontier.
+				let record =
+					decode(&value, destination, services_root.globals.pending_count().end)?;
 				if ownership.as_ref() != Some(&witness(&value)) {
 					return Err(Error::bad_database(
 						"Outgoing transaction ownership witness is missing or changed",
@@ -536,7 +539,7 @@ impl Data {
 			}
 			return Ok(true);
 		};
-		decode(&expected.value, destination, services_root.globals.current_count())?;
+		decode(&expected.value, destination, services_root.globals.pending_count().end)?;
 		let Some((value, record)) = current else { return Ok(true) };
 		if value != expected.value {
 			if record.generation > expected.generation {
