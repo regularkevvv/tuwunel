@@ -763,6 +763,36 @@ mod tests {
 	}
 
 	#[test]
+	fn sealed_header_refuses_hostile_member_count_hints_before_allocation() {
+		let destination = Destination::Appservice("hint-owner".into());
+		let record = Record {
+			owner: destination.get_prefix().into(),
+			generation: 2,
+			kind: AttemptKind::Appservice,
+			recipient: Some([1; 32]),
+			members: Vec::new(),
+			body_len: 2,
+			body_digest: hash(b"{}"),
+		};
+		let header = encode(&record).unwrap();
+		let name = b"members";
+		let field = header
+			.windows(name.len())
+			.position(|bytes| bytes == name)
+			.expect("CBOR field");
+		let offset = field + name.len();
+		assert_eq!(header[offset], 0x80, "empty definite CBOR array");
+		let mut hostile = header[..offset].to_vec();
+		hostile.push(0x9B);
+		hostile.extend_from_slice(&u64::MAX.to_be_bytes());
+		hostile.extend_from_slice(&header[offset + 1..header.len() - 32]);
+		let seal = hash(&hostile);
+		hostile.extend_from_slice(&seal);
+		decode(&hostile, &destination, 2)
+			.expect_err("tiny valid seal cannot advertise unlimited members");
+	}
+
+	#[test]
 	fn sealed_headers_still_reject_wrong_owner_kind_and_counter() {
 		let destination = Destination::Appservice("owner".into());
 		let prefix = destination.get_prefix();

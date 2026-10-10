@@ -435,7 +435,8 @@ pub(crate) async fn outgoing_key_metadata(
 					.as_bytes()
 					.len()
 					.saturating_add(device.as_str().len())
-					.saturating_add(id.as_str().len()),
+					.saturating_add(id.as_str().len())
+					.saturating_add(16),
 			)?;
 			let algorithm = id.algorithm();
 			if !counts.contains_key(&algorithm) && counts.len() >= 16 {
@@ -461,7 +462,10 @@ pub(crate) async fn outgoing_key_metadata(
 		budget.charge(
 			bytes
 				.len()
-				.saturating_add(algorithm.as_str().len()),
+				.saturating_add(algorithm.as_str().len())
+				.saturating_add(user_id.as_bytes().len())
+				.saturating_add(device_id.as_str().len())
+				.saturating_add(16),
 		)?;
 		if examined >= 16 || bytes.len() > 64 * 1024 {
 			return Err(err!(Request(TooLarge("Outgoing fallback metadata inventory limit"))));
