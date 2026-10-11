@@ -532,6 +532,8 @@ async fn recover_refused_failure(url: &str) -> Result {
 		1,
 		"shutdown ACK must preserve the unsent successor"
 	);
+	// The successor requests the same counts-only reconciliation. Its current
+	// count already matches the actual ACK, so no redundant HTTP is owed.
 	services
 		.sending
 		.resume_queue(
@@ -572,7 +574,7 @@ async fn refused_failure() -> Result {
 	let fake = Fake::start().await?;
 	let fixture = fixture(Some(&fake.url), 10).await?;
 	let services = &fixture.services;
-	let mut gateway = Gateway::new(3, 0, true).await?;
+	let mut gateway = Gateway::new(2, 0, true).await?;
 	let destination = push(services, &gateway).await?;
 	let response = services
 		.sending
@@ -672,17 +674,28 @@ async fn refused_failure() -> Result {
 	)
 	.await
 	.expect("bounded cold refused-failure recovery")?;
-	assert!(status.success(), "fresh writer verifies known-refusal recovery and actual ACKs");
+	assert!(
+		status.success(),
+		"fresh writer verifies known-refusal recovery and badge coalescing"
+	);
 	assert_eq!(gateway.next().await, original, "cold replay preserves exact gateway wire bytes");
-	gateway.next().await;
+	timeout(Duration::from_secs(2), &mut gateway.task)
+		.await
+		.expect("all expected gateway requests finish")
+		.expect("owned gateway task succeeds")?;
+	assert!(matches!(
+		gateway.captures.try_recv(),
+		Err(mpsc::error::TryRecvError::Disconnected)
+	));
 	assert!(fake.rows(active_map).is_empty());
 	assert!(fake.rows(pending_map).is_empty());
 	report(
 		"gateway_failure_refused_persistence",
 		started,
-		&json!({"gateway_requests":3,"refused_shutdown_ms":refused_ms,"retained_rows_during_refusal":1,
+		&json!({"gateway_requests":2,"refused_shutdown_ms":refused_ms,"retained_rows_during_refusal":1,
 		"retained_successors_during_refusal":1,"known_refusal_propagated":true,"deferred_429_recovery":false,
-		"cold_newer_writer":true,"cold_replayed_identical_gateway_body":true,"remaining_rows":0}),
+		"cold_newer_writer":true,"cold_replayed_identical_gateway_body":true,
+		"unchanged_badge_successor_coalesced_after_actual_ack":true,"remaining_rows":0}),
 	);
 	Ok(())
 }
