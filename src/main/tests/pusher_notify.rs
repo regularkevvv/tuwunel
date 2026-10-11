@@ -21,9 +21,12 @@ use tuwunel_core::{
 	matrix::{Pdu, PduCount, PduId, RawPduId},
 	ruma::{
 		DeviceId, EventId, OwnedEventId, OwnedRoomId, RoomId, UInt, UserId,
-		api::client::push::{
-			Pusher, PusherIds, PusherInit, PusherKind,
-			set_pusher::v3::{PusherAction, Request as SetPusherRequest},
+		api::client::{
+			device::Device,
+			push::{
+				Pusher, PusherIds, PusherInit, PusherKind,
+				set_pusher::v3::{PusherAction, Request as SetPusherRequest},
+			},
 		},
 		device_id,
 		presence::PresenceState,
@@ -174,6 +177,7 @@ struct PushRetry {
 async fn prepare_badge_recovery(services: &Services) -> Result<BadgeRecovery> {
 	let server_name = services.globals.server_name();
 	let user = UserId::parse_with_server_name("badge-recovery", server_name)?;
+	prepare_device(services, &user, device_id!("BADGERECOVERY")).await?;
 	let pushkey = "pk-badge-recovery";
 
 	let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -201,6 +205,7 @@ async fn prepare_badge_recovery(services: &Services) -> Result<BadgeRecovery> {
 async fn prepare_push_retry(services: &Services) -> Result<PushRetry> {
 	let server_name = services.globals.server_name();
 	let user = UserId::parse_with_server_name("push-retry", server_name)?;
+	prepare_device(services, &user, device_id!("PUSHRETRY")).await?;
 	let pushkey = "pk-push-retry";
 	let room_id = OwnedRoomId::from_parts('!', "push-retry", Some(server_name.as_str()))?;
 	prepare_room_membership(services, &room_id, &user).await?;
@@ -430,6 +435,7 @@ async fn expect_retry_active_set(
 async fn verify_badge_retry(services: &Services) -> Result {
 	let server_name = services.globals.server_name();
 	let user = UserId::parse_with_server_name("badge-retry", server_name)?;
+	prepare_device(services, &user, device_id!("BADGERETRY")).await?;
 	let pushkey = "pk-badge-retry";
 
 	let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -592,6 +598,7 @@ async fn wait_for_queue_cleanup(services: &Services, destination: &Destination) 
 async fn run_cases(services: &Services) -> Result {
 	let server_name = services.globals.server_name();
 	let user = UserId::parse_with_server_name("pushtest", server_name)?;
+	prepare_device(services, &user, device_id!("PUSHDEV")).await?;
 
 	services
 		.users
@@ -689,6 +696,22 @@ async fn count_read_failure_refuses_gateway_and_preserves_badge(
 		"repaired retry sends actual count"
 	);
 	Ok(())
+}
+
+/// These disposable fixtures bypass login but still register pushers for real
+/// device records. Seed them before exercising the guarded pusher service.
+async fn prepare_device(services: &Services, user: &UserId, device: &DeviceId) -> Result {
+	services.db["userdeviceid_metadata"]
+		.put(
+			(user, device),
+			Json(Device {
+				device_id: device.to_owned(),
+				display_name: None,
+				last_seen_ts: None,
+				last_seen_ip: None,
+			}),
+		)
+		.await
 }
 
 /// Synthetic group rooms still need a consistent push-rule count context.

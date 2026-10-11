@@ -50,7 +50,6 @@ use tuwunel_core::{
 				PusherIds, PusherInit, PusherKind, set_pusher::v3::Request as SetPusherRequest,
 			},
 		},
-		device_id,
 		push::HttpPusherData,
 	},
 };
@@ -533,6 +532,8 @@ async fn persist_appservice(services: &Services, appservice: &str, base: String)
 }
 
 async fn register_pusher(services: &Services, manifest: &Manifest, base: &str) -> Result {
+	let (recipient, device, _) = services.users.find_from_token(BOB).await?;
+	assert_eq!(recipient, manifest.recipient, "persisted pusher token owner");
 	let pusher = PusherInit {
 		ids: PusherIds::new(PUSHKEY.into(), "disposable.queue.test".into()),
 		kind: PusherKind::Http(HttpPusherData::new(format!("{base}/_matrix/push/v1/notify"))),
@@ -544,11 +545,7 @@ async fn register_pusher(services: &Services, manifest: &Manifest, base: &str) -
 	.into();
 	services
 		.pusher
-		.set_pusher(
-			&manifest.recipient,
-			device_id!("QUEUERESTART"),
-			&SetPusherRequest::post(pusher).action,
-		)
+		.set_pusher(&manifest.recipient, &device, &SetPusherRequest::post(pusher).action)
 		.await?;
 	Ok(())
 }

@@ -22,7 +22,7 @@ use tuwunel_core::{
 		device_id,
 	},
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, users::Register};
 
 const TO_DEVICE: &str = "de.sorunome.msc2409.to_device";
 const DEVICE_LISTS: &str = "org.matrix.msc3202.device_lists";
@@ -73,14 +73,27 @@ async fn run_cases(services: &Arc<Services>) -> Result {
 	let stub = spawn(stub_appservice(listener, tx));
 
 	let server_name = services.globals.server_name();
-	register(services, "voicebridge_on", &url, "_von", "@_von_.*", true).await?;
-	register(services, "voicebridge_off", &url, "_voff", "@_voff_.*", false).await?;
-
 	let on_ghost = UserId::parse_with_server_name("_von_ghost", server_name)?;
 	let off_ghost = UserId::parse_with_server_name("_voff_ghost", server_name)?;
 	let sender = UserId::parse("@alice:remote.example")?;
 	let device = device_id!("GHOSTDEV");
 	let content = json!({ "algorithm": "m.olm.v1.curve25519-aes-sha2", "ciphertext": {} });
+	for ghost in [&on_ghost, &off_ghost] {
+		services
+			.users
+			.full_register(Register {
+				user_id: Some(ghost),
+				is_appservice: true,
+				..Default::default()
+			})
+			.await?;
+		services
+			.users
+			.create_device(ghost, Some(device), (None, None), None, None, None)
+			.await?;
+	}
+	register(services, "voicebridge_on", &url, "_von", "@_von_.*", true).await?;
+	register(services, "voicebridge_off", &url, "_voff", "@_voff_.*", false).await?;
 
 	// The opted-in bridge gets the to-device event plus an MSC3202 one-time-key
 	// count for the device (empty here: the drained-pool signal).
@@ -131,6 +144,7 @@ async fn send_to_device(
 		.users
 		.add_to_device_event(sender, target, device, "m.room.encrypted", content)
 		.await;
+	assert!(count > 0, "the appservice transaction must forward an admitted inbox event");
 
 	services
 		.sending
