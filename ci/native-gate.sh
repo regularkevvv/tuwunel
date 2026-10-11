@@ -192,12 +192,14 @@ case "$mode" in
       --sender-stress-log "$test_root/sender-stress.log"
     ;;
   release)
-    # Reuse the release dependency closure already built by container-lifecycle,
-    # rather than rebuilding native dependencies with a different feature set.
+    # Match the lifecycle library package selection as well as its features:
+    # selected service dev-dependencies enable tokio/test-util under resolver 2.
+    # A narrower package set changes that closure and rebuilds optimized crates.
     features=$(python3 ci/check-container-lifecycle.py --features)
     workspace_features="tuwunel/${features//,/,tuwunel/}"
     cargo test --locked --release --no-default-features --features "$workspace_features" \
-      -p tuwunel -p tuwunel_database --lib de_record_ -- --nocapture \
+      -p tuwunel -p tuwunel_core -p tuwunel_database -p tuwunel_service -p tuwunel_router \
+      --lib de_record_ -- --nocapture \
       | tee "$test_root/codec.log"
     grep -Fq 'test result: ok. 7 passed; 0 failed;' "$test_root/codec.log"
     ;;

@@ -150,7 +150,8 @@ if os.environ["TEST_STRESS_CASE"] in sys.argv:
     sys.exit(0)
 if "de_record_" in sys.argv:
     print("test result: ok. 0 passed; 0 failed; 0 ignored;")
-    print("test result: ok. 7 passed; 0 failed; 0 ignored;")
+    passed = os.environ.get("TEST_CODEC_PASSED", "7")
+    print(f"test result: ok. {passed} passed; 0 failed; 0 ignored;")
     sys.exit(0)
 for case in json.loads(os.environ["TEST_REQUIRED"]):
     print(f"test {case} ... ok")
@@ -201,15 +202,32 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
         self.assertFalse((self.base / "receipt.json").exists())
 
     def test_record_decoding_reuses_the_container_release_feature_closure(self):
+        lifecycle = self.run_gate()
+        self.assertEqual(lifecycle.returncode, 0, lifecycle.stderr)
         result = self.run_gate("release")
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [json.loads(line) for line in (self.base / "cargo.jsonl").read_text().splitlines()]
-        self.assertEqual(len(commands), 1)
-        command = commands[0]
-        for argument in ("--release", "--no-default-features", "tuwunel", "tuwunel_database", "de_record_"):
-            self.assertIn(argument, command)
-        features = command[command.index("--features") + 1].replace("tuwunel/", "").split(",")
-        self.assertEqual(features, GATE.feature_contract().split(","))
+        self.assertEqual(len(commands), 4)
+        library, codec = commands[0], commands[3]
+        packages = [codec[index + 1] for index, argument in enumerate(codec) if argument == "-p"]
+        self.assertEqual(packages, ["tuwunel", "tuwunel_core", "tuwunel_database",
+                                    "tuwunel_service", "tuwunel_router"])
+        # Identical package/feature/target selection reuses the already-built
+        # release libraries; only the runtime test filter and output differ.
+        self.assertEqual(codec[:codec.index("--lib") + 1],
+                         library[:library.index("--lib") + 1])
+        self.assertEqual(codec[codec.index("--lib") + 1:], ["de_record_", "--", "--nocapture"])
+
+    def test_record_decoding_requires_all_seven_cases(self):
+        for count in ("0", "6", "8"):
+            with self.subTest(passed=count):
+                self.env["TEST_CODEC_PASSED"] = count
+                result = self.run_gate("release")
+                self.assertNotEqual(result.returncode, 0, "decoder count mismatch must refuse")
+
+    def test_record_decoding_cargo_failure_refuses(self):
+        self.env["TEST_CARGO_FAIL"] = "1"
+        self.assertNotEqual(self.run_gate("release").returncode, 0)
 
     def test_darwin_refuses_before_cargo(self):
         self.env["TEST_OS"] = "Darwin"
