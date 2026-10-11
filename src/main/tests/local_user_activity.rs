@@ -47,9 +47,8 @@ fn local_user_activity_preserves_order_and_refuses_incomplete_inventories() -> R
 
 async fn device(services: &Services, user: &UserId, json: serde_json::Value) -> Result {
 	let device: Device = serde_json::from_value(json)?;
-	services
-		.users
-		.put_device_metadata(user, false, &device)
+	services.db["userdeviceid_metadata"]
+		.put((user, &device.device_id), tuwunel_database::Json(&device))
 		.await
 }
 
