@@ -56,7 +56,8 @@ fn http_inbox_pages_preserve_backlog_retries_and_failed_read_claims() -> Result 
 				.await
 				.map_err(|_| err!("inbox paging HTTP fixture exceeded deadline"))
 				.and_then(|result| result);
-			outcome.and(server.server.shutdown())
+			let shutdown = server.server.shutdown();
+			outcome.and(shutdown)
 		};
 		let (run, outcome) = tokio::join!(async_run(&server), exercise);
 		drop(services);
@@ -222,13 +223,15 @@ async fn v3_backlog(client: &Client<'_>, user: &UserId, device: &DeviceId) -> Re
 	let mut received = numbers(&first, "/to_device/events")?;
 	assert_eq!(received.len(), 128, "v3 page is row bounded");
 	let mut cursor = field(&first, "next_batch")?.to_owned();
-	let mut room_deliveries = 0;
+	let mut room_deliveries = 0_usize;
 	for _ in 0..3 {
 		if received.len() == 300 {
 			break;
 		}
 		let body = v3_request(client, Some(&cursor), http::StatusCode::OK).await?;
-		room_deliveries += usize::from(room_contains(&body, &room, &room_event));
+		room_deliveries = room_deliveries
+			.checked_add(usize::from(room_contains(&body, &room, &room_event)))
+			.expect("bounded room delivery count");
 		received.extend(numbers(&body, "/to_device/events")?);
 		cursor = field(&body, "next_batch")?.to_owned();
 	}

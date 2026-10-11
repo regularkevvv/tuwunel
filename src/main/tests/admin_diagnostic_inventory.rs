@@ -224,12 +224,14 @@ async fn registered_users(services: &Services) -> Result {
 			.await?;
 	}
 	refused(services, UPDATE, http::StatusCode::TOO_MANY_REQUESTS).await?;
-	assert!(
+	assert_eq!(
 		services
 			.users
 			.bounded_local_users()
 			.await
-			.is_err()
+			.expect_err("disabled source bytes must refuse before local-user filtering")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
 	);
 	users.clear().await?;
 	changes.clear().await?;

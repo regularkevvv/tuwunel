@@ -581,6 +581,10 @@ async fn atomic_refusals(services: &Services, client: &Client<'_>, foreign: &Roo
 
 /// Whole-room purge retires a genuinely redacted event's saved payload and
 /// parent metadata. The chronological retention row remains housekeeping.
+#[expect(
+	clippy::too_many_lines,
+	reason = "one atomic erasure scenario shares retained and foreign payload canaries"
+)]
 async fn whole_room_original_and_metadata_erasure(
 	services: &Services,
 	client: &Client<'_>,
@@ -655,13 +659,12 @@ async fn whole_room_original_and_metadata_erasure(
 		.timeline
 		.get_pdu_json(&foreign_event)
 		.await?;
-	{
-		let guard = services.state.mutex.lock(foreign).await;
-		services
-			.retention
-			.save_original_pdu(&foreign_event, &foreign_json, &guard)
-			.await?;
-	}
+	let guard = services.state.mutex.lock(foreign).await;
+	services
+		.retention
+		.save_original_pdu(&foreign_event, &foreign_json, &guard)
+		.await?;
+	drop(guard);
 	let foreign_original = services.db["eventid_originalpdu"]
 		.get(&foreign_event)
 		.await?
