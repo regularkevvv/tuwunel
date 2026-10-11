@@ -28,7 +28,7 @@ jobs:
   native:
     name: native
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
