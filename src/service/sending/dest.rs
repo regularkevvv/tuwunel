@@ -1,13 +1,33 @@
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Formatter};
 
 use ruma::{OwnedServerName, OwnedUserId};
 use tuwunel_core::{implement, matrix::pdu::RawPduId};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Destination {
 	Appservice(String),
 	Push(OwnedUserId, String), // user and pushkey
 	Federation(OwnedServerName),
+}
+
+impl Debug for Destination {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+		match self {
+			| Self::Appservice(id) => formatter
+				.debug_tuple("Appservice")
+				.field(id)
+				.finish(),
+			| Self::Push(user, _) => formatter
+				.debug_tuple("Push")
+				.field(user)
+				.field(&"[redacted]")
+				.finish(),
+			| Self::Federation(server) => formatter
+				.debug_tuple("Federation")
+				.field(server)
+				.finish(),
+		}
+	}
 }
 
 #[implement(Destination)]

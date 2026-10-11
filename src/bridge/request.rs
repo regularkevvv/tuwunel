@@ -17,7 +17,7 @@ pub const MAX_DEPTH: usize = 32;
 /// Maximum CBOR items/chunks, checked before container-length allocation hints.
 pub const MAX_ITEMS: usize = 65_536;
 
-/// Incremental admission for one atomic batch of puts to a catalog map.
+/// Incremental admission for one atomic batch of puts to catalog maps.
 ///
 /// Counts the existing commit encoding, including the supplied writer identity,
 /// without owning keys, values or an encoded body. Key contents do not affect
@@ -74,7 +74,15 @@ impl PutBatchBudget {
 
 	/// Admits a prospective put only if all widths and the whole batch fit.
 	pub fn try_put(&mut self, key_len: usize, value: &[u8]) -> Result<(), Error> {
+		self.try_put_to(self.map, key_len, value)
+	}
+
+	/// Admits a prospective put to any catalog map in this same atomic batch.
+	/// The owner lease and aggregate operation/encoding budget remain shared.
+	pub fn try_put_to(&mut self, map: u16, key_len: usize, value: &[u8]) -> Result<(), Error> {
 		static KEY: [u8; super::MAX_KEY_BYTES] = [0; super::MAX_KEY_BYTES];
+		super::check_map(map)?;
+
 		if self.operations >= super::MAX_COMMIT_OPS {
 			return Err(too_large("ops", super::MAX_COMMIT_OPS));
 		}
@@ -85,7 +93,7 @@ impl PutBatchBudget {
 			return Err(too_large("value", super::MAX_VALUE_BYTES));
 		}
 		let put = BorrowedMutation::Put {
-			map: self.map,
+			map,
 			key: serde_bytes::Bytes::new(&KEY[..key_len]),
 			val: serde_bytes::Bytes::new(value),
 		};
@@ -600,6 +608,70 @@ mod tests {
 				assert_eq!(budget.encoded_size().expect("unchanged size"), size);
 			}
 		}
+	}
+
+	#[test]
+	fn mixed_put_admission_matches_owned_wire_and_preserves_refused_budget() {
+		use serde_bytes::ByteBuf;
+
+		use super::super::Mutation;
+		let lease = Lease { holder: "mixed-owner".into(), epoch: 256 };
+		let mut budget = PutBatchBudget::new(0, &lease).expect("catalog map");
+		let mut checked = CommitBudget::new(&lease).expect("mixed budget");
+		let mut ops = Vec::new();
+		for index in 0..super::super::MAX_COMMIT_OPS {
+			let map = [0, 23, 24, 111][index % 4];
+			let key = vec![42; [1, 23, 24, 255, 256][index % 5]];
+			let value = vec![43; index % 27];
+			budget
+				.try_put_to(map, key.len(), &value)
+				.expect("mixed prospective put");
+			checked
+				.try_put(map, &key, &value)
+				.expect("actual keyed put");
+			ops.push(Mutation::Put {
+				map,
+				key: ByteBuf::from(key),
+				val: ByteBuf::from(value),
+			});
+			if [1, 23, 24, 255, 256, 900].contains(&ops.len()) {
+				let wire = encode(&commit(&lease, ops.clone())).expect("owned wire");
+				assert_eq!(budget.encoded_size().expect("prospective size"), wire.len());
+				assert_eq!(checked.encoded_size().expect("mixed size"), wire.len());
+			}
+		}
+		let before = budget.encoded_size().expect("full budget");
+		budget
+			.try_put_to(24, 1, &[])
+			.expect_err("operation 901");
+		assert_eq!(budget.operations(), super::super::MAX_COMMIT_OPS);
+		assert_eq!(
+			budget
+				.encoded_size()
+				.expect("refusal preserves size"),
+			before
+		);
+		let mut fresh = PutBatchBudget::new(0, &lease).expect("empty budget");
+		let before = fresh.encoded_size().expect("empty size");
+		fresh
+			.try_put_to(u16::MAX, 1, b"value")
+			.expect_err("invalid catalog map");
+		fresh
+			.try_put_to(24, super::super::MAX_KEY_BYTES.saturating_add(1), b"value")
+			.expect_err("oversized key");
+		fresh
+			.try_put_to(24, 1, &vec![0; super::super::MAX_VALUE_BYTES.saturating_add(1)])
+			.expect_err("oversized value");
+		assert_eq!(fresh.operations(), 0);
+		assert_eq!(
+			fresh
+				.encoded_size()
+				.expect("refusal preserves empty size"),
+			before
+		);
+		fresh
+			.try_put_to(24, 1, b"retry")
+			.expect("valid admission after refusals");
 	}
 
 	#[test]

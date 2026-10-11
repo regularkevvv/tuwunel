@@ -123,6 +123,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	unknown_admin_protection(services, &foreign).await?;
 	preflight_preservation(services, &client, &foreign).await?;
 	atomic_refusals(services, &client, &foreign).await?;
+	whole_room_original_and_metadata_erasure(services, &client, &foreign).await?;
 	history_event_atomicity(services, &client).await?;
 	retention_expiry_atomicity(services, &foreign).await
 }
@@ -574,6 +575,229 @@ async fn atomic_refusals(services: &Services, client: &Client<'_>, foreign: &Roo
 		.filter(|((_, key), _)| key.ends_with(b"foreign-fixture"))
 	{
 		assert_eq!(after.get(at), Some(hash));
+	}
+	Ok(())
+}
+
+/// Whole-room purge retires a genuinely redacted event's saved payload and
+/// parent metadata. The chronological retention row remains housekeeping.
+async fn whole_room_original_and_metadata_erasure(
+	services: &Services,
+	client: &Client<'_>,
+	foreign: &RoomId,
+) -> Result {
+	use tuwunel_core::ruma::OwnedEventId;
+	let room = client
+		.create_room(&json!({"preset":"public_chat"}))
+		.await?;
+	let sent: Value = services
+		.client
+		.clients
+		.default
+		.put(client.url(&format!("rooms/{room}/send/m.room.message/room-original")))
+		.bearer_auth(TOKEN)
+		.json(&json!({"msgtype":"m.text", "body":"whole room retained original sentinel"}))
+		.send()
+		.await?
+		.error_for_status()?
+		.json()
+		.await?;
+	let event = OwnedEventId::try_from(
+		sent["event_id"]
+			.as_str()
+			.expect("real client event"),
+	)?;
+	let raw = services.timeline.get_pdu_id(&event).await?;
+	let short = services.short.get_shortroomid(&room).await?;
+	services
+		.client
+		.clients
+		.default
+		.put(client.url(&format!("rooms/{room}/redact/{event}/room-original-redact")))
+		.bearer_auth(TOKEN)
+		.json(&json!({"reason":"disposable erasure regression"}))
+		.send()
+		.await?
+		.error_for_status()?;
+	let saved = services.db["eventid_originalpdu"]
+		.get(&event)
+		.await?
+		.to_vec();
+	assert!(String::from_utf8_lossy(&saved).contains("whole room retained original sentinel"));
+	let redacted = services.timeline.get_pdu_json(&event).await?;
+	assert!(
+		redacted
+			.get("content")
+			.and_then(|content| content.as_object())
+			.is_some_and(|content| !content.contains_key("body")),
+		"the original is independent of the redacted canonical event"
+	);
+	// Complete user eviction before refusal snapshots, isolating the storage
+	// transaction from its deliberately separate shutdown phase.
+	services
+		.client
+		.clients
+		.default
+		.delete(format!("{}/_synapse/admin/v1/rooms/{room}", client.base))
+		.bearer_auth(TOKEN)
+		.json(&json!({"purge":false}))
+		.send()
+		.await?
+		.error_for_status()?;
+	let relations = history_metadata(services, &room, &event, &raw, short).await?;
+	let (foreign_key, _, foreign_pdu) = first_pdu(services, foreign).await?;
+	let foreign_event = OwnedEventId::try_from(
+		foreign_pdu["event_id"]
+			.as_str()
+			.expect("foreign canonical event"),
+	)?;
+	let foreign_json = services
+		.timeline
+		.get_pdu_json(&foreign_event)
+		.await?;
+	{
+		let guard = services.state.mutex.lock(foreign).await;
+		services
+			.retention
+			.save_original_pdu(&foreign_event, &foreign_json, &guard)
+			.await?;
+	}
+	let foreign_original = services.db["eventid_originalpdu"]
+		.get(&foreign_event)
+		.await?
+		.to_vec();
+	let foreign_raw = tuwunel_core::matrix::pdu::RawPduId::from_bytes(&foreign_key)?;
+	let foreign_relations = history_metadata(
+		services,
+		foreign,
+		&foreign_event,
+		&foreign_raw,
+		services.short.get_shortroomid(foreign).await?,
+	)
+	.await?;
+	let mut foreign_metadata = Vec::new();
+	for (name, key) in foreign_relations {
+		foreign_metadata.push((name, key.clone(), services.db[name].get(&key).await?.to_vec()));
+	}
+	for name in ["softfailedeventids", "eventid_policysigstate", "eventid_outlierpdu"] {
+		foreign_metadata.push((
+			name,
+			foreign_event.as_bytes().to_vec(),
+			services.db[name]
+				.get(&foreign_event)
+				.await?
+				.to_vec(),
+		));
+	}
+	let housekeeping = services.db["timeredacted_eventid"]
+		.raw_rows_after(None, 4096)
+		.await?;
+	assert!(
+		housekeeping
+			.iter()
+			.any(|(key, _)| key.ends_with(event.as_bytes()))
+	);
+	let before = snapshot(services, &room).await?;
+	for map in [
+		"eventid_originalpdu",
+		"tofrom_relation",
+		"softfailedeventids",
+		"eventid_policysigstate",
+	] {
+		refusal::refuse_next(map);
+		let guard = services.state.mutex.lock(&room).await;
+		services
+			.delete
+			.delete_room(&room, false, guard)
+			.await
+			.expect_err("refused whole-room payload or metadata commit must fail");
+		assert_eq!(refusal::pending(), 0, "the intended erasure commit was refused");
+		assert_eq!(
+			snapshot(services, &room).await?,
+			before,
+			"refusal preserves original, canonical and unrelated bytes"
+		);
+	}
+	services.db["eventid_originalpdu"]
+		.insert(&event, b"invalid-original-json")
+		.await?;
+	let corrupt = snapshot(services, &room).await?;
+	let guard = services.state.mutex.lock(&room).await;
+	services
+		.delete
+		.delete_room(&room, false, guard)
+		.await
+		.expect_err("corrupt retained payload refuses complete room erasure");
+	assert_eq!(snapshot(services, &room).await?, corrupt);
+	services.db["eventid_originalpdu"]
+		.insert(&event, &saved)
+		.await?;
+	let (map, key) = relations.first().expect("owned parent relation");
+	let relation = services.db[map].get(key).await?.to_vec();
+	services.db[map]
+		.insert(key, b"invalid-relation-value")
+		.await?;
+	let corrupt = snapshot(services, &room).await?;
+	let guard = services.state.mutex.lock(&room).await;
+	services
+		.delete
+		.delete_room(&room, false, guard)
+		.await
+		.expect_err("corrupt parent relation refuses complete room erasure");
+	assert_eq!(snapshot(services, &room).await?, corrupt);
+	services.db[map].insert(key, &relation).await?;
+	let guard = services.state.mutex.lock(&room).await;
+	services
+		.delete
+		.delete_room(&room, false, guard)
+		.await?;
+	for name in [
+		"eventid_originalpdu",
+		"softfailedeventids",
+		"eventid_policysigstate",
+		"eventid_outlierpdu",
+		"eventid_pduid",
+	] {
+		assert!(
+			services.db[name]
+				.get(&event)
+				.await
+				.expect_err("whole-room purge removes owned event payload/metadata")
+				.is_not_found()
+		);
+	}
+	for (name, key) in relations {
+		assert!(
+			services.db[name]
+				.get(&key)
+				.await
+				.expect_err("whole-room purge removes owned parent relations")
+				.is_not_found()
+		);
+	}
+	assert_eq!(
+		services.db["timeredacted_eventid"]
+			.raw_rows_after(None, 4096)
+			.await?,
+		housekeeping,
+		"scheduled chronological housekeeping is intentionally unchanged"
+	);
+	assert!(!services.metadata.exists_checked(&room).await?);
+	assert!(services.metadata.exists_checked(foreign).await?);
+	assert_eq!(
+		services.db["eventid_originalpdu"]
+			.get(&foreign_event)
+			.await?
+			.as_ref(),
+		foreign_original.as_slice(),
+		"unrelated retained payload survives room erasure"
+	);
+	for (name, key, value) in foreign_metadata {
+		assert_eq!(
+			services.db[name].get(&key).await?.as_ref(),
+			value.as_slice(),
+			"unrelated parent metadata survives room erasure"
+		);
 	}
 	Ok(())
 }

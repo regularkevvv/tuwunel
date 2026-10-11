@@ -104,7 +104,13 @@ mod admission_tests;
 mod producer_tests;
 
 #[cfg(test)]
+mod qualification_tests;
+
+#[cfg(test)]
 mod source_handoff_tests;
+
+#[cfg(test)]
+mod logging_tests;
 
 /// Bookkeeping for admitted tasks and exact cleanup/persistence retries.
 /// Cross-attempt backoff lives in durable peer or push records.
@@ -621,14 +627,13 @@ fn wake_deadline(delay: Duration) -> (TokioInstant, Duration) {
 
 #[implement(Service)]
 fn record_push_failure(dest: &Destination, error: &Error, tries: u32, retry_in: Duration) {
-	let Destination::Push(user_id, pushkey) = dest else {
+	let Destination::Push(user_id, _) = dest else {
 		return;
 	};
 
 	match tries {
 		| PUSH_FAILURE_STREAK => error!(
 			%user_id,
-			%pushkey,
 			streak = tries,
 			retry_in_seconds = retry_in.as_secs(),
 			chain = %error_chain(error),
@@ -636,7 +641,6 @@ fn record_push_failure(dest: &Destination, error: &Error, tries: u32, retry_in: 
 		),
 		| _ => warn!(
 			%user_id,
-			%pushkey,
 			streak = tries,
 			retry_in_seconds = retry_in.as_secs(),
 			chain = %error_chain(error),
@@ -2085,7 +2089,7 @@ impl Service {
 	#[tracing::instrument(
 		name = "push",
 		level = "info",
-		skip(self, events),
+		skip(self, pushkey, events),
 		fields(
 			events = %events.len(),
 		),
@@ -2111,7 +2115,7 @@ impl Service {
 			.map(|result| match result {
 				| Ok(pusher) => Ok(Some(pusher)),
 				| Err(error) if error.is_not_found() => {
-					error!(%user_id, %pushkey, "Pusher disappeared before delivery");
+					error!(%user_id, "Pusher disappeared before delivery");
 
 					Ok(None)
 				},
@@ -2157,7 +2161,6 @@ impl Service {
 				| Ok(()) => (),
 				| Err(error) if is_permanent_push_error(&error) => warn!(
 					%user_id,
-					%pushkey,
 					chain = %error_chain(&error),
 					"Dropping a badge push with a permanent local error",
 				),
@@ -2186,7 +2189,7 @@ impl Service {
 			match result {
 				| Ok(()) => {},
 				| Err(error) if is_permanent_push_error(&error) => warn!(
-					%user_id, %pushkey, ?pdu_id, chain = %error_chain(&error), "Dropping a push with a permanent local error",
+					%user_id, ?pdu_id, chain = %error_chain(&error), "Dropping a push with a permanent local error",
 				),
 				| Err(error) => failures = failures.retain(*pdu_id, error),
 			}

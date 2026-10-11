@@ -281,7 +281,7 @@ async fn send_http_notice(
 	if response.rejected.contains(pushkey) {
 		error!(
 			url = %http.url,
-			%pushkey,
+			%user_id,
 			"Push gateway rejected the pushkey; removing the pusher. Push notifications \
 			 for this device stop until the client registers a new pusher.",
 		);

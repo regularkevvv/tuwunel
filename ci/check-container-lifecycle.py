@@ -11,6 +11,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
+    "sending::sender::retry_restart_tests::maximum_producer_singleton_with_full_key_rows_replays_and_drains",
+    "room_storage_erasure_is_atomic_and_protects_operator_access",
+    "administrative_inventories_refuse_before_output_or_key_markers",
+    "http_inbox_pages_preserve_backlog_retries_and_failed_read_claims",
+    "sending::sender::qualification_tests::actual_push_failure_retains_rows_when_shutdown_retry_persistence_is_refused",
+    "sending::sender::qualification_tests::held_remote_ack_shutdown_stops_uncertain_writer_and_recovers_exact_rows",
     "tasks::tests::cancelled_join_retains_completion_and_owner",
     "tasks::tests::native_completion_retains_failure_across_cancelled_join",
     "tasks::tests::concurrent_joiners_both_wait_for_completion",
@@ -55,6 +61,38 @@ REQUIRED = {
     "durable_pending_and_active_deliveries_survive_kill_and_disabled_startup",
 }
 
+STRESS_CASE = "sending::sender::qualification_tests::maximum_sender_inventories_recover_large_held_http_after_bounded_shutdown"
+
+
+def verify_sender_stress(log, source_commit):
+    names = set(re.findall(r"(?:^|\n)test ([A-Za-z0-9_:]+) \.\.\. ", log))
+    summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log, re.MULTILINE)
+    if (STRESS_CASE not in names or f"test {STRESS_CASE} ... ignored" in log
+            or ("ok", "1", "0", "0") not in summaries
+            or any(status != "ok" or failed != "0" or ignored != "0"
+                   for status, _, failed, ignored in summaries)):
+        raise ValueError("Expected one passing, explicitly executed sender stress test")
+    receipts = [json.loads(line) for line in log.splitlines() if line.startswith('{"')]
+    receipts = [item for item in receipts if item.get("phase") == "sender-qualification"
+                and item.get("case") == "maximum_sender_inventory"]
+    if len(receipts) != 1:
+        raise ValueError("Expected one isolated sender stress metrics receipt")
+    receipt = receipts[0]
+    measurements = receipt.get("measurements", {})
+    expected = {"inventory_workers": 4, "slots_per_worker": 16, "deliveries": 64,
+                "active_rows": 128, "payload_bytes_per_row": 1_400_047,
+                "replayed_identical_transactions": 64, "remaining_rows": 0}
+    if (receipt.get("source_revision") != source_commit or receipt.get("profile") != "release"
+            or receipt.get("os") != "linux" or receipt.get("arch") != "x86_64"
+            or receipt.get("provider_acceptance") is not False
+            or type(receipt.get("linux_vm_hwm_kib")) is not int or receipt["linux_vm_hwm_kib"] <= 0
+            or type(receipt.get("elapsed_ms")) is not int or receipt["elapsed_ms"] < 0
+            or type(measurements.get("shutdown_ms")) is not int or measurements["shutdown_ms"] < 0
+            or any(type(measurements.get(key)) is not int or measurements[key] != value
+                   for key, value in expected.items())):
+        raise ValueError("Incomplete or wrong-source/profile sender stress metrics")
+    return receipt
+
 
 def feature_contract(root=ROOT):
     raw = (root / "ci/container-features.txt").read_text().strip()
@@ -83,6 +121,7 @@ def verify_log(log):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", action="store_true")
+    parser.add_argument("--sender-stress-log", type=Path)
     parser.add_argument("log", nargs="?", type=Path)
     parser.add_argument("report", nargs="?", type=Path)
     args = parser.parse_args()
@@ -94,6 +133,9 @@ def main():
         parser.error("log and report are required")
     verify_log(args.log.read_text())
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if args.sender_stress_log is None:
+        parser.error("--sender-stress-log is required for the completed lifecycle gate")
+    sender_stress = verify_sender_stress(args.sender_stress_log.read_text(), commit)
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip())
     args.report.write_text(json.dumps({
         "schema": 1, "status": "passed", "source_commit": commit, "source_dirty": dirty,
@@ -101,6 +143,7 @@ def main():
         "default_features": False, "features": features.split(","),
         "test_dev_dependency_features": ["tuwunel_database/commit_refusals", "tuwunel_service/notification_recovery_tests"],
         "required_cases": sorted(REQUIRED), "required_case_count": len(REQUIRED),
+        "sender_stress": sender_stress,
         "scope": "Linux/amd64 release-feature lifecycle; local RocksDB and loopback remote controls",
         "excludes": ["real D1/R2", "staging deployment", "hot modules", "io_uring", "systemd"],
     }, indent=2) + "\n")

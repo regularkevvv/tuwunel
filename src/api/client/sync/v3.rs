@@ -336,6 +336,12 @@ pub(crate) async fn sync_events_route(
 		if time::timeout_at(stop_at, watchers).await.is_err() || services.server.is_stopping() {
 			let response =
 				build_empty_response(&services, sender_user, sender_device, next_batch).await;
+			if let Some(device) = sender_device {
+				services
+					.users
+					.remove_to_device_events(sender_user, device, since)
+					.await?;
+			}
 
 			trace!(since, next_batch, "empty response");
 			return Ok(response);
@@ -403,6 +409,26 @@ async fn build_sync_events(
 	state_after: StateAfter,
 	filter: &FilterDefinition,
 ) -> Result<sync_events::v3::Response> {
+	// To-device shares v3's global cursor. Capture a bounded inbox page first
+	// and lower the whole snapshot watermark before any other source readers
+	// are constructed, so events beyond this page remain eligible next time.
+	let inbox = sender_device
+		.map_async(|device| {
+			services.users.to_device_page(
+				sender_user,
+				device,
+				since,
+				next_batch,
+				tuwunel_service::users::device::MAX_TO_DEVICE_PAGE_ROWS,
+			)
+		})
+		.await
+		.transpose()?;
+	let next_batch = inbox
+		.as_ref()
+		.map_or(next_batch, |page| page.next_batch);
+	let to_device_events = inbox.map(|page| page.events.into_iter().map(at!(1)).collect());
+
 	// MSC4380: when m.invite_permission_config blocks invites, suppress stored
 	// invite events from /sync entirely; a later unblock re-exposes them.
 	let invites_blocked = services.users.invites_blocked(sender_user).await;
@@ -448,14 +474,6 @@ async fn build_sync_events(
 		.map(ToOwned::to_owned)
 		.collect::<HashSet<_>>();
 
-	let to_device_events = sender_device.map_async(|sender_device| {
-		services
-			.users
-			.get_to_device_events(sender_user, sender_device, Some(since), Some(next_batch))
-			.map(at!(1))
-			.collect::<Vec<_>>()
-	});
-
 	let device_one_time_keys_count = sender_device.map_async(|sender_device| {
 		services
 			.users
@@ -469,29 +487,17 @@ async fn build_sync_events(
 			.collect::<Vec<_>>()
 	});
 
-	// Remove all to-device events the device received *last time*
-	let remove_to_device_events = sender_device.map_async(|sender_device| {
-		services
-			.users
-			.remove_to_device_events(sender_user, sender_device, since)
-	});
-
 	let (
 		account_data,
 		keys_changed,
 		presence_updates,
-		(_, to_device_events, device_one_time_keys_count, device_unused_fallback_key_types),
+		(device_one_time_keys_count, device_unused_fallback_key_types),
 		(joined_rooms, left_rooms, invited_rooms, knocked_rooms),
 	) = join5(
 		account_data,
 		keys_changed,
 		presence_updates,
-		join4(
-			remove_to_device_events,
-			to_device_events,
-			device_one_time_keys_count,
-			device_unused_fallback_key_types,
-		),
+		join(device_one_time_keys_count, device_unused_fallback_key_types),
 		join4(joined_rooms, left_rooms, invited_rooms, knocked_rooms),
 	)
 	.boxed()
@@ -505,6 +511,15 @@ async fn build_sync_events(
 		collect_device_list_left(services, sender_user, left_encrypted_users).await;
 
 	let presence_events = build_presence_events(presence_updates);
+
+	// The previous cursor acknowledges rows only after all fallible source
+	// reads for this response succeeded. A refused response performs no ACK.
+	if let Some(device) = sender_device {
+		services
+			.users
+			.remove_to_device_events(sender_user, device, since)
+			.await?;
+	}
 
 	Ok(sync_events::v3::Response {
 		account_data: GlobalAccountData { events: account_data },

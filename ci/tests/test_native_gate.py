@@ -34,9 +34,53 @@ class LifecycleReceipt(unittest.TestCase):
         with self.assertRaises(ValueError):
             GATE.verify_log(self.log().replace(" ... ok", " ... ignored", 1))
 
+    def test_maximum_singleton_replay_requires_execution(self):
+        case = "sending::sender::retry_restart_tests::maximum_producer_singleton_with_full_key_rows_replays_and_drains"
+        self.assertIn(case, GATE.REQUIRED)
+        for replacement in ("", f"test {case} ... ignored\n"):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                GATE.verify_log(self.log().replace(f"test {case} ... ok\n", replacement))
+
+    def test_http_storage_and_admin_controls_each_require_execution(self):
+        for case in ("room_storage_erasure_is_atomic_and_protects_operator_access",
+                     "administrative_inventories_refuse_before_output_or_key_markers",
+                     "http_inbox_pages_preserve_backlog_retries_and_failed_read_claims"):
+            with self.subTest(case=case):
+                self.assertIn(case, GATE.REQUIRED)
+                for replacement in ("", f"test {case} ... ignored\n"):
+                    with self.assertRaises(ValueError):
+                        GATE.verify_log(self.log().replace(f"test {case} ... ok\n", replacement))
+
     def test_failed_outer_harness_refuses_even_after_passing_child(self):
         with self.assertRaises(ValueError):
             GATE.verify_log(self.log() + "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n")
+
+    def stress_log(self, **changes):
+        report = {"phase": "sender-qualification", "case": "maximum_sender_inventory",
+                  "source_revision": "current", "profile": "release", "os": "linux", "arch": "x86_64",
+                  "provider_acceptance": False, "linux_vm_hwm_kib": 256000, "elapsed_ms": 10000,
+                  "measurements": {"inventory_workers": 4, "slots_per_worker": 16, "deliveries": 64,
+                                   "active_rows": 128, "payload_bytes_per_row": 1_400_047,
+                                   "replayed_identical_transactions": 64, "remaining_rows": 0,
+                                   "shutdown_ms": 4000}}
+        report.update(changes)
+        return (f"test {GATE.STRESS_CASE} ... child diagnostics\n" + json.dumps(report) +
+                "\ntest result: ok. 1 passed; 0 failed; 0 ignored;\nok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored;\n")
+
+    def test_executed_stress_requires_matching_source_and_measurements(self):
+        self.assertEqual(GATE.verify_sender_stress(self.stress_log(), "current")["measurements"]["deliveries"], 64)
+        for changes in ({"source_revision": "older"}, {"linux_vm_hwm_kib": None},
+                        {"profile": "debug"}, {"provider_acceptance": True}, {"measurements": {}}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                GATE.verify_sender_stress(self.stress_log(**changes), "current")
+
+    def test_ignored_or_failed_stress_cannot_qualify_metrics(self):
+        for log in (self.stress_log().replace(" ... child diagnostics", " ... ignored"),
+                    self.stress_log() + "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n",
+                    f"test {GATE.STRESS_CASE} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n"):
+            with self.assertRaises(ValueError):
+                GATE.verify_sender_stress(log, "current")
 
     def test_interleaved_real_process_output_is_accepted(self):
         name = sorted(GATE.REQUIRED)[0]
@@ -69,6 +113,22 @@ with open(os.environ["TEST_CARGO_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\\n")
 if os.environ.get("TEST_CARGO_FAIL") == "1":
     sys.exit(1)
+if os.environ["TEST_STRESS_CASE"] in sys.argv:
+    case = os.environ["TEST_STRESS_CASE"]
+    print(f"test {case} ... ok")
+    if os.environ.get("TEST_STRESS_SKIP") == "1":
+        print("test result: ok. 0 passed; 0 failed; 1 ignored;")
+        sys.exit(0)
+    report = {"phase": "sender-qualification", "case": "maximum_sender_inventory",
+              "source_revision": os.environ["TUWUNEL_QUALIFICATION_REVISION"],
+              "profile": "release", "os": "linux", "arch": "x86_64",
+              "provider_acceptance": False, "linux_vm_hwm_kib": 256000, "elapsed_ms": 10000,
+              "measurements": {"inventory_workers": 4, "slots_per_worker": 16, "deliveries": 64,
+                               "active_rows": 128, "payload_bytes_per_row": 1_400_047,
+                               "replayed_identical_transactions": 64, "remaining_rows": 0, "shutdown_ms": 4000}}
+    print(json.dumps(report))
+    print("test result: ok. 1 passed; 0 failed; 0 ignored;")
+    sys.exit(0)
 if "de_record_" in sys.argv:
     print("test result: ok. 0 passed; 0 failed; 0 ignored;")
     print("test result: ok. 7 passed; 0 failed; 0 ignored;")
@@ -84,6 +144,7 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
         self.env = {**os.environ, "PATH": f"{self.tools}:{os.environ['PATH']}",
                     "TEST_CARGO_LOG": str(self.base / "cargo.jsonl"),
                     "TEST_REQUIRED": json.dumps(sorted(GATE.REQUIRED)),
+                    "TEST_STRESS_CASE": GATE.STRESS_CASE,
                     "TUWUNEL_LIFECYCLE_REPORT": str(self.base / "receipt.json"),
                     "TUWUNEL_QUEUE_RESTART_SCENARIO": "corrupt-pdu"}
 
@@ -95,17 +156,28 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [json.loads(line) for line in (self.base / "cargo.jsonl").read_text().splitlines()]
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 3)
         for command in commands:
             for flag in ("--locked", "--release", "--no-default-features"):
                 self.assertIn(flag, command)
             features = command[command.index("--features") + 1].replace("tuwunel/", "").split(",")
             self.assertEqual(features, GATE.feature_contract().split(","))
-        for target in ("cancellation_lifecycle", "fatal_lifecycle", "sending_queue_restart"):
+        for target in ("cancellation_lifecycle", "fatal_lifecycle", "sending_queue_restart",
+                       "room_storage_erasure", "admin_diagnostic_inventory", "inbox_paging"):
             self.assertIn(target, commands[1])
+        self.assertIn(GATE.STRESS_CASE, commands[2])
+        for flag in ("--ignored", "--exact", "--nocapture"):
+            self.assertIn(flag, commands[2])
         receipt = json.loads((self.base / "receipt.json").read_text())
         self.assertEqual(receipt["required_case_count"], len(GATE.REQUIRED))
         self.assertEqual(receipt["cargo_profile"], "release")
+        self.assertEqual(receipt["sender_stress"]["measurements"]["replayed_identical_transactions"], 64)
+
+    def test_skipped_stress_produces_no_passing_receipt(self):
+        self.env["TEST_STRESS_SKIP"] = "1"
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.base / "receipt.json").exists())
 
     def test_record_decoding_reuses_the_container_release_feature_closure(self):
         result = self.run_gate("release")
@@ -137,6 +209,14 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
     def test_cargo_failure_produces_no_passing_receipt(self):
         self.env["TEST_CARGO_FAIL"] = "1"
         self.assertNotEqual(self.run_gate().returncode, 0)
+        self.assertFalse((self.base / "receipt.json").exists())
+
+    def test_source_revision_failure_refuses_before_cargo(self):
+        git = self.tools / "git"
+        git.write_text("#!/bin/sh\nexit 1\n")
+        git.chmod(0o755)
+        self.assertNotEqual(self.run_gate().returncode, 0)
+        self.assertFalse((self.base / "cargo.jsonl").exists())
         self.assertFalse((self.base / "receipt.json").exists())
 
 

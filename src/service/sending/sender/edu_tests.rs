@@ -432,12 +432,12 @@ async fn device_key_fanout_proves_complete_sources_before_marking_change() -> Re
 		let services = &fixture.services;
 		let user = user_id!("@fanout:localhost");
 		let room = room_id!("!fanout:localhost");
-		services.db["userroomid_joinedcount"]
+		services.db["userroomid_joined"]
 			.put_raw((user, room), 1_u64.to_be_bytes())
 			.await?;
 		match source {
 			| "corrupt_room" =>
-				services.db["userroomid_joinedcount"]
+				services.db["userroomid_joined"]
 					.put_raw((user, "not-a-room"), [])
 					.await?,
 			| "corrupt_server" =>
@@ -503,7 +503,7 @@ async fn device_key_fanout_and_appservice_queue_share_mutation_transaction() -> 
 	let services = &fixture.services;
 	let user = user_id!("@fanout:localhost");
 	let room = room_id!("!fanout:localhost");
-	services.db["userroomid_joinedcount"]
+	services.db["userroomid_joined"]
 		.put_raw((user, room), 1_u64.to_be_bytes())
 		.await?;
 	let plan = services

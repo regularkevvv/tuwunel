@@ -313,7 +313,16 @@ async fn inventory_errors(endpoint: &Endpoint<'_>, alice: &UserId) -> Result {
 			.expect("valid long user ID");
 		users.insert(&user, "").await?;
 	}
-	assert_eq!(services.users.bounded_local_users().await?.len(), 1);
+	assert_eq!(services.users.bounded_local_user_count().await?, 1);
+	assert_eq!(
+		services
+			.users
+			.bounded_local_users()
+			.await
+			.expect_err("raw disabled-account bytes must be charged before filtering")
+			.status_code(),
+		http::StatusCode::TOO_MANY_REQUESTS
+	);
 	endpoint
 		.refused(3, "user_id=nonexistent&limit=1", http::StatusCode::TOO_MANY_REQUESTS)
 		.await?;

@@ -1,5 +1,4 @@
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::api::client::dehydrated_device::{
 	delete_dehydrated_device::unstable as delete_dehydrated_device,
 	get_dehydrated_device::unstable as get_dehydrated_device, get_events::unstable as get_events,
@@ -112,17 +111,19 @@ pub(crate) async fn get_dehydrated_events_route(
 		.map(str::parse)
 		.transpose()?;
 
-	let mut next_batch: Option<u64> = None;
-	let events = services
+	let until = services.globals.wait_pending().await?;
+	let page = services
 		.users
-		.get_to_device_events(sender_user, device_id, since, None)
-		.take(MAX_BATCH_EVENTS)
-		.inspect(|&(count, _)| {
-			next_batch.replace(count);
-		})
-		.map(at!(1))
-		.collect()
-		.await;
+		.to_device_page(
+			sender_user,
+			device_id,
+			since.unwrap_or(0).min(until),
+			until,
+			MAX_BATCH_EVENTS,
+		)
+		.await?;
+	let next_batch = page.events.last().map(|(count, _)| *count);
+	let events = page.events.into_iter().map(at!(1)).collect();
 
 	Ok(get_events::Response {
 		events,

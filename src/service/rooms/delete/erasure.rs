@@ -154,6 +154,32 @@ impl Service {
 				.db
 				.stage_federation_erasure(txn, &raw)
 				.await?;
+			// Retained redaction originals are payloads owned by this event too.
+			// Charge raw bytes before decoding, alongside canonical PDU values.
+			let original = services_root.db["eventid_originalpdu"]
+				.get(&pdu.event_id)
+				.await;
+			match original {
+				| Ok(original) => {
+					budget.value(&original)?;
+					let original: PduEvent = serde_json::from_slice(&original)
+						.map_err(|_| Error::bad_database("Invalid retained room erasure PDU"))?;
+					if original.event_id != pdu.event_id || original.room_id != room {
+						return Err(Error::bad_database(
+							"Room erasure original PDU binding differs",
+						));
+					}
+				},
+				| Err(error) if error.is_not_found() => (),
+				| Err(error) => return Err(error),
+			}
+			services_root
+				.retention
+				.append_purge_original(txn, &pdu.event_id);
+			services_root
+				.pdu_metadata
+				.append_purge_event_relations(txn, short, raw.pdu_count(), room, &pdu.event_id)
+				.await?;
 			txn.del_raw(map, key);
 			txn.del_raw(&services_root.db["eventid_pduid"], &pdu.event_id);
 			txn.del_raw(&services_root.db["eventid_outlierpdu"], &pdu.event_id);

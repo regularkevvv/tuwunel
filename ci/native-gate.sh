@@ -163,8 +163,12 @@ case "$mode" in
     features=$(python3 ci/check-container-lifecycle.py --features)
     workspace_features="tuwunel/${features//,/,tuwunel/}"
     [[ -n "$features" && "$features" != *$'\n'* ]]
+    TUWUNEL_QUALIFICATION_REVISION=$(git rev-parse HEAD)
+    export TUWUNEL_QUALIFICATION_REVISION
     unset TUWUNEL_QUEUE_RESTART_PHASE TUWUNEL_QUEUE_RESTART_DIRECTORY TUWUNEL_QUEUE_RESTART_SCENARIO
     unset TUWUNEL_CANCELLATION_CASE
+    unset TUWUNEL_SENDER_QUALIFICATION_CHILD TUWUNEL_SENDER_QUALIFICATION_ROOT
+    unset TUWUNEL_SENDER_QUALIFICATION_VERIFY_URL
     # --no-default-features applies to every selected workspace package.
     # These are the production release optimizer and feature choices, not a
     # fault-injection image or the default systemd/io_uring build.
@@ -173,9 +177,17 @@ case "$mode" in
       --lib -- --color never | tee "$test_root/container-lifecycle.log"
     cargo test --locked --release --no-default-features --features "$features" \
       -p tuwunel --test cancellation_lifecycle --test fatal_lifecycle --test sending_queue_restart \
+      --test room_storage_erasure --test admin_diagnostic_inventory --test inbox_paging \
       -- --color never | tee -a "$test_root/container-lifecycle.log"
+    # The large-payload test stays opt-in for ordinary developer runs, but
+    # this declared Linux release gate must execute it and retain its metrics.
+    cargo test --locked --release --no-default-features --features "$workspace_features" \
+      -p tuwunel -p tuwunel_service --lib \
+      sending::sender::qualification_tests::maximum_sender_inventories_recover_large_held_http_after_bounded_shutdown \
+      -- --ignored --exact --nocapture --color never | tee "$test_root/sender-stress.log"
     python3 ci/check-container-lifecycle.py "$test_root/container-lifecycle.log" \
-      "${TUWUNEL_LIFECYCLE_REPORT:-$test_root/container-lifecycle.json}"
+      "${TUWUNEL_LIFECYCLE_REPORT:-$test_root/container-lifecycle.json}" \
+      --sender-stress-log "$test_root/sender-stress.log"
     ;;
   release)
     # Reuse the release dependency closure already built by container-lifecycle,

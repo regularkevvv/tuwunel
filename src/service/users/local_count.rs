@@ -15,15 +15,16 @@ const MAX_LOCAL_USER_INVENTORY_BYTES: usize = 128 * 1024;
 
 impl Service {
 	/// A complete local-user inventory for administrative work. Examines at
-	/// most 1,025 rows including disabled accounts, retains at most 128 KiB of
-	/// user IDs, and closes the read before any caller starts changing users or
-	/// rooms. Refuses an oversized or corrupt inventory without a partial list.
+	/// most 1,025 rows including disabled accounts, charges at most 128 KiB of
+	/// raw key/value source bytes before filtering or owned IDs, and closes the
+	/// read before any caller starts changing users or rooms. Refuses an
+	/// oversized or corrupt inventory without a partial list.
 	pub async fn bounded_local_users(&self) -> Result<Vec<OwnedUserId>> {
 		self.bounded_users(true).await
 	}
 
 	/// A complete registered-user inventory, including inactive accounts, with
-	/// the same 1,024-row / 128 KiB retained-ID limits as the local inventory.
+	/// the same 1,024-row / 128 KiB raw-source limits as the local inventory.
 	/// Refuses overflow, malformed IDs and storage errors without a partial
 	/// list.
 	pub async fn bounded_registered_users(&self) -> Result<Vec<OwnedUserId>> {
@@ -34,23 +35,26 @@ impl Service {
 		let rows = self
 			.db
 			.userid_password
-			.stream_capped::<&UserId, &[u8]>(MAX_LOCAL_USER_COUNT_ROWS.saturating_add(1));
+			.stream_capped::<&[u8], &[u8]>(MAX_LOCAL_USER_COUNT_ROWS.saturating_add(1));
 		pin_mut!(rows);
 		let mut users = Vec::new();
 		let mut scanned = 0_usize;
 		let mut bytes = 0_usize;
 		while let Some(row) = rows.next().await {
-			let (user, password) = row?;
+			let (key, password) = row?;
 			if scanned >= MAX_LOCAL_USER_COUNT_ROWS {
 				return Err(inventory_limit());
 			}
 			scanned = scanned.saturating_add(1);
-			if local_only && password.is_empty() {
-				continue;
-			}
-			bytes = bytes.saturating_add(user.as_bytes().len());
+			bytes = bytes
+				.saturating_add(key.len())
+				.saturating_add(password.len());
 			if bytes > MAX_LOCAL_USER_INVENTORY_BYTES {
 				return Err(inventory_limit());
+			}
+			let user: &UserId = tuwunel_database::deserialize_from_slice(key)?;
+			if local_only && password.is_empty() {
+				continue;
 			}
 			users.push(user.to_owned());
 		}
