@@ -41,12 +41,16 @@ use tuwunel_core::{
 	ruma::{
 		EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, UserId,
 		api::appservice::{Namespace, Namespaces, Registration, RegistrationInit},
-		events::room::member::{MembershipState, RoomMemberEventContent},
+		events::room::{
+			member::{MembershipState, RoomMemberEventContent},
+			message::RoomMessageEventContent,
+		},
 	},
 };
 use tuwunel_database::{Database, Interfix, refusal, serialize_key};
 use tuwunel_service::{
 	Services,
+	rooms::state::RoomMutexGuard,
 	sending::{Destination, SendingEvent},
 	transaction_ids,
 	users::Register,
@@ -187,22 +191,30 @@ fn every_effect_of_a_stored_event_runs() -> Result {
 
 async fn exercise(services: &Services, base: &str) -> Result {
 	wait_until_ready(services, base).await?;
-	services
-		.pusher
-		.pause_notification_retry_for_test(true);
-
 	let logged = Logged::default();
 	let capture = logged.capture(services);
 	let _capturing = capture.start();
 
 	register(services, "effectsalice", ALICE_TOKEN).await?;
 	register(services, "effectsbob", BOB_TOKEN).await?;
+	let bob = UserId::parse_with_server_name("effectsbob", services.globals.server_name())?;
+
+	// The real retry worker waits on an earlier room's canonical state lock.
+	// Immediate appends in the target room still run in every build profile.
+	let (retry_room, retry_barrier) =
+		notification_retry_barrier(services, base, &logged, &bob).await?;
 	let room = create_public_room(services, base).await?;
+	assert!(
+		services
+			.short
+			.get_shortroomid(&retry_room)
+			.await? < services.short.get_shortroomid(&room).await?,
+		"retry barrier precedes target-room plans in the worker's ordered inventory"
+	);
 	join_room(services, base, &room, BOB_TOKEN).await?;
 	let remote = join_remote(services, &room).await?;
 	let (mut transactions, stub) = register_appservice(services).await?;
 
-	let bob = UserId::parse_with_server_name("effectsbob", services.globals.server_name())?;
 	services
 		.client
 		.clients
@@ -327,8 +339,60 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	}
 
 	stub.abort();
+	drop(retry_barrier);
 
 	Ok(())
+}
+
+/// Freeze only background recovery through its existing room-state exclusion.
+/// The durable blocker is ordered before all later target-room plans. This
+/// owned fixture uses the normal append/refusal paths in release and debug;
+/// production does not acquire a test pause or an extra control surface.
+async fn notification_retry_barrier(
+	services: &Services,
+	base: &str,
+	logged: &Logged,
+	bob: &UserId,
+) -> Result<(OwnedRoomId, RoomMutexGuard)> {
+	let room = create_public_room(services, base).await?;
+	join_room(services, base, &room, BOB_TOKEN).await?;
+	// This rule matches only the blocker message. The target fixture's broad
+	// rule remains installed after its membership setup, as before.
+	services.client.clients.default
+		.put(format!("{base}/_matrix/client/v3/pushrules/global/override/effects-retry-barrier"))
+		.bearer_auth(BOB_TOKEN)
+		.json(&json!({
+			"conditions": [{"kind":"event_match", "key":"content.body", "pattern":"notificationretrybarrier"}],
+			"actions": ["notify", {"set_tweak":"highlight", "value":true}],
+		}))
+		.send().await?.error_for_status()?;
+	let state = services.state.mutex.lock(&room).await;
+	let alice = UserId::parse_with_server_name("effectsalice", services.globals.server_name())?;
+	refusal::refuse_next("useridcount_notification");
+	let event = services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::timeline(&RoomMessageEventContent::text_plain(
+				"notificationretrybarrier",
+			)),
+			&alice,
+			&room,
+			&state,
+		)
+		.await?;
+	refused(services, logged, "push", &event).await?;
+	assert_count_pair(services, bob, &room, None, (0, 0)).await?;
+	let raw = services.timeline.get_pdu_id(&event).await?;
+	let plans = services.db["pduid_notificationplan"]
+		.raw_rows_prefix_after(&[], None, 2)
+		.await?;
+	assert_eq!(
+		plans.len(),
+		1,
+		"the real refused notification plan is the first recovery obligation"
+	);
+	assert_eq!(plans[0].0.as_slice(), raw.as_ref());
+	Ok((room, state))
 }
 
 type Snapshot = BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>;
