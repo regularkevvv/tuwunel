@@ -207,6 +207,28 @@ pub async fn add_typed_relation<E: Event>(
 	rel_type: RelationType,
 ) -> Result {
 	let services_guard = self.services.get();
+	services_guard
+		.short
+		.get_or_create_shorteventid(child.event_id())
+		.await?;
+	let mut txn = services_guard.db.txn();
+	self.append_typed_relation(&mut txn, shortroomid, child_count, parent, child, rel_type)
+		.await?;
+	txn.execute().await
+}
+
+/// Prepare a typed relation without changing any durable row before its PDU.
+#[implement(Service)]
+pub(crate) async fn append_typed_relation<E: Event>(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	shortroomid: ShortRoomId,
+	child_count: PduCount,
+	parent: &EventId,
+	child: &E,
+	rel_type: RelationType,
+) -> Result {
+	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
 	let Some(tag) = tag(&rel_type) else {
@@ -221,6 +243,14 @@ pub async fn add_typed_relation<E: Event>(
 	if parent_id.shortroomid != shortroomid {
 		return Err(Error::bad_database("Mismatched typed relation parent room"));
 	}
+	let parent_raw: RawPduId = parent_id.into();
+	let parent_pdu = services_root
+		.timeline
+		.get_pdu_from_id(&parent_raw)
+		.await?;
+	if parent_pdu.event_id() != parent || parent_pdu.room_id() != child.room_id() {
+		return Err(Error::bad_database("Mismatched typed relation parent event"));
+	}
 	let parent_count = parent_id.count;
 
 	let (PduCount::Normal(_), PduCount::Normal(_)) = (parent_count, child_count) else {
@@ -229,18 +259,16 @@ pub async fn add_typed_relation<E: Event>(
 
 	let child_short = services_root
 		.short
-		.get_or_create_shorteventid(child.event_id())
+		.get_shorteventid(child.event_id())
 		.await?;
 
 	let child_ts = u64::from(child.origin_server_ts().get());
 	let key = key(shortroomid, parent_count, tag, child_ts, child_count);
 
-	self.db
-		.relatesto_typed
-		.aput_raw::<KEY_LEN, _, _>(key.as_slice(), child_short.to_be_bytes())
-		.await
+	txn.insert_raw(&self.db.relatesto_typed, key.as_slice(), child_short.to_be_bytes());
+	txn.check_bridge_admission()?;
+	Ok(())
 }
-
 fn tag(rel_type: &RelationType) -> Option<Tag> {
 	match rel_type {
 		| RelationType::Replacement => Some(Tag::Replace),
@@ -332,6 +360,51 @@ pub async fn delete_typed_relation(&self, child_id: &RawPduId, child: &Canonical
 		.remove(key.as_slice())
 		.await
 		.expect("database write error");
+}
+
+/// Remove the target child's typed index in the same transaction as redaction.
+#[implement(Service)]
+pub(crate) async fn append_delete_typed_relation(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	child_id: &RawPduId,
+	child: &CanonicalJsonObject,
+) -> Result {
+	let services_guard = self.services.get();
+	let child: Pdu = serde_json::from_value(serde_json::to_value(child)?)
+		.map_err(|_| Error::bad_database("Invalid redaction target"))?;
+	let Ok(content) = child.get_content::<ExtractRelatesTo>() else {
+		return Ok(());
+	};
+	let (rel_type, parent) = match content.relates_to {
+		| Relation::Replacement(value) => (RelationType::Replacement, value.event_id),
+		| Relation::Reference(value) => (RelationType::Reference, value.event_id),
+		| _ => return Ok(()),
+	};
+	let Some(tag) = tag(&rel_type) else {
+		return Ok(());
+	};
+	let parent_id = match services_guard.timeline.get_pdu_id(&parent).await {
+		| Ok(id) => id,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
+	};
+	if parent_id.shortroomid() != child_id.shortroomid() {
+		return Err(Error::bad_database("Mismatched redaction relation room"));
+	}
+	let parent_count = parent_id.pdu_count();
+	let child_count = child_id.pdu_count();
+	if matches!((parent_count, child_count), (PduCount::Normal(_), PduCount::Normal(_))) {
+		let key = key(
+			u64_from_u8(&child_id.shortroomid()),
+			parent_count,
+			tag,
+			u64::from(child.origin_server_ts().get()),
+			child_count,
+		);
+		txn.del_raw(&self.db.relatesto_typed, key.as_slice());
+	}
+	Ok(())
 }
 
 pub(super) fn prefix(shortroomid: ShortRoomId, parent: PduCount, tag: Tag) -> Prefix {

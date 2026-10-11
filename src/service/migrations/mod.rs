@@ -113,19 +113,19 @@ pub(crate) async fn migrations(services: &Services) -> Result {
 		sleep(FORCE_MIGRATION_DELAY).await;
 	}
 
-	let users_count = services.users.count().await;
+	let has_users = services.users.has_users().await?;
 	// Computed before check_server_name backfills SERVER_NAME_KEY, which would
 	// otherwise mask a Conduit-lineage database (it carries no foreign marker).
 	let foreign_lineage = is_foreign_lineage(services).await;
 	// An empty account inventory or disabled migrations must not bypass the
 	// incompatible-version gate and rewrite a newer native database as fresh.
-	check_database_version(services, foreign_lineage, users_count != 0).await?;
+	check_database_version(services, foreign_lineage, has_users).await?;
 
 	if !services.config.database_migrations {
 		warn!("Skipping database migrations due to configuration...");
 		return Ok(());
 	}
-	if users_count == 0 {
+	if !has_users {
 		return fresh(services).await;
 	}
 	check_server_name(services).await?;

@@ -34,19 +34,10 @@ use crate::rooms::{
 
 type Band<'a> = SmallVec<[&'a EventId; 1]>;
 
-/// The outcome of one effect of a durable pdu, logged when it failed.
-///
-/// A pdu's effects follow the commit that stores it, each on its own: push
-/// counts, notification rows and pushes, membership, the search index,
-/// relations and threads, and appservice delivery. One that fails is logged at
-/// error level under its name, with the pdu's event id and never its content,
-/// and the rest still run. The pdu stays sent: its sender is told so, and a
-/// retry of the sender's transaction finds the record and runs nothing again.
-///
-/// Federation, notifications and membership have separate durable plans. The
-/// other effects run at most once per live process. Nothing records an
-/// effect as owed, so one that failed, or one a crash cut short, is not
-/// replayed.
+/// Log failure of an optional policy/cache action or durable-plan completion.
+/// Required direct derived rows commit with the canonical PDU. Deferred
+/// notification, membership and federation work retains its durable plan on
+/// failure, while optional policy handoffs may be abandoned on shutdown.
 pub(crate) trait Effect {
 	fn effect(self, name: &'static str, event_id: &EventId);
 }
@@ -152,9 +143,10 @@ where
 /// that followed the event's, and failed, did the same: the count still
 /// retired, and the stale pointer stayed across restarts.
 ///
-/// Returns the pdu id, or an error only when the pdu did not commit. The pdu's
-/// effects follow its commit, and one that fails is logged, not returned
-/// (`Effect`).
+/// Returns the pdu id only after canonical storage and required derived
+/// indexes/queues commit together. Deferred notification, membership and
+/// federation work is represented by durable plans in that same commit.
+/// Optional policy and cache effects may fail after acceptance (`Effect`).
 #[implement(super::Service)]
 #[inline]
 pub async fn append_pdu<'a, Leafs>(
@@ -261,6 +253,24 @@ where
 		.set_forward_extremities_txn(&mut txn, pdu.room_id(), leafs, state_lock)
 		.await;
 
+	// Lock order: room state -> insert -> originals -> appservice registry ->
+	// sender admission. History/room erasure also takes originals before sender.
+	let originals = if *pdu.kind() == TimelineEventType::RoomRedaction {
+		Some(services_root.retention.lock_originals().await)
+	} else {
+		None
+	};
+	self.stage_pdu_effects(
+		&mut txn,
+		pdu_id,
+		pdu,
+		shortroomid,
+		count,
+		state_lock,
+		originals.as_ref(),
+	)
+	.await?;
+
 	let notifications = services_root
 		.pusher
 		.stage_notification_plan(&mut txn, pdu_id, pdu, room_state)
@@ -282,25 +292,23 @@ where
 		)
 		.await?;
 
-	let federation = if federate {
-		let state = match room_state {
-			| Some(state) => state,
-			| None =>
-				services_root
-					.state
-					.get_room_shortstatehash(pdu.room_id())
-					.await?,
-		};
-		Some(
-			services_root
-				.sending
-				.db
-				.stage_federation_plan(&mut txn, pdu_id, pdu, state)
-				.await?,
+	let appservices = services_root
+		.appservice
+		.prepare_pdu(pdu_id, pdu, room_state)
+		.await?;
+	appservices.append(&mut txn)?;
+
+	if federate {
+		self.stage_federation_delivery(
+			&mut txn,
+			pdu_id,
+			pdu,
+			room_state,
+			appservices.sender_guard(),
 		)
-	} else {
-		None
-	};
+		.await?;
+	}
+
 	// This is one indivisible admission, including metadata, deletions, client
 	// transaction identity, state and both notification/federation plans.
 	let projection = services_root
@@ -317,8 +325,11 @@ where
 	txn.check_bridge_admission()?;
 	txn.execute_flushed().await?;
 	drop(projection);
-	drop(federation);
 	drop(notifications);
+	drop(originals);
+	appservices
+		.finish()
+		.effect("appservice wake", pdu.event_id());
 
 	if let Some(sender_read) = sender_read {
 		sender_read.committed(&services_root.pusher);
@@ -373,13 +384,35 @@ where
 		services_root.sending.wake_federation_sources();
 	}
 
-	services_root
-		.appservice
-		.append_pdu(pdu_id, pdu)
-		.await
-		.effect("appservice delivery", event_id);
-
 	Ok(pdu_id)
+}
+
+/// Stage the accepted event's federation obligation under the sender guard
+/// already held by its appservice plan, without reacquiring admission.
+#[implement(super::Service)]
+async fn stage_federation_delivery(
+	&self,
+	txn: &mut Txn,
+	pdu_id: RawPduId,
+	pdu: &PduEvent,
+	room_state: Option<ShortStateHash>,
+	sender_guard: &tokio::sync::OwnedMutexGuard<()>,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let state = match room_state {
+		| Some(state) => state,
+		| None =>
+			services_root
+				.state
+				.get_room_shortstatehash(pdu.room_id())
+				.await?,
+	};
+	services_root
+		.sending
+		.db
+		.stage_federation_plan_locked(txn, pdu_id, pdu, state, sender_guard)
+		.await
 }
 
 #[implement(super::Service)]
@@ -490,71 +523,181 @@ pub(crate) async fn federate_existing_pdu(
 	Ok(())
 }
 
-/// The effects a durable pdu's type and relations call for.
-///
-/// Each runs whether or not the ones before it failed (`Effect`).
+/// Stage every required derived mutation before canonical acceptance. There
+/// is no volatile owed frontier: either the complete batch commits or none
+/// does.
 #[implement(super::Service)]
-async fn append_pdu_effects(
+#[expect(clippy::too_many_arguments)]
+async fn stage_pdu_effects(
 	&self,
+	txn: &mut Txn,
 	pdu_id: RawPduId,
 	pdu: &PduEvent,
 	shortroomid: ShortRoomId,
 	count: PduCount,
 	state_lock: &RoomMutexGuard,
-) {
+	originals: Option<&tokio::sync::MutexGuard<'_, ()>>,
+) -> Result {
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
-
-	let event_id = pdu.event_id();
-
 	match *pdu.kind() {
-		| TimelineEventType::RoomRedaction => self
-			.append_redaction_effects(pdu, shortroomid, state_lock)
-			.await
-			.effect("redaction", event_id),
-		| TimelineEventType::RoomMember => self
-			.append_member_effects(pdu, count)
-			.await
-			.effect("membership", event_id),
-		| TimelineEventType::RoomMessage => {
-			// A body that is not a string leaves nothing to index.
-			let body = pdu
-				.get_content::<ExtractBody>()
-				.ok()
-				.and_then(|content| content.body);
-
-			if let Some(body) = body {
-				services_root
-					.search
-					.index_pdu(shortroomid, &pdu_id, &body)
-					.await
-					.effect("search index", event_id);
-
-				if services_root
-					.admin
-					.is_admin_command(pdu, &body)
-					.await
-				{
-					services_root
-						.admin
-						.command(body, Some(event_id.into()))
-						.await
-						.effect("admin command", event_id);
-				}
+		| TimelineEventType::RoomRedaction => {
+			let originals =
+				originals.ok_or_else(|| err!(Database("Missing redaction exclusion")))?;
+			let version = services_root
+				.state
+				.get_room_version(pdu.room_id())
+				.await?;
+			let rules = room_version::rules(&version)?;
+			if let Some(target) = pdu.redacts_id(&rules)
+				&& services_root
+					.state_accessor
+					.user_can_redact(&target, pdu.sender(), pdu.room_id(), false)
+					.await?
+			{
+				self.append_redaction(txn, &target, pdu, shortroomid, state_lock, originals)
+					.await?;
 			}
 		},
-		| TimelineEventType::RoomTopic =>
+		| TimelineEventType::RoomMessage => {
+			if let Some(body) = pdu
+				.get_content::<ExtractBody>()
+				.ok()
+				.and_then(|content| content.body)
+			{
+				services_root
+					.search
+					.append_index_pdu(txn, shortroomid, &pdu_id, &body)?;
+			}
+		},
+		| TimelineEventType::RoomTopic => {
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
 				services_root
 					.search
-					.index_pdu(shortroomid, &pdu_id, &topic)
-					.await
-					.effect("search index", event_id);
-			},
+					.append_index_pdu(txn, shortroomid, &pdu_id, &topic)?;
+			}
+		},
 		| _ => {},
 	}
+	let relation_parent = if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>() {
+		self.checked_relation_parent(&content.relates_to.event_id, pdu)
+			.await?
+	} else {
+		None
+	};
+	if let Some(parent) = relation_parent {
+		services_root
+			.pdu_metadata
+			.append_relation(txn, count, parent);
+	}
+	if let Ok(content) = pdu.get_content::<ExtractRelatesTo>() {
+		match content.relates_to {
+			| Relation::Reply(reply) => {
+				if let Some(parent) = self
+					.checked_relation_parent(&reply.in_reply_to.event_id, pdu)
+					.await?
+				{
+					services_root
+						.pdu_metadata
+						.append_relation(txn, count, parent);
+				}
+			},
+			| Relation::Thread(thread) if relation_parent.is_some() => {
+				services_root
+					.threads
+					.append_to_thread(txn, &thread.event_id, pdu_id, pdu)
+					.await?;
+			},
+			| Relation::Replacement(replacement) if relation_parent.is_some() => {
+				services_root
+					.pdu_metadata
+					.append_typed_relation(
+						txn,
+						shortroomid,
+						count,
+						&replacement.event_id,
+						pdu,
+						RelationType::Replacement,
+					)
+					.await?;
+			},
+			| Relation::Reference(reference) if relation_parent.is_some() => {
+				services_root
+					.pdu_metadata
+					.append_typed_relation(
+						txn,
+						shortroomid,
+						count,
+						&reference.event_id,
+						pdu,
+						RelationType::Reference,
+					)
+					.await?;
+			},
+			| _ => {},
+		}
+	}
+	txn.check_bridge_admission()?;
+	Ok(())
+}
 
-	// The cached hierarchy summary projects room state; evict on any state change.
+#[implement(super::Service)]
+async fn checked_relation_parent(
+	&self,
+	event: &EventId,
+	child: &PduEvent,
+) -> Result<Option<PduCount>> {
+	let raw = match self.get_pdu_id(event).await {
+		| Ok(raw) => raw,
+		| Err(error) if error.is_not_found() => return Ok(None),
+		| Err(error) => return Err(error),
+	};
+	let parent = self.get_pdu_from_id(&raw).await?;
+	if parent.event_id() != event {
+		return Err(err!(Database("Mismatched event relation parent")));
+	}
+	// A relation may name a real event in another room. Accept its content
+	// without following or indexing that reference; it is not storage corruption.
+	if parent.room_id() != child.room_id() {
+		return Ok(None);
+	}
+	Ok(Some(raw.pdu_count()))
+}
+
+/// Optional policy handoffs and expiring-cache eviction run after acceptance.
+#[implement(super::Service)]
+async fn append_pdu_effects(
+	&self,
+	_pdu_id: RawPduId,
+	pdu: &PduEvent,
+	_shortroomid: ShortRoomId,
+	count: PduCount,
+	_state_lock: &RoomMutexGuard,
+) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let event_id = pdu.event_id();
+	if *pdu.kind() == TimelineEventType::RoomMember {
+		self.append_member_effects(pdu, count)
+			.await
+			.effect("membership auto-accept", event_id);
+	}
+	if *pdu.kind() == TimelineEventType::RoomMessage
+		&& let Some(body) = pdu
+			.get_content::<ExtractBody>()
+			.ok()
+			.and_then(|content| content.body)
+		&& services_root
+			.admin
+			.is_admin_command(pdu, &body)
+			.await
+	{
+		services_root
+			.admin
+			.command(body, Some(event_id.into()))
+			.await
+			.effect("admin command", event_id);
+	}
 	if pdu.state_key().is_some() {
 		services_root
 			.spaces
@@ -562,101 +705,6 @@ async fn append_pdu_effects(
 			.await
 			.effect("space hierarchy cache", event_id);
 	}
-
-	if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>()
-		&& let Ok(related_pducount) = self
-			.get_pdu_count(&content.relates_to.event_id)
-			.await
-	{
-		services_root
-			.pdu_metadata
-			.add_relation(count, related_pducount)
-			.await
-			.effect("relation", event_id);
-	}
-
-	if let Ok(content) = pdu.get_content::<ExtractRelatesTo>() {
-		match content.relates_to {
-			| Relation::Reply(ruma::events::relation::Reply { in_reply_to }) => {
-				// We need to do it again here, because replies don't have
-				// event_id as a top level field
-				if let Ok(related_pducount) = self.get_pdu_count(&in_reply_to.event_id).await {
-					services_root
-						.pdu_metadata
-						.add_relation(count, related_pducount)
-						.await
-						.effect("relation", event_id);
-				}
-			},
-			| Relation::Thread(thread) => {
-				services_root
-					.threads
-					.add_to_thread(&thread.event_id, pdu_id, pdu)
-					.await
-					.effect("thread", event_id);
-			},
-			| Relation::Replacement(replacement) => {
-				services_root
-					.pdu_metadata
-					.add_typed_relation(
-						shortroomid,
-						count,
-						&replacement.event_id,
-						pdu,
-						RelationType::Replacement,
-					)
-					.await
-					.effect("typed relation", event_id);
-			},
-			| Relation::Reference(reference) => {
-				services_root
-					.pdu_metadata
-					.add_typed_relation(
-						shortroomid,
-						count,
-						&reference.event_id,
-						pdu,
-						RelationType::Reference,
-					)
-					.await
-					.effect("typed relation", event_id);
-			},
-			| _ => {}, // TODO: Aggregate other types
-		}
-	}
-}
-
-/// Redacts the event a redaction names, when its sender may redact it.
-#[implement(super::Service)]
-async fn append_redaction_effects(
-	&self,
-	pdu: &PduEvent,
-	shortroomid: ShortRoomId,
-	state_lock: &RoomMutexGuard,
-) -> Result {
-	let services_guard = self.services.get();
-	let services_root = services_guard.as_ref();
-
-	let room_version = services_root
-		.state
-		.get_room_version(pdu.room_id())
-		.await?;
-
-	let room_rules = room_version::rules(&room_version)?;
-
-	let redacts_id = pdu.redacts_id(&room_rules);
-
-	if let Some(redacts_id) = &redacts_id
-		&& services_root
-			.state_accessor
-			.user_can_redact(redacts_id, pdu.sender(), pdu.room_id(), false)
-			.await?
-	{
-		self.redact_pdu(redacts_id, pdu, shortroomid, state_lock)
-			.await?;
-	}
-
-	Ok(())
 }
 
 /// Record the membership transition an `m.room.member` event carries.

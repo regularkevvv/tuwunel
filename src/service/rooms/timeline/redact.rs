@@ -17,13 +17,37 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 	state_lock: &RoomMutexGuard,
 ) -> Result {
 	let services_guard = self.services.get();
+	let originals = services_guard.retention.lock_originals().await;
+	let mut txn = services_guard.db.txn();
+	self.append_redaction(&mut txn, event_id, reason, shortroomid, state_lock, &originals)
+		.await?;
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await
+}
+
+/// Stage the complete authorized target mutation with the redaction event.
+/// The originals guard is retained by the caller through the canonical commit.
+#[implement(super::Service)]
+pub(crate) async fn append_redaction<Pdu: Event + Send + Sync>(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	event_id: &EventId,
+	reason: &Pdu,
+	shortroomid: ShortRoomId,
+	_state_lock: &RoomMutexGuard,
+	originals: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result {
+	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 
-	let Ok(pdu_id) = self.get_pdu_id(event_id).await else {
-		// If event does not exist, just noop
-		// TODO this is actually wrong!
-		return Ok(());
+	let pdu_id = match self.get_pdu_id(event_id).await {
+		| Ok(id) => id,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
 	};
+	if pdu_id.shortroomid() != shortroomid.to_be_bytes() {
+		return Err(err!(Database("Redaction target belongs to another room")));
+	}
 
 	let mut pdu = self
 		.get_pdu_json_from_id(&pdu_id)
@@ -32,9 +56,15 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 			err!(Database(error!(?pdu_id, ?event_id, ?e, "PDU ID points to invalid PDU.")))
 		})?;
 
+	let target: tuwunel_core::matrix::pdu::PduEvent =
+		serde_json::from_value(serde_json::to_value(&pdu)?)
+			.map_err(|_| err!(Database("Invalid redaction target")))?;
+	if target.event_id() != event_id || target.room_id() != reason.room_id() {
+		return Err(err!(Database("Mismatched redaction target")));
+	}
 	services_root
 		.retention
-		.save_original_pdu(event_id, &pdu, state_lock)
+		.append_original_pdu(txn, event_id, &pdu, originals)
 		.await?;
 
 	let body = pdu["content"]
@@ -45,8 +75,18 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 	if let Some(body) = body {
 		services_root
 			.search
-			.deindex_pdu(shortroomid, &pdu_id, body)
-			.await?;
+			.append_deindex_pdu(txn, shortroomid, &pdu_id, body)?;
+	}
+
+	if *target.kind() == ruma::events::TimelineEventType::RoomTopic
+		&& let Some(topic) = target
+			.get_content()
+			.ok()
+			.and_then(crate::rooms::state_accessor::plain_text_topic)
+	{
+		services_root
+			.search
+			.append_deindex_pdu(txn, shortroomid, &pdu_id, &topic)?;
 	}
 
 	let room_id: &RoomId = pdu.get("room_id").try_into()?;
@@ -64,8 +104,8 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 
 	services_root
 		.pdu_metadata
-		.delete_typed_relation(&pdu_id, &pdu)
-		.await;
+		.append_delete_typed_relation(txn, &pdu_id, &pdu)
+		.await?;
 
 	redact_in_place(
 		&mut pdu,
@@ -74,5 +114,7 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 	)
 	.map_err(|err| err!("invalid event: {err}"))?;
 
-	self.replace_pdu(&pdu_id, &pdu).await
+	txn.raw_put(&self.db.pduid_pdu, pdu_id, tuwunel_database::Json(&pdu));
+	txn.check_bridge_admission()?;
+	Ok(())
 }

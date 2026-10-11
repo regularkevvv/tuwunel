@@ -11,6 +11,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {
+    "migrations::tests::startup_account_probe_reads_one_provider_key_including_disabled_accounts",
+    "migrations::tests::startup_account_read_refusal_cannot_initialize_fresh_state",
+    "migrations::tests::startup_account_invalid_key_cannot_initialize_fresh_state",
+    "migrations::tests::checked_empty_accounts_initialize_fresh_but_cannot_downgrade_native_schema",
+    "migrations::tests::disabled_account_and_disabled_migrations_preserve_unsupported_schema_refusal",
+    "every_effect_of_a_stored_event_runs",
+    "canonical_derived_effects_survive_actual_sigkill_without_replay",
+    "transaction_ids_commit_with_their_effects",
+    "appservice_e2ee_transactions",
+    "canonical_to_device_appservice_copy_survives_sigkill",
+    "inbound_pdus_are_redacted_on_bad_hashes_and_refused_when_not_canonical",
     "sending::sender::retry_restart_tests::maximum_producer_singleton_with_full_key_rows_replays_and_drains",
     "room_storage_erasure_is_atomic_and_protects_operator_access",
     "administrative_inventories_refuse_before_output_or_key_markers",

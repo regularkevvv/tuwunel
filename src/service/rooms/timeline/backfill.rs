@@ -448,34 +448,9 @@ pub async fn backfill_pdu(
 	.into();
 
 	// Insert pdu
-	self.prepend_backfill_pdu(
-		&pdu_id,
-		room_id,
-		&event_id,
-		u64::from(pdu.origin_server_ts),
-		&value,
-	)
-	.await?;
+	self.prepend_backfill_pdu(&pdu_id, &pdu, &value)
+		.await?;
 	drop(insert_lock);
-
-	match pdu.kind {
-		| TimelineEventType::RoomMessage => {
-			if let Ok(ExtractBody { body: Some(body) }) = pdu.get_content() {
-				services_root
-					.search
-					.index_pdu(shortroomid, &pdu_id, &body)
-					.await?;
-			}
-		},
-		| TimelineEventType::RoomTopic =>
-			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
-				services_root
-					.search
-					.index_pdu(shortroomid, &pdu_id, &topic)
-					.await?;
-			},
-		| _ => {},
-	}
 
 	drop(mutex_lock);
 
@@ -487,11 +462,15 @@ pub async fn backfill_pdu(
 async fn prepend_backfill_pdu(
 	&self,
 	pdu_id: &RawPduId,
-	room_id: &RoomId,
-	event_id: &EventId,
-	origin_server_ts: u64,
+	pdu: &tuwunel_core::matrix::pdu::PduEvent,
 	json: &CanonicalJsonObject,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let room_id = pdu.room_id();
+	let event_id = pdu.event_id();
+	let origin_server_ts = u64::from(pdu.origin_server_ts);
+	let shortroomid = u64::from_be_bytes(pdu_id.shortroomid());
 	let mut txn = self.db.db.txn();
 	self.services
 		.get()
@@ -507,6 +486,23 @@ async fn prepend_backfill_pdu(
 	let count_key = bias_count(pdu_id.count());
 	let key = (room_id, origin_server_ts, count_key);
 	txn.put_raw(&self.db.roomid_tscount_pducount, key, pdu_id.count());
+
+	match pdu.kind {
+		| TimelineEventType::RoomMessage => {
+			if let Ok(ExtractBody { body: Some(body) }) = pdu.get_content() {
+				services_root
+					.search
+					.append_index_pdu(&mut txn, shortroomid, pdu_id, &body)?;
+			}
+		},
+		| TimelineEventType::RoomTopic =>
+			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
+				services_root
+					.search
+					.append_index_pdu(&mut txn, shortroomid, pdu_id, &topic)?;
+			},
+		| _ => {},
+	}
 
 	txn.check_bridge_admission()?;
 	txn.execute_flushed().await

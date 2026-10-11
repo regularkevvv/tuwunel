@@ -59,6 +59,19 @@ pub async fn add_relation(&self, from: PduCount, to: PduCount) -> Result {
 	Ok(())
 }
 
+/// Stage relation ownership in the canonical event transaction.
+#[implement(Service)]
+pub(crate) fn append_relation(
+	&self,
+	txn: &mut tuwunel_database::Txn,
+	from: PduCount,
+	to: PduCount,
+) {
+	if let (PduCount::Normal(from), PduCount::Normal(to)) = (from, to) {
+		txn.put_raw(&self.db.tofrom_relation, &[to, from][..], []);
+	}
+}
+
 /// Query relations of an event to determine if matching any of the trailing
 /// arguments. When all criteria are None the mere presence of a relation causes
 /// this function to return true.

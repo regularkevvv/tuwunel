@@ -55,6 +55,25 @@ class LifecycleReceipt(unittest.TestCase):
         with self.assertRaises(ValueError):
             GATE.verify_log(self.log() + "test result: FAILED. 0 passed; 1 failed; 0 ignored;\n")
 
+    def test_atomic_acceptance_and_startup_controls_each_require_execution(self):
+        for case in (
+                "migrations::tests::startup_account_probe_reads_one_provider_key_including_disabled_accounts",
+                "migrations::tests::startup_account_read_refusal_cannot_initialize_fresh_state",
+                "migrations::tests::startup_account_invalid_key_cannot_initialize_fresh_state",
+                "migrations::tests::checked_empty_accounts_initialize_fresh_but_cannot_downgrade_native_schema",
+                "migrations::tests::disabled_account_and_disabled_migrations_preserve_unsupported_schema_refusal",
+                "every_effect_of_a_stored_event_runs",
+                "canonical_derived_effects_survive_actual_sigkill_without_replay",
+                "transaction_ids_commit_with_their_effects",
+                "appservice_e2ee_transactions",
+                "canonical_to_device_appservice_copy_survives_sigkill",
+                "inbound_pdus_are_redacted_on_bad_hashes_and_refused_when_not_canonical"):
+            with self.subTest(case=case):
+                self.assertIn(case, GATE.REQUIRED)
+                for replacement in ("", f"test {case} ... ignored\n"):
+                    with self.assertRaises(ValueError):
+                        GATE.verify_log(self.log().replace(f"test {case} ... ok\n", replacement))
+
     def stress_log(self, **changes):
         report = {"phase": "sender-qualification", "case": "maximum_sender_inventory",
                   "source_revision": "current", "profile": "release", "os": "linux", "arch": "x86_64",
@@ -163,7 +182,9 @@ print("test result: ok. 42 passed; 0 failed; 0 ignored;")
             features = command[command.index("--features") + 1].replace("tuwunel/", "").split(",")
             self.assertEqual(features, GATE.feature_contract().split(","))
         for target in ("cancellation_lifecycle", "fatal_lifecycle", "sending_queue_restart",
-                       "room_storage_erasure", "admin_diagnostic_inventory", "inbox_paging"):
+                       "room_storage_erasure", "admin_diagnostic_inventory", "inbox_paging",
+                       "post_commit_effects", "txn_id_atomicity", "appservice_txn",
+                       "federation_pdu_integrity"):
             self.assertIn(target, commands[1])
         self.assertIn(GATE.STRESS_CASE, commands[2])
         for flag in ("--ignored", "--exact", "--nocapture"):

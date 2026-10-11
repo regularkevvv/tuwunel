@@ -38,12 +38,25 @@ pub(super) const ACTIVE_PROMOTION_LIMIT: usize = 48;
 /// the caller commits the pending rows alongside its device mutation.
 pub(crate) struct DeviceListAdmission {
 	// Field order releases sender exclusion before registry exclusion.
-	_guard: tokio::sync::OwnedMutexGuard<()>,
+	sender_guard: tokio::sync::OwnedMutexGuard<()>,
 	_registrations: crate::appservice::RegistrationReadGuard,
 	pub(super) requests: Vec<(Destination, SendingEvent, Vec<u8>)>,
 }
 
 impl DeviceListAdmission {
+	pub(super) fn into_requests(self) -> Vec<(Destination, SendingEvent, Vec<u8>)> {
+		let Self {
+			sender_guard: guard,
+			_registrations: registrations,
+			requests,
+		} = self;
+		drop(guard);
+		drop(registrations);
+		requests
+	}
+
+	pub(crate) fn sender_guard(&self) -> &tokio::sync::OwnedMutexGuard<()> { &self.sender_guard }
+
 	pub(crate) fn append(&self, db: &Database, txn: &mut Txn) {
 		for (_, event, key) in &self.requests {
 			txn.insert_raw(&db["servernameevent_data"], key, event.value_bytes());
@@ -287,8 +300,23 @@ impl Data {
 			destination.prefix_len(),
 			matches!(destination, Destination::Push(..)),
 		)?;
+		let map = tuwunel_bridge::catalog::map_id("servernameevent_data")
+			.ok_or_else(|| Error::bad_database("Missing sending queue map"))?;
 		budget
-			.try_put(key_len, event.value_bytes())
+			.try_put_to(map.0, key_len, event.value_bytes())
+			.map_err(|error| admission_error(&error))
+	}
+
+	pub(super) fn admit_to_device_request(
+		budget: &mut tuwunel_bridge::request::PutBatchBudget,
+		payload: &[u8],
+		destination: &Destination,
+	) -> Result {
+		active::validate_payload(payload)?;
+		let map = tuwunel_bridge::catalog::map_id("servernameevent_data")
+			.ok_or_else(|| Error::bad_database("Missing sending queue map"))?;
+		budget
+			.try_put_to(map.0, destination.prefix_len().saturating_add(8), payload)
 			.map_err(|error| admission_error(&error))
 	}
 
@@ -318,10 +346,47 @@ impl Data {
 			prepared.push((destination, event, key));
 		}
 		Ok(DeviceListAdmission {
-			_guard: guard,
+			sender_guard: guard,
 			_registrations: registrations,
 			requests: prepared,
 		})
+	}
+
+	/// Canonical producers retain registry and sender exclusion through commit.
+	pub(super) async fn prepare_coupled_appservice_admission(
+		&self,
+		requests: Vec<(Destination, SendingEvent, Vec<u8>)>,
+		registrations: crate::appservice::RegistrationReadGuard,
+		check_keys: bool,
+	) -> Result<DeviceListAdmission> {
+		let guard = self.active_write.clone().lock_owned().await;
+		let mut budget = self.queue_budget()?;
+		for (destination, event, key) in &requests {
+			Self::admit_request(&mut budget, event, destination)?;
+			self.require_uncancelled_destination(destination)
+				.await?;
+			if let Some(raw) = event.pdu_id()
+				&& self.event_erasure_started(raw).await?
+			{
+				return Err(Error::bad_database("Cannot admit an erasing event"));
+			}
+			if check_keys {
+				self.validate_new_queue_key(key).await?;
+			}
+		}
+		Ok(DeviceListAdmission {
+			sender_guard: guard,
+			_registrations: registrations,
+			requests,
+		})
+	}
+
+	pub(super) async fn validate_new_queue_key(&self, key: &[u8]) -> Result {
+		match self.servernameevent_data.get(key).await {
+			| Ok(_) => Err(Error::bad_database("Canonical queue identity already exists")),
+			| Err(error) if error.is_not_found() => Ok(()),
+			| Err(error) => Err(error),
+		}
 	}
 
 	pub(super) async fn queue_requests<'a, I>(&self, requests: I) -> Result<Vec<Vec<u8>>>

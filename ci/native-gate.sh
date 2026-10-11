@@ -178,6 +178,8 @@ case "$mode" in
     cargo test --locked --release --no-default-features --features "$features" \
       -p tuwunel --test cancellation_lifecycle --test fatal_lifecycle --test sending_queue_restart \
       --test room_storage_erasure --test admin_diagnostic_inventory --test inbox_paging \
+      --test post_commit_effects --test txn_id_atomicity --test appservice_txn \
+      --test federation_pdu_integrity \
       -- --color never | tee -a "$test_root/container-lifecycle.log"
     # The large-payload test stays opt-in for ordinary developer runs, but
     # this declared Linux release gate must execute it and retain its metrics.

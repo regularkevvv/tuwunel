@@ -33,7 +33,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use futures::future::join;
+use futures::{TryStreamExt, future::join};
 use serde_json::{
 	Value, json,
 	value::{RawValue as RawJsonValue, to_raw_value},
@@ -59,7 +59,7 @@ use tuwunel_core::{
 		signatures::{Ed25519KeyPair, hash_and_sign_event, reference_hash, sign_json},
 	},
 };
-use tuwunel_database::Json;
+use tuwunel_database::{Json, refusal};
 use tuwunel_service::{Services, users::Register};
 
 const REMOTE: &str = "c3-remote.test";
@@ -149,6 +149,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		"an honest join must keep its content"
 	);
 	room_version_errors_refuse_invitation_fallback(services, &room_id, &honest).await?;
+	backfill_search_acceptance_is_atomic(services, &room_id, &trent, &honest_id, &remote).await?;
 
 	// A join whose content no longer matches its hash is stored redacted.
 	let mallory = remote_user("mallory")?;
@@ -1008,4 +1009,109 @@ async fn send_raw(
 	let status = response.status().as_u16();
 
 	Ok((status, response.json().await.unwrap_or(Value::Null)))
+}
+
+/// Exercise the actual authenticated backfill path: an index refusal cannot
+/// publish a prepend that retry then mistakes for already-complete history.
+async fn backfill_search_acceptance_is_atomic(
+	services: &Services,
+	room: &RoomId,
+	sender: &UserId,
+	joined: &OwnedEventId,
+	remote: &Remote,
+) -> Result {
+	let mut message = signed_join(services, room, sender, remote, "backfill template").await?;
+	message.remove("state_key");
+	message.insert("type".into(), "m.room.message".into());
+	message.insert(
+		"content".into(),
+		serde_json::from_value(json!({"msgtype":"m.text","body":"atomicbackfillsearch"}))?,
+	);
+	let join_rules: OwnedEventId = services
+		.state_accessor
+		.room_state_get_id(room, &StateEventType::RoomJoinRules, "")
+		.await?;
+	let auth_events = message
+		.get_mut("auth_events")
+		.and_then(CanonicalJsonValue::as_array_mut)
+		.expect("signed template auth events");
+	// Messages cannot cite the join-only authorization event.
+	auth_events.retain(|id| id.as_str() != Some(join_rules.as_str()));
+	auth_events.push(joined.as_str().into());
+	resign(&mut message, remote)?;
+	let event = event_id(&message, remote)?;
+	let before = backfill_canonical_snapshot(services).await?;
+	refusal::refuse_next("tokenids");
+	assert!(
+		services
+			.timeline
+			.backfill_pdu(room, &remote.name, to_raw_value(&message)?)
+			.await
+			.is_err(),
+		"backfill required-index refusal refuses canonical prepend"
+	);
+	assert_eq!(refusal::pending(), 0, "actual prepend batch contains tokenids");
+	assert_eq!(
+		backfill_canonical_snapshot(services).await?,
+		before,
+		"refusal leaves all canonical prepend/index rows unchanged"
+	);
+	assert!(
+		services
+			.timeline
+			.backfill_pdu(room, &remote.name, to_raw_value(&message)?)
+			.await?
+	);
+	let raw = services.timeline.get_pdu_id(&event).await?;
+	assert!(matches!(raw.pdu_count(), tuwunel_core::matrix::PduCount::Backfilled(_)));
+	let rows = services.db["tokenids"].raw_stream();
+	futures::pin_mut!(rows);
+	let mut indexed = false;
+	while let Some((key, _)) = rows.try_next().await? {
+		indexed |= key.ends_with(raw.as_ref());
+	}
+	assert!(indexed, "accepted prepend already has its search index");
+	let accepted = backfill_canonical_snapshot(services).await?;
+	assert!(
+		!services
+			.timeline
+			.backfill_pdu(room, &remote.name, to_raw_value(&message)?)
+			.await?
+	);
+	assert_eq!(
+		backfill_canonical_snapshot(services).await?,
+		accepted,
+		"duplicate cannot reapply prepend/index"
+	);
+	message.insert("content".into(), serde_json::from_value(json!({"msgtype":"m.text"}))?);
+	resign(&mut message, remote)?;
+	let empty = event_id(&message, remote)?;
+	assert!(
+		services
+			.timeline
+			.backfill_pdu(room, &remote.name, to_raw_value(&message)?)
+			.await?,
+		"missing-body event keeps prior accepted backfill behavior"
+	);
+	let raw = services.timeline.get_pdu_id(&empty).await?;
+	let rows = services.db["tokenids"].raw_stream();
+	futures::pin_mut!(rows);
+	while let Some((key, _)) = rows.try_next().await? {
+		assert!(!key.ends_with(raw.as_ref()), "missing body produces no search index");
+	}
+	Ok(())
+}
+
+async fn backfill_canonical_snapshot(
+	services: &Services,
+) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>> {
+	let mut rows = Vec::new();
+	for name in ["pduid_pdu", "eventid_pduid", "roomid_tscount_pducount", "tokenids"] {
+		let stream = services.db[name].raw_stream();
+		futures::pin_mut!(stream);
+		while let Some((key, value)) = stream.try_next().await? {
+			rows.push((name.to_owned(), key.to_vec(), value.to_vec()));
+		}
+	}
+	Ok(rows)
 }

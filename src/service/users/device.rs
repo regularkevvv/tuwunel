@@ -636,8 +636,8 @@ pub async fn add_to_device_event(
 	*count
 }
 
-/// Deliver one request's local to-device messages, then forward them to the
-/// appservices interested in each recipient.
+/// Admit one request's local inboxes and frozen interested-appservice copies
+/// in the same transaction as its deduplication record.
 ///
 /// Every inbox write and the request's transaction record (`txnid`, a
 /// [`crate::transaction_ids::key`], recorded with an empty response) land in
@@ -645,8 +645,9 @@ pub async fn add_to_device_event(
 /// recipients or none, and a retry that finds the record delivers nothing
 /// again. `AllDevices` resolves to the devices the user has now.
 ///
-/// Appservice forwarding follows the commit and reuses its counts. A failure
-/// there is logged rather than returned, as the delivery already stands.
+/// Complete shared inbox/forwarding admission precedes count allocation.
+/// Only payload-free wake hints follow the durable commit; restart discovers
+/// copies whose wake was interrupted.
 #[implement(super::Service)]
 pub async fn deliver_to_device(
 	&self,
@@ -689,13 +690,8 @@ pub async fn deliver_to_device(
 	for target in targets {
 		let (device_ids, forward) = match &target.device {
 			| DeviceIdOrAllDevices::DeviceId(device_id) => (vec![device_id.clone()], true),
-			| DeviceIdOrAllDevices::AllDevices => (
-				self.bounded_device_ids(&target.user_id).await?,
-				services_root
-					.appservice
-					.is_interested_in_user(&target.user_id)
-					.await,
-			),
+			| DeviceIdOrAllDevices::AllDevices =>
+				(self.bounded_device_ids(&target.user_id).await?, true),
 		};
 		let mut available = Vec::new();
 		for device_id in device_ids {
@@ -723,58 +719,46 @@ pub async fn deliver_to_device(
 		resolved.push((target, available, forward, body));
 	}
 
-	let mut deliveries = Vec::new();
+	let mut forwarding = services_root
+		.sending
+		.prepare_to_device_forwarding(
+			sender,
+			event_type,
+			resolved
+				.iter()
+				.map(|(target, devices, forward, _)| {
+					(&*target.user_id, devices.as_slice(), &target.content, *forward)
+				}),
+			&mut budget,
+		)
+		.await?;
+	let mut counts = Vec::new();
+	let mut permits = Vec::new();
 	let mut txn = services_root.db.txn();
-	for (target, devices, forward, body) in resolved {
-		let mut addressed = Vec::new();
+	for (target, devices, _, body) in resolved {
 		for device in devices {
 			let count = services_root.globals.next_count().await?;
 			txn.put_raw(&self.db.todeviceid_events, (&*target.user_id, &*device, *count), &body);
-			addressed.push((device, count));
+			counts.push(*count);
+			permits.push(count);
 		}
-		deliveries.push((target, addressed, forward));
 	}
 	if let Some(txnid) = txnid {
 		txn.insert_raw(&self.db.userdevicetxnid_response, txnid, []);
 	}
+	services_root
+		.sending
+		.append_to_device_forwarding(&mut forwarding, &counts, &mut txn)
+		.await?;
 	txn.check_bridge_admission()?;
-	txn.execute().await?;
-
-	// Only durable inbox admission requires user mutation exclusion.
+	txn.execute_flushed().await?;
 	drop(guards);
-
-	trace!(
-		%sender,
-		%event_type,
-		deliveries = deliveries.iter().map(|(_, deliveries, _)| deliveries.len()).sum::<usize>(),
-		"to_device deliver",
-	);
-
-	for (target, deliveries, forward) in deliveries {
-		let deliveries: Vec<(OwnedDeviceId, u64)> = deliveries
-			.into_iter()
-			.map(|(device_id, count)| (device_id, *count))
-			.collect();
-
-		if !forward || deliveries.is_empty() {
-			continue;
-		}
-
-		services_root
-			.sending
-			.send_to_device_appservices(
-				sender,
-				&target.user_id,
-				deliveries
-					.iter()
-					.map(|(device_id, count)| (&**device_id, *count)),
-				event_type,
-				&target.content,
-			)
-			.await
-			.log_err()
-			.ok();
-	}
+	drop(permits);
+	services_root
+		.sending
+		.finish_to_device_forwarding(forwarding)
+		.log_err()
+		.ok();
 
 	Ok(())
 }

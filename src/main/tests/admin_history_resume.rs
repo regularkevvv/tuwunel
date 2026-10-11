@@ -388,10 +388,29 @@ async fn seed_cleanup(services: &Services, manifest: &Manifest) -> Result {
 		.save_original_pdu(&manifest.large, &original, &state)
 		.await?;
 	drop(state);
-	services
-		.search
-		.index_pdu(short, &raw, &original_body)
-		.await?;
+	// Seed the historical index in bounded commits: the canonical writer now
+	// refuses more than 900 operations atomically. Keep all 1,000 distinct
+	// tokens so resumed history deletion still crosses multiple token pages.
+	for words in original_body
+		.split_whitespace()
+		.collect::<Vec<_>>()
+		.chunks(128)
+	{
+		services
+			.search
+			.index_pdu(short, &raw, &words.join(" "))
+			.await?;
+	}
+	let mut original_tokens = short.to_be_bytes().to_vec();
+	original_tokens.extend_from_slice(b"originalword");
+	assert_eq!(
+		services.db["tokenids"]
+			.raw_keys_prefix_after(&original_tokens, None, 1001)
+			.await?
+			.len(),
+		1000,
+		"historical cleanup retains the full multi-page token fixture"
+	);
 	// Make expiry due before restarts. Acceptance runs with expiry disabled;
 	// resumed workers must honor the canonical room pin even before this event
 	// becomes the current target. No fixture-side WAL barrier is added.

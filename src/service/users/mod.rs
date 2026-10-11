@@ -459,6 +459,18 @@ impl Service {
 	#[inline]
 	pub async fn count(&self) -> usize { self.db.userid_password.count().await }
 
+	/// Whether any account row exists, including disabled accounts. Reads at
+	/// most one checked key and propagates backend errors before startup
+	/// writes.
+	pub(crate) async fn has_users(&self) -> Result<bool> {
+		Ok(!self
+			.db
+			.userid_password
+			.raw_keys_after(None, 1)
+			.await?
+			.is_empty())
+	}
+
 	/// Returns an iterator over all users on this homeserver.
 	pub fn stream(&self) -> impl Stream<Item = &UserId> + Send {
 		self.db.userid_password.keys().ignore_err()

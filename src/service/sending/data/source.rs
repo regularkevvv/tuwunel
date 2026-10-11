@@ -374,18 +374,17 @@ impl Data {
 		txn.execute_flushed().await
 	}
 
-	pub(crate) async fn stage_federation_plan(
+	pub(crate) async fn stage_federation_plan_locked(
 		&self,
 		txn: &mut Txn,
 		raw: RawPduId,
 		pdu: &PduEvent,
 		state: ShortStateHash,
-	) -> Result<OwnedMutexGuard<()>> {
-		let guard = self.lock_federation_sources().await;
+		_guard: &OwnedMutexGuard<()>,
+	) -> Result {
 		self.require_active_schema().await?;
 		self.prepare_federation_plan(txn, raw, pdu, state)
-			.await?;
-		Ok(guard)
+			.await
 	}
 
 	// Caller holds active_write through either the canonical commit or the

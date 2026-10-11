@@ -155,6 +155,36 @@ pub async fn save_original_pdu(
 	txn.execute().await
 }
 
+/// Stage the original and its expiry index while the caller holds originals
+/// exclusion through the canonical redaction commit.
+#[implement(Service)]
+pub(crate) async fn append_original_pdu(
+	&self,
+	txn: &mut Txn,
+	event_id: &EventId,
+	pdu: &CanonicalJsonObject,
+	_guard: &MutexGuard<'_, ()>,
+) -> Result {
+	let services_guard = self.services.get();
+	if !services_guard.config.save_unredacted_events {
+		return Ok(());
+	}
+	if let Some((original, _)) = self.original_snapshot(event_id).await? {
+		let room = pdu
+			.get("room_id")
+			.and_then(ruma::CanonicalJsonValue::as_str);
+		if original.event_id.as_str() != event_id.as_str()
+			|| room != Some(original.room_id.as_str())
+		{
+			return Err(Error::bad_database("Mismatched retained redaction original"));
+		}
+		return Ok(());
+	}
+	txn.raw_put(&self.eventid_originalpdu, event_id, Json(pdu));
+	txn.put_raw(&self.timeredacted_eventid, (now().as_secs(), event_id), []);
+	Ok(())
+}
+
 #[implement(Service)]
 pub fn retained_pdus_raw(&self) -> impl Stream<Item = Result<&[u8]>> + Send {
 	self.eventid_originalpdu

@@ -225,6 +225,21 @@ impl Service {
 		E: Event,
 	{
 		let services_guard = self.services.get();
+		let mut txn = services_guard.db.txn();
+		self.append_to_thread(&mut txn, root_event_id, pdu_id, event)
+			.await?;
+		txn.execute().await
+	}
+
+	/// Stage participation, activity and the root bundle with the reply PDU.
+	pub(crate) async fn append_to_thread<E: Event>(
+		&self,
+		txn: &mut Txn,
+		root_event_id: &EventId,
+		pdu_id: RawPduId,
+		event: &E,
+	) -> Result {
+		let services_guard = self.services.get();
 		let services_root = services_guard.as_ref();
 
 		let root_id = services_root
@@ -240,7 +255,9 @@ impl Service {
 			.get_pdu_from_id(&root_id)
 			.await
 			.map_err(|e| err!(Request(InvalidParam("Thread root not found: {e:?}"))))?;
-		if root_pdu.room_id() != event.room_id() || root_id.shortroomid() != pdu_id.shortroomid()
+		if root_pdu.event_id() != root_event_id
+			|| root_pdu.room_id() != event.room_id()
+			|| root_id.shortroomid() != pdu_id.shortroomid()
 		{
 			return Err(err!(Request(InvalidParam("Thread root belongs to another room"))));
 		}
@@ -273,9 +290,8 @@ impl Service {
 
 		// Commit participants and activity before the bundle so concurrent MSC3816
 		// readers never observe stale participation.
-		let mut txn = services_root.db.txn();
 
-		self.update_participants(&mut txn, &root_id, &users);
+		self.update_participants(txn, &root_id, &users);
 
 		let count = pdu_id.pdu_count();
 
@@ -283,8 +299,6 @@ impl Service {
 			txn.insert_raw(&self.db.threadactivityid_rootid, pdu_id, root_id);
 			txn.insert_raw(&self.db.threadrootid_latestcount, root_id, count.to_be_bytes());
 		}
-
-		txn.execute().await?;
 
 		if let CanonicalJsonValue::Object(unsigned) = root_pdu_json
 			.entry("unsigned".into())
@@ -327,12 +341,16 @@ impl Service {
 				);
 			}
 
-			services_root
-				.timeline
-				.replace_pdu(&root_id, &root_pdu_json)
-				.await?;
+			txn.raw_put(
+				&services_root.db["pduid_pdu"],
+				root_id,
+				tuwunel_database::Json(&root_pdu_json),
+			);
+		} else {
+			return Err(Error::bad_database("Invalid thread root unsigned data"));
 		}
 
+		txn.check_bridge_admission()?;
 		Ok(())
 	}
 

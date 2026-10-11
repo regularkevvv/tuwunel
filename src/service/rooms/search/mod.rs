@@ -61,18 +61,30 @@ pub async fn index_pdu(
 	pdu_id: &RawPduId,
 	message_body: &str,
 ) -> Result {
-	let items = tokenize(message_body).map(|word| {
-		let mut key = shortroomid.to_be_bytes().to_vec();
-		key.extend_from_slice(word.as_bytes());
-		key.push(0xFF);
-		key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
+	let services_guard = self.services.get();
+	let mut txn = services_guard.db.txn();
+	self.append_index_pdu(&mut txn, shortroomid, pdu_id, message_body)?;
+	txn.execute().await
+}
 
-		(key, [])
-	});
-
-	Txn::insert(&self.db.tokenids, items)
-		.execute()
-		.await
+/// Stage every distinct token with the canonical event. Refuse the entire
+/// admission when the complete derived index cannot fit the backend batch.
+#[implement(Service)]
+pub(crate) fn append_index_pdu(
+	&self,
+	txn: &mut Txn,
+	shortroomid: ShortRoomId,
+	pdu_id: &RawPduId,
+	message_body: &str,
+) -> Result {
+	let mut words = std::collections::BTreeSet::new();
+	for word in tokenize(message_body) {
+		if words.insert(word.clone()) {
+			txn.insert_raw(&self.db.tokenids, deindex_tokenid(shortroomid, &word, pdu_id), []);
+			txn.check_bridge_admission()?;
+		}
+	}
+	Ok(())
 }
 
 #[implement(Service)]

@@ -8,19 +8,27 @@
 //! an interruption by making the commit directly, as the route would, and
 //! retries that too.
 
-use std::{env::var, net::TcpListener, path::PathBuf, process::id as process_id};
+use std::{env::var, net::TcpListener, path::PathBuf, process::id as process_id, time::Duration};
 
 use futures::{StreamExt, future::join};
 use serde_json::{Value, json};
+use tokio::{
+	io::{AsyncReadExt, AsyncWriteExt},
+	sync::mpsc::unbounded_channel,
+	time::timeout,
+};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Err, Result,
 	matrix::pdu::PduBuilder,
 	ruma::{
 		DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId,
-		events::room::message::RoomMessageEventContent, to_device::DeviceIdOrAllDevices,
+		api::appservice::{Namespace, Namespaces, Registration, RegistrationInit},
+		events::room::message::RoomMessageEventContent,
+		to_device::DeviceIdOrAllDevices,
 	},
 };
+use tuwunel_database::refusal;
 use tuwunel_service::{Services, transaction_ids, users::ToDeviceTarget};
 
 use self::client::{Client, field, register, wait_until_ready};
@@ -86,6 +94,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	room_send(services, &client, &alice, &room).await?;
 	to_device(services, &client, &alice, &bob).await?;
+	atomic_appservice_forwarding(services, &client, &alice, &bob).await?;
 
 	Ok(())
 }
@@ -315,4 +324,131 @@ async fn only_device(services: &Services, user: &UserId) -> Result<OwnedDeviceId
 		| [device] => Ok(device.clone()),
 		| _ => Err!("{user} has {} devices, expected one", devices.len()),
 	}
+}
+
+/// Refusing the coupled AS row refuses inbox and dedup; a real HTTP retry
+/// delivers one copy and a repeated request remains a no-op.
+async fn atomic_appservice_forwarding(
+	services: &Services,
+	client: &Client<'_>,
+	alice: &UserId,
+	bob: &UserId,
+) -> Result {
+	let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+	let url = format!("http://{}", listener.local_addr()?);
+	let (tx, mut rx) = unbounded_channel();
+	let gateway = tokio::spawn(async move {
+		while let Ok((mut socket, _)) = listener.accept().await {
+			let mut bytes = Vec::new();
+			let mut block = [0_u8; 4096];
+			loop {
+				let count = socket
+					.read(&mut block)
+					.await
+					.expect("owned gateway read");
+				if count == 0 {
+					break;
+				}
+				bytes.extend_from_slice(&block[..count]);
+				if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+					let head = std::str::from_utf8(&bytes[..end]).expect("HTTP headers");
+					let len = head
+						.lines()
+						.find_map(|line| {
+							line.split_once(':')
+								.filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+								.and_then(|(_, v)| v.trim().parse::<usize>().ok())
+						})
+						.expect("HTTP body length");
+					let body_start = end.saturating_add(4);
+					let body_end = body_start.saturating_add(len);
+					if bytes.len() >= body_end {
+						tx.send(bytes[body_start..body_end].to_vec())
+							.expect("owned receiver");
+						break;
+					}
+				}
+			}
+			socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.expect("owned gateway ACK");
+		}
+	});
+	let mut namespaces = Namespaces::new();
+	namespaces.users = vec![Namespace::new(true, "^@txnidbob:.*$".into())];
+	let registration: Registration = RegistrationInit {
+		id: "atomic-forwarding".into(),
+		url: Some(url),
+		as_token: "disposable-atomic-AS-token".into(),
+		hs_token: "disposable-atomic-HS-token".into(),
+		sender_localpart: "atomic_forwarding_bot".into(),
+		namespaces,
+		rate_limited: None,
+		protocols: None,
+	}
+	.into();
+	services
+		.appservice
+		.register_appservice(registration)
+		.await?;
+	let alice_device = only_device(services, alice).await?;
+	let device = services
+		.users
+		.bounded_device_ids(bob)
+		.await?
+		.into_iter()
+		.next()
+		.expect("Bob has existing inbox devices");
+	let before = services
+		.users
+		.get_to_device_events(bob, &device, None, None)
+		.count()
+		.await;
+	let txn_id: &TransactionId = "coupled-forwarding-refusal".into();
+	let body = json!({"messages":{(bob.as_str()):{(device.as_str()):{"atomic":true}}}});
+	refusal::refuse_next("servernameevent_data");
+	send_to_device(client, txn_id.as_str(), &body)
+		.await
+		.expect_err("queue refusal must refuse entire inbox admission");
+	assert_eq!(refusal::pending(), 0, "actual coupled transaction reached queue refusal");
+	assert_eq!(
+		services
+			.users
+			.get_to_device_events(bob, &device, None, None)
+			.count()
+			.await,
+		before
+	);
+	let absent = services
+		.transaction_ids
+		.existing_txnid(alice, Some(&alice_device), txn_id)
+		.await
+		.expect_err("refused inbox has no dedup marker");
+	assert!(absent.is_not_found());
+	timeout(Duration::from_millis(200), rx.recv())
+		.await
+		.expect_err("refusal cannot dispatch AS copy");
+	send_to_device(client, txn_id.as_str(), &body).await?;
+	send_to_device(client, txn_id.as_str(), &body).await?;
+	assert_eq!(
+		services
+			.users
+			.get_to_device_events(bob, &device, None, None)
+			.count()
+			.await,
+		before.saturating_add(1)
+	);
+	let payload = timeout(Duration::from_secs(10), rx.recv())
+		.await
+		.expect("forwarding deadline")
+		.expect("forwarding body");
+	let payload: Value = serde_json::from_slice(&payload)?;
+	let events = payload["de.sorunome.msc2409.to_device"]
+		.as_array()
+		.expect("actual to-device extension");
+	assert_eq!(events.len(), 1);
+	assert_eq!(events[0]["content"]["atomic"], true);
+	timeout(Duration::from_millis(200), rx.recv())
+		.await
+		.expect_err("dedup retry cannot forward twice");
+	gateway.abort();
+	Ok(())
 }

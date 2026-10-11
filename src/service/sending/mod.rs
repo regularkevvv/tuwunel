@@ -23,7 +23,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt, pin_mut};
 use loole::{TrySendError, bounded};
-use ruma::{DeviceId, OwnedRoomId, RoomId, ServerName, UserId};
+use ruma::{DeviceId, OwnedDeviceId, OwnedRoomId, RoomId, ServerName, UserId};
 use serde::Serialize;
 use tokio::{sync::Notify, task, task::JoinSet};
 use tuwunel_core::{
@@ -53,6 +53,13 @@ use crate::rooms::timeline::RawPduId;
 pub(crate) struct PreparedDeviceListTargets {
 	ids: Vec<String>,
 	registrations: crate::appservice::RegistrationReadGuard,
+}
+
+/// Frozen to-device copies. Placeholder counts have fixed encoded width;
+/// the shared inbox/queue budget is proven before any permit is requested.
+pub(crate) struct PreparedToDevice {
+	admission: DeviceListAdmission,
+	indices: Vec<usize>,
 }
 
 pub struct Service {
@@ -226,6 +233,128 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	pub(crate) async fn prepare_pdu_appservice_admission(
+		&self,
+		raw: RawPduId,
+		ids: Vec<String>,
+		registrations: crate::appservice::RegistrationReadGuard,
+	) -> Result<DeviceListAdmission> {
+		let mut requests = Vec::new();
+		let mut budget = self.db.queue_budget()?;
+		for id in ids {
+			let destination = Destination::Appservice(id);
+			let event = SendingEvent::Pdu(raw);
+			Data::admit_request(&mut budget, &event, &destination)?;
+			let key = destination.event_key(&raw);
+			requests.push((destination, event, key));
+		}
+		self.db
+			.prepare_coupled_appservice_admission(requests, registrations, true)
+			.await
+	}
+
+	pub(crate) fn append_appservice_admission(
+		&self,
+		admission: &DeviceListAdmission,
+		txn: &mut tuwunel_database::Txn,
+	) {
+		admission.append(&self.db.db, txn);
+	}
+
+	pub(crate) async fn prepare_to_device_forwarding<'a, I>(
+		&self,
+		sender: &UserId,
+		event_type: &str,
+		targets: I,
+		budget: &mut tuwunel_bridge::request::PutBatchBudget,
+	) -> Result<PreparedToDevice>
+	where
+		I: Iterator<Item = (&'a UserId, &'a [OwnedDeviceId], &'a serde_json::Value, bool)>,
+	{
+		let services_guard = self.services.get();
+		let registrations = services_guard
+			.as_ref()
+			.appservice
+			.read_owned()
+			.await;
+		let mut registration_bytes = 0_usize;
+		for (n, info) in registrations.values().enumerate() {
+			registration_bytes = registration_bytes.saturating_add(info.registration.id.len());
+			if n >= 128 || registration_bytes > 128 * 1024 {
+				return Err(err!(Request(TooLarge("Appservice to-device registration limit"))));
+			}
+		}
+		let mut requests = Vec::new();
+		let mut indices = Vec::new();
+		let mut offset = 0_usize;
+		for (user, devices, content, forward) in targets {
+			if forward
+				&& registrations
+					.values()
+					.any(|info| info.is_user_match(user))
+			{
+				let payloads = to_device_payloads(
+					sender,
+					user,
+					devices.iter().map(|id| (&**id, 0)),
+					event_type,
+					content,
+				)?;
+				for info in registrations
+					.values()
+					.filter(|info| info.is_user_match(user))
+				{
+					let destination = Destination::Appservice(info.registration.id.clone());
+					for (index, payload) in payloads.iter().enumerate() {
+						Data::admit_to_device_request(budget, payload, &destination)?;
+						let event = SendingEvent::ToDevice(payload.clone());
+						let mut key = destination.get_prefix_with_capacity(8);
+						key.extend_from_slice(&0_u64.to_be_bytes());
+						requests.push((destination.clone(), event, key));
+						indices.push(offset.saturating_add(index));
+					}
+				}
+			}
+			offset = offset.saturating_add(devices.len());
+		}
+		let admission = self
+			.db
+			.prepare_coupled_appservice_admission(requests, registrations, false)
+			.await?;
+		Ok(PreparedToDevice { admission, indices })
+	}
+
+	pub(crate) async fn append_to_device_forwarding(
+		&self,
+		prepared: &mut PreparedToDevice,
+		counts: &[u64],
+		txn: &mut tuwunel_database::Txn,
+	) -> Result {
+		for ((destination, event, key), index) in prepared
+			.admission
+			.requests
+			.iter_mut()
+			.zip(&prepared.indices)
+		{
+			let count = counts
+				.get(*index)
+				.ok_or_else(|| err!(Database("Missing to-device queue count")))?;
+			let SendingEvent::ToDevice(payload) = event else {
+				return Err(err!(Database("Invalid to-device admission")));
+			};
+			payload[1..9].copy_from_slice(&count.to_be_bytes());
+			*key = destination.get_prefix_with_capacity(8);
+			key.extend_from_slice(&count.to_be_bytes());
+			self.db.validate_new_queue_key(key).await?;
+		}
+		prepared.admission.append(&self.db.db, txn);
+		Ok(())
+	}
+
+	pub(crate) fn finish_to_device_forwarding(&self, prepared: PreparedToDevice) -> Result {
+		self.dispatch_device_list_admission(prepared.admission)
+	}
+
 	pub(crate) fn stage_frozen_push(
 		&self,
 		txn: &mut tuwunel_database::Txn,
@@ -610,7 +739,7 @@ impl Service {
 		&self,
 		admission: DeviceListAdmission,
 	) -> Result {
-		for (dest, _event, queue_id) in admission.requests {
+		for (dest, _event, queue_id) in admission.into_requests() {
 			self.dispatch(Msg {
 				dest,
 				event: SendingEvent::BadgeRefresh,
