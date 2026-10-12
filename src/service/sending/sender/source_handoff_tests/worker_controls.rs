@@ -243,7 +243,7 @@ async fn progress(services: &Services, raw: RawPduId) -> Result {
 		{
 			tokio::time::sleep(Duration::from_millis(10)).await;
 		}
-		Result::Ok(())
+		Result::<()>::Ok(())
 	})
 	.await
 	.expect("same live worker materializes the owed page after capacity returns")?;

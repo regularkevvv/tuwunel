@@ -1,6 +1,6 @@
 //! A canonical commit owns its immutable federation recipients. Queue pages
 //! transfer that obligation atomically; hints and post-commit caches do not.
-use std::{future::Future, sync::atomic::Ordering, time::Duration};
+use std::{sync::atomic::Ordering, time::Duration};
 
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use sha2::{Digest, Sha256};
@@ -654,10 +654,7 @@ impl Service {
 		{
 			let (ids, _) = match inventory().await {
 				| Ok(inventory) => inventory,
-				| Err(error)
-					if error.status_code()
-						== tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS =>
-				{
+				| Err(error) if error.status_code() == http::StatusCode::TOO_MANY_REQUESTS => {
 					// A write can temporarily close snapshot admission. Retain
 					// the durable obligation and cursor, releasing its lock
 					// before waiting. Hints cannot bypass this capacity delay.
