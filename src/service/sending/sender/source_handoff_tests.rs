@@ -30,6 +30,7 @@ mod membership_controls;
 mod notification_controls;
 mod presence_controls;
 mod quota_controls;
+mod receipt_appservice_controls;
 mod receipt_inventory_controls;
 mod recount_controls;
 mod worker_controls;
@@ -127,6 +128,23 @@ fn receipt_selection_preserves_cursor_on_refused_persistence() -> Result {
 		"receipt-repair",
 		"receipt-again",
 	])
+}
+
+#[test]
+fn public_receipt_sender_refusal_is_retryable_and_survives_cold_restart() -> Result {
+	run("public_receipt_sender_refusal_is_retryable_and_survives_cold_restart", &[
+		"appreceipt-refuse",
+		"appreceipt-restart",
+		"appreceipt-again",
+	])
+}
+
+#[test]
+fn public_receipt_sender_capacity_refusal_preserves_receipt_until_capacity_returns() -> Result {
+	run(
+		"public_receipt_sender_capacity_refusal_preserves_receipt_until_capacity_returns",
+		&["appreceipt-capacity", "appreceipt-restart", "appreceipt-again"],
+	)
 }
 
 #[test]
@@ -661,6 +679,7 @@ fn auxiliary_phase(phase: &str) -> bool {
 				| "interrupt"
 				| "inventory"
 				| "quota" | "receipt"
+				| "appreceipt"
 				| "presence"
 		)
 	)
@@ -835,6 +854,8 @@ async fn auxiliary_child(fixture: Fixture, root: &Path, phase: &str) -> Result {
 		inventory_controls::child(&fixture.services, root, phase).await?;
 	} else if phase.starts_with("presence-") {
 		Box::pin(presence_controls::child(&fixture.services, root, phase)).await?;
+	} else if phase.starts_with("appreceipt-") {
+		Box::pin(receipt_appservice_controls::child(&fixture.services, root, phase)).await?;
 	} else if phase.starts_with("receipt-") {
 		Box::pin(receipt_inventory_controls::child(&fixture.services, root, phase)).await?;
 	} else if phase.starts_with("quota-") {

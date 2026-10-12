@@ -23,7 +23,10 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt, pin_mut};
 use loole::{TrySendError, bounded};
-use ruma::{DeviceId, OwnedDeviceId, OwnedRoomId, RoomId, ServerName, UserId};
+use ruma::{
+	DeviceId, OwnedDeviceId, OwnedRoomId, RoomId, ServerName, UserId,
+	api::appservice::event::push_events::v1::EphemeralData, events::receipt::ReceiptEvent,
+};
 use serde::Serialize;
 use tokio::{sync::Notify, task, task::JoinSet};
 use tuwunel_core::{
@@ -233,6 +236,105 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	/// Freeze receipt recipients and queue values before allocating its count.
+	/// The caller holds room state and retains this plan through receipt
+	/// commit.
+	pub(crate) async fn prepare_receipt_appservice_admission(
+		&self,
+		room: &RoomId,
+		event: &ReceiptEvent,
+	) -> Result<DeviceListAdmission> {
+		let services_guard = self.services.get();
+		let services = services_guard.as_ref();
+		let registrations = services.appservice.read_owned().await;
+		let mut bytes = 0_usize;
+		for (count, info) in registrations.values().enumerate() {
+			bytes = bytes.saturating_add(info.registration.id.len());
+			if count >= 128 || bytes > 128 * 1024 {
+				return Err(err!(Request(TooLarge("Appservice receipt registration limit"))));
+			}
+		}
+		let interested = registrations
+			.values()
+			.any(|info| info.registration.receive_ephemeral);
+		let (members, aliases) = if interested {
+			let state = services
+				.state
+				.get_room_shortstatehash(room)
+				.await?;
+			(
+				services
+					.state_accessor
+					.notification_members_at_state(state, room)
+					.await?,
+				services
+					.alias
+					.bounded_local_aliases_for_room(room)
+					.await?,
+			)
+		} else {
+			(Vec::new(), Vec::new())
+		};
+		let ids: Vec<_> = registrations
+			.values()
+			.filter(|info| {
+				info.registration.receive_ephemeral
+					&& (info.rooms.is_match(room.as_str())
+						|| members
+							.iter()
+							.any(|user| info.is_user_match(user))
+						|| aliases
+							.iter()
+							.any(|alias| info.aliases.is_match(alias.as_str())))
+			})
+			.map(|info| info.registration.id.clone())
+			.collect();
+		let mut requests = Vec::new();
+		if !ids.is_empty() {
+			let frozen::Body::Ready(bytes) = frozen::bounded_custom(
+				|writer| {
+					Ok(serde_json::to_writer(
+						writer,
+						&EphemeralData::Receipt(ReceiptEvent {
+							content: event.content.clone(),
+							room_id: room.to_owned(),
+						}),
+					)?)
+				},
+				tuwunel_bridge::MAX_VALUE_BYTES.saturating_sub(10),
+			)?
+			else {
+				return Err(err!(Request(TooLarge("Appservice receipt payload limit"))));
+			};
+			let event = SendingEvent::Edu(EduBuf::from_slice(&bytes));
+			let mut budget = self.db.queue_budget()?;
+			for id in ids {
+				let destination = Destination::Appservice(id);
+				Data::admit_request(&mut budget, &event, &destination)?;
+				let mut key = destination.get_prefix_with_capacity(8);
+				key.extend_from_slice(&u64::MAX.to_be_bytes());
+				requests.push((destination, event.clone(), key));
+			}
+		}
+		self.db
+			.prepare_coupled_appservice_admission(requests, registrations, false)
+			.await
+	}
+
+	/// Replace fixed-width preview keys under the retained sender exclusion.
+	pub(crate) async fn set_receipt_appservice_count(
+		&self,
+		admission: &mut DeviceListAdmission,
+		count: u64,
+	) -> Result {
+		for (destination, _, key) in &mut admission.requests {
+			*key = destination.get_prefix_with_capacity(8);
+			key.extend_from_slice(&count.to_be_bytes());
+			self.db.validate_new_queue_key(key).await?;
+		}
+		Ok(())
+	}
+
 	pub(crate) async fn prepare_pdu_appservice_admission(
 		&self,
 		raw: RawPduId,

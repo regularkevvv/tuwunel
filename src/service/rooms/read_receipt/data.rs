@@ -7,12 +7,15 @@ use futures::{
 };
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, RoomId, UserId,
-	events::{AnySyncEphemeralRoomEvent, receipt::ReceiptEvent},
+	events::{
+		AnySyncEphemeralRoomEvent,
+		receipt::{ReceiptEvent, ReceiptThread},
+	},
 	serde::Raw,
 };
 use serde::{Deserialize, de::IgnoredAny};
 use tuwunel_core::{
-	Error, Result,
+	Error, Result, error,
 	matrix::pdu::PduCount,
 	smallvec::SmallVec,
 	utils::{TryReadyExt, stream::TryIgnore},
@@ -59,6 +62,16 @@ pub(crate) struct PreparedPrivateRead {
 	_permit: Option<tuwunel_core::utils::two_phase_counter::Permit>,
 	thread: ruma::events::receipt::ReceiptThread,
 	local: bool,
+}
+
+struct PublicReceiptUpdate<'a> {
+	user: &'a UserId,
+	room: &'a RoomId,
+	event: &'a ReceiptEvent,
+	thread: &'a ReceiptThread,
+	superseded: Superseded,
+	guard: crate::pusher::NotificationGuard,
+	cutoff: Option<u64>,
 }
 
 impl PreparedPrivateRead {
@@ -115,17 +128,6 @@ impl Data {
 		{
 			return Ok(false);
 		}
-		let mut txn = services_root.db.txn();
-		for key in &superseded {
-			txn.del_raw(&self.readreceiptid_readreceipt, key);
-		}
-		check_receipt_mutation(&txn)?;
-		let count = services_root.globals.next_count().await?;
-		txn.put(
-			&self.readreceiptid_readreceipt,
-			(room_id, *count, user_id, thread_kind),
-			Json(event),
-		);
 		let thread = event
 			.content
 			.values()
@@ -135,7 +137,7 @@ impl Data {
 			.map(|receipt| &receipt.thread)
 			.ok_or_else(|| Error::bad_database("Receipt has no thread context"))?;
 		let local = services_root.globals.user_is_local(user_id);
-		if local {
+		let cutoff = if local {
 			match services_root.timeline.get_pdu_id(event_id).await {
 				| Ok(raw) => {
 					let pdu = services_root
@@ -145,38 +147,111 @@ impl Data {
 					if pdu.room_id != room_id {
 						return Err(Error::bad_database("Receipt cutoff room mismatch"));
 					}
-					services_root
-						.pusher
-						.stage_notification_reset(
-							&mut txn,
-							&guard,
-							thread,
-							Some(*count),
-							Some(raw.pdu_count().into_normal().into_unsigned()),
-						)
-						.await?;
-					services_root
-						.pusher
-						.stage_notification_cutoff(
-							&mut txn,
-							&guard,
-							thread,
-							raw.pdu_count().into_normal().into_unsigned(),
-						)
-						.await?;
+					Some(raw.pdu_count().into_normal().into_unsigned())
 				},
-				| Err(error) if error.is_not_found() => {},
+				| Err(error) if error.is_not_found() => None,
 				| Err(error) => return Err(error),
 			}
-		}
+		} else {
+			None
+		};
+		let update = PublicReceiptUpdate {
+			user: user_id,
+			room: room_id,
+			event,
+			thread,
+			superseded,
+			guard,
+			cutoff,
+		};
+		let admission = services_root
+			.sending
+			.prepare_receipt_appservice_admission(room_id, event)
+			.await?;
+		self.commit_public_receipt(&update, admission)
+			.await?;
+		Ok(true)
+	}
+
+	async fn commit_public_receipt(
+		&self,
+		update: &PublicReceiptUpdate<'_>,
+		mut admission: crate::sending::DeviceListAdmission,
+	) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+		// Every count/stamp is fixed-width. Prove the complete mixed-map batch
+		// before the global counter's durable reservation makes any write.
+		let mut preview = self
+			.stage_public_receipt(update, u64::MAX)
+			.await?;
+		services_root
+			.sending
+			.append_appservice_admission(&admission, &mut preview);
+		check_receipt_mutation(&preview)?;
+		preview.check_bridge_admission()?;
+		drop(preview);
+		let count = services_root.globals.next_count().await?;
+		services_root
+			.sending
+			.set_receipt_appservice_count(&mut admission, *count)
+			.await?;
+		let mut txn = self.stage_public_receipt(update, *count).await?;
+		services_root
+			.sending
+			.append_appservice_admission(&admission, &mut txn);
 		check_receipt_mutation(&txn)?;
-		txn.execute().await?;
-		if local {
+		txn.check_bridge_admission()?;
+		txn.execute_flushed().await?;
+		if services_root.globals.user_is_local(update.user) {
 			services_root
 				.pusher
-				.notification_reset_committed(&guard, thread);
+				.notification_reset_committed(&update.guard, update.thread);
 		}
-		Ok(true)
+		// Wake hints are disposable only after the durable ownership is flushed.
+		if let Err(error) = services_root
+			.sending
+			.dispatch_device_list_admission(admission)
+		{
+			error!(effect = "receipt appservice wake", "A durable receipt wake failed: {error}");
+		}
+		Ok(())
+	}
+
+	async fn stage_public_receipt(
+		&self,
+		update: &PublicReceiptUpdate<'_>,
+		count: u64,
+	) -> Result<Txn> {
+		let services_guard = self.services.get();
+		let services = services_guard.as_ref();
+		let mut txn = services.db.txn();
+		for key in &update.superseded {
+			txn.del_raw(&self.readreceiptid_readreceipt, key);
+		}
+		txn.put(
+			&self.readreceiptid_readreceipt,
+			(update.room, count, update.user, event_thread_kind(update.event)),
+			Json(update.event),
+		);
+		if let Some(position) = update.cutoff {
+			services
+				.pusher
+				.stage_notification_reset(
+					&mut txn,
+					&update.guard,
+					update.thread,
+					Some(count),
+					Some(position),
+				)
+				.await?;
+			services
+				.pusher
+				.stage_notification_cutoff(&mut txn, &update.guard, update.thread, position)
+				.await?;
+		}
+		check_receipt_mutation(&txn)?;
+		Ok(txn)
 	}
 
 	/// Inspect complete bounded room pages, including errors and malformed

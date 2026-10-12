@@ -44,7 +44,7 @@ pub(crate) async fn federation_servers_for_append(
 	let services_guard = self.services.get();
 	let services_root = services_guard.as_ref();
 	let mut servers = BTreeSet::new();
-	let members = self.state_members_for_append(state, pending);
+	let members = self.state_members_checked(state, pending.room_id(), Some(pending));
 	pin_mut!(members);
 	while let Some((user, membership)) = members.try_next().await? {
 		if membership == MembershipState::Join
@@ -79,7 +79,36 @@ pub(crate) async fn notification_members_for_append(
 	state: ShortStateHash,
 	pending: &Pdu,
 ) -> Result<Vec<OwnedUserId>> {
-	let entries = self.state_members_for_append(state, pending);
+	let entries = self.state_members_checked(state, pending.room_id(), Some(pending));
+	pin_mut!(entries);
+	let mut members = Vec::new();
+	let mut bytes = 0_usize;
+	while let Some((user, membership)) = entries.try_next().await? {
+		if membership != MembershipState::Join {
+			continue;
+		}
+		bytes = bytes.saturating_add(user.as_bytes().len());
+		if members.len() >= 1024 || bytes > 128 * 1024 {
+			return Err(Error::Request(
+				ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+				"Notification member inventory limit reached".into(),
+				http::StatusCode::TOO_MANY_REQUESTS,
+			));
+		}
+		members.push(user);
+	}
+	Ok(members)
+}
+
+/// Complete joined IDs at committed room state, without a pending overlay.
+/// Uses the same checked dictionaries and recipient budget as PDU admission.
+#[implement(super::Service)]
+pub(crate) async fn notification_members_at_state(
+	&self,
+	state: ShortStateHash,
+	room: &RoomId,
+) -> Result<Vec<OwnedUserId>> {
+	let entries = self.state_members_checked(state, room, None);
 	pin_mut!(entries);
 	let mut members = Vec::new();
 	let mut bytes = 0_usize;
@@ -103,10 +132,11 @@ pub(crate) async fn notification_members_for_append(
 /// Validate both compact dictionaries and every membership binding before
 /// yielding it. Neither consumer may silently substitute a derived cache.
 #[implement(super::Service)]
-fn state_members_for_append<'a>(
+fn state_members_checked<'a>(
 	&'a self,
 	state: ShortStateHash,
-	pending: &'a Pdu,
+	room: &'a RoomId,
+	pending: Option<&'a Pdu>,
 ) -> impl Stream<Item = Result<(OwnedUserId, MembershipState)>> + Send + 'a {
 	async_stream::try_stream! {
 		let services_guard = self.services.get();
@@ -145,10 +175,10 @@ fn state_members_for_append<'a>(
 				continue;
 			}
 			let pdu = self
-				.state_event_for_append(&event, Some(pending))
+				.state_event_for_append(&event, pending)
 				.await?;
 			if pdu.event_id() != event
-				|| pdu.room_id() != pending.room_id
+				|| pdu.room_id() != room
 				|| pdu.event_type().to_cow_str() != kind.to_cow_str()
 				|| pdu.state_key() != Some(key.as_str())
 			{

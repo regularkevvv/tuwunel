@@ -7,7 +7,6 @@ use std::{collections::BTreeMap, sync::Arc};
 use futures::{Stream, StreamExt, TryStreamExt};
 use ruma::{
 	MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomId, UInt, UserId,
-	api::appservice::event::push_events::v1::EphemeralData,
 	events::{
 		AnySyncEphemeralRoomEvent, SyncEphemeralRoomEvent,
 		receipt::{
@@ -117,28 +116,9 @@ impl Service {
 			return Ok(false);
 		}
 
-		// The receipt is stored. Each delivery that follows runs whether or not the
-		// other failed; one that fails is logged, and the receipt stays stored.
+		// Appservice ownership committed atomically with the receipt. Federation
+		// receipts are reconstructed from the committed receipt watermark.
 		let event_id = event.content.keys().next();
-
-		services_root
-			.sending
-			.send_edu_room_appservices(room_id, |buf| {
-				let edu = EphemeralData::Receipt(ReceiptEvent {
-					content: event.content.clone(),
-					room_id: room_id.to_owned(),
-				});
-
-				Ok(serde_json::to_writer(buf, &edu)?)
-			})
-			.await
-			.unwrap_or_else(|e| {
-				error!(
-					?event_id,
-					effect = "receipt to appservices",
-					"A receipt effect failed: {e}"
-				);
-			});
 
 		if services_root.globals.user_is_local(user_id) {
 			services_root
