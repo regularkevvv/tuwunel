@@ -10,7 +10,7 @@ use tuwunel_core::{
 	Error, Result, err, http::StatusCode, implement, utils::string_from_bytes, warn,
 };
 
-use super::request::add_access_token_query;
+use super::request::{add_access_token_query, execute_request};
 use crate::client::read_response_capped;
 
 /// Pings an appservice per MSC2659, surfacing the spec's failure error codes.
@@ -50,10 +50,7 @@ pub async fn ping(
 
 	let reqwest_request = Request::try_from(http_request)?;
 
-	let response = services_root
-		.client
-		.appservice
-		.execute(reqwest_request)
+	let response = execute_request(&services_root.client.appservice, reqwest_request)
 		.await
 		.map_err(|e| {
 			if e.is_timeout() {
