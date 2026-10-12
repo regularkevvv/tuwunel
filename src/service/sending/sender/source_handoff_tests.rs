@@ -1,6 +1,7 @@
 //! Canonical local events must retain their owed federation delivery.
-//! Every phase owns a native scratch database, starts no service workers, and
-//! exits before a cold restart reopens the database. No transport is used.
+//! Every phase owns a native scratch database and exits before a cold restart
+//! reopens it. Worker-capacity controls start only the owned source worker and
+//! loopback bridge; no federation transport is used.
 
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
@@ -31,6 +32,7 @@ mod presence_controls;
 mod quota_controls;
 mod receipt_inventory_controls;
 mod recount_controls;
+mod worker_controls;
 
 const PHASE: &str = "TUWUNEL_SOURCE_HANDOFF_PHASE";
 const DIRECTORY: &str = "TUWUNEL_SOURCE_HANDOFF_DIRECTORY";
@@ -468,6 +470,30 @@ fn startup_repairs_membership_before_restoring_interrupted_history_exclusion() -
 	])
 }
 
+#[test]
+fn source_worker_retries_busy_snapshot_until_durable_page_progresses() -> Result {
+	run("source_worker_retries_busy_snapshot_until_durable_page_progresses", &[
+		"worker-busy",
+	])
+}
+
+#[test]
+fn source_worker_retries_truncated_snapshot_without_losing_durable_page() -> Result {
+	run("source_worker_retries_truncated_snapshot_without_losing_durable_page", &[
+		"worker-truncated",
+	])
+}
+
+#[test]
+fn source_worker_interrupts_during_snapshot_capacity_wait() -> Result {
+	run("source_worker_interrupts_during_snapshot_capacity_wait", &["worker-interrupt"])
+}
+
+#[test]
+fn source_worker_propagates_corrupt_inventory() -> Result {
+	run("source_worker_propagates_corrupt_inventory", &["worker-corrupt"])
+}
+
 fn run(test: &str, phases: &[&str]) -> Result {
 	if let Ok(phase) = std::env::var(PHASE) {
 		assert!(phases.contains(&phase.as_str()), "owned child phase");
@@ -641,6 +667,9 @@ fn auxiliary_phase(phase: &str) -> bool {
 }
 
 async fn child(root: &Path, phase: &str) -> Result {
+	if phase.starts_with("worker-") {
+		return worker_controls::child(root, phase).await;
+	}
 	let fixture = owned_fixture(root, phase).await?;
 	if auxiliary_phase(phase) {
 		return auxiliary_child(fixture, root, phase).await;

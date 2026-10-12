@@ -1,6 +1,6 @@
 //! A canonical commit owns its immutable federation recipients. Queue pages
 //! transfer that obligation atomically; hints and post-commit caches do not.
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{future::Future, sync::atomic::Ordering, time::Duration};
 
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,7 @@ const MAX_RECIPIENTS: usize = 4097;
 const MAX_PENDING: usize = 64;
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 const PAGE: usize = 64;
+const INVENTORY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 struct Plan {
 	state: ShortStateHash,
@@ -623,6 +624,27 @@ impl Service {
 	pub(crate) fn wake_federation_sources(&self) { self.federation_source_signal.notify_one(); }
 
 	pub(in crate::sending) async fn federation_source_worker(&self) -> Result {
+		self.federation_source_worker_with_inventory(|| self.federation_source_inventory())
+			.await
+	}
+
+	pub(in crate::sending) async fn federation_source_inventory(
+		&self,
+	) -> Result<(Vec<RawPduId>, usize)> {
+		let _guard = self.db.lock_federation_sources().await;
+		self.db.source_inventory().await
+	}
+
+	// The production loop and native fault controls use the same admission,
+	// cursor, page materialization and interrupt behavior.
+	pub(in crate::sending) async fn federation_source_worker_with_inventory<F, I>(
+		&self,
+		mut inventory: F,
+	) -> Result
+	where
+		F: FnMut() -> I,
+		I: Future<Output = Result<(Vec<RawPduId>, usize)>>,
+	{
 		let mut after = None;
 		let mut turns = 0_usize;
 		while self.server.is_running()
@@ -630,9 +652,33 @@ impl Service {
 				.federation_source_stopped
 				.load(Ordering::Acquire)
 		{
-			let (ids, _) = {
-				let _guard = self.db.lock_federation_sources().await;
-				self.db.source_inventory().await?
+			let (ids, _) = match inventory().await {
+				| Ok(inventory) => inventory,
+				| Err(error)
+					if error.status_code()
+						== tuwunel_core::http::StatusCode::TOO_MANY_REQUESTS =>
+				{
+					// A write can temporarily close snapshot admission. Retain
+					// the durable obligation and cursor, releasing its lock
+					// before waiting. Hints cannot bypass this capacity delay.
+					let delay = tokio::time::sleep(INVENTORY_RETRY_DELAY);
+					tokio::pin!(delay);
+					loop {
+						if !self.server.is_running()
+							|| self
+								.federation_source_stopped
+								.load(Ordering::Acquire)
+						{
+							return Ok(());
+						}
+						tokio::select! {
+							() = &mut delay => break,
+							() = self.federation_source_signal.notified() => {},
+						}
+					}
+					continue;
+				},
+				| Err(error) => return Err(error),
 			};
 			let next = ids.iter().find(|raw| {
 				after
@@ -653,7 +699,7 @@ impl Service {
 			let delay = if ids.is_empty() {
 				Duration::from_secs(5)
 			} else {
-				Duration::from_secs(1)
+				INVENTORY_RETRY_DELAY
 			};
 			tokio::select! {
 				() = self.federation_source_signal.notified() => {},
