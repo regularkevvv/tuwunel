@@ -60,7 +60,7 @@ struct StoredContent {
 pub(crate) struct PreparedPrivateRead {
 	guard: crate::pusher::NotificationGuard,
 	_permit: Option<tuwunel_core::utils::two_phase_counter::Permit>,
-	thread: ruma::events::receipt::ReceiptThread,
+	thread: ReceiptThread,
 	local: bool,
 }
 

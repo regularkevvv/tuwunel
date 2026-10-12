@@ -195,7 +195,10 @@ mod tests {
 					.read(&mut chunk)
 					.await
 					.expect("owned request read");
-				assert!(n > 0 && wire.len() + n <= 16 * 1024, "bounded request headers");
+				assert!(
+					n > 0 && wire.len().saturating_add(n) <= 16 * 1024,
+					"bounded request headers"
+				);
 				wire.extend_from_slice(&chunk[..n]);
 			}
 			send.send(wire)
