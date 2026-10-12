@@ -11,6 +11,29 @@ use tuwunel_core::{
 
 use crate::{keyval::KeyBuf, ser};
 
+/// Checks whether a serialized key exists, preserving database failures.
+///
+/// Only a not-found result becomes `false`; a present key, including one
+/// with an empty value, becomes `true`. Values are not deserialized.
+///
+/// # Panics
+///
+/// Panics if the key cannot be serialized.
+#[implement(super::Map)]
+pub fn contains_checked<K>(
+	self: &Arc<Self>,
+	key: &K,
+) -> impl Future<Output = Result<bool>> + Send + use<'_, K>
+where
+	K: Serialize + ?Sized + Debug,
+{
+	self.qry(key).map(|result| match result {
+		| Ok(_) => Ok(true),
+		| Err(error) if error.is_not_found() => Ok(false),
+		| Err(error) => Err(error),
+	})
+}
+
 /// Checks whether a serialized key exists.
 ///
 /// The key is encoded into an owned buffer before asynchronous raw-key lookup.

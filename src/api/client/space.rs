@@ -1,12 +1,11 @@
 use std::{
 	collections::{BTreeSet, VecDeque},
-	convert::identity,
 	str::FromStr,
 };
 
 use axum::extract::State;
 use futures::{
-	StreamExt,
+	StreamExt, TryStreamExt,
 	future::ready,
 	stream::{once, unfold},
 };
@@ -19,7 +18,7 @@ use tuwunel_core::{
 	trace,
 	utils::{
 		BoolExt,
-		stream::{IterStream, ReadyExt, WidebandExt},
+		stream::{IterStream, TryReadyExt, WidebandExt},
 	},
 };
 use tuwunel_service::{
@@ -180,14 +179,14 @@ pub(crate) async fn get_client_hierarchy(
 
 	// Stream all accessible rooms in depth-first order: root first, then
 	// descendants discovered by unfolding the queue.
-	let rooms = once(ready(Some(root_summary)))
+	let rooms = once(ready(Ok(Some(root_summary))))
 		.chain(unfold(initial_state, async |(mut queue, mut visited)| {
 			let (current_room, via, depth) = queue.pop_front()?;
 
 			// Cycle guard: a room reachable via multiple parents is only
 			// visited (and queued for children) once.
 			if visited.contains(&current_room) {
-				return Some((None, (queue, visited)));
+				return Some((Ok(None), (queue, visited)));
 			}
 
 			match services
@@ -198,12 +197,12 @@ pub(crate) async fn get_client_hierarchy(
 				| Err(e) if !e.is_not_found() => {
 					error!(?current_room, ?depth, "space child error: {e}");
 
-					Some((None, (queue, visited)))
+					Some((Err(e), (queue, visited)))
 				},
 				| Err(_) | Ok(Accessibility::Inaccessible) => {
 					trace!(?current_room, ?depth, "child inaccessible or not found");
 
-					Some((None, (queue, visited)))
+					Some((Ok(None), (queue, visited)))
 				},
 				| Ok(Accessibility::Accessible(s)) => {
 					visited.insert(current_room);
@@ -222,33 +221,32 @@ pub(crate) async fn get_client_hierarchy(
 							});
 					}
 
-					Some((Some(s), (queue, visited)))
+					Some((Ok(Some(s)), (queue, visited)))
 				},
 			}
 		}))
-		.ready_filter_map(identity)
-		.wide_filter_map(async |summary| {
-			skip_ids
-				.is_empty()
-				.is_false()
-				.then_async(async || {
-					services
-						.short
-						.get_shortroomid(&summary.summary.room_id)
-						.await
-						.ok()
-						.filter(|shortid| skip_ids.contains(shortid))
-				})
-				.await
-				.flatten()
-				.is_none()
+		.ready_try_filter_map(Result::Ok)
+		.wide_then(async |summary| {
+			let summary = summary?;
+			let skipped = !skip_ids.is_empty()
+				&& match services
+					.short
+					.get_shortroomid(&summary.summary.room_id)
+					.await
+				{
+					| Ok(shortid) => skip_ids.contains(&shortid),
+					| Err(error) if error.is_not_found() => false,
+					| Err(error) => return Err(error),
+				};
+			Ok((!skipped)
 				.then_some(summary)
 				.filter(is_summary_serializable)
-				.map(summary_to_chunk)
+				.map(summary_to_chunk))
 		})
+		.ready_try_filter_map(Result::Ok)
 		.take(limit)
-		.collect::<Vec<_>>()
-		.await;
+		.try_collect::<Vec<_>>()
+		.await?;
 
 	// If we filled the page, produce a continuation token encoding every room
 	// emitted so far (previous pages + this page). The next request skips all
@@ -259,6 +257,7 @@ pub(crate) async fn get_client_hierarchy(
 				.iter()
 				.copied()
 				.stream()
+				.map(Ok)
 				.chain(rooms.iter().stream().then(async |chunk| {
 					// `get_or_create_shortroomid` is used (not `get_shortroomid`) because rooms
 					// in a remote hierarchy our server has never touched have no shortroomid
@@ -270,20 +269,23 @@ pub(crate) async fn get_client_hierarchy(
 						.get_or_create_shortroomid(&chunk.summary.room_id)
 						.await
 				}))
-				.collect::<Vec<_>>()
-				.await;
+				.try_collect::<Vec<_>>()
+				.await?;
 
 			// Backstop against pagination loops: only return a token if the skip
 			// set strictly grew. With `get_or_create_shortroomid` above this should
 			// always hold when `rooms.len() >= limit`, but checking is cheap.
-			(next_skip.len() > skip_room_ids.len()).then_some(PaginationToken {
-				suggested_only,
-				short_room_ids: next_skip,
-				limit: limit.try_into().unwrap_or_default(),
-				max_depth: max_depth.try_into().unwrap_or_default(),
-			})
+			Ok::<_, tuwunel_core::Error>((next_skip.len() > skip_room_ids.len()).then_some(
+				PaginationToken {
+					suggested_only,
+					short_room_ids: next_skip,
+					limit: limit.try_into().unwrap_or_default(),
+					max_depth: max_depth.try_into().unwrap_or_default(),
+				},
+			))
 		})
 		.await
+		.transpose()?
 		.flatten()
 		.as_ref()
 		.map(ToString::to_string);

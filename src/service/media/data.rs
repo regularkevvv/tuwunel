@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, pin_mut};
-use ruma::{Mxc, OwnedMxcUri, OwnedUserId, UserId, http_headers::ContentDisposition};
+use ruma::{
+	Mxc, OwnedMxcUri, OwnedUserId, UserId,
+	api::error::{ErrorKind, LimitExceededErrorData},
+	http_headers::ContentDisposition,
+};
 use serde::Deserialize;
 #[cfg(feature = "url_preview")]
 use serde::Serialize;
 use tuwunel_core::{
-	Err, Result, at, debug, debug_info, err,
+	Err, Error, Result, at, debug, debug_info, err,
 	utils::{ReadyExt, str_from_bytes, stream::TryIgnore, string_from_bytes},
 };
 use tuwunel_database::{
@@ -393,20 +397,27 @@ impl Data {
 		mxc: &Mxc<'_>,
 		dim: &Dim,
 	) -> Result<Metadata> {
+		self.search_file_metadata_checked(mxc, dim)
+			.await?
+			.ok_or_else(|| err!(Request(NotFound("Media not found"))))
+	}
+
+	pub(super) async fn search_file_metadata_checked(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+	) -> Result<Option<Metadata>> {
 		let dim: &[u32] = &[dim.width, dim.height];
 		let prefix = (mxc, dim, Interfix);
 
 		let keys = self
 			.mediaid_file
-			.keys_prefix_raw(&prefix)
-			.ignore_err()
-			.map(ToOwned::to_owned);
-
+			.keys_prefix_raw_capped(&prefix, 1);
 		pin_mut!(keys);
-		let key = keys
-			.next()
-			.await
-			.ok_or_else(|| err!(Request(NotFound("Media not found"))))?;
+		let Some(key) = keys.next().await.transpose()? else {
+			return Ok(None);
+		};
+		let key = key.to_vec();
 
 		let mut parts = key.rsplit(|&b| b == 0xFF);
 
@@ -429,7 +440,7 @@ impl Data {
 			.transpose()
 			.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?;
 
-		Ok(Metadata { content_disposition, content_type, key })
+		Ok(Some(Metadata { content_disposition, content_type, key }))
 	}
 
 	/// Uploading local user of the media at the given MXC, from the uploader
@@ -446,27 +457,75 @@ impl Data {
 		users.next().await
 	}
 
-	/// Gets all the MXCs associated with a user
-	pub(super) async fn get_all_user_mxcs(&self, user_id: &UserId) -> Vec<OwnedMxcUri> {
-		self.mediaid_user
-			.stream()
-			.ignore_err()
-			.ready_filter_map(|((key, _), user): ((&str, Ignore), &UserId)| {
-				(user == user_id).then(|| key.into())
-			})
-			.collect()
-			.await
+	/// Complete uploader inventory, bounded before filtering or owned copies.
+	/// Unrelated uploaders consume the same 4,096-row / 1 MiB source budget.
+	/// Refuse overflow and read/decoding errors rather than return a short
+	/// list.
+	pub(super) async fn get_all_user_mxcs(&self, user_id: &UserId) -> Result<Vec<OwnedMxcUri>> {
+		const MAX_ROWS: usize = 4096;
+		const MAX_BYTES: usize = 1024 * 1024;
+		let rows = self
+			.mediaid_user
+			.stream_capped::<&[u8], &[u8]>(MAX_ROWS.saturating_add(1));
+		pin_mut!(rows);
+		let mut examined = 0_usize;
+		let mut bytes = 0_usize;
+		let mut mxcs = Vec::new();
+		while let Some(row) = rows.next().await {
+			let (key, value) = row?;
+			examined = examined.saturating_add(1);
+			bytes = bytes
+				.saturating_add(key.len())
+				.saturating_add(value.len());
+			if examined > MAX_ROWS || bytes > MAX_BYTES {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"User media source inventory limit reached".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			let (key, index_user): (&str, &UserId) = deserialize_from_slice(key)?;
+			let user: &UserId = deserialize_from_slice(value)?;
+			if index_user != user {
+				return Err(Error::bad_database("Mismatched uploader media owner"));
+			}
+			if user == user_id {
+				let mxc: OwnedMxcUri = key.into();
+				mxc.parts()
+					.map_err(|_| Error::bad_database("Invalid uploader media URI"))?;
+				mxcs.push(mxc);
+			}
+		}
+		Ok(mxcs)
 	}
 
 	/// Gets all the media keys in our database (this includes all the metadata
-	/// associated with it such as width, height, content-type, etc)
-	pub(crate) async fn get_all_media_keys(&self) -> Vec<Vec<u8>> {
-		self.mediaid_file
-			.raw_keys()
-			.ignore_err()
-			.map(<[u8]>::to_vec)
-			.collect()
-			.await
+	/// associated with it such as width, height, content-type, etc). Refuses
+	/// inventories above 4,096 rows or 1 MiB of retained keys, with one
+	/// overflow row for detection, and preserves read failures before caller
+	/// mutations.
+	pub(crate) async fn get_all_media_keys(&self) -> Result<Vec<Vec<u8>>> {
+		const MAX_ROWS: usize = 4096;
+		const MAX_BYTES: usize = 1024 * 1024;
+		let rows = self
+			.mediaid_file
+			.stream_capped::<&[u8], &[u8]>(MAX_ROWS.saturating_add(1));
+		pin_mut!(rows);
+		let mut keys = Vec::new();
+		let mut bytes = 0_usize;
+		while let Some(row) = rows.next().await {
+			let (key, _) = row?;
+			bytes = bytes.saturating_add(key.len());
+			if keys.len() >= MAX_ROWS || bytes > MAX_BYTES {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"Media inventory limit reached; use a bounded media operation".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			keys.push(key.to_vec());
+		}
+		Ok(keys)
 	}
 
 	pub(super) async fn set_url_preview(&self, url: &str, cached: &CachedPreview) -> Result {

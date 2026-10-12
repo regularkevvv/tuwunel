@@ -7,9 +7,7 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Err, Error, Result, debug_info, info,
-	utils::{BoolExt, future::OptionFutureExt, time::timepoint_has_passed},
-	warn,
+	Err, Error, Result, debug_info, info, utils::time::timepoint_has_passed, warn,
 };
 use tuwunel_service::{
 	Services,
@@ -46,15 +44,17 @@ pub(crate) async fn refresh_token_route(
 
 			if expires_at.is_some_and(timepoint_has_passed) {
 				let hard = services.server.config.refresh_token_hard_logout;
-				hard.then_async(|| services.users.remove_device(&user_id, &device_id))
-					.unwrap_or_else_async(async || {
-						services
-							.users
-							.remove_refresh_token(&user_id, &device_id)
-							.await
-							.ok();
-					})
-					.await;
+				if hard {
+					services
+						.users
+						.remove_device(&user_id, &device_id)
+						.await?;
+				} else {
+					services
+						.users
+						.remove_refresh_token(&user_id, &device_id)
+						.await?;
+				}
 
 				return Err(Error::BadRequest(
 					ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: !hard }),
@@ -112,7 +112,7 @@ pub(crate) async fn refresh_token_route(
 				services
 					.users
 					.remove_device(&user_id, &device_id)
-					.await;
+					.await?;
 			}
 
 			Err(Error::BadRequest(
@@ -159,7 +159,10 @@ pub(crate) async fn upstream_gate(
 		| None | Some(Recheck::Allowed) => Ok(()),
 
 		| Some(Recheck::Denied(reason)) => {
-			let devices = services.oauth.revoke_user_sessions(user_id).await;
+			let devices = services
+				.oauth
+				.revoke_user_sessions(user_id)
+				.await?;
 
 			warn!(
 				audit = "upstream_denied",
@@ -181,7 +184,7 @@ pub(crate) async fn upstream_gate(
 			services
 				.users
 				.remove_device(user_id, device_id)
-				.await;
+				.await?;
 
 			warn!(
 				audit = "grant_missing",

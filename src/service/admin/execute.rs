@@ -13,8 +13,12 @@ pub(super) const SIGNAL: &str = "SIGUSR2";
 #[cfg_attr(not(feature = "console"), expect(clippy::unused_async))]
 pub(super) async fn console_auto_start(&self) {
 	#[cfg(feature = "console")]
-	if self
-		.services
+	let services_guard = self.services.get();
+	#[cfg(feature = "console")]
+	let services_root = services_guard.as_ref();
+
+	#[cfg(feature = "console")]
+	if services_root
 		.server
 		.config
 		.admin_console_automatic
@@ -41,16 +45,18 @@ pub(super) async fn console_auto_stop(&self) {
 /// Execute admin commands after startup
 #[implement(super::Service)]
 pub async fn startup_execute(&self) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// List of commands to execute
-	let commands = &self.services.server.config.admin_execute;
+	let commands = &services_root.server.config.admin_execute;
 
 	// Determine if we're running in smoketest-mode which will change some behaviors
-	let smoketest = self.services.server.config.test.contains("smoke");
+	let smoketest = services_root.server.config.test.contains("smoke");
 
 	// When true, errors are ignored and startup continues.
 	let errors = !smoketest
-		&& self
-			.services
+		&& services_root
 			.server
 			.config
 			.admin_execute_errors_ignore;
@@ -69,7 +75,7 @@ pub async fn startup_execute(&self) -> Result {
 	// shutdown after all commands have executed.
 	if smoketest {
 		debug_info!("Smoketest mode. All commands complete. Shutting down now...");
-		self.services
+		services_root
 			.server
 			.shutdown()
 			.inspect_err(error::inspect_log)
@@ -82,17 +88,18 @@ pub async fn startup_execute(&self) -> Result {
 /// Execute admin commands after signal
 #[implement(super::Service)]
 pub(super) async fn signal_execute(&self) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// List of commands to execute
-	let commands = self
-		.services
+	let commands = services_root
 		.server
 		.config
 		.admin_signal_execute
 		.clone();
 
 	// When true, errors are ignored and execution continues.
-	let ignore_errors = self
-		.services
+	let ignore_errors = services_root
 		.server
 		.config
 		.admin_execute_errors_ignore;

@@ -1,10 +1,24 @@
-use futures::{Stream, StreamExt, TryStreamExt};
 use regex::Regex;
-use ruma::{OwnedRoomId, RoomId};
-use tuwunel_core::{Result, utils::stream::ReadyExt};
+use ruma::{OwnedUserId, RoomId};
+use tuwunel_core::{Error, Result};
 use tuwunel_service::Services;
 
-use crate::{Context, admin_command, get_room_info, utils::parse_user_id};
+use crate::{admin_command, get_room_info, utils::parse_user_id};
+
+enum Target {
+	User(OwnedUserId),
+	Pattern(Regex),
+}
+
+impl Target {
+	fn matches(&self, members: &[OwnedUserId], sole_member: bool) -> bool {
+		(!sole_member || members.len() == 1)
+			&& members.iter().any(|member| match self {
+				| Self::User(user) => member == user,
+				| Self::Pattern(pattern) => pattern.is_match(member.as_str()),
+			})
+	}
+}
 
 #[admin_command]
 pub(super) async fn room_purge_user(
@@ -15,96 +29,111 @@ pub(super) async fn room_purge_user(
 	dry_run: bool,
 ) -> Result {
 	let services = self.services;
-
-	if dry_run {
-		self.write_str("Matching rooms:\n```\n").await?;
+	// Prove which room is protected; a failed admin lookup cannot mean false.
+	let admin_room = services.admin.get_admin_room().await?;
+	let target = if regex {
+		Target::Pattern(Regex::new(&user_id)?)
+	} else {
+		Target::User(parse_user_id(services, &user_id)?)
+	};
+	let rooms = match &target {
+		| Target::Pattern(_) => services.metadata.bounded_room_ids().await?,
+		| Target::User(user) =>
+			services
+				.state_cache
+				.bounded_rooms_joined(user)
+				.await?,
+	};
+	let mut selected = Vec::new();
+	let mut rows = 4096_usize;
+	let mut bytes = 256_usize * 1024;
+	// Complete every source and member inventory before any deletion. Keys of
+	// unmatched rooms consume the shared budget too; no partial candidate list.
+	for room in rooms {
+		if room == admin_room {
+			continue;
+		}
+		let _state_lock = services.state.mutex.lock(&room).await;
+		let members = members(services, &room, rows, bytes).await?;
+		rows = charge(rows, members.len())?;
+		bytes = charge(
+			bytes,
+			members
+				.iter()
+				.map(|user| user.as_bytes().len())
+				.sum(),
+		)?;
+		if target.matches(&members, sole_member) {
+			selected.push(room);
+		}
 	}
 
-	let count = if regex {
-		let pattern = &Regex::new(&user_id)?;
-		let rooms = services
-			.metadata
-			.iter_ids()
-			.map(ToOwned::to_owned)
-			.filter_map(async |room_id| {
-				(!services.admin.is_admin_room(&room_id).await
-					&& room_has_matching_member(services, &room_id, pattern, sole_member).await)
-					.then_some(room_id)
-			});
+	if dry_run {
+		let mut details = Vec::new();
+		for room in &selected {
+			details.push(get_room_info(services, room).await?);
+		}
+		self.write_str("Matching rooms:\n```\n").await?;
+		for (id, members, name) in details {
+			writeln!(self, "{id}\tMembers: {members}\tName: {name}").await?;
+		}
+		return write!(self, "```\nMatched {} rooms.", selected.len()).await;
+	}
 
-		purge_stream(self, rooms, dry_run).await?
-	} else {
-		let user_id = parse_user_id(services, &user_id)?;
-		let rooms = services
-			.state_cache
-			.rooms_joined(&user_id)
-			.map(ToOwned::to_owned)
-			.filter_map(async |room_id| {
-				(!services.admin.is_admin_room(&room_id).await
-					&& (!sole_member || is_sole_joined_member(services, &room_id).await))
-					.then_some(room_id)
-			});
-
-		purge_stream(self, rooms, dry_run).await?
-	};
-
-	match (dry_run, count) {
-		| (true, _) => write!(self, "```\nMatched {count} rooms."),
-		| (false, 0) => write!(self, "No rooms matched."),
-		| (false, _) => write!(self, "Deleted {count} rooms from our database."),
+	let mut deleted = 0_usize;
+	let mut rows = 4096_usize;
+	let mut bytes = 256_usize * 1024;
+	for room in selected {
+		let state_lock = services.state.mutex.lock(&room).await;
+		// Membership may change after preflight. Recheck under the deletion's
+		// state lock, with a second bounded pass. This is not cross-room atomic.
+		let members = members(services, &room, rows, bytes).await?;
+		rows = charge(rows, members.len())?;
+		bytes = charge(
+			bytes,
+			members
+				.iter()
+				.map(|user| user.as_bytes().len())
+				.sum(),
+		)?;
+		if !target.matches(&members, sole_member) {
+			continue;
+		}
+		services
+			.delete
+			.delete_room(&room, false, state_lock)
+			.await?;
+		deleted = deleted.saturating_add(1);
+	}
+	match deleted {
+		| 0 => write!(self, "No rooms matched."),
+		| _ => write!(self, "Deleted {deleted} rooms from our database."),
 	}
 	.await
 }
 
-async fn room_has_matching_member(
+async fn members(
 	services: &Services,
-	room_id: &RoomId,
-	pattern: &Regex,
-	sole_member: bool,
-) -> bool {
-	let sole_ok = !sole_member || is_sole_joined_member(services, room_id).await;
-
-	sole_ok
-		&& services
-			.state_cache
-			.room_members(room_id)
-			.ready_any(|user| pattern.is_match(user.as_str()))
-			.await
-}
-
-async fn is_sole_joined_member(services: &Services, room_id: &RoomId) -> bool {
-	services
+	room: &RoomId,
+	rows: usize,
+	bytes: usize,
+) -> Result<Vec<OwnedUserId>> {
+	let count = services
 		.state_cache
-		.room_joined_count(room_id)
-		.await
-		.is_ok_and(|count| count == 1)
+		.room_joined_count_uint(room)
+		.await?;
+	let members = services
+		.state_cache
+		.bounded_room_members_with_budget(room, rows, bytes)
+		.await?;
+	if u64::from(count) != u64::try_from(members.len())? {
+		return Err(Error::bad_database("Joined-member count disagrees with inventory"));
+	}
+	Ok(members)
 }
 
-/// Lists (dry run) or deletes each matched room, returning the count.
-async fn purge_stream<S>(context: &Context<'_>, rooms: S, dry_run: bool) -> Result<usize>
-where
-	S: Stream<Item = OwnedRoomId> + Send,
-{
-	let services = context.services;
-
-	rooms
-		.map(Ok)
-		.try_fold(0_usize, async |count, room_id: OwnedRoomId| {
-			if dry_run {
-				let (id, members, name) = get_room_info(services, &room_id).await;
-
-				writeln!(context, "{id}\tMembers: {members}\tName: {name}").await?;
-			} else {
-				let state_lock = services.state.mutex.lock(&room_id).await;
-
-				// Non-forced: preserves local users' left-membership records.
-				services
-					.delete
-					.delete_room(&room_id, false, state_lock)
-					.await?;
-			}
-
-			Ok(count.saturating_add(1))
-		})
-		.await
+fn charge(remaining: usize, used: usize) -> Result<usize> {
+	remaining
+		.checked_sub(used)
+		.ok_or_else(|| Error::bad_database("Invalid member purge inventory budget"))
 }

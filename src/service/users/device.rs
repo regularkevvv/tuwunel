@@ -1,30 +1,34 @@
 use std::{
+	io::{self, Write},
 	iter::once,
 	net::IpAddr,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
 
-use futures::{FutureExt, Stream, StreamExt, future::join};
+use futures::{Stream, StreamExt, pin_mut};
 use ruma::{
 	DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::device::Device, events::AnyToDeviceEvent, serde::Raw,
 	to_device::DeviceIdOrAllDevices,
 };
+use serde::Serialize;
 use serde_json::json;
 use tuwunel_core::{
-	Err, Result, at, implement, trace,
+	Err, Error, Result, at, implement, trace,
 	utils::{
 		self, BoolExt, ReadyExt, random_string,
 		result::LogErr,
-		stream::{IterStream, TryIgnore},
+		stream::TryIgnore,
 		string::to_small_string,
 		time::{
 			duration_since_epoch, timepoint_from_epoch, timepoint_from_now, timepoint_has_passed,
 		},
 	},
 };
-use tuwunel_database::{Cbor, Deserialized, Ignore, Interfix, Json, Map, Txn};
+use tuwunel_database::{
+	Cbor, Deserialized, Ignore, Interfix, Json, Map, Txn, deserialize_from_slice, serialize_key,
+};
 
 /// generated device ID length
 const DEVICE_ID_LENGTH: usize = 10;
@@ -80,86 +84,9 @@ fn resolve_device_id(device_id: Option<&DeviceId>) -> OwnedDeviceId {
 /// Removes a device from a user.
 #[implement(super::Service)]
 #[tracing::instrument(level = "info", skip(self))]
-pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) {
-	// Remove access tokens
-	self.remove_tokens(user_id, device_id).await;
-
-	// Remove todevice events
-	let prefix = (user_id, device_id, Interfix);
-	self.db
-		.todeviceid_events
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			self.db
-				.todeviceid_events
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
-	// Remove pushers
-	self.services
-		.pusher
-		.get_device_pushkeys(user_id, device_id)
-		.map(Vec::into_iter)
-		.map(IterStream::stream)
-		.flatten_stream()
-		.for_each(|pushkey| async move {
-			self.services
-				.pusher
-				.delete_pusher(user_id, &pushkey)
-				.await;
-		})
-		.await;
-
-	// Removes the dehydrated device if the ID matches, otherwise no-op
-	self.remove_dehydrated_device(user_id, Some(device_id))
+pub async fn remove_device(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	self.remove_devices(user_id, &[device_id.to_owned()])
 		.await
-		.ok();
-
-	// TODO: Remove onetimekeys
-
-	// MSC2732: drop fallback keys for this device.
-	let prefix = (user_id, device_id, Interfix);
-	self.db
-		.userdeviceidalgorithm_fallback
-		.keys_prefix_raw(&prefix)
-		.ignore_err()
-		.for_each(|key| async move {
-			self.db
-				.userdeviceidalgorithm_fallback
-				.remove(key)
-				.await
-				.expect("database remove error");
-		})
-		.await;
-
-	// MSC3890: drop this device's local notification settings.
-	let event_type = format!("org.matrix.msc3890.local_notification_settings.{device_id}").into();
-	self.services
-		.account_data
-		.delete(None, user_id, event_type)
-		.await
-		.ok();
-
-	let userdeviceid = (user_id, device_id);
-	self.db
-		.userdeviceid_metadata
-		.del(userdeviceid)
-		.await
-		.expect("database write error");
-	self.db
-		.oidcdevice_userdeviceid
-		.del(userdeviceid)
-		.await
-		.expect("database write error");
-
-	self.mark_device_key_update(user_id).await;
-	increment(&self.db.userid_devicelistversion, user_id.as_bytes())
-		.await
-		.expect("database write error");
 }
 
 /// Returns an iterator over all device ids of this user.
@@ -200,16 +127,13 @@ pub async fn find_from_token(
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn remove_tokens(&self, user_id: &UserId, device_id: &DeviceId) {
-	let remove_access = self
-		.remove_access_token(user_id, device_id)
-		.map(Result::ok);
-
-	let remove_refresh = self
-		.remove_refresh_token(user_id, device_id)
-		.map(Result::ok);
-
-	join(remove_access, remove_refresh).await;
+pub async fn remove_tokens(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	self.append_token_removal(user_id, device_id, true, true, &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// Replaces the access token of one device.
@@ -223,6 +147,9 @@ pub async fn set_access_token(
 	expires_in: Option<Duration>,
 	refresh_token: Option<&str>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	assert!(
 		access_token.len() >= TOKEN_LENGTH,
 		"Caller must supply an access_token >= {TOKEN_LENGTH} chars."
@@ -233,6 +160,11 @@ pub async fn set_access_token(
 			.await?;
 	}
 
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
 	let expires_at = expires_in
 		.map(timepoint_from_now)
 		.transpose()?
@@ -243,15 +175,19 @@ pub async fn set_access_token(
 	let userdeviceid = (user_id, device_id);
 
 	// Fold the prior pointer token into the index for pre-index upgrades.
-	let previous = self
+	let previous = match self
 		.db
 		.userdeviceid_token
 		.qry(&userdeviceid)
 		.await
 		.deserialized::<String>()
-		.ok();
+	{
+		| Ok(previous) => Some(previous),
+		| Err(error) if error.is_not_found() => None,
+		| Err(error) => return Err(error),
+	};
 
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	if let Some(previous) = previous.as_deref() {
 		let key = (user_id, device_id, previous);
@@ -275,77 +211,63 @@ pub async fn set_access_token(
 /// care to not leave dangling devices if using this method.
 #[implement(super::Service)]
 pub async fn remove_access_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
-	let prefix = (user_id, device_id, Interfix);
-	self.db
-		.userdeviceidtoken_index
-		.keys_prefix(&prefix)
-		.ignore_err()
-		.for_each(|(_, _, token): (Ignore, Ignore, &str)| async move {
-			self.db
-				.token_userdeviceid
-				.remove(token)
-				.await
-				.expect("database write error");
-			self.db
-				.userdeviceidtoken_index
-				.del((user_id, device_id, token))
-				.await
-				.expect("database write error");
-		})
-		.await;
-
-	// Cover any pre-index token still recorded only in the legacy pointer.
-	let token = self
-		.db
-		.userdeviceid_token
-		.qry(&(user_id, device_id))
-		.await
-		.deserialized::<String>()
-		.ok();
-
-	let mut txn = self.services.db.txn();
-
-	if let Some(token) = token.as_deref() {
-		txn.del_raw(&self.db.token_userdeviceid, token);
-	}
-
-	txn.del(&self.db.userdeviceid_token, (user_id, device_id));
-
-	txn.execute().await?;
-
-	Ok(())
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	self.append_token_removal(user_id, device_id, true, false, &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// Revoke a single access token by value, leaving the device and any other
 /// tokens it holds intact.
 #[implement(super::Service)]
-pub async fn remove_access_token_value(&self, access_token: &str) {
-	let owner = self
+pub async fn remove_access_token_value(&self, access_token: &str) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let owner = match self
 		.db
 		.token_userdeviceid
 		.get(access_token)
 		.await
 		.deserialized::<(OwnedUserId, OwnedDeviceId, Option<u64>)>()
-		.ok();
-
-	let mut txn = self.services.db.txn();
-
-	if let Some((user_id, device_id, _)) = owner {
-		let user_device_token = (&*user_id, &*device_id, access_token);
-
-		txn.del(&self.db.userdeviceidtoken_index, user_device_token);
+	{
+		| Ok(owner) => owner,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
+	};
+	let _guard = self
+		.device_mutation_locks
+		.lock::<UserId>(&owner.0)
+		.await;
+	let current = match self
+		.db
+		.token_userdeviceid
+		.get(access_token)
+		.await
+		.deserialized::<(OwnedUserId, OwnedDeviceId, Option<u64>)>()
+	{
+		| Ok(owner) => owner,
+		| Err(error) if error.is_not_found() => return Ok(()),
+		| Err(error) => return Err(error),
+	};
+	if current != owner {
+		return Err(Error::bad_database("Token ownership changed during revocation"));
 	}
-
+	let mut txn = services_root.db.txn();
+	txn.del(&self.db.userdeviceidtoken_index, (&*owner.0, &*owner.1, access_token));
 	txn.del_raw(&self.db.token_userdeviceid, access_token);
-
-	txn.execute().await.expect("database write error");
+	txn.execute().await
 }
 
 #[implement(super::Service)]
 pub fn generate_access_token(&self, expires: bool) -> (String, Option<Duration>) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let access_token = random_string(TOKEN_LENGTH);
 	let expires_in = expires
-		.then_some(self.services.server.config.access_token_ttl)
+		.then_some(services_root.server.config.access_token_ttl)
 		.map(Duration::from_secs);
 
 	(access_token, expires_in)
@@ -360,9 +282,17 @@ pub async fn set_refresh_token(
 	device_id: &DeviceId,
 	refresh_token: &str,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	debug_assert!(refresh_token.starts_with("refresh_"), "refresh_token missing prefix");
 
-	let config = &self.services.server.config;
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+	let config = &services_root.server.config;
 	let ttl = config.refresh_token_ttl;
 	let idle_only = config.refresh_token_idle_only;
 
@@ -383,9 +313,8 @@ pub async fn set_refresh_token(
 		.ok();
 
 	// Also drops the prior spent entry.
-	self.remove_refresh_token(user_id, device_id)
-		.await
-		.ok();
+	self.remove_refresh_token_unlocked(user_id, device_id)
+		.await?;
 
 	let expires_at = match (ttl, prior_expires_at) {
 		| (0, _) => None,
@@ -400,7 +329,7 @@ pub async fn set_refresh_token(
 
 	let userdeviceid = (user_id, device_id);
 	let value = (user_id, device_id, expires_at_secs);
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 
 	txn.raw_put(&self.db.token_userdeviceid, refresh_token, value);
 	txn.put_raw(&self.db.userdeviceid_refresh, userdeviceid, refresh_token);
@@ -456,50 +385,18 @@ async fn find_refresh_token_expires_at(
 /// dangling devices if using this method.
 #[implement(super::Service)]
 pub async fn remove_refresh_token(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
-	let userdeviceid = (user_id, device_id);
-	let refresh_token = self
-		.db
-		.userdeviceid_refresh
-		.qry(&userdeviceid)
-		.await;
-
-	let mut txn = self.services.db.txn();
-
-	if let Ok(refresh_token) = refresh_token {
-		txn.del_raw(&self.db.token_userdeviceid, &refresh_token);
-	}
-
-	txn.del(&self.db.userdeviceid_refresh, userdeviceid);
-
-	self.forget_spent_refresh_token(user_id, device_id, &mut txn)
-		.await;
-
-	txn.execute().await?;
-
-	Ok(())
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.remove_refresh_token_unlocked(user_id, device_id)
+		.await
 }
 
-/// Drop the spent (previous-generation) refresh token retained for reuse
-/// detection, if any.
 #[implement(super::Service)]
-async fn forget_spent_refresh_token(
-	&self,
-	user_id: &UserId,
-	device_id: &DeviceId,
-	txn: &mut Txn,
-) {
-	let userdeviceid = (user_id, device_id);
-
-	if let Ok(spent) = self
-		.db
-		.userdeviceid_spentrefresh
-		.qry(&userdeviceid)
-		.await
-	{
-		txn.del_raw(&self.db.spentrefresh_userdeviceid, &spent);
-	}
-
-	txn.del(&self.db.userdeviceid_spentrefresh, userdeviceid);
+async fn remove_refresh_token_unlocked(&self, user_id: &UserId, device_id: &DeviceId) -> Result {
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	self.append_token_removal(user_id, device_id, false, true, &mut txn)
+		.await?;
+	txn.execute().await
 }
 
 /// Classification of a refresh token presented for rotation at a token
@@ -530,6 +427,9 @@ pub enum RefreshToken {
 /// Classify a presented refresh token for the token-endpoint rotation path.
 #[implement(super::Service)]
 pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// The current refresh token resolves and matches the device's active
 	// pointer (an access token resolves but will not match).
 	if let Ok((user_id, device_id, expires_at)) = self.find_from_token(presented).await {
@@ -566,8 +466,7 @@ pub async fn classify_refresh_token(&self, presented: &str) -> RefreshToken {
 		.deserialized()
 		.ok();
 
-	let grace_window = self
-		.services
+	let grace_window = services_root
 		.server
 		.config
 		.refresh_token_reuse_grace;
@@ -598,6 +497,91 @@ pub struct ToDeviceTarget {
 	pub content: serde_json::Value,
 }
 
+fn to_device_limit() -> Error {
+	tuwunel_core::err!(Request(TooLarge("To-device delivery inventory or payload limit")))
+}
+
+fn to_device_admission_error(error: &tuwunel_bridge::Error) -> Error {
+	tuwunel_core::err!(Request(TooLarge("To-device commit admission: {error}")))
+}
+
+fn admit_to_device_targets(targets: &[ToDeviceTarget], txnid: Option<&[u8]>) -> Result {
+	if targets.len() > tuwunel_bridge::MAX_COMMIT_OPS {
+		return Err(to_device_limit());
+	}
+	let mut bytes = txnid.map_or(0, <[u8]>::len);
+	if txnid.is_some_and(|key| key.is_empty() || key.len() > tuwunel_bridge::MAX_KEY_BYTES) {
+		return Err(to_device_limit());
+	}
+	for target in targets {
+		let device_bytes = match &target.device {
+			| DeviceIdOrAllDevices::DeviceId(id) => id.as_str().len(),
+			| DeviceIdOrAllDevices::AllDevices => 1,
+		};
+		if target.user_id.as_bytes().len() > tuwunel_bridge::MAX_KEY_BYTES
+			|| device_bytes > tuwunel_bridge::MAX_KEY_BYTES
+		{
+			return Err(to_device_limit());
+		}
+		bytes = bytes
+			.saturating_add(target.user_id.as_bytes().len())
+			.saturating_add(device_bytes);
+		if bytes > tuwunel_bridge::request::MAX_BYTES {
+			return Err(to_device_limit());
+		}
+	}
+	Ok(())
+}
+
+#[derive(Serialize)]
+struct ToDeviceBody<'a> {
+	// Preserve the existing Json(json!({...})) map's stored field ordering.
+	content: &'a serde_json::Value,
+	sender: &'a UserId,
+	#[serde(rename = "type")]
+	kind: &'a str,
+}
+
+struct ToDeviceBodyWriter {
+	bytes: Vec<u8>,
+	exceeded: bool,
+}
+
+impl Write for ToDeviceBodyWriter {
+	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+		let length = self.bytes.len().saturating_add(bytes.len());
+		if length > tuwunel_bridge::MAX_VALUE_BYTES {
+			self.exceeded = true;
+			return Err(io::Error::from(io::ErrorKind::FileTooLarge));
+		}
+		if length > self.bytes.capacity() {
+			let capacity = length
+				.max(self.bytes.capacity().saturating_mul(2))
+				.min(tuwunel_bridge::MAX_VALUE_BYTES);
+			self.bytes
+				.try_reserve_exact(capacity.saturating_sub(self.bytes.len()))
+				.map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+		}
+		self.bytes.extend_from_slice(bytes);
+		Ok(bytes.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+fn encode_to_device_body(
+	sender: &UserId,
+	kind: &str,
+	content: &serde_json::Value,
+) -> Result<Vec<u8>> {
+	let mut writer = ToDeviceBodyWriter { bytes: Vec::new(), exceeded: false };
+	match serde_json::to_writer(&mut writer, &ToDeviceBody { content, sender, kind }) {
+		| Ok(()) => Ok(writer.bytes),
+		| Err(_) if writer.exceeded => Err(to_device_limit()),
+		| Err(error) => Err(error.into()),
+	}
+}
+
 /// Store one to-device message in one device's inbox, returning its count.
 #[implement(super::Service)]
 pub async fn add_to_device_event(
@@ -608,8 +592,27 @@ pub async fn add_to_device_event(
 	event_type: &str,
 	content: &serde_json::Value,
 ) -> u64 {
-	let count = self
-		.services
+	let _guard = self
+		.device_mutation_locks
+		.lock(target_user_id)
+		.await;
+
+	// A delivery that waited behind revocation must not recreate an inbox.
+	match self
+		.db
+		.userdeviceid_metadata
+		.qry(&(target_user_id, target_device_id))
+		.await
+	{
+		| Ok(_) => {},
+		| Err(error) if error.is_not_found() => return 0,
+		| Err(error) => panic!("Cannot check recipient device: {error}"),
+	}
+
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let count = services_root
 		.globals
 		.next_count()
 		.await
@@ -633,8 +636,8 @@ pub async fn add_to_device_event(
 	*count
 }
 
-/// Deliver one request's local to-device messages, then forward them to the
-/// appservices interested in each recipient.
+/// Admit one request's local inboxes and frozen interested-appservice copies
+/// in the same transaction as its deduplication record.
 ///
 /// Every inbox write and the request's transaction record (`txnid`, a
 /// [`crate::transaction_ids::key`], recorded with an empty response) land in
@@ -642,8 +645,9 @@ pub async fn add_to_device_event(
 /// recipients or none, and a retry that finds the record delivers nothing
 /// again. `AllDevices` resolves to the devices the user has now.
 ///
-/// Appservice forwarding follows the commit and reuses its counts. A failure
-/// there is logged rather than returned, as the delivery already stands.
+/// Complete shared inbox/forwarding admission precedes count allocation.
+/// Only payload-free wake hints follow the durable commit; restart discovers
+/// copies whose wake was interrupted.
 #[implement(super::Service)]
 pub async fn deliver_to_device(
 	&self,
@@ -652,77 +656,109 @@ pub async fn deliver_to_device(
 	targets: &[ToDeviceTarget],
 	txnid: Option<&[u8]>,
 ) -> Result {
-	// Resolve every addressed device, and draw each delivery's count, before
-	// anything is written. The permits stay held until the commit lands so no
-	// reader advances past a count whose inbox row is still in flight.
-	let mut resolved = Vec::with_capacity(targets.len());
+	admit_to_device_targets(targets, txnid)?;
+	let mut recipients = targets
+		.iter()
+		.map(|target| target.user_id.clone())
+		.collect::<Vec<_>>();
+	recipients.sort_unstable();
+	recipients.dedup();
+	let mut guards = Vec::new();
+	for user in &recipients {
+		guards.push(
+			self.device_mutation_locks
+				.lock::<UserId>(user)
+				.await,
+		);
+	}
+
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	// Complete inventories and the exact encoded inbox budget precede count
+	// permits and transaction allocation. The transaction record shares the
+	// same mixed-map budget and actual writer lease as the inbox rows.
+	let mut budget = self.db.todeviceid_events.put_batch_budget()?;
+	if let Some(txnid) = txnid {
+		let map = tuwunel_bridge::catalog::map_id("userdevicetxnid_response")
+			.ok_or_else(|| Error::bad_database("Missing transaction record catalog map"))?;
+		budget
+			.try_put_to(map.0, txnid.len(), &[])
+			.map_err(|error| to_device_admission_error(&error))?;
+	}
+	let mut resolved = Vec::new();
 	for target in targets {
 		let (device_ids, forward) = match &target.device {
 			| DeviceIdOrAllDevices::DeviceId(device_id) => (vec![device_id.clone()], true),
-			| DeviceIdOrAllDevices::AllDevices => (
-				self.all_device_ids(&target.user_id)
-					.map(ToOwned::to_owned)
-					.collect()
-					.await,
-				self.services
-					.appservice
-					.is_interested_in_user(&target.user_id)
-					.await,
-			),
+			| DeviceIdOrAllDevices::AllDevices =>
+				(self.bounded_device_ids(&target.user_id).await?, true),
 		};
-
-		let mut deliveries = Vec::with_capacity(device_ids.len());
+		let mut available = Vec::new();
 		for device_id in device_ids {
-			deliveries.push((device_id, self.services.globals.next_count().await?));
+			match self
+				.db
+				.userdeviceid_metadata
+				.qry(&(&*target.user_id, &*device_id))
+				.await
+			{
+				| Ok(_) => available.push(device_id),
+				| Err(error) if error.is_not_found() => {},
+				| Err(error) => return Err(error),
+			}
 		}
-
-		resolved.push((target, deliveries, forward));
-	}
-
-	let rows = resolved
-		.iter()
-		.flat_map(|(target, deliveries, _)| {
-			deliveries.iter().map(move |(device_id, count)| {
-				(&*target.user_id, &**device_id, **count, &target.content)
-			})
-		});
-
-	self.to_device_txn(sender, event_type, rows, txnid)
-		.execute()
-		.await?;
-
-	trace!(
-		%sender,
-		%event_type,
-		deliveries = resolved.iter().map(|(_, deliveries, _)| deliveries.len()).sum::<usize>(),
-		"to_device deliver",
-	);
-
-	for (target, deliveries, forward) in resolved {
-		let deliveries: Vec<(OwnedDeviceId, u64)> = deliveries
-			.into_iter()
-			.map(|(device_id, count)| (device_id, *count))
-			.collect();
-
-		if !forward || deliveries.is_empty() {
+		if available.is_empty() {
 			continue;
 		}
-
-		self.services
-			.sending
-			.send_to_device_appservices(
-				sender,
-				&target.user_id,
-				deliveries
-					.iter()
-					.map(|(device_id, count)| (&**device_id, *count)),
-				event_type,
-				&target.content,
-			)
-			.await
-			.log_err()
-			.ok();
+		let body = encode_to_device_body(sender, event_type, &target.content)?;
+		for device_id in &available {
+			let key = serialize_key((&*target.user_id, &**device_id, 0_u64))?;
+			budget
+				.try_put(key.len(), &body)
+				.map_err(|error| to_device_admission_error(&error))?;
+		}
+		resolved.push((target, available, forward, body));
 	}
+
+	let mut forwarding = services_root
+		.sending
+		.prepare_to_device_forwarding(
+			sender,
+			event_type,
+			resolved
+				.iter()
+				.map(|(target, devices, forward, _)| {
+					(&*target.user_id, devices.as_slice(), &target.content, *forward)
+				}),
+			&mut budget,
+		)
+		.await?;
+	let mut counts = Vec::new();
+	let mut permits = Vec::new();
+	let mut txn = services_root.db.txn();
+	for (target, devices, _, body) in resolved {
+		for device in devices {
+			let count = services_root.globals.next_count().await?;
+			txn.put_raw(&self.db.todeviceid_events, (&*target.user_id, &*device, *count), &body);
+			counts.push(*count);
+			permits.push(count);
+		}
+	}
+	if let Some(txnid) = txnid {
+		txn.insert_raw(&self.db.userdevicetxnid_response, txnid, []);
+	}
+	services_root
+		.sending
+		.append_to_device_forwarding(&mut forwarding, &counts, &mut txn)
+		.await?;
+	txn.check_bridge_admission()?;
+	txn.execute_flushed().await?;
+	drop(guards);
+	drop(permits);
+	services_root
+		.sending
+		.finish_to_device_forwarding(forwarding)
+		.log_err()
+		.ok();
 
 	Ok(())
 }
@@ -745,7 +781,10 @@ pub fn to_device_txn<'a, I>(
 where
 	I: IntoIterator<Item = (&'a UserId, &'a DeviceId, u64, &'a serde_json::Value)>,
 {
-	let mut txn = self.services.db.txn();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let mut txn = services_root.db.txn();
 
 	for (target_user_id, target_device_id, count, content) in deliveries {
 		txn.put(
@@ -790,34 +829,184 @@ pub fn get_to_device_events<'a>(
 		.map(|((_, _, count), event)| (count, event))
 }
 
+/// A complete diagnostic inbox inventory, bounded by the existing admin
+/// inventory ceilings: 128 rows and 64 KiB of combined stored keys and JSON.
+/// One lookahead detects overflow. Charge borrowed bytes before typed key
+/// decoding or owning JSON; storage and codec errors refuse the whole result.
+/// Sync consumers retain their existing streaming interface.
+#[implement(super::Service)]
+pub async fn bounded_to_device_events(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+) -> Result<Vec<(u64, Raw<AnyToDeviceEvent>)>> {
+	let prefix = (user_id, device_id, Interfix);
+	let rows = self
+		.db
+		.todeviceid_events
+		.stream_prefix_capped::<&[u8], &[u8], _>(
+			&prefix,
+			super::MAX_ADMIN_DEVICE_ROWS.saturating_add(1),
+		);
+	pin_mut!(rows);
+	let mut events = Vec::new();
+	let mut bytes = 0_usize;
+	while let Some(row) = rows.next().await {
+		let (key, value) = row?;
+		bytes = bytes
+			.saturating_add(key.len())
+			.saturating_add(value.len());
+		if events.len() >= super::MAX_ADMIN_DEVICE_ROWS || bytes > super::MAX_ADMIN_DEVICE_BYTES {
+			return Err(Error::bad_database(
+				"To-device diagnostic inventory exceeds row/byte budget",
+			));
+		}
+		let (owner, device, count): (&UserId, &DeviceId, u64) = deserialize_from_slice(key)?;
+		if owner != user_id || device != device_id {
+			return Err(Error::bad_database(
+				"To-device inbox key does not match requested device",
+			));
+		}
+		let event = serde_json::from_slice(value)
+			.map_err(|_| Error::bad_database("Cannot deserialize stored to-device event JSON"))?;
+		events.push((count, event));
+	}
+	Ok(events)
+}
+
+/// A bounded contiguous inbox page. `next_batch` only advances past admitted
+/// events; it reaches `until` only when the entire captured range is exhausted.
+#[derive(Debug)]
+pub struct ToDevicePage {
+	/// Admitted messages, in stored sequence order.
+	pub events: Vec<(u64, Raw<AnyToDeviceEvent>)>,
+	/// Inclusive watermark proved safe by this page.
+	pub next_batch: u64,
+	/// Whether the captured range was exhausted rather than page limited.
+	pub complete: bool,
+}
+
+/// Maximum inbox rows retained in one sync response.
+pub const MAX_TO_DEVICE_PAGE_ROWS: usize = 128;
+/// Stored key and JSON bytes retained in one inbox page. A legal maximum-width
+/// value fits alone. Lookahead borrows at most one extra storage-width row.
+pub const MAX_TO_DEVICE_PAGE_BYTES: usize = tuwunel_bridge::request::MAX_BYTES;
+
+/// Reads a contiguous checked page from `(since, until]` before any ACK write.
+/// Source fetches stop at `limit + 1`; raw key/value widths, borrowed tuple
+/// decoding and JSON validity are checked even for lookahead. Retained bytes
+/// are at most 4 MiB; inspection adds at most one storage-width peek row.
+/// JSON ownership follows byte/row admission, so the peek is never cloned or
+/// skipped by the next cursor.
+#[implement(super::Service)]
+pub async fn to_device_page(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	since: u64,
+	until: u64,
+	limit: usize,
+) -> Result<ToDevicePage> {
+	if limit == 0 || limit > MAX_TO_DEVICE_PAGE_ROWS || since > until {
+		return Err(Error::bad_database("Invalid to-device page bounds"));
+	}
+	if since == until {
+		return Ok(ToDevicePage {
+			events: Vec::new(),
+			next_batch: until,
+			complete: true,
+		});
+	}
+	let prefix = serialize_key((user_id, device_id, Interfix))?;
+	let from = serialize_key((user_id, device_id, since.saturating_add(1)))?;
+	let rows = self
+		.db
+		.todeviceid_events
+		.stream_capped_from::<&[u8], &[u8]>(Some(&from), limit.saturating_add(1));
+	pin_mut!(rows);
+	let mut page = ToDevicePage {
+		events: Vec::new(),
+		next_batch: until,
+		complete: true,
+	};
+	let mut bytes = 0_usize;
+	while let Some(row) = rows.next().await {
+		let (key, value) = row?;
+		if !key.starts_with(&prefix) {
+			break;
+		}
+		if key.len() > tuwunel_bridge::MAX_KEY_BYTES
+			|| value.len() > tuwunel_bridge::MAX_VALUE_BYTES
+		{
+			return Err(Error::bad_database("To-device row exceeds storage width"));
+		}
+		let (owner, device, count): (&UserId, &DeviceId, u64) = deserialize_from_slice(key)?;
+		if owner != user_id || device != device_id || count <= since {
+			return Err(Error::bad_database("To-device page key does not match requested range"));
+		}
+		if count > until {
+			break;
+		}
+		let prospective_bytes = bytes
+			.saturating_add(key.len())
+			.saturating_add(value.len());
+		if page.events.len() == limit || prospective_bytes > MAX_TO_DEVICE_PAGE_BYTES {
+			// Validate the borrowed peek without allocating an owned Raw event.
+			let _: &serde_json::value::RawValue =
+				serde_json::from_slice(value).map_err(|_| {
+					Error::bad_database("Cannot deserialize stored to-device event JSON")
+				})?;
+			let Some((last, _)) = page.events.last() else {
+				return Err(Error::bad_database("To-device event exceeds page byte budget"));
+			};
+			page.next_batch = *last;
+			page.complete = false;
+			break;
+		}
+		let event = serde_json::from_slice(value)
+			.map_err(|_| Error::bad_database("Cannot deserialize stored to-device event JSON"))?;
+		page.events.push((count, event));
+		bytes = prospective_bytes;
+	}
+	Ok(page)
+}
+
+/// Collects one atomic bounded page of already acknowledged inbox rows. Old
+/// acknowledged backlog may remain for a later GC pass, but reads exclude it
+/// by `since`; limiting GC therefore cannot omit or redeliver pending events.
+/// No deletion is staged until every selected key has been checked.
 #[implement(super::Service)]
 pub async fn remove_to_device_events<Until>(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
 	until: Until,
-) where
+) -> Result
+where
 	Until: Into<Option<u64>> + Send,
 {
-	type Key<'a> = (&'a UserId, &'a DeviceId, u64);
-
+	let _guard = self.device_mutation_locks.lock(user_id).await;
 	let until = until.into().unwrap_or(u64::MAX);
-	let from = (user_id, device_id, until);
-	self.db
+	let prefix = serialize_key((user_id, device_id, Interfix))?;
+	let from = serialize_key((user_id, device_id, until))?;
+	let keys = self
+		.db
 		.todeviceid_events
-		.rev_keys_from(&from)
-		.ignore_err()
-		.ready_take_while(move |(user_id_, device_id_, _): &Key<'_>| {
-			user_id == *user_id_ && device_id == *device_id_
-		})
-		.for_each(|key: Key<'_>| async move {
-			self.db
-				.todeviceid_events
-				.del(key)
-				.await
-				.expect("database write error");
-		})
-		.await;
+		.raw_keys_prefix_reverse(&prefix, &from, MAX_TO_DEVICE_PAGE_ROWS)
+		.await?;
+	for key in &keys {
+		let (owner, device, count): (&UserId, &DeviceId, u64) = deserialize_from_slice(key)?;
+		if owner != user_id || device != device_id || count > until {
+			return Err(Error::bad_database("To-device ACK key does not match requested range"));
+		}
+	}
+	let services = self.services.get();
+	let mut txn = services.db.txn();
+	for key in keys {
+		txn.del_raw(&self.db.todeviceid_events, key);
+	}
+	txn.check_bridge_admission()?;
+	txn.execute().await
 }
 
 #[implement(super::Service)]
@@ -853,7 +1042,11 @@ pub async fn put_device_metadata(
 	notify: bool,
 	device: &Device,
 ) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
 	let key = (user_id, &device.device_id);
+	if !notify {
+		self.db.userdeviceid_metadata.qry(&key).await?;
+	}
 	self.db
 		.userdeviceid_metadata
 		.put(key, Json(device))
@@ -924,6 +1117,12 @@ pub async fn mark_oidc_device(
 	device_id: &DeviceId,
 	idp_id: &str,
 ) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+
 	self.db
 		.oidcdevice_userdeviceid
 		.put((user_id, device_id), Json(idp_id))
@@ -1028,3 +1227,11 @@ mod tests {
 		assert_eq!(device_id.as_str(), "HELLOWORLD");
 	}
 }
+
+#[cfg(test)]
+#[path = "to_device_admission_tests.rs"]
+mod to_device_admission_tests;
+
+#[cfg(test)]
+#[path = "inbox_paging_tests.rs"]
+mod inbox_paging_tests;

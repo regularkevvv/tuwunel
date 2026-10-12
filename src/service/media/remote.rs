@@ -42,6 +42,9 @@ pub async fn fetch_remote_thumbnail(
 	timeout_ms: Duration,
 	dim: &Dim,
 ) -> Result<Media> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
@@ -49,7 +52,7 @@ pub async fn fetch_remote_thumbnail(
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
-		&& self.services.server.config.request_legacy_media
+		&& services_root.server.config.request_legacy_media
 	{
 		return self
 			.fetch_thumbnail_unauthenticated(mxc, server, timeout_ms, dim)
@@ -67,6 +70,9 @@ pub async fn fetch_remote_content(
 	server: Option<&ServerName>,
 	timeout_ms: Duration,
 ) -> Result<Media> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.check_fetch_authorized(mxc)?;
 
 	let result = self
@@ -74,7 +80,7 @@ pub async fn fetch_remote_content(
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
-		&& self.services.server.config.request_legacy_media
+		&& services_root.server.config.request_legacy_media
 	{
 		return self
 			.fetch_content_unauthenticated(mxc, server, timeout_ms)
@@ -260,7 +266,10 @@ async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<M
 
 #[implement(super::Service)]
 async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Media> {
-	let limit = self.services.server.config.max_response_size;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let limit = services_root.server.config.max_response_size;
 
 	self.location_request(Fetch::Extern, location, limit)
 		.await
@@ -278,19 +287,21 @@ pub(super) async fn location_request(
 	location: &str,
 	limit: usize,
 ) -> Result<Media> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let url = Url::parse(location)
 		.map_err(|e| err!(Request(Unknown("Invalid media location URL: {e}"))))?;
 
 	self.check_url_host(&url)?;
 
 	let request = match fetch {
-		| Fetch::Extern => self
-			.services
+		| Fetch::Extern => services_root
 			.client
 			.extern_media
 			.get(url.as_str()),
 		| Fetch::Preview(agent) => {
-			let request = self.services.client.url_preview.get(url.as_str());
+			let request = services_root.client.url_preview.get(url.as_str());
 
 			self.preview_headers(request, &url, agent)
 		},
@@ -303,8 +314,7 @@ pub(super) async fn location_request(
 		return Err!(Request(Forbidden("Media response has no peer address")));
 	};
 
-	if !self
-		.services
+	if !services_root
 		.client
 		.valid_cidr_range_remote_addr(response.url(), remote_addr)
 	{
@@ -359,7 +369,10 @@ where
 	Request::Authentication: FedAuth,
 	Request::PathBuilder: FedPath,
 {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.federation
 		.execute(server.unwrap_or(mxc.server_name), request)
 		.await
@@ -397,6 +410,9 @@ pub async fn fetch_remote_thumbnail_legacy(
 	&self,
 	body: &media::get_content_thumbnail::v3::Request,
 ) -> Result<media::get_content_thumbnail::v3::Response> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
@@ -404,8 +420,7 @@ pub async fn fetch_remote_thumbnail_legacy(
 
 	self.check_legacy_freeze()?;
 	self.check_fetch_authorized(&mxc)?;
-	let response = self
-		.services
+	let response = services_root
 		.federation
 		.execute(mxc.server_name, media::get_content_thumbnail::v3::Request {
 			allow_remote: body.allow_remote,
@@ -437,10 +452,12 @@ pub async fn fetch_remote_content_legacy(
 	allow_redirect: bool,
 	timeout_ms: Duration,
 ) -> Result<media::get_content::v3::Response, Error> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	self.check_legacy_freeze()?;
 	self.check_fetch_authorized(mxc)?;
-	let response = self
-		.services
+	let response = services_root
 		.federation
 		.execute(mxc.server_name, media::get_content::v3::Request {
 			allow_remote: true,
@@ -486,14 +503,15 @@ fn cached_or_quota_full(result: Result) -> Result {
 
 #[implement(super::Service)]
 fn check_fetch_authorized(&self, mxc: &Mxc<'_>) -> Result {
-	if self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if services_root
 		.server
 		.config
 		.prevent_media_downloads_from
 		.is_match(mxc.server_name.host())
-		|| self
-			.services
+		|| services_root
 			.server
 			.config
 			.is_forbidden_remote_server_name(mxc.server_name)
@@ -509,7 +527,10 @@ fn check_fetch_authorized(&self, mxc: &Mxc<'_>) -> Result {
 
 #[implement(super::Service)]
 fn check_legacy_freeze(&self) -> Result {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.server
 		.config
 		.freeze_legacy_media

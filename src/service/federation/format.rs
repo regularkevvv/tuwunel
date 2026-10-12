@@ -10,6 +10,9 @@ pub async fn format_pdu_into(
 	mut pdu_json: CanonicalJsonObject,
 	room_version: Option<&RoomVersionId>,
 ) -> Box<RawJsonValue> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let room_id = pdu_json
 		.get("room_id")
 		.and_then(CanonicalJsonValue::as_str)
@@ -19,7 +22,7 @@ pub async fn format_pdu_into(
 	let query_room_version: OptionFuture<_> = room_id
 		.filter(|_| room_version.is_none())
 		.map(async |room_id| {
-			self.services
+			services_root
 				.state
 				.get_room_version(&room_id)
 				.await

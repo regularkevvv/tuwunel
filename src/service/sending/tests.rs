@@ -1,6 +1,6 @@
 use super::{
-	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED, TAG_TO_DEVICE,
-	data::parse_servercurrentevent,
+	Destination, EduBuf, SendingEvent, TAG_BADGE_REFRESH, TAG_DEVICE_LIST_CHANGED,
+	TAG_FROZEN_PUSH, TAG_TO_DEVICE, data::parse_servercurrentevent,
 };
 
 /// `RawId::NORMAL_LEN`: a `ShortRoomId` (u64) plus a count (u64).
@@ -73,10 +73,17 @@ fn appservice_empty_value_decodes_as_pdu() {
 
 #[test]
 fn appservice_unknown_tag_decodes_as_edu() {
-	let (_, decoded) = parse_servercurrentevent(&count_key(), &[0x04, 0xAA, 0xBB])
+	const UNKNOWN_TAG: u8 = 0xFF;
+	assert!(
+		![TAG_TO_DEVICE, TAG_DEVICE_LIST_CHANGED, TAG_BADGE_REFRESH, TAG_FROZEN_PUSH]
+			.contains(&UNKNOWN_TAG),
+		"the compatibility control must use an unreserved tag"
+	);
+	let bytes = [UNKNOWN_TAG, 0xAA, 0xBB];
+	let (_, decoded) = parse_servercurrentevent(&count_key(), &bytes)
 		.expect("unknown-tag appservice row decodes");
 
-	assert!(matches!(decoded, SendingEvent::Edu(_)));
+	assert_eq!(decoded, SendingEvent::Edu(EduBuf::from_slice(&bytes)));
 }
 
 #[test]

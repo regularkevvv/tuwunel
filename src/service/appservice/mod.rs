@@ -16,14 +16,14 @@ use std::{
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, TryStreamExt};
 use ruma::{RoomAliasId, RoomId, UserId, api::appservice::Registration};
-use tokio::sync::{RwLock, RwLockReadGuard, SetOnce};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, SetOnce};
 use tuwunel_core::{Err, Result, defer, err, utils::stream::IterStream};
 use tuwunel_database::Map;
 
 pub use self::{namespace_regex::NamespaceRegex, registration_info::RegistrationInfo};
 
 pub struct Service {
-	registration_info: RwLock<Registrations>,
+	registration_info: Arc<RwLock<Registrations>>,
 	loaded: SetOnce<()>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
@@ -35,11 +35,21 @@ struct Data {
 
 type Registrations = BTreeMap<String, RegistrationInfo>;
 
+/// Retains one registration incarnation through a coupled queue admission.
+/// Registration removal takes the registry write lock before sender exclusion.
+pub(crate) struct RegistrationReadGuard(OwnedRwLockReadGuard<Registrations>);
+
+impl std::ops::Deref for RegistrationReadGuard {
+	type Target = BTreeMap<String, RegistrationInfo>;
+
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			registration_info: RwLock::new(BTreeMap::new()),
+			registration_info: Arc::new(RwLock::new(BTreeMap::new())),
 			loaded: SetOnce::new(),
 			services: args.services.clone(),
 			db: Data {
@@ -65,7 +75,10 @@ impl Service {
 	/// The configured `appservice` table is read first, then any YAML under
 	/// `appservice_dir`, then the registrations persisted by the admin command.
 	async fn load(&self) -> Result {
-		for (id, mut appservice) in self.services.config.appservice.clone() {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		for (id, mut appservice) in services_root.config.appservice.clone() {
 			if appservice.id.is_empty() {
 				appservice.id = id.clone();
 			}
@@ -81,7 +94,7 @@ impl Service {
 			self.load_appservice(appservice.into()).await?;
 		}
 
-		if let Some(appservice_dir) = &self.services.config.appservice_dir {
+		if let Some(appservice_dir) = &services_root.config.appservice_dir {
 			let entries = read_dir(appservice_dir).map_err(|e| {
 				err!(Config("appservice_dir", "Failed to read {appservice_dir:?}: {e}"))
 			})?;
@@ -120,10 +133,13 @@ impl Service {
 	/// is written to D1 first, under the registry's write lock, so it is never
 	/// usable before it is durable.
 	async fn admit(&self, registration: Registration, persist: Option<String>) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		//TODO: Check for collisions between exclusive appservice namespaces
 
 		let registration_info =
-			RegistrationInfo::new(registration, self.services.globals.server_name())?;
+			RegistrationInfo::new(registration, services_root.globals.server_name())?;
 
 		let id = &registration_info.registration.id;
 
@@ -145,8 +161,8 @@ impl Service {
 
 		let appservice_user = &registration_info.sender;
 
-		if !self.services.users.exists(appservice_user).await {
-			self.services
+		if !services_root.users.exists(appservice_user).await {
+			services_root
 				.users
 				.create(appservice_user, None, None)
 				.await?;
@@ -174,6 +190,9 @@ impl Service {
 	}
 
 	pub async fn unregister_appservice(&self, appservice_id: &str) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		self.loaded().await;
 
 		let mut registrations = self.registration_info.write().await;
@@ -205,7 +224,7 @@ impl Service {
 
 		// deletes all active requests for the appservice if there are any so we stop
 		// sending to the URL
-		self.services
+		services_root
 			.sending
 			.cleanup_events(Some(appservice_id), None, None)
 			.await
@@ -299,6 +318,11 @@ impl Service {
 
 	pub fn read(&self) -> impl Future<Output = RwLockReadGuard<'_, Registrations>> + Send {
 		self.registration_info.read()
+	}
+
+	/// Owned exclusion for queue plans that outlive a borrowed service lookup.
+	pub(crate) async fn read_owned(&self) -> RegistrationReadGuard {
+		RegistrationReadGuard(self.registration_info.clone().read_owned().await)
 	}
 
 	/// Waits for the boot-time registration load to finish.

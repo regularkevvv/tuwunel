@@ -34,6 +34,9 @@ pub async fn create_hash_and_sign_event(
 	// Take mutex guard to make sure users get the room state mutex
 	_mutex_lock: &RoomMutexGuard,
 ) -> Result<(PduEvent, CanonicalJsonObject)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let PduBuilder {
 		event_type,
 		content,
@@ -48,8 +51,7 @@ pub async fn create_hash_and_sign_event(
 		.await?;
 
 	// If there was no create event yet, assume we are creating a room
-	let (room_version, version_rules) = self
-		.services
+	let (room_version, version_rules) = services_root
 		.state
 		.get_room_version(room_id)
 		.await
@@ -68,8 +70,7 @@ pub async fn create_hash_and_sign_event(
 			Ok((room_version.clone(), room_version::rules(&room_version)?))
 		})?;
 
-	let auth_events = self
-		.services
+	let auth_events = services_root
 		.state
 		.get_auth_events(
 			room_id,
@@ -96,8 +97,7 @@ pub async fn create_hash_and_sign_event(
 
 	let mut unsigned = unsigned.unwrap_or_default();
 	if let Some(state_key) = &state_key
-		&& let Ok(prev_pdu) = self
-			.services
+		&& let Ok(prev_pdu) = services_root
 			.state_accessor
 			.room_state_get(room_id, &event_type.to_string().into(), state_key)
 			.await
@@ -125,7 +125,7 @@ pub async fn create_hash_and_sign_event(
 		event_id: ruma::event_id!("$thiswillbereplaced").into(),
 		room_id: room_id.to_owned(),
 		sender: sender.to_owned(),
-		origin: Some(self.services.globals.server_name().to_owned()),
+		origin: Some(services_root.globals.server_name().to_owned()),
 		content,
 		origin_server_ts,
 		kind: event_type,
@@ -178,8 +178,7 @@ pub async fn create_hash_and_sign_event(
 		pdu_json.remove("room_id");
 	}
 
-	pdu.event_id = self
-		.services
+	pdu.event_id = services_root
 		.server_keys
 		.gen_id_hash_and_sign_event(&mut pdu_json, &room_version)?;
 
@@ -202,8 +201,10 @@ async fn compute_prev_events(
 	room_id: &RoomId,
 	event_type: &TimelineEventType,
 ) -> Result<PrevEvents> {
-	let prev_events: PrevEvents = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let prev_events: PrevEvents = services_root
 		.state
 		.get_forward_extremities(room_id)
 		.take(20)

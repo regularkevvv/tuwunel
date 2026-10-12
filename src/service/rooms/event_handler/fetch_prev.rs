@@ -51,13 +51,16 @@ pub(super) async fn fetch_prev<'a, Events>(
 where
 	Events: Iterator<Item = &'a EventId> + Clone + Send,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let has_gap = initial_set
 		.clone()
 		.stream()
 		.any(async |event_id| !self.is_known_prev(event_id).await)
 		.await;
 
-	let wait_ms = self.services.server.config.fetch_prev_wait_ms;
+	let wait_ms = services_root.server.config.fetch_prev_wait_ms;
 	let has_gap = (has_gap && wait_ms > 0)
 		.then_async(|| self.await_prev_gap(initial_set.clone(), Duration::from_millis(wait_ms)))
 		.await
@@ -97,7 +100,7 @@ where
 		.stream()
 		.map(ToOwned::to_owned)
 		.filter_map(async |event_id| {
-			let timeline = &self.services.timeline;
+			let timeline = &services_root.timeline;
 			let unknown = timeline
 				.non_outlier_pdu_exists(&event_id)
 				.await
@@ -121,7 +124,7 @@ where
 	let mut eventid_info = HashMap::new();
 	let mut graph: HashMap<OwnedEventId, _> = HashMap::with_capacity(todo_outlier_stack.len());
 	while let Some((prev_event_id, mut outlier)) = todo_outlier_stack.next().await {
-		self.services.server.check_running()?;
+		services_root.server.check_running()?;
 
 		let Some((pdu, mut json_opt)) = outlier.pop() else {
 			// Fetch and handle failed
@@ -131,7 +134,7 @@ where
 
 		check_room_id(&pdu, room_id)?;
 
-		let limit = self.services.server.config.max_fetch_prev_events;
+		let limit = services_root.server.config.max_fetch_prev_events;
 		if amount > limit {
 			debug_warn!(?limit, "Max prev event limit reached!");
 			graph.insert(prev_event_id.clone(), Default::default());
@@ -139,8 +142,7 @@ where
 		}
 
 		if json_opt.is_none() {
-			json_opt = self
-				.services
+			json_opt = services_root
 				.timeline
 				.get_outlier_pdu_json(&prev_event_id)
 				.await
@@ -230,6 +232,9 @@ async fn await_prev_gap<'a, Events>(&self, initial_set: Events, wait: Duration) 
 where
 	Events: Iterator<Item = &'a EventId> + Send,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let deadline = Instant::now()
 		.checked_add(wait)
 		.expect("wait deadline overflows");
@@ -237,7 +242,7 @@ where
 	// Each watcher registers before its existence recheck, so a prev that
 	// arrives during the recheck still wakes us.
 	let pending: FuturesUnordered<_> = initial_set
-		.map(|event_id| (event_id, self.services.timeline.watch_event(event_id)))
+		.map(|event_id| (event_id, services_root.timeline.watch_event(event_id)))
 		.stream()
 		.filter_map(async |(event_id, watcher)| {
 			(!self.is_known_prev(event_id).await).then_some(watcher)
@@ -258,7 +263,10 @@ where
 /// event or an outlier, or it rejected it.
 #[implement(super::Service)]
 async fn is_known_prev(&self, event_id: &EventId) -> bool {
-	let timeline = &self.services.timeline;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let timeline = &services_root.timeline;
 
 	timeline.pdu_exists(event_id).await || timeline.is_pdu_rejected(event_id).await
 }
@@ -279,8 +287,10 @@ async fn prefetch_missing_events(
 	room_version: &RoomVersionId,
 	recursion_level: usize,
 ) {
-	let boundary: EventWindow = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let boundary: EventWindow = services_root
 		.state
 		.get_forward_extremities(room_id)
 		.map(ToOwned::to_owned)
@@ -295,7 +305,7 @@ async fn prefetch_missing_events(
 		.attempt_limit(super::EVENT_FETCH_ATTEMPT_LIMIT)
 		.fanout_for_op();
 
-	let Ok(outcome) = self.services.fetcher.fetch(opts).await else {
+	let Ok(outcome) = services_root.fetcher.fetch(opts).await else {
 		return;
 	};
 

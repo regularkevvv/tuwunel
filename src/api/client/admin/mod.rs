@@ -66,8 +66,8 @@ async fn authorize(services: &crate::State, caller: &UserId, target: &UserId) ->
 pub(crate) async fn require_admin(services: &crate::State, sender: &UserId) -> Result {
 	services
 		.admin
-		.user_is_admin(sender)
-		.await
+		.user_is_admin_checked(sender)
+		.await?
 		.then_some(())
 		.ok_or_else(|| {
 			err!(Request(Forbidden("Only server administrators can use this endpoint")))

@@ -9,11 +9,13 @@
 //! timeline showed Bob's leave, her state still had him joined, and she shared
 //! the next room key with him.
 //!
-//! The appservice registry lock holds the writer at a fixed point after its
-//! count retired: the test holds a read guard and queues a writer behind it,
-//! and tokio's fair lock parks the leave's own registry read behind that
-//! writer. Whatever the leave has not made current by then stays stale until
-//! the test lets go.
+//! The test holds a registry read guard and queues a writer behind it, so
+//! tokio's fair lock parks the leave's appservice-admission read behind that
+//! writer. Atomic admission now waits there before committing the event and
+//! retiring its count: neither the timeline nor current membership may advance.
+//! A writer that has already published the leave must also have made it
+//! current; the original timeline-before-state behavior therefore still fails
+//! this check.
 
 use std::{env::var, net::TcpListener, path::PathBuf, process::id as process_id, time::Duration};
 
@@ -136,15 +138,20 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		return Err!("an absent appservice was unregistered");
 	}
 	left?;
-	if !published {
-		return Err!("bob's leave never became visible to sync");
+	if published {
+		assert_eq!(
+			state?,
+			MembershipState::Leave,
+			"sync could see bob's leave while the current state still had him joined"
+		);
+	} else {
+		// Atomic appservice admission may park the entire append before publication.
+		// In that case neither the timeline nor current membership may advance.
+		assert_eq!(state?, MembershipState::Join);
 	}
-
-	assert_eq!(
-		state?,
-		MembershipState::Leave,
-		"sync could see bob's leave while the current state still had him joined"
-	);
+	if !poll_until(|| leave_is_published(services, room, bob)).await {
+		return Err!("bob's leave never became visible after registry release");
+	}
 	assert_eq!(membership(services, room, bob).await?, MembershipState::Leave);
 
 	Ok(())

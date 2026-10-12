@@ -123,10 +123,13 @@ pub fn get_space_children<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = Result<OwnedRoomId>> + Send + 'a {
-	self.services
-		.state_accessor
-		.room_state_keys(room_id, &StateEventType::SpaceChild)
-		.try_filter_map(async |state_key| Ok(OwnedRoomId::parse(state_key.as_str()).ok()))
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state_accessor
+			.room_state_keys(room_id, &StateEventType::SpaceChild)
+			.try_filter_map(async |state_key| Ok(OwnedRoomId::parse(state_key.as_str()).ok()))
+	})
 }
 
 /// Returns the complete, valid m.space.child events of a room.
@@ -134,20 +137,23 @@ pub fn get_space_children<'a>(
 fn get_space_child_events<'a>(
 	&'a self,
 	room_id: &'a RoomId,
-) -> impl Stream<Item = Result<impl Event>> + Send + 'a {
-	self.services
-		.state_accessor
-		.room_state_type_pdus(room_id, &StateEventType::SpaceChild)
-		.try_filter_map(async |pdu| {
-			let content = pdu
-				.get_content::<SpaceChildEventContent>()
-				.map_err(|_| Error::bad_database("Invalid space child state event"))?;
-			let state_key = pdu
-				.state_key()
-				.ok_or_else(|| Error::bad_database("Space child event without state key"))?;
+) -> impl Stream<Item = Result<impl Event + use<>>> + Send + 'a {
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state_accessor
+			.room_state_type_pdus(room_id, &StateEventType::SpaceChild)
+			.try_filter_map(async |pdu| {
+				let content = pdu
+					.get_content::<SpaceChildEventContent>()
+					.map_err(|_| Error::bad_database("Invalid space child state event"))?;
+				let state_key = pdu
+					.state_key()
+					.ok_or_else(|| Error::bad_database("Space child event without state key"))?;
 
-			Ok((!content.via.is_empty() && RoomId::parse(state_key).is_ok()).then_some(pdu))
-		})
+				Ok((!content.via.is_empty() && RoomId::parse(state_key).is_ok()).then_some(pdu))
+			})
+	})
 }
 
 /// With the given identifier, checks if a room is accessible
@@ -168,10 +174,12 @@ async fn is_accessible_child(
 	join_rule: &JoinRuleSummary,
 	sender: &Identifier<'_>,
 ) -> bool {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if let Identifier::ServerName(server_name) = sender {
 		// Checks if ACLs allow for the server to participate
-		if self
-			.services
+		if services_root
 			.event_handler
 			.acl_check(server_name, current_room)
 			.await
@@ -182,13 +190,11 @@ async fn is_accessible_child(
 	}
 
 	if let Identifier::UserId(user_id) = sender {
-		let is_joined = self
-			.services
+		let is_joined = services_root
 			.state_cache
 			.is_joined(user_id, current_room);
 
-		let is_invited = self
-			.services
+		let is_invited = services_root
 			.state_cache
 			.is_invited(user_id, current_room);
 
@@ -213,13 +219,13 @@ async fn is_accessible_child(
 				.stream()
 				.any(async |room| match sender {
 					| Identifier::UserId(user) =>
-						self.services
+						services_root
 							.state_cache
 							.is_joined(user, room)
 							.await,
 
 					| Identifier::ServerName(server) =>
-						self.services
+						services_root
 							.state_cache
 							.server_in_room(server, room)
 							.await,

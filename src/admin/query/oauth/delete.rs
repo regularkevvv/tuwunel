@@ -16,13 +16,17 @@ pub(super) async fn oauth_delete(&self, id: SessionOrUserId, force: bool) -> Res
 
 	match &id {
 		| Left(sess_id) => {
-			self.services.oauth.sessions.delete(sess_id).await;
+			self.services
+				.oauth
+				.sessions
+				.delete(sess_id)
+				.await?;
 		},
 		| Right(user_id) => {
 			self.services
 				.oauth
 				.delete_user_sessions(user_id)
-				.await;
+				.await?;
 		},
 	}
 

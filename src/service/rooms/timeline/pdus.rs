@@ -1,12 +1,11 @@
 use futures::{
-	Stream, StreamExt, TryFutureExt, TryStreamExt,
+	Stream, TryFutureExt, TryStreamExt,
 	future::Either::{Left, Right},
 };
-use ruma::{MilliSecondsSinceUnixEpoch, RoomId, UInt, UserId, api::Direction};
+use ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId, UInt, UserId, api::Direction};
 use tuwunel_core::{
-	Result, at, err, implement,
+	Error, Result, at, err, implement,
 	matrix::pdu::{PduCount, PduEvent},
-	trace,
 	utils::{
 		result::LogErr,
 		stream::{TryIgnore, TryReadyExt, TryWidebandExt},
@@ -29,44 +28,6 @@ pub fn bias_count(count: [u8; 8]) -> u64 {
 }
 
 #[implement(super::Service)]
-pub async fn delete_pdus(&self, room_id: &RoomId) -> Result {
-	let current = self
-		.count_to_id(room_id, PduCount::min(), Direction::Forward)
-		.await?;
-
-	let prefix = current.shortroomid();
-	let stream = self
-		.db
-		.pduid_pdu
-		.raw_stream_from(&current)
-		.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)));
-	futures::pin_mut!(stream);
-	while let Some(item) = stream.next().await {
-		let (key, value) = item?;
-		{
-			let pdu = serde_json::from_slice::<PduEvent>(value)?;
-			let ts: u64 = pdu.origin_server_ts.into();
-			let event_id = &pdu.event_id;
-
-			let mut txn = self.db.db.txn();
-
-			txn.del_raw(&self.db.pduid_pdu, key);
-			txn.del_raw(&self.db.eventid_pduid, event_id);
-			txn.del_raw(&self.db.eventid_outlierpdu, event_id);
-
-			let room_id_ts_key = (room_id, ts, bias_count(RawPduId::from(key).count()));
-			txn.del(&self.db.roomid_tscount_pducount, room_id_ts_key);
-
-			txn.execute().await?;
-
-			trace!(?event_id, ?room_id, ?ts, ?key, "Removed");
-		}
-	}
-
-	Ok(())
-}
-
-#[implement(super::Service)]
 pub fn pdus_near_ts(
 	&self,
 	user_id: Option<&UserId>,
@@ -81,7 +42,7 @@ pub fn pdus_near_ts(
 				.map_ok(|pdu| (pdu_id, pdu))
 				.await
 		})
-		.ready_and_then(move |item| Self::each_pdu(item, user_id))
+		.ready_and_then(move |item| Self::each_pdu(item, user_id, room_id))
 }
 
 #[implement(super::Service)]
@@ -91,37 +52,38 @@ pub fn pdu_ids_near_ts(
 	ts: MilliSecondsSinceUnixEpoch,
 	dir: Direction,
 ) -> impl Stream<Item = Result<(MilliSecondsSinceUnixEpoch, PduId)>> + Send {
-	use Direction::{Backward, Forward};
+	let services_guard = self.services.get();
+	crate::once_services::services_stream!(services_guard, services_root, {
+		use Direction::{Backward, Forward};
 
-	type KeyVal<'a> = ((&'a RoomId, UInt, u64), i64);
+		type KeyVal = ((OwnedRoomId, UInt, u64), i64);
 
-	let ts: u64 = ts.get().into();
+		let ts: u64 = ts.get().into();
 
-	self.services
-		.short
-		.get_shortroomid(room_id)
-		.map_err(|e| err!(Request(NotFound("Room not found: {e:?}"))))
-		.map_ok(move |shortroomid| {
-			match dir {
-				| Forward => Left(self.db.roomid_tscount_pducount.stream_from(&(
-					room_id,
-					ts,
-					u64::MIN,
-				))),
-				| Backward => Right(self.db.roomid_tscount_pducount.rev_stream_from(&(
-					room_id,
-					ts,
-					u64::MAX,
-				))),
-			}
-			.ready_try_take_while(
-				move |((room_id_, ..), _): &KeyVal<'_>| Ok(room_id == *room_id_),
-			)
-			.map_ok(move |((_, ts, _), count)| {
-				(MilliSecondsSinceUnixEpoch(ts), PduId { shortroomid, count: count.into() })
+		services_root
+			.short
+			.get_shortroomid(room_id)
+			.map_err(|e| err!(Request(NotFound("Room not found: {e:?}"))))
+			.map_ok(move |shortroomid| {
+				match dir {
+					| Forward => Left(self.db.roomid_tscount_pducount.stream_from(&(
+						room_id,
+						ts,
+						u64::MIN,
+					))),
+					| Backward => Right(self.db.roomid_tscount_pducount.rev_stream_from(&(
+						room_id,
+						ts,
+						u64::MAX,
+					))),
+				}
+				.ready_try_take_while(move |((room_id_, ..), _): &KeyVal| Ok(room_id == room_id_))
+				.map_ok(move |((_, ts, _), count)| {
+					(MilliSecondsSinceUnixEpoch(ts), PduId { shortroomid, count: count.into() })
+				})
 			})
-		})
-		.try_flatten_stream()
+			.try_flatten_stream()
+	})
 }
 
 /// Returns an iterator over all PDUs in a room. Unknown rooms produce no
@@ -155,7 +117,7 @@ pub fn pdus<'a>(
 				.pduid_pdu
 				.raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
-				.ready_and_then(move |item| Self::each_slice(item, user_id))
+				.and_then(move |item| Box::pin(self.each_slice(item, user_id, room_id)))
 		})
 		.try_flatten_stream()
 }
@@ -178,7 +140,7 @@ pub fn pdus_rev<'a>(
 				.pduid_pdu
 				.rev_raw_stream_from(&current)
 				.ready_try_take_while(move |(key, _)| Ok(key.starts_with(&prefix)))
-				.ready_and_then(move |item| Self::each_slice(item, user_id))
+				.and_then(move |item| Box::pin(self.each_slice(item, user_id, room_id)))
 		})
 		.try_flatten_stream()
 }
@@ -197,18 +159,40 @@ pub fn outlier_pdus_raw(&self) -> impl Stream<Item = Result<Val<'_>>> + Send {
 }
 
 #[implement(super::Service)]
-fn each_slice((pdu_id, pdu): KeyVal<'_>, user_id: Option<&UserId>) -> Result<PdusIterItem> {
-	let pdu_id: RawPduId = pdu_id.into();
-	let pdu = serde_json::from_slice::<PduEvent>(pdu)?;
-
-	Self::each_pdu((pdu_id, pdu), user_id)
+async fn each_slice(
+	&self,
+	(pdu_id, pdu): KeyVal<'_>,
+	user_id: Option<&UserId>,
+	room_id: &RoomId,
+) -> Result<PdusIterItem> {
+	let pdu_id = RawPduId::from_bytes(pdu_id)?;
+	let pdu = serde_json::from_slice::<PduEvent>(pdu)
+		.map_err(|_| Error::bad_database("Invalid stored timeline event"))?;
+	let accepted_id = self
+		.get_pdu_id(&pdu.event_id)
+		.await
+		.map_err(|error| {
+			if error.is_not_found() {
+				Error::bad_database("Missing stored timeline event index")
+			} else {
+				error
+			}
+		})?;
+	if accepted_id != pdu_id {
+		return Err(Error::bad_database("Mismatched stored timeline event index"));
+	}
+	Self::each_pdu((pdu_id, pdu), user_id, room_id)
 }
 
 #[implement(super::Service)]
 fn each_pdu(
 	(pdu_id, mut pdu): (RawPduId, PduEvent),
 	user_id: Option<&UserId>,
+	room_id: &RoomId,
 ) -> Result<PdusIterItem> {
+	if pdu.room_id.as_str() != room_id.as_str() {
+		return Err(Error::bad_database("Mismatched stored timeline event room"));
+	}
 	pdu.remove_transaction_id_unless_sender(user_id);
 	pdu.add_age().log_err().ok();
 

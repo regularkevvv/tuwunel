@@ -1,18 +1,11 @@
-use futures::StreamExt;
 use tuwunel_core::Result;
 
-use crate::{PAGE_SIZE, admin_command, get_room_info};
+use crate::{PAGE_SIZE, admin_command, utils::bounded_room_listing};
 
 #[admin_command]
 pub(super) async fn directory_list(&self, page: Option<usize>) -> Result {
 	let page = page.unwrap_or(1);
-	let mut rooms: Vec<_> = self
-		.services
-		.directory
-		.public_rooms()
-		.then(|room_id| get_room_info(self.services, room_id))
-		.collect()
-		.await;
+	let mut rooms = bounded_room_listing(self.services, true, false, false).await?;
 
 	rooms.sort_by_key(|r| r.1);
 	rooms.reverse();

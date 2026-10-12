@@ -36,6 +36,13 @@ pub(crate) enum UsersCommand {
 		/// Only list historical user ids
 		#[arg(long)]
 		historical: bool,
+		/// Resume strictly after this inventory row, including filtered rows.
+		#[arg(long)]
+		after: Option<OwnedUserId>,
+		/// Maximum inventory rows included in a page; one lookahead detects
+		/// more.
+		#[arg(short, long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=32))]
+		limit: u16,
 	},
 
 	PasswordHash {

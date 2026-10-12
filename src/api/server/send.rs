@@ -560,7 +560,9 @@ async fn handle_edu_receipt_room_user(
 					content: ReceiptEventContent(content.into()),
 					room_id: room_id.to_owned(),
 				})
-				.await;
+				.await
+				.log_err()
+				.ok();
 		})
 		.await;
 }
@@ -643,7 +645,9 @@ async fn handle_edu_device_list_update(
 	services
 		.users
 		.mark_device_key_update(&user_id)
-		.await;
+		.await
+		.log_err()
+		.ok();
 }
 
 async fn handle_edu_direct_to_device(

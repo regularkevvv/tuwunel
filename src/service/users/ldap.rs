@@ -23,10 +23,13 @@ const SEARCH_TIMELIMIT: i32 = 10;
 /// to true if the user is an admin.
 #[implement(super::Service)]
 pub async fn search_ldap(&self, user_id: &UserId) -> Result<Vec<(String, bool)>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let localpart = user_id.localpart().to_owned();
 	let lowercased_localpart = localpart.to_lowercase();
 
-	let config = &self.services.config.ldap;
+	let config = &services_root.config.ldap;
 
 	let (driver, mut ldap) = self.ldap_connect().await?;
 
@@ -157,8 +160,10 @@ pub async fn auth_ldap(&self, user_dn: &str, password: &str) -> Result {
 
 #[implement(super::Service)]
 async fn ldap_connect(&self) -> Result<(JoinHandle<()>, Ldap)> {
-	let uri = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let uri = services_root
 		.config
 		.ldap
 		.uri
@@ -166,13 +171,13 @@ async fn ldap_connect(&self) -> Result<(JoinHandle<()>, Ldap)> {
 		.ok_or_else(|| err!(Ldap(error!("LDAP URI is not configured."))))?;
 
 	if uri.scheme().starts_with("ldaps") {
-		self.services.globals.init_rustls_provider()?;
+		services_root.globals.init_rustls_provider()?;
 	}
 
 	let settings = LdapConnSettings::new()
 		.set_conn_timeout(CONN_TIMEOUT)
 		.set_no_tls_verify(
-			self.services
+			services_root
 				.config
 				.allow_invalid_tls_certificates,
 		);
@@ -185,7 +190,7 @@ async fn ldap_connect(&self) -> Result<(JoinHandle<()>, Ldap)> {
 			err!(Ldap("LDAP connection failed"))
 		})?;
 
-	let driver = self.services.server.runtime().spawn(async move {
+	let driver = services_root.server.runtime().spawn(async move {
 		match conn.drive().await {
 			| Err(e) => error!("LDAP connection error: {e}"),
 			| Ok(()) => debug!("LDAP connection completed."),
@@ -201,7 +206,10 @@ async fn ldap_connect(&self) -> Result<(JoinHandle<()>, Ldap)> {
 #[implement(super::Service)]
 #[must_use]
 pub fn ldap_bind_dn(&self, localpart: &str) -> Option<String> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.server
 		.config
 		.ldap

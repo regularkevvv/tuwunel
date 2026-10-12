@@ -6,7 +6,7 @@ use std::{
 	time::Instant,
 };
 
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, RoomId, RoomVersionId, ServerName,
 	events::StateEventType, room_version_rules::RoomVersionRules,
@@ -28,10 +28,10 @@ use super::{
 	state_local_build::WalkMode,
 };
 use crate::rooms::{
-	state::{RoomMutexGuard, Trigger, prune_goal},
+	state::{Trigger, prune_goal},
 	state_compressor::{CompressedState, HashSetCompressStateEvent},
 	state_res::{AuthCheckOutcome, auth_check},
-	timeline::RawPduId,
+	timeline::{Effect, RawPduId},
 };
 
 #[cfg(test)]
@@ -76,16 +76,16 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	room_version: &RoomVersionId,
 	recursion_level: usize,
 	create_event_id: &EventId,
+	federate: bool,
 ) -> Result<Option<(RawPduId, bool)>> {
-	// Skip the PDU if we already have it as a timeline event
-	if let Ok(pdu_id) = self
-		.services
-		.timeline
-		.get_pdu_id(incoming_pdu.event_id())
-		.await
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if let Some(raw) = self
+		.known_timeline_pdu(room_id, incoming_pdu.event_id(), federate, None)
+		.await?
 	{
-		debug!(?pdu_id, "Exists.");
-		return Ok(Some((pdu_id, false)));
+		return Ok(Some((raw, false)));
 	}
 
 	trace!("Upgrading to timeline pdu");
@@ -125,7 +125,15 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	// 13. Use state resolution to find new room state
 	// We start looking at current room state now, so lets lock the room
 	trace!("Locking the room");
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let state_lock = services_root.state.mutex.lock(room_id).await;
+	// Another delivery may have accepted this event while authentication and
+	// state reconstruction ran. Recheck inside the canonical room exclusion.
+	if let Some(raw) = self
+		.known_timeline_pdu(room_id, incoming_pdu.event_id(), federate, Some(&state_lock))
+		.await?
+	{
+		return Ok(Some((raw, false)));
+	}
 
 	// 14. Check if the event passes auth based on the current room state.
 	let soft_fail_current_state = !self
@@ -138,7 +146,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 		.compute_remaining_extremities(room_id, &incoming_pdu)
 		.await;
 
-	let config = &self.services.server.config;
+	let config = &services_root.server.config;
 	let max = config.forward_extremities_max;
 	let len = extremities
 		.len()
@@ -152,8 +160,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 			config.forward_extremities_prune_batch,
 		);
 
-		let summary = self
-			.services
+		let summary = services_root
 			.state
 			.prune_forward_extremities(room_id, &mut extremities, goal, Trigger::Receive)
 			.await;
@@ -162,17 +169,16 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	}
 
 	trace!("Compressing state...");
-	let state_ids_compressed: Arc<CompressedState> = self
-		.services
+	let state_ids_compressed: Arc<CompressedState> = services_root
 		.state_compressor
 		.compress_state_events(
 			state_at_incoming_event
 				.iter()
 				.map(|(ssk, eid)| (ssk, eid.borrow())),
 		)
-		.collect()
-		.map(Arc::new)
-		.await;
+		.try_collect()
+		.map_ok(Arc::new)
+		.await?;
 
 	// Memoize only complete local or fetched state after positional auth succeeds;
 	// soft-failed events cannot establish reusable state.
@@ -183,32 +189,28 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 
 	// A soft-failed event is not a forward extremity, so it never drives the
 	// room's current state; only an accepted state event resolves forward.
-	if incoming_pdu.state_key().is_some() && !soft_fail {
-		self.resolve_and_force_state_after(
+	let resolved = self
+		.resolve_state_after(
 			room_id,
 			room_version,
 			&incoming_pdu,
 			&state_at_incoming_event,
-			&state_lock,
+			soft_fail,
 		)
 		.boxed()
 		.await?;
-	}
 
 	// We use the `state_at_event` instead of `state_after` so we accurately
 	// represent the state for this event.
 	trace!("Appending pdu to timeline");
 
 	// Incoming event will be referenced in prev_events unless soft-failed.
-	let incoming_extremity = once(incoming_pdu.event_id()).filter(|_| !soft_fail);
-
 	let extremities = extremities
 		.iter()
 		.map(Borrow::borrow)
-		.chain(incoming_extremity);
+		.chain(once(incoming_pdu.event_id()).filter(|_| !soft_fail));
 
-	let pdu_id = self
-		.services
+	let pdu_id = services_root
 		.timeline
 		.append_incoming_pdu(
 			&incoming_pdu,
@@ -216,9 +218,18 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 			extremities,
 			state_ids_compressed,
 			soft_fail,
+			resolved
+				.as_ref()
+				.map(|state| state.shortstatehash),
+			federate,
 			&state_lock,
 		)
 		.await?;
+
+	if let Some(resolved) = resolved.filter(|_| pdu_id.is_some()) {
+		self.finish_resolved_membership(room_id, &incoming_pdu, resolved, &state_lock)
+			.await;
+	}
 
 	debug_assert!(
 		pdu_id.is_some() || soft_fail,
@@ -226,7 +237,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	);
 
 	if soft_fail {
-		self.services
+		services_root
 			.pdu_metadata
 			.mark_event_soft_failed(incoming_pdu.event_id())
 			.await?;
@@ -249,13 +260,8 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	drop(state_lock);
 
 	if cleared {
-		self.services
-			.pdu_metadata
-			.clear_event_soft_failed(incoming_pdu.event_id())
+		self.clear_accepted_soft_fail(incoming_pdu.event_id())
 			.await?;
-
-		self.record_success(Context::Upgrade, incoming_pdu.event_id())
-			.await;
 	}
 
 	debug_info!(
@@ -264,6 +270,18 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	);
 
 	Ok(pdu_id.zip(Some(true)))
+}
+
+#[implement(super::Service)]
+async fn clear_accepted_soft_fail(&self, event: &EventId) -> Result {
+	self.services
+		.get()
+		.as_ref()
+		.pdu_metadata
+		.clear_event_soft_failed(event)
+		.await?;
+	self.record_success(Context::Upgrade, event).await;
+	Ok(())
 }
 
 #[implement(super::Service)]
@@ -279,9 +297,11 @@ async fn current_state_auth_passes(
 	incoming_pdu: &PduEvent,
 	room_rules: &RoomVersionRules,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	trace!("Gathering current-state auth events.");
-	let auth_events = self
-		.services
+	let auth_events = services_root
 		.state
 		.get_auth_events(
 			room_id,
@@ -360,10 +380,12 @@ async fn soft_fail_standing(
 	room_rules: &RoomVersionRules,
 	pdu_json: &mut CanonicalJsonObject,
 ) -> Result<Standing> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = incoming_pdu.event_id();
 
-	if !self
-		.services
+	if !services_root
 		.pdu_metadata
 		.is_event_soft_failed(event_id)
 		.await
@@ -406,7 +428,10 @@ async fn soft_fail_standing(
 async fn rejected_prevs_replaced(&self, incoming_pdu: &PduEvent) -> Option<PduEvent> {
 	const REJECTED_WALK_LIMIT: usize = 64;
 
-	let timeline = &self.services.timeline;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let timeline = &services_root.timeline;
 	let mut replaced = false;
 	let mut walked = 0_usize;
 	let mut seen = HashSet::new();
@@ -449,6 +474,9 @@ async fn resolve_state_at_incoming_event(
 	recursion_level: usize,
 	create_event_id: &EventId,
 ) -> Result<(HashMap<u64, OwnedEventId>, ResolvedVia)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// 10. Fetch missing state and auth chain events by calling /state_ids at
 	//     backwards extremities doing all the checks in this list starting at 1.
 	//     These are not timeline events.
@@ -470,7 +498,7 @@ async fn resolve_state_at_incoming_event(
 		return Ok((state, ResolvedVia::Derived));
 	}
 
-	let config = &self.services.server.config;
+	let config = &services_root.server.config;
 	let enabled = config.resolve_state_locally && config.resolve_state_locally_max > 0;
 
 	if enabled {
@@ -544,14 +572,16 @@ async fn auth_check_outlier_pdu(
 	room_rules: &RoomVersionRules,
 	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
 ) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Every event holding a `shorteventid_shortstatehash` row passed spec check 5
 	// (auth against the state at its own position) as a hard reject; soft failure
 	// (spec check 6) still writes the row, so soft-failed events are valid fold
 	// inputs while positionally rejected events never gain a row.
 
 	let state_fetch = async |k: StateEventType, s: StateKey| {
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_shortstatekey(&k, s.as_str())
 			.await?;
@@ -564,7 +594,7 @@ async fn auth_check_outlier_pdu(
 				)))
 			})?;
 
-		self.services
+		services_root
 			.timeline
 			.get_pdu(event_id)
 			.await
@@ -601,13 +631,15 @@ async fn compute_soft_fail(
 	room_rules: &RoomVersionRules,
 	pdu_json: &mut CanonicalJsonObject,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Soft fail check before doing state res
 	trace!("Performing soft-fail check");
 	let soft_fail_redact = match incoming_pdu.redacts_id(room_rules) {
 		| None => false,
 		| Some(redact_id) =>
-			!self
-				.services
+			!services_root
 				.state_accessor
 				.user_can_redact(&redact_id, incoming_pdu.sender(), incoming_pdu.room_id(), true)
 				.await?,
@@ -628,11 +660,13 @@ async fn compute_remaining_extremities(
 	room_id: &RoomId,
 	incoming_pdu: &PduEvent,
 ) -> Vec<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Now we calculate the set of extremities this room has after the incoming
 	// event has been applied. We start with the previous extremities (aka leaves)
 	trace!("Calculating extremities");
-	let extremities: Vec<_> = self
-		.services
+	let extremities: Vec<_> = services_root
 		.state
 		.get_forward_extremities(room_id)
 		.ready_filter(|&event_id| {
@@ -644,7 +678,7 @@ async fn compute_remaining_extremities(
 		.map(ToOwned::to_owned)
 		.broad_filter_map(|event_id| async move {
 			// Only keep those extremities were not referenced yet
-			self.services
+			services_root
 				.pdu_metadata
 				.is_event_referenced(room_id, &event_id)
 				.await
@@ -664,24 +698,29 @@ async fn compute_remaining_extremities(
 }
 
 #[implement(super::Service)]
-async fn resolve_and_force_state_after(
+async fn resolve_state_after(
 	&self,
 	room_id: &RoomId,
 	room_version: &RoomVersionId,
 	incoming_pdu: &PduEvent,
 	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
-	state_lock: &RoomMutexGuard,
-) -> Result {
+	soft_fail: bool,
+) -> Result<Option<HashSetCompressStateEvent>> {
+	if soft_fail || incoming_pdu.state_key().is_none() {
+		return Ok(None);
+	}
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// We also add state after incoming event to the fork states
 	let mut state_after = state_at_incoming_event.clone();
 	if let Some(state_key) = incoming_pdu.state_key() {
 		let event_id = incoming_pdu.event_id();
 		let event_type = incoming_pdu.kind();
-		let shortstatekey = self
-			.services
+		let shortstatekey = services_root
 			.short
 			.get_or_create_shortstatekey(&event_type.to_string().into(), state_key)
-			.await;
+			.await?;
 
 		state_after.insert(shortstatekey, event_id.to_owned());
 		// Now it's the state after the event.
@@ -703,22 +742,30 @@ async fn resolve_and_force_state_after(
 
 	// Set the new room state to the resolved state
 	trace!("Saving resolved state.");
-	let HashSetCompressStateEvent { shortstatehash, added, removed } = self
-		.services
+	services_root
 		.state_compressor
 		.save_state(room_id, new_room_state)
-		.await?;
+		.await
+		.map(Some)
+}
 
-	debug!(
-		?shortstatehash,
-		added = added.len(),
-		removed = removed.len(),
-		"Forcing new room state."
-	);
+/// Current state was already published by the canonical commit. Derived
+/// membership must not change before that acceptance boundary.
+#[implement(super::Service)]
+async fn finish_resolved_membership(
+	&self,
+	room: &RoomId,
+	pdu: &PduEvent,
+	_resolved: HashSetCompressStateEvent,
+	_lock: &crate::rooms::state::RoomMutexGuard,
+) {
+	// Canonical admission already retained and attempted all membership
+	// projections, including resolved changes to users other than the PDU target.
 	self.services
-		.state
-		.force_state(room_id, shortstatehash, added, removed, state_lock)
-		.await?;
-
-	Ok(())
+		.get()
+		.as_ref()
+		.spaces
+		.cache_evict(room)
+		.await
+		.effect("resolved hierarchy", pdu.event_id());
 }

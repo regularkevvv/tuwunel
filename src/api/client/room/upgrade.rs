@@ -279,7 +279,7 @@ async fn upgrade_room_create_legacy(
 	let _short_id = services
 		.short
 		.get_or_create_shortroomid(&new_room_id)
-		.await;
+		.await?;
 
 	// Get the old room creation event
 	let mut content: CanonicalJsonObject = services

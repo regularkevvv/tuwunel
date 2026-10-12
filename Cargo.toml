@@ -54,6 +54,9 @@ features = ["serde"]
 [workspace.dependencies.async-channel]
 version = "2.3.1"
 
+[workspace.dependencies.async-stream]
+version = "=0.3.6"
+
 [workspace.dependencies.async-trait]
 version = "0.1"
 

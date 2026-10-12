@@ -146,13 +146,20 @@ pub(super) enum UserCommand {
 
 	/// - List local users by recent activity.
 	LastActive {
-		#[arg(short, long)]
-		limit: Option<usize>,
+		#[arg(short, long, default_value_t = 48, value_parser = clap::value_parser!(u16).range(1..=64))]
+		limit: u16,
 	},
 
-	/// - List local users in the database
+	/// - List one bounded page of local users in database order
 	#[clap(alias = "list")]
-	ListUsers,
+	ListUsers {
+		/// Resume strictly after this user id (including disabled accounts).
+		#[arg(long)]
+		after: Option<OwnedUserId>,
+		/// Maximum inventory rows per page; one extra row detects continuation.
+		#[arg(short, long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=32))]
+		limit: u16,
+	},
 
 	/// - Lists all the rooms (local and remote) that the specified user is
 	///   joined in

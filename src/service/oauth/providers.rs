@@ -84,7 +84,10 @@ pub async fn get(&self, id: &str) -> Result<Provider> {
 /// provider matches the brand.
 #[implement(Providers)]
 pub fn get_config(&self, id: &str) -> Result<Provider> {
-	let providers = &self.services.config.identity_provider;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let providers = &services_root.config.identity_provider;
 
 	if let Some(provider) = providers
 		.values()
@@ -116,13 +119,16 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 /// by fallback.
 #[implement(Providers)]
 pub fn get_default_id(&self) -> Option<String> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.config
 		.identity_provider
 		.values()
 		.find(|idp| idp.default)
 		.or_else(|| {
-			self.services
+			services_root
 				.config
 				.identity_provider
 				.values()
@@ -166,6 +172,9 @@ async fn get_cached(&self, id: &str) -> Option<Provider> {
 	skip(self),
 )]
 async fn configure(&self, mut provider: Provider) -> Result<Provider> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	_ = provider
 		.name
 		.get_or_insert_with(|| provider.brand.clone());
@@ -268,7 +277,7 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 	}
 
 	if provider.callback_url.is_none()
-		&& let Some(server_url) = self.services.config.well_known.client.as_ref()
+		&& let Some(server_url) = services_root.config.well_known.client.as_ref()
 	{
 		let callback_path =
 			format!("_matrix/client/unstable/login/sso/callback/{}", provider.client_id);
@@ -284,9 +293,11 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 #[implement(Providers)]
 #[tracing::instrument(level = "debug", ret(level = "trace"), skip(self))]
 pub async fn discover(&self, provider: &Provider) -> Result<JsonValue> {
-	let limit = self.services.config.max_response_size;
-	let response = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let limit = services_root.config.max_response_size;
+	let response = services_root
 		.client
 		.oauth
 		.get(discovery_url(provider)?)
@@ -351,14 +362,16 @@ async fn get_cached_jwks(&self, id: &str, min_age: Duration) -> Option<Arc<JwkSe
 #[implement(Providers)]
 #[tracing::instrument(level = "debug", skip(self))]
 async fn fetch_jwks(&self, provider: &Provider) -> Result<JwkSet> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let url = provider
 		.jwks_url
 		.clone()
 		.ok_or_else(|| err!(Config("jwks_url", "Missing JWKS URL in config")))?;
 
-	let limit = self.services.config.max_response_size;
-	let response = self
-		.services
+	let limit = services_root.config.max_response_size;
+	let response = services_root
 		.client
 		.oauth
 		.get(url)

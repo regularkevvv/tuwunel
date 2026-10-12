@@ -22,8 +22,10 @@ pub async fn erased_for_server(
 	origin: &ServerName,
 	mut pdu: CanonicalJsonObject,
 ) -> CanonicalJsonObject {
-	if !self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if !services_root
 		.config
 		.enforce_erasure_over_federation
 	{
@@ -40,7 +42,7 @@ pub async fn erased_for_server(
 		return pdu;
 	};
 
-	if !self.services.users.is_erased(sender).await {
+	if !services_root.users.is_erased(sender).await {
 		return pdu;
 	}
 
@@ -68,8 +70,7 @@ pub async fn erased_for_server(
 		return pdu;
 	};
 
-	let Ok(rules) = self
-		.services
+	let Ok(rules) = services_root
 		.state
 		.get_room_version_rules(room_id)
 		.await
@@ -107,7 +108,10 @@ pub async fn erased_view(&self, user_id: &UserId, pdu: &Pdu) -> Option<Pdu> {
 /// read.
 #[implement(super::Service)]
 pub async fn erased_for(&self, user_id: &UserId, pdu: &Pdu) -> bool {
-	let is_erased = self.services.users.is_erased(pdu.sender());
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let is_erased = services_root.users.is_erased(pdu.sender());
 	let not_joined = self
 		.user_membership_at_pdu(user_id, pdu)
 		.map(|membership| membership.ne(&MembershipState::Join));
@@ -119,8 +123,10 @@ pub async fn erased_for(&self, user_id: &UserId, pdu: &Pdu) -> bool {
 /// `redacted_because`; no redaction event exists for a serve-time erasure.
 #[implement(super::Service)]
 async fn pruned(&self, pdu: &Pdu) -> Option<Pdu> {
-	let rules = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let rules = services_root
 		.state
 		.get_room_version_rules(pdu.room_id())
 		.await

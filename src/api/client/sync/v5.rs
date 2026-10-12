@@ -222,7 +222,7 @@ pub(crate) async fn sync_events_v5_route(
 			.boxed()
 			.await;
 
-		if conn.globalsince < conn.next_batch {
+		if conn.globalsince < conn.next_batch || extensions::to_device_needs_collection(&conn) {
 			let ranges = collect_ranges(sync_info, &conn, &window);
 			let extensions = handle_extensions(sync_info, &conn, &window);
 			let (mut ranges, extensions) = join(ranges, extensions).boxed().await;
@@ -237,6 +237,8 @@ pub(crate) async fn sync_events_v5_route(
 			if !is_empty_response(&response) {
 				response.pos = conn.next_batch.to_string().into();
 				trace!(conn.globalsince, conn.next_batch, "response {response:?}");
+				extensions::acknowledge_to_device(services, sender_user, sender_device, &conn)
+					.await?;
 				conn.store(&services.sync, &conn_key).await?;
 				return Ok(response);
 			}
@@ -252,6 +254,8 @@ pub(crate) async fn sync_events_v5_route(
 		if timeout == 0 || services.server.is_stopping() || waiter().boxed().await {
 			response.pos = conn.next_batch.to_string().into();
 			trace!(conn.globalsince, conn.next_batch, "empty response {response:?}");
+			extensions::acknowledge_to_device(services, sender_user, sender_device, &conn)
+				.await?;
 			conn.store(&services.sync, &conn_key).await?;
 			return Ok(response);
 		}

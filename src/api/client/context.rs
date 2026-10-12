@@ -18,7 +18,7 @@ use tuwunel_core::{
 	ref_at,
 	utils::{
 		BoolExt,
-		stream::{ReadyExt, TryIgnore, WidebandExt},
+		stream::{TryReadyExt, TryWidebandExt},
 	},
 };
 use tuwunel_service::{
@@ -155,10 +155,12 @@ pub(crate) async fn event_context(
 		limit.div_ceil(2),
 	);
 
-	let (base_event, events_before, events_after): (_, Vec<_>, Vec<_>) =
+	let (base_event, events_before, events_after) =
 		join3(base_event, events_before, events_after)
 			.boxed()
 			.await;
+	let events_before = events_before?;
+	let events_after = events_after?;
 
 	let lazy_loading_context = lazy_loading::Context {
 		user_id: sender_user,
@@ -205,6 +207,7 @@ pub(crate) async fn event_context(
 			.bundle_aggregations(sender_user, pdu)
 	}))
 	.await
+	.transpose()?
 	.map(Event::into_format);
 
 	Ok(get_context::v3::Response {
@@ -327,7 +330,7 @@ async fn collect_timeline_half<'a, S>(
 	half: TimelineHalf<'a>,
 	pdus: S,
 	take: usize,
-) -> Vec<PdusIterItem>
+) -> Result<Vec<PdusIterItem>>
 where
 	S: Stream<Item = Result<PdusIterItem>> + Send + 'a,
 {
@@ -340,21 +343,24 @@ where
 		bypass_visibility,
 	} = half;
 
-	pdus.ignore_err()
-		.ready_filter_map(|item| event_filter(item, filter))
-		.wide_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
-		.wide_filter_map(|item| event_filters(services, sender_user, item, bypass_visibility))
+	pdus.ready_try_filter_map(|item| Ok(event_filter(item, filter)))
+		.try_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
+		.try_filter_map(async |item| {
+			Ok(event_filters(services, sender_user, item, bypass_visibility).await)
+		})
 		.take(take)
-		.wide_then(|item| add_membership_unsigned(services, item, sender_user, encrypted))
-		.wide_then(async |(count, pdu)| {
+		.wide_and_then(async |item| {
+			Ok(add_membership_unsigned(services, item, sender_user, encrypted).await)
+		})
+		.wide_and_then(async |(count, pdu)| {
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
-			(count, pdu)
+			Ok((count, pdu))
 		})
-		.collect()
+		.try_collect()
 		.await
 }
 

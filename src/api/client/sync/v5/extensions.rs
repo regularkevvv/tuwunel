@@ -15,6 +15,9 @@ use ruma::{
 		response::{Extensions, Room as ResponseRoom},
 	},
 };
+pub(super) use to_device::{
+	acknowledge as acknowledge_to_device, needs_collection as to_device_needs_collection,
+};
 use tuwunel_core::{Result, apply, at, extract_variant, utils::BoolExt};
 use tuwunel_service::sync::Connection;
 

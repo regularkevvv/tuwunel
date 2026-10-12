@@ -1,20 +1,35 @@
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::{MilliSecondsSinceUnixEpoch, UInt, UserId, api::Direction};
 use synapse_admin_api::users::list_users::{
 	v2::{self, UserMinorDetails},
 	v3,
 };
 use tuwunel_core::{
-	Result,
-	utils::{
-		IterStream, ReadyExt,
-		math::{ruma_from_usize, usize_from_ruma},
-		stream::WidebandExt,
-	},
+	Error, Result,
+	utils::math::{ruma_from_usize, usize_from_ruma},
 };
 
 use crate::{Ruma, client::admin::require_admin};
+
+const MAX_DEVICE_ROWS: usize = 4096;
+const MAX_DEVICE_BYTES: usize = 256 * 1024;
+const MAX_DETAILS_BYTES: usize = 256 * 1024;
+
+struct InventoryBudget {
+	device_rows: usize,
+	device_bytes: usize,
+	detail_bytes: usize,
+}
+
+impl Default for InventoryBudget {
+	fn default() -> Self {
+		Self {
+			device_rows: MAX_DEVICE_ROWS,
+			device_bytes: MAX_DEVICE_BYTES,
+			detail_bytes: MAX_DETAILS_BYTES,
+		}
+	}
+}
 
 /// The `deactivated` query filter, whose semantics differ between v2 and v3.
 #[derive(Clone, Copy)]
@@ -67,7 +82,7 @@ pub(crate) async fn admin_list_users_v2_route(
 		dir: body.dir.unwrap_or(Direction::Forward),
 	};
 
-	let (users, next_token, total) = list_users(services, &params).await;
+	let (users, next_token, total) = list_users(services, &params).await?;
 
 	Ok(v2::Response { users, next_token, total })
 }
@@ -96,7 +111,7 @@ pub(crate) async fn admin_list_users_v3_route(
 		dir: body.dir.unwrap_or(Direction::Forward),
 	};
 
-	let (users, next_token, total) = list_users(services, &params).await;
+	let (users, next_token, total) = list_users(services, &params).await?;
 
 	Ok(v3::Response { users, next_token, total })
 }
@@ -108,13 +123,10 @@ pub(crate) async fn admin_list_users_v3_route(
 async fn list_users(
 	services: crate::State,
 	params: &ListParams<'_>,
-) -> (Vec<UserMinorDetails>, Option<String>, UInt) {
-	let mut names: Vec<String> = services
-		.users
-		.stream()
-		.map(ToString::to_string)
-		.collect()
-		.await;
+) -> Result<(Vec<UserMinorDetails>, Option<String>, UInt)> {
+	// An exact filtered total requires a complete source inventory. Refuse
+	// larger sources rather than paging a silently shortened list.
+	let mut names = services.users.bounded_registered_users().await?;
 
 	names.sort_unstable();
 
@@ -122,13 +134,18 @@ async fn list_users(
 		names.reverse();
 	}
 
-	let matched: Vec<UserMinorDetails> = names
-		.iter()
-		.map(String::as_str)
-		.stream()
-		.wide_filter_map(async |name| user_minor_details(services, name, params).await)
-		.collect()
-		.await;
+	let mut matched = Vec::new();
+	let mut budget = InventoryBudget::default();
+	for user_id in &names {
+		if let Some(details) = user_minor_details(services, user_id, params, &mut budget).await? {
+			let encoded_bytes = serde_json::to_vec(&details)?.len();
+			budget.detail_bytes = budget
+				.detail_bytes
+				.checked_sub(encoded_bytes)
+				.ok_or_else(inventory_limit)?;
+			matched.push(details);
+		}
+	}
 
 	let matched_count = matched.len();
 	let total = ruma_from_usize(matched_count);
@@ -142,7 +159,7 @@ async fn list_users(
 	let end = params.from.saturating_add(page.len());
 	let next_token = (end < matched_count).then(|| end.to_string());
 
-	(page, next_token, total)
+	Ok((page, next_token, total))
 }
 
 /// Applies the substring, admin, locked and deactivated filters to one user and
@@ -150,17 +167,18 @@ async fn list_users(
 /// out.
 async fn user_minor_details(
 	services: crate::State,
-	name: &str,
+	user_id: &UserId,
 	params: &ListParams<'_>,
-) -> Option<UserMinorDetails> {
-	let user_id = UserId::parse(name).ok()?;
+	budget: &mut InventoryBudget,
+) -> Result<Option<UserMinorDetails>> {
+	let name = user_id.as_str();
 
-	let displayname = services.profile.displayname(&user_id).await.ok();
+	let displayname = optional_field(services.profile.displayname(user_id).await)?;
 
 	if let Some(needle) = params.user_id.filter(|_| params.name.is_none())
 		&& !name.contains(needle)
 	{
-		return None;
+		return Ok(None);
 	}
 
 	if let Some(needle) = params.name {
@@ -170,27 +188,26 @@ async fn user_minor_details(
 			.is_some_and(|display| display.contains(needle));
 
 		if !in_localpart && !in_displayname {
-			return None;
+			return Ok(None);
 		}
 	}
 
-	let admin = services.admin.user_is_admin(&user_id).await;
+	let admin = services
+		.admin
+		.user_is_admin_checked(user_id)
+		.await?;
 	if let Some(want_admin) = params.admins
 		&& want_admin != admin
 	{
-		return None;
+		return Ok(None);
 	}
 
-	let locked = services.users.is_locked(&user_id).await;
+	let locked = services.users.is_locked_checked(user_id).await?;
 	if locked && !params.locked {
-		return None;
+		return Ok(None);
 	}
 
-	let deactivated = services
-		.users
-		.is_deactivated(&user_id)
-		.await
-		.unwrap_or(false);
+	let deactivated = services.users.is_deactivated(user_id).await?;
 
 	let keep = match params.deactivated {
 		| DeactivatedFilter::Any | DeactivatedFilter::Include => true,
@@ -199,25 +216,31 @@ async fn user_minor_details(
 	};
 
 	if !keep {
-		return None;
+		return Ok(None);
 	}
 
-	let avatar_url = services
-		.profile
-		.avatar_url(&user_id)
-		.await
-		.ok()
-		.map(|url| url.to_string());
+	let avatar_url =
+		optional_field(services.profile.avatar_url(user_id).await)?.map(|url| url.to_string());
 
-	let erased = services.users.is_erased(&user_id).await;
+	let erased = services.users.is_erased_checked(user_id).await?;
 
-	let last_seen_ts = services
+	let devices = services
 		.users
-		.all_devices_metadata(&user_id)
-		.ready_fold(None, |max, device| max.max(device.last_seen_ts))
-		.await;
+		.bounded_devices_metadata(user_id, budget.device_rows, budget.device_bytes)
+		.await?;
+	budget.device_rows = budget
+		.device_rows
+		.saturating_sub(devices.examined);
+	budget.device_bytes = budget
+		.device_bytes
+		.saturating_sub(devices.encoded_bytes);
+	let last_seen_ts = devices
+		.devices
+		.into_iter()
+		.filter_map(|device| device.last_seen_ts)
+		.max();
 
-	Some(UserMinorDetails {
+	Ok(Some(UserMinorDetails {
 		displayname,
 		avatar_url,
 		admin,
@@ -228,5 +251,23 @@ async fn user_minor_details(
 		// tuwunel has no creation timestamp; emit a 0 sentinel (strict clients reject null).
 		creation_ts: Some(MilliSecondsSinceUnixEpoch(UInt::from(0_u32))),
 		..UserMinorDetails::new(name.to_owned())
-	})
+	}))
+}
+
+fn optional_field<T>(field: Result<T>) -> Result<Option<T>> {
+	match field {
+		| Ok(value) => Ok(Some(value)),
+		| Err(error) if error.is_not_found() => Ok(None),
+		| Err(error) => Err(error),
+	}
+}
+
+fn inventory_limit() -> Error {
+	Error::Request(
+		ruma::api::error::ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData {
+			retry_after: None,
+		}),
+		"User-list inventory limit reached".into(),
+		http::StatusCode::TOO_MANY_REQUESTS,
+	)
 }

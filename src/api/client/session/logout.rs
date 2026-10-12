@@ -1,5 +1,4 @@
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::api::client::session::{logout, logout_all};
 use tuwunel_core::{Result, info};
 
@@ -31,25 +30,9 @@ pub(crate) async fn logout_route(
 	let device_id = body.sender_device()?;
 
 	services
-		.users
-		.remove_device(user_id, device_id)
-		.await;
-
-	services
 		.oauth
-		.clear_device_grants(user_id, device_id)
-		.await;
-
-	// A grant obtained before grants were bound to devices backs every device
-	// that has none of its own, so only the last device out clears it.
-	if services
-		.users
-		.all_device_ids(user_id)
-		.count()
-		.await == 0
-	{
-		services.oauth.clear_user_grants(user_id).await;
-	}
+		.revoke_device_session(user_id, device_id)
+		.await?;
 
 	info!(audit = "logout", %user_id, %device_id, "Device signed out.");
 
@@ -79,12 +62,9 @@ pub(crate) async fn logout_all_route(
 	let user_id = body.sender_user();
 
 	services
-		.users
-		.all_device_ids(user_id)
-		.for_each(|device_id| services.users.remove_device(user_id, device_id))
-		.await;
-
-	services.oauth.clear_user_grants(user_id).await;
+		.oauth
+		.revoke_user_sessions(user_id)
+		.await?;
 
 	info!(audit = "logout_all", %user_id, "Every device of the account signed out.");
 

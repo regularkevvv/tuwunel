@@ -199,8 +199,7 @@ pub fn set_thread_participated(&mut self, participated: bool) -> Result {
 /// the whole bundle: the `sender` keys the erasure gate, the `event_id` loads
 /// the event on a hit.
 #[implement(Pdu)]
-#[must_use]
-pub fn thread_latest_event(&self) -> Option<(OwnedEventId, OwnedUserId)> {
+pub fn thread_latest_event(&self) -> Result<Option<(OwnedEventId, OwnedUserId)>> {
 	#[derive(Deserialize)]
 	struct Relations {
 		#[serde(rename = "m.thread")]
@@ -209,7 +208,7 @@ pub fn thread_latest_event(&self) -> Option<(OwnedEventId, OwnedUserId)> {
 
 	#[derive(Deserialize)]
 	struct Thread {
-		latest_event: Option<Identity>,
+		latest_event: Identity,
 	}
 
 	#[derive(Deserialize)]
@@ -218,16 +217,16 @@ pub fn thread_latest_event(&self) -> Option<(OwnedEventId, OwnedUserId)> {
 		sender: OwnedUserId,
 	}
 
-	let relations: Relations = self
-		.unsigned
-		.as_ref()?
+	let Some(unsigned) = self.unsigned.as_ref() else {
+		return Ok(None);
+	};
+	let relations: Option<Relations> = unsigned
 		.get_field("m.relations")
-		.ok()
-		.flatten()?;
-
-	let identity = relations.thread?.latest_event?;
-
-	Some((identity.event_id, identity.sender))
+		.map_err(|_| err!(Database("Invalid stored thread bundle")))?;
+	Ok(relations
+		.and_then(|relations| relations.thread)
+		.map(|thread| thread.latest_event)
+		.map(|identity| (identity.event_id, identity.sender)))
 }
 
 /// MSC4025: overwrite `unsigned.m.relations.m.thread.latest_event`, serving

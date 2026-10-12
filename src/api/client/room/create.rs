@@ -708,7 +708,7 @@ async fn create_create_event_legacy(
 	let _short_id = services
 		.short
 		.get_or_create_shortroomid(&room_id)
-		.await;
+		.await?;
 
 	let create_content = match &body.creation_content {
 		| Some(content) => {

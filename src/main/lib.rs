@@ -9,6 +9,9 @@ pub mod sentry;
 pub mod server;
 pub mod signals;
 
+#[cfg(any(not(tuwunel_mods), not(feature = "tuwunel_mods")))]
+mod lifecycle;
+
 use std::sync::Arc;
 
 use log as _;
@@ -34,6 +37,7 @@ pub fn run(server: &Arc<Server>, runtime: &Runtime) -> Result {
 
 /// Operate the server normally in release-mode static builds. This will start,
 /// run and stop the server within the asynchronous runtime.
+#[cfg(any(not(tuwunel_mods), not(feature = "tuwunel_mods")))]
 #[tracing::instrument(
     name = "main",
     parent = None,
@@ -45,32 +49,29 @@ pub async fn async_exec(server: &Arc<Server>) -> Result {
 		.runtime()
 		.spawn(signals::enable(server.clone()));
 
-	async_start(server).await?;
-	async_run(server).await?;
-	async_stop(server).await?;
-	signals.await?;
+	let mut cleanup = lifecycle::Process::new(server.clone(), signals);
+	let execution = async {
+		async_start(server).await?;
+		async_run(server).await
+	}
+	.await;
+	let stopped = cleanup.finish().await;
 
 	debug_info!("Exit runtime");
-	Ok(())
+	execution.and(stopped)
 }
 
 #[cfg(any(not(tuwunel_mods), not(feature = "tuwunel_mods")))]
 pub async fn async_start(server: &Arc<Server>) -> Result<Arc<Services>> {
 	extern crate tuwunel_router as router;
 
-	Ok(match router::start(&server.server).await {
-		| Ok(services) => server
-			.services
-			.lock()
-			.await
-			.insert(services)
-			.clone(),
-
+	match router::start(&server.server).await {
+		| Ok(services) => lifecycle::install(server, services).await,
 		| Err(error) => {
 			error!("Critical error starting server: {error}");
-			return Err(error);
+			Err(error)
 		},
-	})
+	}
 }
 
 /// Operate the server normally in release-mode static builds. This will start,
@@ -79,16 +80,11 @@ pub async fn async_start(server: &Arc<Server>) -> Result<Arc<Services>> {
 pub async fn async_run(server: &Arc<Server>) -> Result {
 	extern crate tuwunel_router as router;
 
-	if let Err(error) = router::run(
-		server
-			.services
-			.lock()
-			.await
-			.as_ref()
-			.expect("services initialized"),
-	)
-	.await
-	{
+	let run = {
+		let slot = server.services.lock().await;
+		router::run(slot.as_ref().expect("services initialized"))
+	};
+	if let Err(error) = run.await {
 		error!("Critical error running server: {error}");
 		return Err(error);
 	}
@@ -98,23 +94,28 @@ pub async fn async_run(server: &Arc<Server>) -> Result {
 
 #[cfg(any(not(tuwunel_mods), not(feature = "tuwunel_mods")))]
 pub async fn async_stop(server: &Arc<Server>) -> Result {
+	server.server.shutdown().ok();
+	let cleanup = server.cleanup.join().await;
+	let stopped = async_stop_inner(server).await;
+	cleanup.and(stopped)
+}
+
+#[cfg(any(not(tuwunel_mods), not(feature = "tuwunel_mods")))]
+async fn async_stop_inner(server: &Arc<Server>) -> Result {
 	extern crate tuwunel_router as router;
 
-	if let Err(error) = router::stop(
-		server
-			.services
-			.lock()
-			.await
-			.take()
-			.expect("services initialized"),
-	)
-	.await
-	{
+	server.server.shutdown().ok();
+	let cleanup = server.server.cleanup.join().await;
+	let Some(services) = server.services.lock().await.take() else {
+		return cleanup;
+	};
+	let stopped = router::stop(services).await;
+	if let Err(error) = &stopped {
 		error!("Critical error stopping server: {error}");
-		return Err(error);
 	}
-
-	Ok(())
+	// A caught stop panic may enqueue fallback cleanup after the first join.
+	let remaining = server.server.cleanup.join().await;
+	cleanup.and(stopped).and(remaining)
 }
 
 /// Operate the server in developer-mode dynamic builds. This will start, run,

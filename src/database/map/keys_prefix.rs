@@ -33,6 +33,33 @@ where
 		.map(result_deserialize_key::<K>)
 }
 
+/// Streams at most `limit` typed keys under a serialized prefix. The same
+/// prefix and cap bound remote fetches and commit drains. Borrowed keys must
+/// not be retained across another poll; values are not projected.
+///
+/// # Panics
+///
+/// Panics if the prefix cannot be serialized.
+#[implement(super::Map)]
+pub fn keys_prefix_capped<'a, K, P>(
+	self: &'a Arc<Self>,
+	prefix: &P,
+	limit: usize,
+) -> impl Stream<Item = Result<Key<'_, K>>> + Send + use<'a, K, P>
+where
+	P: Serialize + ?Sized + Debug,
+	K: Deserialize<'a> + Send,
+{
+	let key = serialize_key(prefix).expect("failed to serialize query key");
+	seek_stream_bounded::<stream::Keys<'_>, _>(self, Direction::Forward, Some(&*key), Bound {
+		within: Some(&key),
+		cap: Some(limit),
+	})
+	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
+	.take(limit)
+	.map(result_deserialize_key::<K>)
+}
+
 /// Streams raw keys matching a serialized prefix in ascending order.
 ///
 /// The scan begins at the encoded prefix and stops at the first nonmatching
@@ -59,6 +86,31 @@ where
 		Bound::within(&key),
 	)
 	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
+}
+
+/// Streams at most `limit` raw keys under a serialized prefix. The prefix and
+/// cap also bound remote fetches and commit drains. Callers can charge encoded
+/// key bytes before decoding potentially malformed records.
+///
+/// # Panics
+///
+/// Panics if the prefix cannot be serialized.
+#[implement(super::Map)]
+pub fn keys_prefix_raw_capped<P>(
+	self: &Arc<Self>,
+	prefix: &P,
+	limit: usize,
+) -> impl Stream<Item = Result<Key<'_>>> + Send + use<'_, P>
+where
+	P: Serialize + ?Sized + Debug,
+{
+	let key = serialize_key(prefix).expect("failed to serialize query key");
+	seek_stream_bounded::<stream::Keys<'_>, _>(self, Direction::Forward, Some(&*key), Bound {
+		within: Some(&key),
+		cap: Some(limit),
+	})
+	.try_take_while(move |k: &Key<'_>| future::ok(k.starts_with(&key)))
+	.take(limit)
 }
 
 /// Streams deserialized keys matching a raw prefix in ascending order.

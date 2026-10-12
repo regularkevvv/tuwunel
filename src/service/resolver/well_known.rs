@@ -11,9 +11,11 @@ use crate::client::read_response_capped;
 	skip(self)
 )]
 pub(super) async fn request_well_known(&self, dest: &str) -> Result<Option<DestString>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	trace!("Requesting well known for {dest}");
-	let response = self
-		.services
+	let response = services_root
 		.client
 		.well_known
 		.get(format!("https://{dest}/.well-known/matrix/server"))

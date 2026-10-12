@@ -1,5 +1,4 @@
 use axum::extract::State;
-use futures::FutureExt;
 use ruma::{
 	OwnedRoomId, OwnedUserId,
 	api::federation::membership::create_leave_event,
@@ -117,20 +116,14 @@ pub(crate) async fn create_leave_event_v2_route(
 		.lock(room_id)
 		.await;
 
-	let pdu_id = services
+	let _accepted = services
 		.event_handler
-		.handle_incoming_pdu(origin, room_id, &event_id, value, true)
+		.handle_incoming_pdu_and_federate(origin, room_id, &event_id, value)
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;
 
 	drop(mutex_lock);
-
-	services
-		.sending
-		.send_pdu_room(room_id, &pdu_id)
-		.boxed()
-		.await?;
 
 	Ok(create_leave_event::v2::Response::new())
 }

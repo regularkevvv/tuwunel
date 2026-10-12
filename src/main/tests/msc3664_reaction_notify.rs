@@ -4,10 +4,11 @@ use std::{
 	env::var, fs::remove_dir_all, net::TcpListener, path::PathBuf, process::id as process_id,
 };
 
+use futures::{TryStreamExt, pin_mut};
 use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
-	Err, Result,
+	Err, Result, http,
 	ruma::{
 		EventId, RoomId, UserId,
 		events::{
@@ -139,7 +140,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let before = services
 		.pusher
 		.notification_count(&author, &room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -187,7 +188,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let baseline = services
 		.pusher
 		.notification_count(&author, &room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -281,7 +282,7 @@ async fn replies_notify(
 	let before = services
 		.pusher
 		.highlight_count(author, room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -306,7 +307,7 @@ async fn replies_notify(
 	let baseline = services
 		.pusher
 		.highlight_count(author, room)
-		.await;
+		.await?;
 
 	reader
 		.send(
@@ -361,9 +362,15 @@ async fn cross_room_relations_are_not_followed(
 	let baseline = services
 		.pusher
 		.notification_count(author, room)
-		.await;
+		.await?;
 
-	reader
+	let hidden_id = services.timeline.get_pdu_id(&hidden).await?;
+	let before = relation_snapshot(services, false).await?;
+	let original = services.db["pduid_pdu"]
+		.get(&hidden_id)
+		.await?
+		.to_vec();
+	let reaction = reader
 		.send(
 			room,
 			"m.reaction",
@@ -381,6 +388,122 @@ async fn cross_room_relations_are_not_followed(
 	if notified(services, author, room, baseline.saturating_add(1)).await {
 		return Err!("a relation into another room was followed");
 	}
+	assert_eq!(
+		relation_snapshot(services, false).await?,
+		before,
+		"foreign reaction adds no index"
+	);
+	foreign_relation_forms(services, reader, room, &hidden).await?;
+	assert_eq!(
+		relation_snapshot(services, false).await?,
+		before,
+		"foreign relations add no indexes"
+	);
+	let current_original = services.db["pduid_pdu"]
+		.get(&hidden_id)
+		.await?
+		.to_vec();
+	assert_eq!(current_original, original, "foreign thread must not rewrite its root bundle");
+	corrupt_relation_parent_refuses(services, reader, room, &hidden, &reaction).await?;
+	Ok(())
+}
 
+/// Missing and foreign parents carry uninterpreted content, without derived
+/// rows.
+async fn foreign_relation_forms(
+	services: &Services,
+	reader: &Client<'_>,
+	room: &RoomId,
+	hidden: &EventId,
+) -> Result {
+	let missing = EventId::parse("$msc3664-never-stored:localhost")?;
+	for (scope, parent) in [("foreign", hidden), ("missing", missing.as_ref())] {
+		let before = relation_snapshot(services, false).await?;
+		for kind in ["m.thread", "m.replace", "m.reference", "reply"] {
+			let relation = if kind == "reply" {
+				json!({"m.in_reply_to": {"event_id": parent}})
+			} else {
+				json!({"rel_type": kind, "event_id": parent})
+			};
+			let event = reader
+				.send(
+					room,
+					"m.room.message",
+					&format!("{scope}-{kind}"),
+					&json!({"msgtype": "m.text", "body": "opaque relation", "m.relates_to": relation}),
+				)
+				.await?;
+			services.timeline.get_pdu_id(&event).await?;
+		}
+		assert_eq!(
+			relation_snapshot(services, false).await?,
+			before,
+			"unfollowed relation indexes unchanged"
+		);
+	}
+	Ok(())
+}
+
+type RelationSnapshot = Vec<(String, Vec<u8>, Vec<u8>)>;
+
+async fn relation_snapshot(services: &Services, canonical: bool) -> Result<RelationSnapshot> {
+	let mut maps = vec![
+		"tofrom_relation",
+		"relatesto_typed",
+		"threadid_userids",
+		"threadactivityid_rootid",
+		"threadrootid_latestcount",
+	];
+	if canonical {
+		maps.extend([
+			"pduid_pdu",
+			"eventid_pduid",
+			"roomid_pduleaves",
+			"userdevicetxnid_response",
+		]);
+	}
+	let mut snapshot = Vec::new();
+	for name in maps {
+		let rows = services.db[name].raw_stream();
+		pin_mut!(rows);
+		while let Some((key, value)) = rows.try_next().await? {
+			snapshot.push((name.to_owned(), key.to_vec(), value.to_vec()));
+		}
+	}
+	Ok(snapshot)
+}
+
+/// A real reverse-index mismatch still refuses before any canonical writes.
+async fn corrupt_relation_parent_refuses(
+	services: &Services,
+	reader: &Client<'_>,
+	room: &RoomId,
+	hidden: &EventId,
+	reaction: &EventId,
+) -> Result {
+	let reverse = &services.db["eventid_pduid"];
+	let saved = reverse.get(hidden).await?.to_vec();
+	let wrong = services.timeline.get_pdu_id(reaction).await?;
+	let wrong_bytes: &[u8] = wrong.as_ref();
+	reverse.raw_put(hidden, wrong_bytes).await?;
+	let before = relation_snapshot(services, true).await?;
+	let response = services
+		.client
+		.clients
+		.default
+		.put(reader.url(&format!("rooms/{room}/send/m.reaction/msc3664-corrupt-parent")))
+		.bearer_auth(reader.token)
+		.json(
+			&json!({"m.relates_to": {"event_id": hidden, "rel_type": "m.annotation", "key": "x"}}),
+		)
+		.send()
+		.await?;
+	let after = relation_snapshot(services, true).await?;
+	reverse.raw_put(hidden, saved.as_slice()).await?;
+	assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+	assert_eq!(
+		after, before,
+		"corrupt relation refusal leaves canonical/index/txn rows unchanged"
+	);
 	Ok(())
 }

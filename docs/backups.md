@@ -228,3 +228,34 @@ For the simplest database copy, stop Tuwunel and copy the entire
 `database_path` to independent storage. The copied RocksDB directory can be
 restored without conversion. Copy the `media/` directory and any external media
 storage providers as part of the same backup set.
+
+## Upgrading durable federation deliveries
+
+Before upgrading a database older than native schema 22, close new admissions
+and let the previous writer drain its active outgoing deliveries. Those versions
+did not persist the transaction body and identity needed to distinguish a retry
+from a second delivery after a lost acknowledgement. The new writer refuses a
+nonempty legacy active queue before migration writes. Do not delete or requeue
+those rows to make the check pass. Keep an offline pre-upgrade backup until the
+new writer has passed recovery checks; an older binary must not open the upgraded
+schema.
+
+Native schema 24 also records whether this server accepted a canonical event's
+federation forwarding role. Databases created by earlier writers have no durable
+historical forwarding receipts. Draining active deliveries does not reconstruct
+those receipts: a received remote membership event may have been forwarded and
+acknowledged already, or may never have acquired a resident forwarding role.
+
+For an already-known event without a role record, a repeated membership handshake
+therefore refuses without admitting another delivery or rewriting the event. It
+reports the missing role and preserves the database. New events record their role
+atomically and are unaffected by that historical ambiguity. A missing role on new
+data is corruption and also refuses. Do not manufacture received/owned records,
+change the schema version, or blindly replay historical events.
+
+Automatic historical role reconstruction is not supported. Preserve the original
+backup and seek an event-specific recovery decision based on independent delivery
+evidence. If rollback is required, restore the complete pre-upgrade backup under
+closed admission and use its matching previous writer; do not downgrade the live
+upgraded database. This refusal is a data-preserving limitation, not a claim of
+transparent legacy handshake compatibility.

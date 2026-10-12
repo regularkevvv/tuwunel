@@ -122,7 +122,7 @@ pub(crate) async fn notified(
 			.pusher
 			.notification_count(user_id, room_id)
 			.await
-			.ge(&want)
+			.is_ok_and(|count| count >= want)
 	})
 	.await
 }
@@ -143,7 +143,7 @@ pub(crate) async fn highlighted(
 			.pusher
 			.highlight_count(user_id, room_id)
 			.await
-			.ge(&want)
+			.is_ok_and(|count| count >= want)
 	})
 	.await
 }

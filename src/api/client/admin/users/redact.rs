@@ -34,6 +34,7 @@ const LIMIT_DEFAULT: usize = 1000;
 
 type FailedRedactions = BTreeMap<OwnedEventId, String>;
 
+#[derive(serde::Serialize)]
 struct RedactArgs {
 	user_id: OwnedUserId,
 	rooms: Vec<OwnedRoomId>,
@@ -56,14 +57,6 @@ pub(crate) async fn admin_redact_user_route(
 	require_admin(&services, body.sender_user()).await?;
 
 	let user_id = &body.user_id;
-
-	let in_progress = services
-		.tasks
-		.has_nonterminal(super::REDACT_USER_ACTION, user_id.as_str());
-
-	if in_progress {
-		return Err!(Request(InvalidParam("Redact already in progress for user {user_id}")));
-	}
 
 	let rooms = body
 		.rooms
@@ -98,9 +91,16 @@ pub(crate) async fn admin_redact_user_route(
 		after_ts,
 	};
 
+	let parameters = serde_json::to_value(&args)?;
 	let redact_id = services
 		.tasks
-		.spawn(super::REDACT_USER_ACTION, resource_id, redact_events(services, args))
+		.spawn(
+			super::REDACT_USER_ACTION,
+			resource_id,
+			parameters,
+			Box::pin(redact_events(services, args)),
+		)
+		.await?
 		.to_string();
 
 	Ok(Response { redact_id })

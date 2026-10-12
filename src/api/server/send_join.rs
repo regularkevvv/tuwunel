@@ -252,20 +252,14 @@ async fn create_join_event(
 		.lock(room_id)
 		.await;
 
-	let pdu_id = services
+	let _accepted = services
 		.event_handler
-		.handle_incoming_pdu(&origin, room_id, &event_id, value, true)
+		.handle_incoming_pdu_and_federate(&origin, room_id, &event_id, value)
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;
 
 	drop(mutex_lock);
-
-	// Join event revealed to existing servers.
-	services
-		.sending
-		.send_pdu_room(room_id, &pdu_id)
-		.await?;
 
 	Ok(create_join_event::v2::RoomState {
 		auth_chain,

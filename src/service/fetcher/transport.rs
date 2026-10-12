@@ -47,7 +47,10 @@ impl Transport for FederationTransport {
 		),
 	)]
 	async fn fetch_raw(&self, op: Op, server: &ServerName, opts: &Opts) -> Result<Bytes> {
-		let federation = &self.services.federation;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let federation = &services_root.federation;
 
 		match op {
 			| Op::Event | Op::AuthEvent => {

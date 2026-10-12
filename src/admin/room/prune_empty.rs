@@ -1,5 +1,4 @@
-use futures::{FutureExt, StreamExt};
-use tuwunel_core::{Result, utils::FutureBoolExt};
+use tuwunel_core::Result;
 
 use crate::admin_command;
 
@@ -7,45 +6,31 @@ use crate::admin_command;
 pub(super) async fn room_prune_empty(&self, force: bool) -> Result {
 	let rooms = self
 		.services
-		.metadata
-		.iter_ids()
-		.filter(|room_id| {
-			let has_no_local_users = self
-				.services
-				.state_cache
-				.local_users_in_room(room_id)
-				.boxed()
-				.into_future()
-				.map(|(next, ..)| next.is_none())
-				.boxed();
+		.delete
+		.bounded_empty_local_rooms()
+		.await?;
 
-			let has_no_local_invites = self
-				.services
-				.state_cache
-				.local_users_invited_to_room(room_id)
-				.boxed()
-				.into_future()
-				.map(|(next, ..)| next.is_none())
-				.boxed();
-
-			has_no_local_users.and(has_no_local_invites)
-		})
-		.map(ToOwned::to_owned)
-		.collect::<Vec<_>>()
-		.await;
-
+	let mut deleted = 0_usize;
 	for room_id in &rooms {
 		let state_lock = self.services.state.mutex.lock(room_id).await;
+		// Membership may have changed since the complete preflight.
+		if self
+			.services
+			.state_cache
+			.has_local_membership_checked(room_id)
+			.await?
+		{
+			continue;
+		}
 
 		self.services
 			.delete
 			.delete_room(room_id, force, state_lock)
 			.await?;
+		deleted = deleted.saturating_add(1);
 	}
 
-	let rooms_len = rooms.len();
-
-	write!(self, "Successfully deleted {rooms_len} rooms from our database.").await?;
+	write!(self, "Successfully deleted {deleted} rooms from our database.").await?;
 
 	Ok(())
 }

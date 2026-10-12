@@ -1,37 +1,28 @@
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::{MilliSecondsSinceUnixEpoch, api::client::push::get_notifications, push::Action};
 use tuwunel_core::{
-	Result, at, err,
+	Error, Result, err,
 	matrix::{Event, PduId},
-	utils::{
-		stream::{ReadyExt, WidebandExt},
-		string::to_small_string,
-	},
+	utils::string::to_small_string,
 };
 
 use crate::Ruma;
 
-/// # `GET /_matrix/client/r0/notifications/`
-///
-/// Paginate through the list of events the user has been, or would have been
-/// notified about.
+/// Paginate through notification events. Storage failures refuse the page;
+/// erased/redacted and filtered rows still advance its exclusive cursor.
 pub(crate) async fn get_notifications_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_notifications::v3::Request>,
 ) -> Result<get_notifications::v3::Response> {
 	use get_notifications::v3::Notification;
-
 	let sender_user = body.sender_user();
-
-	let from = body
+	let mut from = body
 		.body
 		.from
 		.as_deref()
 		.map(str::parse)
 		.transpose()
 		.map_err(|e| err!(Request(InvalidParam("Invalid `from' parameter: {e}"))))?;
-
 	let limit: usize = body
 		.body
 		.limit
@@ -39,68 +30,89 @@ pub(crate) async fn get_notifications_route(
 		.transpose()?
 		.unwrap_or(50)
 		.clamp(1, 100);
-
 	let only_highlight = body
 		.body
 		.only
 		.as_deref()
 		.is_some_and(|only| only.contains("highlight"));
-
-	let mut next_token: Option<u64> = None;
-	let notifications = services
-		.pusher
-		.get_notifications(sender_user, from)
-		.ready_filter(|(_, notify)| {
-			if only_highlight && !notify.actions.iter().any(Action::is_highlight) {
-				return false;
+	let mut notifications = Vec::with_capacity(limit);
+	let mut examined = 0_usize;
+	let mut bytes = 0_usize;
+	let mut next_token = None;
+	// Bound work even when every row is filtered. Return progress so the
+	// client can continue rather than repeatedly scanning the same rows.
+	while examined < 512 && notifications.len() < limit {
+		let page_limit = 64
+			.min(limit.saturating_sub(notifications.len()))
+			.min(512_usize.saturating_sub(examined));
+		let page = services
+			.pusher
+			.get_notifications(sender_user, from, page_limit)
+			.await?;
+		if page.is_empty() {
+			next_token = None;
+			break;
+		}
+		let short_page = page.len() < page_limit;
+		for (count, notify, row_bytes) in page {
+			bytes = bytes.saturating_add(row_bytes);
+			if bytes > 4 * 1024 * 1024 {
+				use ruma::api::error::{ErrorKind, LimitExceededErrorData};
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"Notification page byte limit exceeded".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
 			}
-
-			true
-		})
-		.wide_filter_map(async |(count, notify)| {
-			let pdu_id = PduId {
-				shortroomid: notify.sroomid,
-				count: count.into(),
-			};
-
-			let event = services
-				.timeline
-				.get_pdu_from_id(&pdu_id.into())
-				.await
-				.ok()
-				.filter(|event| !event.is_redacted())?;
-
-			let read = services
-				.pusher
-				.last_notification_read(sender_user, event.room_id())
-				.await
-				.is_ok_and(|last_read| last_read.ge(&count));
-
-			let ts = notify
-				.ts
-				.try_into()
-				.map(MilliSecondsSinceUnixEpoch)
-				.ok()?;
-
-			let notification = Notification {
-				room_id: event.room_id().into(),
-				event: event.into_format(),
-				ts,
-				read,
-				profile_tag: notify.tag,
-				actions: notify.actions,
-			};
-
-			Some((count, notification))
-		})
-		.take(limit)
-		.inspect(|(count, _)| {
-			next_token.replace(*count);
-		})
-		.map(at!(1))
-		.collect::<Vec<_>>()
-		.await;
-
+			examined = examined.saturating_add(1);
+			from = Some(count);
+			next_token = Some(count);
+			if !only_highlight || notify.actions.iter().any(Action::is_highlight) {
+				let id = PduId {
+					shortroomid: notify.sroomid,
+					count: count.into(),
+				};
+				let event = match services
+					.timeline
+					.get_pdu_from_id(&id.into())
+					.await
+				{
+					| Ok(event) => Some(event),
+					| Err(error) if error.is_not_found() => None,
+					| Err(error) => return Err(error),
+				};
+				if let Some(event) = event.filter(|event| !event.is_redacted()) {
+					if services
+						.short
+						.get_shortroomid(event.room_id())
+						.await? != notify.sroomid
+					{
+						return Err(Error::bad_database("Notification source room mismatch"));
+					}
+					let read = services
+						.pusher
+						.notification_is_read(sender_user, &event, count)
+						.await?;
+					notifications.push(Notification {
+						room_id: event.room_id().into(),
+						event: event.into_format(),
+						ts: MilliSecondsSinceUnixEpoch(notify.ts.try_into().map_err(|_| {
+							Error::bad_database("Invalid notification timestamp")
+						})?),
+						read,
+						profile_tag: notify.tag,
+						actions: notify.actions,
+					});
+				}
+			}
+			if notifications.len() == limit {
+				break;
+			}
+		}
+		if short_page {
+			break;
+		}
+	}
 	Ok(get_notifications::v3::Response {
 		next_token: next_token.map(to_small_string),
 		notifications,

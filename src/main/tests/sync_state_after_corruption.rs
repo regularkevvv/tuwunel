@@ -20,7 +20,7 @@ const UNSTABLE_REQUEST: &str = "org.matrix.msc4222.use_state_after";
 const UNSTABLE_RESPONSE: &str = "org.matrix.msc4222.state_after";
 
 #[test]
-fn corrupt_state_after_is_scoped_to_one_joined_room() -> Result {
+fn state_after_fallback_preserves_complete_sync_or_refuses_cursor() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 
@@ -178,23 +178,29 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.await?;
 	services.clear_cache().await;
 
-	let omitted = sync(services, base, token, Some(&since), true, Some(STABLE_REQUEST)).await?;
-
-	next_batch(&omitted)?;
-
-	if joined_room(&omitted, &healthy_room)?
-		.get(STABLE_RESPONSE)
-		.is_none()
-	{
-		return Err!("healthy room was lost with corrupt room");
-	}
-
-	if omitted["rooms"]["join"]
-		.get(corrupt_room.as_str())
-		.is_some()
-	{
-		return Err!("room with two corrupt state boundaries was not omitted");
-	}
+	let response = services
+		.client
+		.clients
+		.default
+		.get(format!(
+			"{base}/_matrix/client/v3/sync?timeout=0&since={since}&full_state=true&\
+			 {STABLE_REQUEST}=true"
+		))
+		.bearer_auth(token)
+		.send()
+		.await?;
+	let status = response.status();
+	let body: Value = response.json().await?;
+	assert_eq!(
+		status,
+		tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+		"both corrupt state boundaries must refuse sync: {body}"
+	);
+	assert!(body.get("next_batch").is_none(), "corrupt state cannot advance sync cursor");
+	assert!(
+		body.get("rooms").is_none(),
+		"sync refuses the whole response when a required room fails"
+	);
 
 	Ok(())
 }

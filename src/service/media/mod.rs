@@ -1,3 +1,4 @@
+mod avatars;
 mod data;
 pub(super) mod migrations;
 mod preview;
@@ -10,7 +11,7 @@ mod video;
 use std::{
 	collections::{HashMap, HashSet},
 	path::PathBuf,
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, OnceLock},
 	time::{Duration, Instant, SystemTime},
 };
 
@@ -80,6 +81,20 @@ pub struct UserMediaEntry {
 	pub user_id: Option<OwnedUserId>,
 }
 
+impl UserMediaEntry {
+	fn retained_bytes(&self) -> usize {
+		size_of::<Self>()
+			.saturating_add(self.mxc.as_str().len())
+			.saturating_add(self.media_type.as_ref().map_or(0, String::len))
+			.saturating_add(self.upload_name.as_ref().map_or(0, String::len))
+			.saturating_add(
+				self.user_id
+					.as_ref()
+					.map_or(0, |user| user.as_str().len()),
+			)
+	}
+}
+
 /// One locally-uploaded media item's uploader and storage-object byte length
 /// and modification time, the row shape of the media-statistics scan.
 #[derive(Clone, Debug)]
@@ -100,6 +115,8 @@ struct MXCState {
 pub struct Service {
 	pub(super) db: Data,
 	services: Arc<crate::services::OnceServices>,
+	server: Arc<tuwunel_core::Server>,
+	storage: OnceLock<Arc<crate::storage::Service>>,
 	url_preview_mutex: MutexMap<String, ()>,
 	federation_mutex: MutexMap<String, ()>,
 	quota_mutex: MutexMap<String, ()>,
@@ -128,6 +145,8 @@ impl crate::Service for Service {
 		let service = Arc::new(Self {
 			db: Data::new(args.db),
 			services: args.services.clone(),
+			server: args.server.clone(),
+			storage: OnceLock::new(),
 			url_preview_mutex: MutexMap::new(),
 			federation_mutex: MutexMap::new(),
 			quota_mutex: MutexMap::new(),
@@ -153,8 +172,11 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
-		if self.services.globals.is_read_only()
-			|| self.services.server.config.media_remote_retention == 0
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if services_root.globals.is_read_only()
+			|| services_root.server.config.media_remote_retention == 0
 		{
 			return Ok(());
 		}
@@ -166,7 +188,7 @@ impl crate::Service for Service {
 				| Err(e) => warn!("Failed to remove remote media past its retention: {e}"),
 			}
 
-			let shutdown = self.services.server.until_shutdown();
+			let shutdown = services_root.server.until_shutdown();
 			if tokio::time::timeout(RETENTION_INTERVAL, shutdown)
 				.await
 				.is_ok()
@@ -188,7 +210,10 @@ impl Service {
 		user: &UserId,
 		unused_expires_at: u64,
 	) -> Result {
-		let config = &self.services.server.config;
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		let config = &services_root.server.config;
 
 		// Rate limiting (rc_media_create)
 		let rate = f64::from(config.media_rc_create_per_second);
@@ -379,12 +404,15 @@ impl Service {
 	/// Deletes a file in the database and from the media directory via an MXC
 	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete(&self, mxc: &Mxc<'_>) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// lazy URL-preview media has no file keys of its own; drop its reference
 		// and staged bytes whenever present so a delete can't re-mint the media
 		let had_lazy = self.db.search_lazy_media(mxc).await.is_ok();
 		if had_lazy {
 			let key = mxc.to_string();
-			let mut txn = self.services.db.txn();
+			let mut txn = services_root.db.txn();
 
 			self.db.remove_lazy_media(&mut txn, &key);
 			self.db.remove_lazy_content(&mut txn, &key);
@@ -452,7 +480,7 @@ impl Service {
 	/// currently, this is only practical for local users
 	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete_from_user(&self, user: &UserId) -> Result<usize> {
-		let mxcs = self.db.get_all_user_mxcs(user).await;
+		let mxcs = self.db.get_all_user_mxcs(user).await?;
 		let mut deletion_count: usize = 0;
 
 		for mxc in mxcs {
@@ -490,12 +518,14 @@ impl Service {
 		skip(self),
 	)]
 	pub async fn get_or_fetch(&self, mxc: &Mxc<'_>, timeout_ms: Duration) -> Result<Media> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		if let Ok(media) = self.get(mxc, Some(timeout_ms)).await {
 			return Ok(media);
 		}
 
-		if self
-			.services
+		if services_root
 			.globals
 			.server_is_ours(mxc.server_name)
 		{
@@ -600,6 +630,9 @@ impl Service {
 	/// at most once per item.
 	#[tracing::instrument(level = "debug", skip(self))]
 	async fn fetch_lazy_media(&self, mxc: &Mxc<'_>) -> Result<Media> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		let key = mxc.to_string();
 
 		// bound outbound amplification to one in-flight fetch per mxc; requests
@@ -624,7 +657,7 @@ impl Service {
 					return Err!(Request(NotFound("Media not found.")));
 				};
 
-				let limit = self.services.config.url_preview_max_media_size;
+				let limit = services_root.config.url_preview_max_media_size;
 
 				self.location_request(Fetch::Preview(Agent::Media), &url, limit)
 					.await?
@@ -654,7 +687,7 @@ impl Service {
 			return Err(e);
 		}
 
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 
 		self.db.remove_lazy_media(&mut txn, &key);
 		self.db.remove_lazy_content(&mut txn, &key);
@@ -670,7 +703,10 @@ impl Service {
 	/// can presign (filesystem-only media).
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn redirect_url(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Option<Url>> {
-		if !self.services.config.media_allow_redirect {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		if !services_root.config.media_allow_redirect {
 			return Ok(None);
 		}
 
@@ -696,15 +732,16 @@ impl Service {
 		Ok(urls.next().await)
 	}
 
-	/// Gets all the MXC URIs in our media database
+	/// Gets the complete MXC inventory through 4,096 stored media rows and
+	/// 1 MiB of retained keys. Refuses overflow, malformed URIs or read errors
+	/// before a caller can start deleting media. Thumbnail rows retain their
+	/// existing separate inventory entries.
 	pub async fn get_all_mxcs(&self) -> Result<Vec<OwnedMxcUri>> {
-		let all_keys = self.db.get_all_media_keys().await;
+		let all_keys = self.db.get_all_media_keys().await?;
 
 		let mut mxcs = Vec::with_capacity(all_keys.len());
 
 		for key in all_keys {
-			trace!("Full MXC key from database: {key:?}");
-
 			let mut parts = key.split(|&b| b == 0xFF);
 			let mxc = parts
 				.next()
@@ -718,20 +755,15 @@ impl Service {
 				.transpose()?;
 
 			let Some(mxc_s) = mxc else {
-				debug_warn!(
-					?mxc,
-					"Parsed MXC URL unicode bytes from database but is still invalid"
-				);
-				continue;
+				return Err!(Database("Missing media URI in inventory"));
 			};
 
-			trace!("Parsed MXC key to URL: {mxc_s}");
 			let mxc = OwnedMxcUri::from(mxc_s);
 
 			if mxc.is_valid() {
 				mxcs.push(mxc);
 			} else {
-				debug_warn!("{mxc:?} from database was found to not be valid");
+				return Err!(Database("Invalid media URI in inventory"));
 			}
 		}
 
@@ -744,16 +776,25 @@ impl Service {
 	/// quarantine, url-cache) are not represented.
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn user_media(&self, user: &UserId) -> Result<Vec<UserMediaEntry>> {
-		let entries = self
-			.db
-			.get_all_user_mxcs(user)
-			.await
-			.into_iter()
-			.stream()
-			.broad_filter_map(async |mxc| self.user_media_entry(Some(user), mxc).await)
-			.collect()
-			.await;
-
+		const MAX_RETAINED_BYTES: usize = 1024 * 1024;
+		let mxcs = self.db.get_all_user_mxcs(user).await?;
+		let mut retained = 0_usize;
+		let mut entries = Vec::new();
+		for mxc in mxcs {
+			if let Some(entry) = self.user_media_entry_checked(user, mxc).await? {
+				retained = retained.saturating_add(entry.retained_bytes());
+				if retained > MAX_RETAINED_BYTES {
+					return Err(Error::Request(
+						ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData {
+							retry_after: None,
+						}),
+						"User media retained metadata limit reached".into(),
+						StatusCode::TOO_MANY_REQUESTS,
+					));
+				}
+				entries.push(entry);
+			}
+		}
 		Ok(entries)
 	}
 
@@ -789,6 +830,35 @@ impl Service {
 		})
 	}
 
+	/// An absent source record is a stale uploader index, not a storage error.
+	/// An absent object retains the existing unknown-size metadata semantics.
+	/// Other storage and decoding failures refuse the complete admin inventory.
+	async fn user_media_entry_checked(
+		&self,
+		user: &UserId,
+		mxc: OwnedMxcUri,
+	) -> Result<Option<UserMediaEntry>> {
+		let parts = mxc
+			.parts()
+			.map_err(|_| Error::bad_database("Invalid uploader media URI"))?;
+		let Some(Metadata { content_type, content_disposition, key }) = self
+			.db
+			.search_file_metadata_checked(&parts, &Dim::default())
+			.await?
+		else {
+			return Ok(None);
+		};
+		let object = self.head_meta_checked(&key).await?;
+		Ok(Some(UserMediaEntry {
+			media_type: content_type,
+			upload_name: content_disposition.and_then(|disposition| disposition.filename),
+			media_length: object.as_ref().map(|object| object.size),
+			created_ts: object.as_ref().map(mtime_millis).unwrap_or(0),
+			user_id: Some(user.to_owned()),
+			mxc,
+		}))
+	}
+
 	/// Uploader, byte length and storage modification time of every media item
 	/// uploaded by a local user, one row per upload; media missing from every
 	/// storage provider are skipped.
@@ -820,10 +890,11 @@ impl Service {
 		size_gt: u64,
 		keep_profiles: bool,
 	) -> Result<Vec<OwnedMxcUri>> {
-		let spared = keep_profiles
-			.then_async(|| self.avatar_mxcs())
-			.await
-			.unwrap_or_default();
+		let spared = if keep_profiles {
+			self.avatar_mxcs().await?
+		} else {
+			HashSet::new()
+		};
 
 		let candidates = self.get_all_mxcs().await?;
 
@@ -850,36 +921,12 @@ impl Service {
 		Ok(deleted)
 	}
 
-	/// The MXCs of every local user's profile avatar and every room's avatar,
-	/// the spare-set honoured by `keep_profiles`.
-	async fn avatar_mxcs(&self) -> HashSet<OwnedMxcUri> {
-		let user_avatars = self
-			.services
-			.users
-			.list_local_users()
-			.map(ToOwned::to_owned)
-			.broad_filter_map(async |user| self.services.profile.avatar_url(&user).await.ok());
-
-		let room_avatars = self
-			.services
-			.metadata
-			.iter_ids()
-			.map(ToOwned::to_owned)
-			.broad_filter_map(|room_id| async move {
-				self.services
-					.state_accessor
-					.get_avatar(&room_id)
-					.await
-					.ok()
-					.and_then(|avatar| avatar.url)
-			});
-
-		user_avatars.chain(room_avatars).collect().await
-	}
-
 	fn is_local(&self, mxc: &OwnedMxcUri) -> bool {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		mxc.server_name()
-			.is_ok_and(|server| self.services.globals.server_is_ours(server))
+			.is_ok_and(|server| services_root.globals.server_is_ours(server))
 	}
 
 	/// First storage provider's object metadata for the media stored under
@@ -897,6 +944,24 @@ impl Service {
 		stream.next().await
 	}
 
+	/// Only an explicit not-found permits trying another storage provider.
+	async fn head_meta_checked(&self, key: &[u8]) -> Result<Option<ObjectMeta>> {
+		let path = self.get_media_name_sha256(key);
+		let mut observed = false;
+		for provider in self.storage_providers() {
+			observed = true;
+			match provider.head(&path).await {
+				| Ok(metadata) => return Ok(Some(metadata)),
+				| Err(error) if absent(&error) => {},
+				| Err(error) => return Err(error),
+			}
+		}
+		if !observed {
+			return Err(Error::bad_database("No media storage provider configured"));
+		}
+		Ok(None)
+	}
+
 	/// Deletes all media files before or after the given time. Returns a usize
 	/// with the number of media files deleted.
 	pub async fn delete_range(
@@ -906,10 +971,13 @@ impl Service {
 		newer_than: bool,
 		yes_i_want_to_delete_local_media: bool,
 	) -> Result<usize> {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		// Records are read in bounded batches from a cursor, each read closed
 		// before its media are deleted. Local media are skipped by resuming
 		// past their keys, unless they are to be deleted too.
-		let local = format!("mxc://{}/", self.services.globals.server_name());
+		let local = format!("mxc://{}/", services_root.globals.server_name());
 		let mut from: Option<Vec<u8>> = None;
 		let mut deletion_count: usize = 0;
 		loop {
@@ -955,7 +1023,7 @@ impl Service {
 
 				trace!("Parsed MXC key to URL: {mxc_s}");
 				let mxc = OwnedMxcUri::from(mxc_s);
-				if (mxc.server_name() == Ok(self.services.globals.server_name())
+				if (mxc.server_name() == Ok(services_root.globals.server_name())
 					&& !yes_i_want_to_delete_local_media)
 					|| !mxc.is_valid()
 				{
@@ -1029,7 +1097,7 @@ impl Service {
 				}
 			}
 
-			if ended || !self.services.server.is_running() {
+			if ended || !services_root.server.is_running() {
 				return Ok(deletion_count);
 			}
 		}
@@ -1073,10 +1141,13 @@ impl Service {
 	}
 
 	async fn create_media_file(&self, key: &[u8], file: &[u8]) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		self.storage_providers()
 			.try_stream()
 			.ready_try_filter(|provider| {
-				let store_media_on_providers = &self.services.config.store_media_on_providers;
+				let store_media_on_providers = &services_root.config.store_media_on_providers;
 
 				store_media_on_providers.is_empty()
 					|| store_media_on_providers.contains(&provider.name)
@@ -1110,17 +1181,20 @@ impl Service {
 	}
 
 	fn storage_providers(&self) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
-		let explicit_providers = &self.services.config.media_storage_providers;
+		let storage = self
+			.storage
+			.get_or_init(|| self.services.get().storage.clone());
+		let explicit_providers = &self.server.config.media_storage_providers;
 
 		let or_all_providers = explicit_providers
 			.is_empty()
-			.then(|| self.services.storage.providers())
+			.then(|| storage.providers())
 			.into_iter()
 			.flatten();
 
 		explicit_providers
 			.iter()
-			.filter_map(|id| self.services.storage.provider(id).ok())
+			.filter_map(|id| storage.provider(id).ok())
 			.chain(or_all_providers)
 	}
 
@@ -1161,7 +1235,10 @@ impl Service {
 
 	#[must_use]
 	pub fn get_media_dir(&self) -> PathBuf {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.server
 			.config
 			.database_path

@@ -66,16 +66,28 @@ async fn revoke(services: &Services, body: RevokeRequest) -> Result<Response, Re
 	// RFC7009 §2.2: invalid or unknown tokens still produce a 200 OK.
 	// remove_device drops both the access and refresh tokens (and the device);
 	// the upstream grant that device's sign-in obtained goes with it.
-	if let Ok((user_id, device_id, _)) = services.users.find_from_token(&token).await {
-		services
-			.users
-			.remove_device(&user_id, &device_id)
-			.await;
-
-		services
-			.oauth
-			.clear_device_grants(&user_id, &device_id)
-			.await;
+	let session = services.users.find_from_token(&token).await;
+	match session {
+		| Ok((user_id, device_id, _)) => {
+			services
+				.oauth
+				.revoke_device_session(&user_id, &device_id)
+				.await
+				.map_err(|_| {
+					oauth_error(
+						StatusCode::INTERNAL_SERVER_ERROR,
+						"server_error",
+						"Session revocation failed",
+					)
+				})?;
+		},
+		| Err(error) if error.is_not_found() => {},
+		| Err(_) =>
+			return Err(oauth_error(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"server_error",
+				"Token lookup failed",
+			)),
 	}
 
 	Ok(Response::builder()

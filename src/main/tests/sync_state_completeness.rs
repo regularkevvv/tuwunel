@@ -19,7 +19,7 @@ const OWNER_TOKEN: &str = "sync-state-completeness-owner-token";
 const PEER_TOKEN: &str = "sync-state-completeness-peer-token";
 
 #[test]
-fn corrupt_full_sync_state_withholds_the_room() -> Result {
+fn corrupt_full_sync_state_refuses_cursor_advancement() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
@@ -84,7 +84,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	pdus.remove(&pdu_id).await?;
 	services.clear_cache().await;
 
-	assert_room_withheld(&owner, &room, topic.as_str(), "corrupt state").await?;
+	assert_room_refused(&owner, &room, topic.as_str(), "corrupt state").await?;
 
 	pdus.raw_put(&pdu_id, &saved).await?;
 	services.clear_cache().await;
@@ -100,7 +100,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	statekeys.remove(&key).await?;
 	services.clear_cache().await;
 
-	assert_room_withheld(&owner, &room, topic.as_str(), "corrupt state key").await?;
+	assert_room_refused(&owner, &room, topic.as_str(), "corrupt state key").await?;
 
 	statekeys.raw_put(&key, &saved).await?;
 	services.clear_cache().await;
@@ -135,14 +135,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	statediffs.remove(&key).await?;
 	services.clear_cache().await;
 
-	assert_incremental_room_withheld(
-		&owner,
-		&room,
-		&since,
-		delta_topic.as_str(),
-		"corrupt delta",
-	)
-	.await?;
+	assert_incremental_room_refused(&owner, &room, &since, delta_topic.as_str(), "corrupt delta")
+		.await?;
 
 	statediffs.raw_put(&key, &saved).await?;
 	services.clear_cache().await;
@@ -269,30 +263,27 @@ async fn assert_full_state_contains(
 	Ok(())
 }
 
-async fn assert_room_withheld(
+async fn assert_room_refused(
 	client: &Client<'_>,
 	room: &RoomId,
 	state_event: &str,
 	phase: &str,
 ) -> Result {
-	let response = full_state_response(client).await?;
-
-	if let Some(rooms) = response
-		.get("rooms")
-		.and_then(|rooms| rooms.get("join"))
-		.and_then(Value::as_object)
-	{
-		assert!(
-			!rooms.contains_key(room.as_str()),
-			"{phase}: returned a partial room payload: {response}"
-		);
-	}
-	assert!(
-		!response.to_string().contains(state_event),
-		"{phase}: response exposed the corrupt state event: {response}"
-	);
-
-	Ok(())
+	assert_failed_sync(
+		client,
+		&[
+			("timeout", "0"),
+			("full_state", "true"),
+			(
+				"filter",
+				r#"{"room":{"state":{"lazy_load_members":true},"timeline":{"limit":0}}}"#,
+			),
+		],
+		room,
+		state_event,
+		phase,
+	)
+	.await
 }
 
 async fn assert_incremental_state_contains(
@@ -321,30 +312,66 @@ async fn assert_incremental_state_contains(
 	Ok(())
 }
 
-async fn assert_incremental_room_withheld(
+async fn assert_incremental_room_refused(
 	client: &Client<'_>,
 	room: &RoomId,
 	since: &str,
 	state_event: &str,
 	phase: &str,
 ) -> Result {
-	let response = incremental_response(client, since).await?;
+	assert_failed_sync(
+		client,
+		&[
+			("timeout", "0"),
+			("since", since),
+			(
+				"filter",
+				r#"{"room":{"state":{"lazy_load_members":true},"timeline":{"limit":0}}}"#,
+			),
+		],
+		room,
+		state_event,
+		phase,
+	)
+	.await
+}
 
-	if let Some(rooms) = response
-		.get("rooms")
-		.and_then(|rooms| rooms.get("join"))
-		.and_then(Value::as_object)
-	{
-		assert!(
-			!rooms.contains_key(room.as_str()),
-			"{phase}: returned a partial room payload: {response}"
-		);
-	}
-	assert!(
-		!response.to_string().contains(state_event),
-		"{phase}: response exposed the corrupt state event: {response}"
+async fn assert_failed_sync(
+	client: &Client<'_>,
+	query: &[(&str, &str)],
+	room: &RoomId,
+	state_event: &str,
+	phase: &str,
+) -> Result {
+	let response = client
+		.services
+		.client
+		.clients
+		.default
+		.get(client.url("sync"))
+		.bearer_auth(client.token)
+		.query(query)
+		.send()
+		.await?;
+	let status = response.status();
+	let body: Value = response.json().await?;
+	assert_eq!(
+		status,
+		tuwunel_core::http::StatusCode::INTERNAL_SERVER_ERROR,
+		"{phase}: refused sync for {room}: {body}"
 	);
-
+	assert!(
+		body.get("next_batch").is_none(),
+		"{phase}: failed sync must not advance the global cursor"
+	);
+	assert!(
+		body.get("rooms").is_none(),
+		"{phase}: failed sync must not return partial rooms"
+	);
+	assert!(
+		!body.to_string().contains(state_event),
+		"{phase}: refusal does not expose the corrupt event"
+	);
 	Ok(())
 }
 

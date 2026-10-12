@@ -211,7 +211,7 @@ pub(crate) async fn login_route(
 		services
 			.users
 			.remove_device(&user_id, &device_id)
-			.await;
+			.await?;
 
 		return Err(error);
 	}

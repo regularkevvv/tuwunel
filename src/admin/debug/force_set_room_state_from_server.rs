@@ -108,7 +108,7 @@ pub(super) async fn force_set_room_state_from_server(
 				.services
 				.short
 				.get_or_create_shortstatekey(&pdu.kind.to_string().into(), state_key)
-				.await;
+				.await?;
 
 			state.insert(shortstatekey, pdu.event_id.clone());
 		}

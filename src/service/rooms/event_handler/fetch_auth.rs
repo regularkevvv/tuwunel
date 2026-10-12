@@ -49,6 +49,9 @@ pub(super) async fn fetch_auth<'a, Events>(
 where
 	Events: Iterator<Item = &'a EventId> + Clone + Send,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let events_with_auth_events: Vec<_> = events
 		.stream()
 		.broad_then(|event_id| self.fetch_auth_chain(origin, room_id, event_id, room_version))
@@ -60,7 +63,7 @@ where
 		.into_iter()
 		.stream()
 		.fold(Vec::new(), async |mut pdus, (id, local_pdu, events_in_reverse_order)| {
-			if self.services.server.check_running().is_err() {
+			if services_root.server.check_running().is_err() {
 				return pdus;
 			}
 
@@ -133,10 +136,13 @@ async fn fetch_auth_chain(
 	event_id: &EventId,
 	room_version: &RoomVersionId,
 ) -> (OwnedEventId, Option<PduEvent>, Vec<(OwnedEventId, CanonicalJsonObject)>) {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// a. Look in the main timeline (pduid_pdu tree)
 	// b. Look at outlier pdu tree
 	// (get_pdu_json checks both)
-	if let Ok(local_pdu) = self.services.timeline.get_pdu(event_id).await {
+	if let Ok(local_pdu) = services_root.timeline.get_pdu(event_id).await {
 		trace!(?event_id, "Found in database");
 		return (event_id.to_owned(), Some(local_pdu), vec![]);
 	}
@@ -165,15 +171,14 @@ async fn fetch_auth_chain(
 			continue;
 		}
 
-		if self.services.timeline.pdu_exists(&next_id).await {
+		if services_root.timeline.pdu_exists(&next_id).await {
 			trace!(?next_id, "Found in database");
 			continue;
 		}
 
 		// A rejected event is never refetched; the events citing it are rejected
 		// on its record instead.
-		if self
-			.services
+		if services_root
 			.timeline
 			.is_pdu_rejected(&next_id)
 			.await
@@ -182,7 +187,7 @@ async fn fetch_auth_chain(
 			continue;
 		}
 
-		if self.services.server.check_running().is_err() {
+		if services_root.server.check_running().is_err() {
 			debug_warn!(?next_id, "Server shutting down");
 			break;
 		}
@@ -195,8 +200,7 @@ async fn fetch_auth_chain(
 			.attempt_limit(super::EVENT_FETCH_ATTEMPT_LIMIT)
 			.fanout_for_op();
 
-		let Ok(outcome) = self
-			.services
+		let Ok(outcome) = services_root
 			.fetcher
 			.fetch(opts)
 			.inspect_err(|e| debug_error!(?next_id, "Failed to fetch event: {e}"))

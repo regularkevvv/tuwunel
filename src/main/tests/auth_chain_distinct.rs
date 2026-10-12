@@ -74,17 +74,17 @@ async fn exercise(services: &Services) -> Result {
 	let left_short = services
 		.short
 		.get_or_create_shorteventid(left)
-		.await;
+		.await?;
 
 	let torn_short = services
 		.short
 		.get_or_create_shorteventid(torn)
-		.await;
+		.await?;
 
 	let cross_short = services
 		.short
 		.get_or_create_shorteventid(cross)
-		.await;
+		.await?;
 
 	let right = mint_distinct_bucket(services, room_id, tail, left_short).await?;
 
@@ -201,7 +201,7 @@ async fn mint_distinct_bucket(
 		let right_short = services
 			.short
 			.get_or_create_shorteventid(&right)
-			.await;
+			.await?;
 
 		if right_short % NUM_BUCKETS != left_short % NUM_BUCKETS {
 			return Ok(right);

@@ -1,10 +1,10 @@
 use axum::extract::State;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use ruma::OwnedDeviceId;
 use synapse_admin_api::mas::sync_devices::{Request, Response};
 use tuwunel_core::{
 	Result,
-	utils::stream::{IterStream, TryBroadbandExt, automatic_width},
+	utils::stream::{IterStream, TryBroadbandExt},
 };
 
 use super::{Mas, existing_user};
@@ -18,24 +18,19 @@ pub(crate) async fn sync_devices_route(
 ) -> Result<Response> {
 	let user_id = existing_user(services, &body.localpart).await?;
 
-	let current: Vec<OwnedDeviceId> = services
+	let current = services
 		.users
-		.all_device_ids(&user_id)
-		.map(ToOwned::to_owned)
-		.collect()
-		.await;
-
-	current
+		.bounded_device_ids(&user_id)
+		.await?;
+	let removed: Vec<OwnedDeviceId> = current
 		.iter()
 		.filter(|device_id| !body.devices.contains(*device_id))
-		.stream()
-		.for_each_concurrent(automatic_width(), async |device_id| {
-			services
-				.users
-				.remove_device(&user_id, device_id)
-				.await;
-		})
-		.await;
+		.cloned()
+		.collect();
+	services
+		.users
+		.remove_devices(&user_id, &removed)
+		.await?;
 
 	body.devices
 		.iter()

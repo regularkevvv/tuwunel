@@ -873,8 +873,8 @@ async fn strays(db: &Database, counter: u64, words: usize) -> u64 {
 		})
 		.await;
 
-	// Sending-queue keys hold a pdu id behind the destination only when
-	// the value is empty; nonempty rows queue EDUs.
+	// Decode both legacy and incarnation-framed active rows, including push
+	// destinations with two key separators and frozen push obligations.
 	let current = db["servercurrentevent_data"]
 		.raw_stream()
 		.ignore_err();
@@ -884,7 +884,14 @@ async fn strays(db: &Database, counter: u64, words: usize) -> u64 {
 		.ignore_err()
 		.chain(current)
 		.ready_fold(strays, |strays, (key, value)| {
-			let pdu = value.is_empty().and_then(|| pdu_shortroomid(key));
+			let pdu = crate::sending::parse_servercurrentevent(key, value)
+				.ok()
+				.and_then(|(_, event)| match event {
+					| crate::sending::SendingEvent::Pdu(raw)
+					| crate::sending::SendingEvent::FrozenPush(raw) =>
+						Some(u64::from_be_bytes(raw.shortroomid())),
+					| _ => None,
+				});
 
 			strays.saturating_add(stray(pdu))
 		})

@@ -6,6 +6,7 @@ mod debug;
 mod git;
 mod implement;
 mod rustc;
+mod rustc_flags;
 mod utils;
 
 use proc_macro::TokenStream;

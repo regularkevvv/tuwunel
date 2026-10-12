@@ -107,11 +107,14 @@ async fn rank_unique<S>(&self, eligible: S) -> Candidates
 where
 	S: Stream<Item = OwnedServerName> + Send,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let ordered: Candidates = eligible
 		.ready_fold(Candidates::new(), push_unique)
 		.await;
 
-	self.services
+	services_root
 		.federation
 		.rank_candidates(ordered, WhenAllBackedOff::Attempt)
 		.await
@@ -131,11 +134,14 @@ fn push_unique(mut ordered: Candidates, server: OwnedServerName) -> Candidates {
 #[implement(RoomCandidates)]
 #[tracing::instrument(level = "trace", skip_all)]
 async fn authority_server(&self, opts: &Opts) -> Option<OwnedServerName> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let room_id = opts.room_id.as_deref()?;
 
 	matches!(opts.op, Op::AuthEvent | Op::AuthChain)
 		.then_async(|| {
-			self.services
+			services_root
 				.state_cache
 				.most_powerful_user_server(room_id)
 		})
@@ -154,23 +160,27 @@ async fn route_by_popularity<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = OwnedServerName> + Send + 'a {
-	let sampled: ArrayVec<OwnedServerName, ROUTE_FANOUT> = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let sampled: ArrayVec<OwnedServerName, ROUTE_FANOUT> = services_root
 		.state_cache
 		.room_members(room_id)
 		.sample_by(|user| user.server_name().to_owned())
 		.await;
 
-	if sampled.is_empty() {
-		return Either::Right(
-			self.services
-				.state_cache
-				.room_servers(room_id)
-				.map(ToOwned::to_owned),
-		);
-	}
+	crate::once_services::services_stream!(services_guard, services_root, {
+		if sampled.is_empty() {
+			return Either::Right(
+				services_root
+					.state_cache
+					.room_servers(room_id)
+					.map(ToOwned::to_owned),
+			);
+		}
 
-	Either::Left(sampled.into_iter().stream())
+		Either::Left(sampled.into_iter().stream())
+	})
 }
 
 /// Uniform-random window over the participating-server cursor: count, skip
@@ -183,8 +193,10 @@ async fn route_uniformly<'a>(
 	&'a self,
 	room_id: &'a RoomId,
 ) -> impl Stream<Item = OwnedServerName> + Send + 'a {
-	let count = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let count = services_root
 		.state_cache
 		.room_servers(room_id)
 		.count()
@@ -192,19 +204,23 @@ async fn route_uniformly<'a>(
 
 	let offset = index(count);
 
-	self.services
-		.state_cache
-		.room_servers(room_id)
-		.map(ToOwned::to_owned)
-		.skip(offset)
-		.take(ROUTE_FANOUT)
+	crate::once_services::services_stream!(services_guard, services_root, {
+		services_root
+			.state_cache
+			.room_servers(room_id)
+			.map(ToOwned::to_owned)
+			.skip(offset)
+			.take(ROUTE_FANOUT)
+	})
 }
 
 #[implement(RoomCandidates)]
 fn is_eligible(&self, server: &ServerName) -> bool {
-	!self.services.globals.server_is_ours(server)
-		&& !self
-			.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	!services_root.globals.server_is_ours(server)
+		&& !services_root
 			.server
 			.config
 			.is_forbidden_remote_server_name(server)

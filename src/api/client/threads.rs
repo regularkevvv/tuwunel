@@ -4,17 +4,20 @@ use axum::extract::State;
 use futures::{StreamExt, TryStreamExt};
 use ruma::{
 	OwnedUserId,
-	api::client::threads::get_threads,
+	api::{
+		client::threads::get_threads,
+		error::{ErrorKind, LimitExceededErrorData},
+	},
 	events::{GlobalAccountDataEventType, ignored_user_list::IgnoredUserListEvent},
 };
 use tuwunel_core::{
-	Err, Result, at,
+	Err, Error, Result, at,
 	matrix::{
 		Event,
 		pdu::{PduCount, PduEvent},
 	},
 	result::{FlatOk, LogErr},
-	utils::stream::TryWidebandExt,
+	utils::{json::serialized_len, stream::TryWidebandExt},
 };
 use tuwunel_service::rooms::pdu_metadata::IgnoredThreadView;
 
@@ -64,6 +67,7 @@ pub(crate) async fn get_threads_route(
 		.unwrap_or_default();
 
 	// One extra row probes whether the list continues past this page.
+	let mut response_bytes = 64_usize;
 	let mut threads: Vec<(PduCount, PduEvent)> = services
 		.threads
 		.threads_until(sender_user, room_id, from, &body.include)
@@ -81,7 +85,7 @@ pub(crate) async fn get_threads_route(
 					services
 						.pdu_metadata
 						.ignored_thread_view(sender_user, &ignored, &pdu)
-						.await,
+						.await?,
 			};
 
 			Ok(match view {
@@ -94,9 +98,24 @@ pub(crate) async fn get_threads_route(
 			let pdu = services
 				.pdu_metadata
 				.bundle_aggregations(sender_user, pdu)
-				.await;
+				.await?;
 
 			Ok((count, apply_ignored_view(pdu, view)))
+		})
+		.map(move |entry| {
+			let (count, pdu) = entry?;
+			response_bytes = response_bytes.saturating_add(1).saturating_add(
+				serialized_len(pdu.as_pdu())
+					.map_err(|_| Error::bad_database("Invalid thread response event"))?,
+			);
+			if response_bytes > 256 * 1024 {
+				return Err(Error::Request(
+					ErrorKind::LimitExceeded(LimitExceededErrorData { retry_after: None }),
+					"Thread response byte limit reached".into(),
+					http::StatusCode::TOO_MANY_REQUESTS,
+				));
+			}
+			Ok((count, pdu))
 		})
 		.try_collect()
 		.await?;

@@ -1,3 +1,5 @@
+mod bounds;
+
 use std::{
 	collections::{BTreeSet, HashMap},
 	fmt::{Debug, Write},
@@ -12,10 +14,11 @@ use tuwunel_core::{
 	Result,
 	arrayvec::ArrayVec,
 	at, checked, err, implement, utils,
-	utils::{bytes, math::usize_from_f64, stream::IterStream},
+	utils::{bytes, math::usize_from_f64},
 };
 use tuwunel_database::{Map, Txn};
 
+use self::bounds::{MAX_DIFF_BYTES, MAX_LAYERS, candidate_state, check_stack, state_limit};
 use crate::rooms::short::{ShortEventId, ShortId, ShortStateHash, ShortStateKey};
 
 pub struct Service {
@@ -130,6 +133,7 @@ pub async fn load_shortstatehash_info(
 		.lock()?
 		.get_mut(&shortstatehash)
 	{
+		check_stack(r)?;
 		return Ok(r.clone());
 	}
 
@@ -172,35 +176,46 @@ async fn new_shortstatehash_info(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> Result<ShortStateInfoVec> {
-	let StateDiff { parent, added, removed } = self.get_statediff(shortstatehash).await?;
-
-	let Some(parent) = parent else {
-		return Ok(vec![ShortStateInfo {
+	let mut pending = Vec::new();
+	let mut seen = BTreeSet::new();
+	let mut current = shortstatehash;
+	let mut stack = Vec::new();
+	loop {
+		if !seen.insert(current) {
+			return Err(err!(Database("Cyclic room state parent chain")));
+		}
+		if let Some(cached) = self.stateinfo_cache.lock()?.get_mut(&current) {
+			check_stack(cached)?;
+			if cached.len().saturating_add(pending.len()) > MAX_LAYERS {
+				return Err(state_limit());
+			}
+			stack = cached.clone();
+			break;
+		}
+		if pending.len() >= MAX_LAYERS {
+			return Err(state_limit());
+		}
+		let diff = self.get_statediff(current).await?;
+		let parent = diff.parent;
+		pending.push((current, diff));
+		let Some(parent) = parent else {
+			break;
+		};
+		current = parent;
+	}
+	for (shortstatehash, StateDiff { added, removed, .. }) in pending.into_iter().rev() {
+		let parent = stack
+			.last()
+			.map(|info: &ShortStateInfo| info.full_state.as_ref());
+		let full_state = candidate_state(parent, &added, &removed)?;
+		stack.push(ShortStateInfo {
 			shortstatehash,
-			full_state: added.clone(),
 			added,
 			removed,
-		}]);
-	};
-
-	let mut stack = Box::pin(self.load_shortstatehash_info(parent)).await?;
-	let top = stack.last().expect("at least one frame");
-
-	let mut full_state = (*top.full_state).clone();
-	full_state.extend(added.iter().copied());
-
-	let removed = (*removed).clone();
-	for r in &removed {
-		full_state.remove(r);
+			full_state: Arc::new(full_state),
+		});
+		check_stack(&stack)?;
 	}
-
-	stack.push(ShortStateInfo {
-		shortstatehash,
-		added,
-		removed: Arc::new(removed),
-		full_state: Arc::new(full_state),
-	});
-
 	Ok(stack)
 }
 
@@ -208,22 +223,21 @@ async fn new_shortstatehash_info(
 pub fn compress_state_events<'a, I>(
 	&'a self,
 	state: I,
-) -> impl Stream<Item = CompressedStateEvent> + Send + 'a
+) -> impl Stream<Item = Result<CompressedStateEvent>> + Send + 'a
 where
 	I: Iterator<Item = (&'a ShortStateKey, &'a EventId)> + Clone + Debug + Send + 'a,
 {
-	let event_ids = state.clone().map(at!(1));
-
-	let short_event_ids = self
-		.services
-		.short
-		.multi_get_or_create_shorteventid(event_ids);
-
-	state
-		.stream()
-		.map(at!(0))
-		.zip(short_event_ids)
-		.map(|(shortstatekey, shorteventid)| compress_state_event(*shortstatekey, shorteventid))
+	let services_guard = self.services.get();
+	async_stream::stream! {
+		let services_root = services_guard.as_ref();
+		let event_ids = state.clone().map(|(_, event_id)| event_id);
+		let short_event_ids = services_root.short.multi_get_or_create_shorteventid(event_ids);
+		futures::pin_mut!(short_event_ids);
+		for (shortstatekey, _) in state {
+			let Some(shorteventid) = short_event_ids.next().await else { break; };
+			yield shorteventid.map(|id| compress_state_event(*shortstatekey, id));
+		}
+	}
 }
 
 #[implement(Service)]
@@ -231,14 +245,16 @@ pub async fn compress_state_event(
 	&self,
 	shortstatekey: ShortStateKey,
 	event_id: &EventId,
-) -> CompressedStateEvent {
-	let shorteventid = self
-		.services
+) -> Result<CompressedStateEvent> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let shorteventid = services_root
 		.short
 		.get_or_create_shorteventid(event_id)
-		.await;
+		.await?;
 
-	compress_state_event(shortstatekey, shorteventid)
+	Ok(compress_state_event(shortstatekey, shorteventid))
 }
 
 /// Creates a new shortstatehash that often is just a diff to an already
@@ -271,6 +287,22 @@ pub fn save_state_from_diff(
 	diff_to_sibling: usize,
 	mut parent_states: ParentStatesVec,
 ) -> Result {
+	check_stack(&parent_states)?;
+	let parent = parent_states
+		.last()
+		.map(|info| info.full_state.as_ref());
+	// Reject a state that the bounded reader cannot reconstruct before adding
+	// a mutation to the caller's transaction.
+	let full_state = candidate_state(parent, &statediffnew, &statediffremoved)?;
+	let mut candidate = parent_states.clone();
+	candidate.push(ShortStateInfo {
+		shortstatehash,
+		full_state: Arc::new(full_state),
+		added: statediffnew.clone(),
+		removed: statediffremoved.clone(),
+	});
+	check_stack(&candidate)?;
+	drop(candidate);
 	let statediffnew_len = statediffnew.len();
 	let statediffremoved_len = statediffremoved.len();
 	let diffsum = checked!(statediffnew_len + statediffremoved_len)?;
@@ -390,8 +422,13 @@ pub async fn save_state(
 	room_id: &RoomId,
 	new_state_ids_compressed: Arc<CompressedState>,
 ) -> Result<HashSetCompressStateEvent> {
-	let previous_shortstatehash = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	if new_state_ids_compressed.len() > bounds::MAX_STATE_EVENTS {
+		return Err(state_limit());
+	}
+	let previous_shortstatehash = services_root
 		.state
 		.get_room_shortstatehash(room_id)
 		.await
@@ -403,8 +440,7 @@ pub async fn save_state(
 			.map(|bytes| &bytes[..]),
 	);
 
-	let existing_shortstatehash = self
-		.services
+	let existing_shortstatehash = services_root
 		.short
 		.get_shortstatehash(&state_hash)
 		.await
@@ -447,7 +483,7 @@ pub async fn save_state(
 	let new_shortstatehash = if let Some(new_shortstatehash) = existing_shortstatehash {
 		new_shortstatehash
 	} else {
-		self.services
+		services_root
 			.short
 			.get_or_create_shortstatehash(&state_hash, |txn, shortstatehash| {
 				self.save_state_from_diff(
@@ -486,9 +522,16 @@ pub(crate) async fn get_statediff(&self, shortstatehash: ShortStateHash) -> Resu
 		.shortstatehash_statediff
 		.aqry::<BUFSIZE, _>(&shortstatehash)
 		.await
-		.map_err(|e| {
-			err!(Database("Failed to find StateDiff from short {shortstatehash:?}: {e}"))
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Database("Missing stored room state delta"))
+			} else {
+				error
+			}
 		})?;
+	if value.len() > MAX_DIFF_BYTES {
+		return Err(state_limit());
+	}
 
 	let parent = value
 		.get(..STRIDE)

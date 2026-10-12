@@ -21,8 +21,10 @@ pub async fn kick(
 	sender_user: &UserId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	let Ok(event) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(event) = services_root
 		.state_accessor
 		.get_member(room_id, user_id)
 		.await
@@ -41,7 +43,7 @@ pub async fn kick(
 		)));
 	}
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {

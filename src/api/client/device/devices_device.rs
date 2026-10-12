@@ -119,7 +119,7 @@ pub(crate) async fn delete_device_route(
 		services
 			.users
 			.remove_device(sender_user, &body.device_id)
-			.await;
+			.await?;
 
 		return Ok(delete_device::v3::Response {});
 	}
@@ -129,7 +129,7 @@ pub(crate) async fn delete_device_route(
 	services
 		.users
 		.remove_device(sender_user, &body.device_id)
-		.await;
+		.await?;
 
 	Ok(delete_device::v3::Response {})
 }

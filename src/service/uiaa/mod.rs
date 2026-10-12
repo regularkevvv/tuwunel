@@ -69,14 +69,17 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
 		loop {
 			tokio::select! {
 				result = self.sweep_sessions() => result?,
-				() = self.services.server.until_shutdown() => return Ok(()),
+				() = services_root.server.until_shutdown() => return Ok(()),
 			}
 			tokio::select! {
 				() = tokio::time::sleep(sweep::INTERVAL) => {},
-				() = self.services.server.until_shutdown() => return Ok(()),
+				() = services_root.server.until_shutdown() => return Ok(()),
 			}
 		}
 	}
@@ -155,6 +158,9 @@ async fn try_auth_inner(
 	uiaainfo: &UiaaInfo,
 	email_identity_mode: EmailIdentityMode,
 ) -> Result<(bool, UiaaInfo)> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// Serialize read, stage side effects, and consumption with SSO completion.
 	// The database writer lease supplies cross-process exclusion; this lock
 	// prevents two requests in that writer from spending the same proof.
@@ -212,8 +218,7 @@ async fn try_auth_inner(
 			// MSC4312: OAuth cross-signing reset uses SSO re-authentication.
 			// If a bypass was granted via SSO re-auth, mark OAuth as completed.
 			if !uiaainfo.completed.contains(&AuthType::OAuth) {
-				if self
-					.services
+				if services_root
 					.users
 					.can_replace_cross_signing_keys(user_id)
 					.await
@@ -287,8 +292,7 @@ async fn try_auth_inner(
 	{
 		let claim = (user_id.to_owned(), device_id.to_owned(), session.as_str().into());
 
-		if !self
-			.services
+		if !services_root
 			.threepid
 			.refresh_claim(&claim)
 			.await?
@@ -337,9 +341,11 @@ async fn authenticate_email_identity(
 	creds: &ThirdpartyIdCredentials,
 	mode: EmailIdentityMode,
 ) -> Result<bool> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	match mode {
-		| EmailIdentityMode::Validate => Ok(self
-			.services
+		| EmailIdentityMode::Validate => Ok(services_root
 			.threepid
 			.session_validated(creds.sid.as_str(), creds.client_secret.as_str())
 			.await),
@@ -351,7 +357,7 @@ async fn authenticate_email_identity(
 
 			let claim = (user_id.to_owned(), device_id.to_owned(), session.as_str().into());
 
-			self.services
+			services_root
 				.threepid
 				.claim_validated(creds.sid.as_str(), creds.client_secret.as_str(), claim)
 				.await
@@ -366,6 +372,9 @@ async fn verify_password(
 	uiaainfo: &mut UiaaInfo,
 	password: &Password,
 ) -> Result<ControlFlow<bool>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Password { identifier, password, user, .. } = password;
 
 	let username = extract!(identifier, x in Some(UserIdentifier::Matrix(ruma::api::client::uiaa::MatrixUserIdentifier { user: x, .. })))
@@ -373,7 +382,7 @@ async fn verify_password(
 		.ok_or(err!(Request(Unrecognized("Identifier type not recognized."))))?;
 
 	let user_id_from_username =
-		UserId::parse_with_server_name(username.clone(), self.services.globals.server_name())
+		UserId::parse_with_server_name(username.clone(), services_root.globals.server_name())
 			.map_err(|_| err!(Request(InvalidParam("User ID is invalid."))))?;
 
 	// Check if the access token being used matches the credentials used for UIAA
@@ -383,8 +392,7 @@ async fn verify_password(
 
 	let user_id = user_id_from_username;
 	// First try local password hash verification
-	let password_verified = self
-		.services
+	let password_verified = services_root
 		.users
 		.password_hash(&user_id)
 		.await
@@ -394,17 +402,16 @@ async fn verify_password(
 	// directory-wide search.
 	#[cfg(feature = "ldap")]
 	let password_verified = if !password_verified
-		&& self.services.server.config.ldap.enable
-		&& self
-			.services
+		&& services_root.server.config.ldap.enable
+		&& services_root
 			.users
 			.origin(&user_id)
 			.await
 			.is_ok_and(|origin| origin == "ldap")
-		&& let Ok(dns) = self.services.users.search_ldap(&user_id).await
+		&& let Ok(dns) = services_root.users.search_ldap(&user_id).await
 		&& let Some((user_dn, _is_admin)) = dns.first()
 	{
-		self.services
+		services_root
 			.users
 			.auth_ldap(user_dn, password)
 			.await

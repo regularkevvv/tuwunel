@@ -31,6 +31,9 @@ pub(super) async fn get_summary_and_children_federation(
 	sender: &Identifier<'_>,
 	via: &[OwnedServerName],
 ) -> Result<Accessibility> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let request = Request {
 		room_id: current_room.to_owned(),
 		suggested_only: false,
@@ -48,8 +51,7 @@ pub(super) async fn get_summary_and_children_federation(
 		..Default::default()
 	};
 
-	let response = self
-		.services
+	let response = services_root
 		.federation
 		.fanout_to(via.iter().cloned().stream(), move |_| request.clone(), opts)
 		.inspect(|outcome| match &outcome.result {

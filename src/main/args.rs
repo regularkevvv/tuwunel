@@ -301,7 +301,10 @@ pub struct Args {
 impl Args {
 	#[must_use]
 	pub fn default_test(name: &[&str]) -> Self {
-		let mut args = Self::default();
+		// The process arguments belong to libtest (for example --color never),
+		// not the homeserver CLI. Keep environment defaults, but do not parse
+		// harness flags as application arguments or exit the test process.
+		let mut args = Self::parse_from(["tuwunel-test"]);
 
 		args.test
 			.extend(name.iter().copied().map(ToOwned::to_owned));

@@ -17,15 +17,18 @@ use tuwunel_core::{
 	debug_error, err, implement,
 	smallvec::SmallVec,
 	utils::{
-		BoolExt, IterStream, ReadyExt, TryReadyExt,
-		result::LogErr,
-		stream::{BroadbandExt, TryIgnore},
-		to_canonical_object,
+		BoolExt, IterStream, ReadyExt, TryReadyExt, stream::TryIgnore, to_canonical_object,
+		two_phase_counter::Permit,
 	},
 };
 use tuwunel_database::{Deserialized, Ignore, Interfix, Json, KeyBuf, Map, Txn, serialize_key};
 
-type Servers = SmallVec<[OwnedServerName; 1]>;
+pub(crate) struct DeviceKeyUpdatePlan {
+	rooms: Vec<OwnedRoomId>,
+	servers: Vec<OwnedServerName>,
+	admission: crate::sending::DeviceListAdmission,
+	count: Permit,
+}
 type Signatures = SmallVec<[(String, String); 1]>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,9 +74,17 @@ pub async fn add_one_time_keys(
 	keys: &BTreeMap<OwnedOneTimeKeyId, Raw<OneTimeKey>>,
 	limit: usize,
 ) -> Result {
+	let _device_guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let device = (user_id.to_owned(), device_id.to_owned());
 	let _guard = self.one_time_key_locks.lock(&device).await;
-	let mut txn = self.services.db.txn();
+	let mut txn = services_root.db.txn();
 	// Hold the oldest permit so the retirement frontier cannot pass this batch
 	// before commit.
 	let mut oldest_count = None;
@@ -110,6 +121,9 @@ async fn add_one_time_key(
 	one_time_key_value: &Raw<OneTimeKey>,
 	txn: &mut Txn,
 ) -> Result<Option<impl Deref<Target = u64> + Send + use<>>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		return Err!(Database("one-time-key column unavailable"));
 	};
@@ -148,7 +162,7 @@ async fn add_one_time_key(
 		return Ok(None);
 	}
 
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 
 	// MSC4225: RocksDB iterates the (user, device) prefix in count_be ascending
 	// order, so /keys/claim issues one-time keys in the order they were uploaded.
@@ -171,7 +185,15 @@ pub async fn add_fallback_keys<'a, Keys>(
 where
 	Keys: Iterator<Item = (&'a OneTimeKeyId, &'a Raw<OneTimeKey>)> + Send + 'a,
 {
-	let mut txn = self.services.db.txn();
+	let _device_guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let mut txn = services_root.db.txn();
 	// Hold the oldest permit so the retirement frontier cannot pass this batch
 	// before commit.
 	let mut oldest_count = None;
@@ -208,6 +230,9 @@ pub async fn add_fallback_key(
 	one_time_key_value: &Raw<OneTimeKey>,
 	txn: &mut Txn,
 ) -> Result<impl Deref<Target = u64> + Send + use<>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	if !self.device_exists(user_id, device_id).await {
 		return Err!(Database(error!(
 			?user_id,
@@ -236,7 +261,7 @@ pub async fn add_fallback_key(
 	};
 
 	let key = (user_id, device_id, one_time_key_key.algorithm());
-	let count = self.services.globals.next_count().await?;
+	let count = services_root.globals.next_count().await?;
 
 	txn.put(&self.db.userdeviceidalgorithm_fallback, key, Json(&entry));
 
@@ -250,6 +275,12 @@ pub async fn take_fallback_key(
 	device_id: &DeviceId,
 	algorithm: &OneTimeKeyAlgorithm,
 ) -> Result<(OwnedKeyId<OneTimeKeyAlgorithm, OneTimeKeyName>, Raw<OneTimeKey>)> {
+	let _device_guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+
 	let key = (user_id, device_id, algorithm);
 	let entry: FallbackEntry = self
 		.db
@@ -258,7 +289,13 @@ pub async fn take_fallback_key(
 		.await
 		.deserialized::<Json<_>>()
 		.map(|Json(entry)| entry)
-		.map_err(|_| err!(Request(NotFound("No fallback key found"))))?;
+		.map_err(|error| {
+			if error.is_not_found() {
+				err!(Request(NotFound("No fallback key found")))
+			} else {
+				error
+			}
+		})?;
 
 	let updated = FallbackEntry { used: true, ..entry };
 	self.db
@@ -304,13 +341,22 @@ pub async fn take_one_time_key(
 	device_id: &DeviceId,
 	key_algorithm: &OneTimeKeyAlgorithm,
 ) -> Result<(OwnedKeyId<OneTimeKeyAlgorithm, OneTimeKeyName>, Raw<OneTimeKey>)> {
+	let _device_guard = self.device_mutation_locks.lock(user_id).await;
+	self.db
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let device = (user_id.to_owned(), device_id.to_owned());
 	let _guard = self.one_time_key_locks.lock(&device).await;
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
 		return Err!(Request(NotFound("No one-time-key found")));
 	};
 
-	let update_count = self.services.globals.next_count().await?;
+	let update_count = services_root.globals.next_count().await?;
 	self.db
 		.userid_lastonetimekeyupdate
 		.insert(user_id, update_count.to_be_bytes())
@@ -339,6 +385,9 @@ pub async fn count_one_time_keys(
 	user_id: &UserId,
 	device_id: &DeviceId,
 ) -> BTreeMap<OneTimeKeyAlgorithm, UInt> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let device = (user_id.to_owned(), device_id.to_owned());
 	let _guard = self.one_time_key_locks.lock(&device).await;
 	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
@@ -365,13 +414,100 @@ pub async fn count_one_time_keys(
 		.filter_map(Result::ok)
 		.fold(0_usize, usize::saturating_add);
 
-	let limit = self.services.config.one_time_key_limit;
+	let limit = services_root.config.one_time_key_limit;
 	if let Some(excess) = total.checked_sub(limit).filter(|&n| n > 0) {
 		self.prune_one_time_keys(user_id, device_id, excess)
 			.await;
 	}
 
 	complete_one_time_key_counts(algorithm_counts)
+}
+
+/// Shared work budget for one appservice transaction's read-only key metadata.
+pub(crate) struct OutgoingKeyBudget {
+	rows: usize,
+	bytes: usize,
+}
+
+impl Default for OutgoingKeyBudget {
+	fn default() -> Self { Self { rows: 4096, bytes: 1024 * 1024 } }
+}
+
+impl OutgoingKeyBudget {
+	fn charge(&mut self, bytes: usize) -> Result {
+		if self.rows == 0 || bytes > self.bytes {
+			return Err(err!(Request(TooLarge("Outgoing key metadata inventory limit"))));
+		}
+		self.rows = self.rows.saturating_sub(1);
+		self.bytes = self.bytes.saturating_sub(bytes);
+		Ok(())
+	}
+}
+
+/// Complete bounded metadata without pruning keys or silently skipping errors.
+#[implement(super::Service)]
+pub(crate) async fn outgoing_key_metadata(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	budget: &mut OutgoingKeyBudget,
+) -> Result<(BTreeMap<OneTimeKeyAlgorithm, UInt>, Vec<OneTimeKeyAlgorithm>)> {
+	let device = (user_id.to_owned(), device_id.to_owned());
+	let _guard = self.one_time_key_locks.lock(&device).await;
+	let mut counts = BTreeMap::new();
+	if let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() {
+		let prefix = (user_id, device_id, Interfix);
+		let keys =
+			otk.keys_prefix_capped::<OtkRowKey<'_>, _>(&prefix, budget.rows.saturating_add(1));
+		pin_mut!(keys);
+		while let Some((owner, device, _, id)) = keys.try_next().await? {
+			budget.charge(
+				owner
+					.as_bytes()
+					.len()
+					.saturating_add(device.as_str().len())
+					.saturating_add(id.as_str().len())
+					.saturating_add(16),
+			)?;
+			let algorithm = id.algorithm();
+			if !counts.contains_key(&algorithm) && counts.len() >= 16 {
+				return Err(err!(Request(TooLarge("Outgoing key algorithm inventory limit"))));
+			}
+			let count: &mut UInt = counts.entry(algorithm).or_default();
+			*count = count.saturating_add(1_u32.into());
+		}
+		counts = complete_one_time_key_counts(counts);
+	}
+	let prefix = (user_id, device_id);
+	let rows = self
+		.db
+		.userdeviceidalgorithm_fallback
+		.stream_prefix_capped::<(Ignore, Ignore, OneTimeKeyAlgorithm), &[u8], _>(
+			&prefix,
+			budget.rows.min(16).saturating_add(1),
+		);
+	pin_mut!(rows);
+	let mut fallbacks = Vec::new();
+	let mut examined = 0_usize;
+	while let Some(((.., algorithm), bytes)) = rows.try_next().await? {
+		budget.charge(
+			bytes
+				.len()
+				.saturating_add(algorithm.as_str().len())
+				.saturating_add(user_id.as_bytes().len())
+				.saturating_add(device_id.as_str().len())
+				.saturating_add(16),
+		)?;
+		if examined >= 16 || bytes.len() > 64 * 1024 {
+			return Err(err!(Request(TooLarge("Outgoing fallback metadata inventory limit"))));
+		}
+		examined = examined.saturating_add(1);
+		let entry: FallbackEntry = serde_json::from_slice(bytes)?;
+		if !entry.used {
+			fallbacks.push(algorithm);
+		}
+	}
+	Ok((counts, fallbacks))
 }
 
 /// Keep zero-count algorithms visible to clients after an OTK pool is drained.
@@ -415,15 +551,20 @@ pub async fn add_device_keys(
 	user_id: &UserId,
 	device_id: &DeviceId,
 	device_keys: &Raw<DeviceKeys>,
-) {
-	let key = (user_id, device_id);
-
+) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
 	self.db
-		.keyid_key
-		.put(key, Json(device_keys))
-		.await
-		.expect("database write error");
-	self.mark_device_key_update(user_id).await;
+		.userdeviceid_metadata
+		.qry(&(user_id, device_id))
+		.await?;
+	let plan = self.prepare_device_key_update(user_id).await?;
+	let services_guard = self.services.get();
+	let mut txn = services_guard.as_ref().db.txn();
+	txn.put(&self.db.keyid_key, (user_id, device_id), Json(device_keys));
+	self.append_device_key_update(user_id, &plan, &mut txn);
+	txn.check_bridge_admission()?;
+	txn.execute().await?;
+	self.finish_device_key_update(user_id, plan).await
 }
 
 #[implement(super::Service)]
@@ -435,6 +576,15 @@ pub async fn add_cross_signing_keys(
 	user_signing_key: &Option<Raw<CrossSigningKey>>,
 	notify: bool,
 ) -> Result {
+	let _guard = self.device_mutation_locks.lock(user_id).await;
+	let plan = if notify {
+		Some(self.prepare_device_key_update(user_id).await?)
+	} else {
+		None
+	};
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	// TODO: Check signatures
 	{
 		let master_key_key = master_key
@@ -452,7 +602,7 @@ pub async fn add_cross_signing_keys(
 			.map(parse_user_signing_key)
 			.transpose()?;
 
-		let mut txn = self.services.db.txn();
+		let mut txn = services_root.db.txn();
 
 		if let Some((master_key, master_key_key)) =
 			master_key.as_ref().zip(master_key_key.as_ref())
@@ -496,11 +646,16 @@ pub async fn add_cross_signing_keys(
 			txn.raw_put(&self.db.userid_usersigningkeyid, user_id, user_signing_key_key);
 		}
 
+		if let Some(plan) = &plan {
+			self.append_device_key_update(user_id, plan, &mut txn);
+		}
+		txn.check_bridge_admission()?;
 		txn.execute().await?;
 	};
 
-	if notify {
-		self.mark_device_key_update(user_id).await;
+	if let Some(plan) = plan {
+		self.finish_device_key_update(user_id, plan)
+			.await?;
 	}
 
 	Ok(())
@@ -535,6 +690,7 @@ pub async fn sign_key(
 	signatures: Signatures,
 	sender_id: &UserId,
 ) -> Result {
+	let _guard = self.device_mutation_locks.lock(target_id).await;
 	let key = (target_id, key_id);
 
 	let mut target_key: serde_json::Value = self
@@ -617,13 +773,15 @@ pub async fn sign_key(
 		return Ok(());
 	}
 
-	let key = (target_id, key_id);
-	self.db
-		.keyid_key
-		.put(key, Json(target_key))
+	let plan = self.prepare_device_key_update(target_id).await?;
+	let services_guard = self.services.get();
+	let mut txn = services_guard.as_ref().db.txn();
+	txn.put(&self.db.keyid_key, (target_id, key_id), Json(target_key));
+	self.append_device_key_update(target_id, &plan, &mut txn);
+	txn.check_bridge_admission()?;
+	txn.execute().await?;
+	self.finish_device_key_update(target_id, plan)
 		.await?;
-
-	self.mark_device_key_update(target_id).await;
 
 	Ok(())
 }
@@ -943,89 +1101,124 @@ fn keys_changed_user_or_room_fallible<'a>(
 	skip_all,
 	fields(%user_id),
 )]
-pub async fn mark_device_key_update(&self, user_id: &UserId) {
-	let update_all_rooms = !self
-		.services
-		.config
-		.device_key_update_encrypted_rooms_only;
+pub async fn mark_device_key_update(&self, user_id: &UserId) -> Result {
+	let plan = self.prepare_device_key_update(user_id).await?;
+	let services_guard = self.services.get();
+	let mut txn = services_guard.as_ref().db.txn();
+	self.append_device_key_update(user_id, &plan, &mut txn);
+	txn.check_bridge_admission()?;
+	txn.execute().await?;
+	self.finish_device_key_update(user_id, plan).await
+}
 
-	let all_or_is_encrypted = async |room_id: &RoomId| {
-		update_all_rooms
-			|| self
-				.services
+/// Prove the complete notification fanout before any device deletion writes.
+/// Repeated and local server keys consume the shared budget before
+/// deduplication. Registration and sender exclusion remain held until commit.
+#[implement(super::Service)]
+pub(crate) async fn prepare_device_key_update(
+	&self,
+	user_id: &UserId,
+) -> Result<DeviceKeyUpdatePlan> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	let all_rooms = services_root
+		.state_cache
+		.bounded_rooms_joined(user_id)
+		.await?;
+	let mut rooms = Vec::new();
+	for room in all_rooms {
+		if !services_root
+			.config
+			.device_key_update_encrypted_rooms_only
+			|| services_root
 				.state_accessor
-				.is_encrypted_room(room_id)
-				.await
-	};
-
-	let count = self
-		.services
-		.globals
-		.next_count()
-		.await
-		.expect("failed to obtain next sequence number");
-	let seq: u64 = *count;
-	let user_key = (user_id, seq);
-
-	self.db
-		.keychangeid_userid
-		.put_raw(user_key, user_id)
-		.await
-		.expect("database insert error");
-
-	self.services
-		.state_cache
-		.rooms_joined(user_id)
-		.filter(|room_id| all_or_is_encrypted(*room_id))
-		.for_each(|room_id| async move {
-			let room_key = (room_id, seq);
-			self.db
-				.keychangeid_userid
-				.put_raw(room_key, user_id)
-				.await
-				.expect("database insert error");
-		})
-		.await;
-
-	self.services
-		.sending
-		.send_device_list_appservices(user_id, *count)
-		.await
-		.log_err()
-		.ok();
-
-	if !self.services.globals.user_is_local(user_id) {
-		return;
+				.is_encrypted_room_strict(&room)
+				.await?
+		{
+			rooms.push(room);
+		}
 	}
-
-	// device_list_update EDUs reach remote servers only on a sender flush.
-	let mut servers: Servers = self
-		.services
-		.state_cache
-		.rooms_joined(user_id)
-		.filter(|room_id| all_or_is_encrypted(*room_id))
-		.map(ToOwned::to_owned)
-		.broad_then(async |room_id: OwnedRoomId| {
-			self.services
+	let mut servers = Vec::new();
+	if services_root.globals.user_is_local(user_id) {
+		let mut rows = 0_usize;
+		let mut bytes = 0_usize;
+		for room in &rooms {
+			let room_servers = services_root
 				.state_cache
-				.room_servers(&room_id)
-				.ready_filter(|server| !self.services.globals.server_is_ours(server))
-				.map(ToOwned::to_owned)
-				.collect()
-				.await
-		})
-		.flat_map(|servers: Vec<OwnedServerName>| servers.into_iter().stream())
-		.collect()
-		.await;
-
-	servers.sort_unstable();
-	servers.dedup();
-
-	self.services
+				.bounded_room_servers_with_budget(
+					room,
+					4096_usize.saturating_sub(rows),
+					(256_usize * 1024).saturating_sub(bytes),
+				)
+				.await?;
+			rows = rows.saturating_add(room_servers.len());
+			bytes = bytes.saturating_add(
+				room_servers
+					.iter()
+					.map(|server| server.as_bytes().len())
+					.sum::<usize>(),
+			);
+			servers.extend(
+				room_servers
+					.into_iter()
+					.filter(|server| !services_root.globals.server_is_ours(server)),
+			);
+		}
+		servers.sort_unstable();
+		servers.dedup();
+	}
+	let appservices = services_root
 		.sending
-		.flush_servers(servers.iter().map(|server| &**server).stream())
-		.await
-		.expect("device key update flush failed");
+		.prepare_device_list_appservices(user_id, &rooms)
+		.await?;
+	let count = services_root.globals.next_count().await?;
+	let admission = services_root
+		.sending
+		.prepare_device_list_admission(user_id, *count, appservices)
+		.await?;
+	Ok(DeviceKeyUpdatePlan { rooms, servers, admission, count })
+}
+
+/// Append all device-list change markers to the deletion's atomic transaction.
+/// The plan retains its count permit until the caller commits and finishes.
+#[implement(super::Service)]
+pub(crate) fn append_device_key_update(
+	&self,
+	user_id: &UserId,
+	plan: &DeviceKeyUpdatePlan,
+	txn: &mut Txn,
+) {
+	txn.put_raw(&self.db.keychangeid_userid, (user_id, *plan.count), user_id);
+	for room in &plan.rooms {
+		txn.put_raw(&self.db.keychangeid_userid, (room, *plan.count), user_id);
+	}
+	let services_guard = self.services.get();
+	plan.admission
+		.append(&services_guard.as_ref().db, txn);
+}
+
+#[implement(super::Service)]
+pub(crate) async fn finish_device_key_update(
+	&self,
+	_user_id: &UserId,
+	plan: DeviceKeyUpdatePlan,
+) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+	services_root
+		.sending
+		.dispatch_device_list_admission(plan.admission)?;
+	services_root
+		.sending
+		.flush_servers(
+			plan.servers
+				.iter()
+				.map(|server| &**server)
+				.stream(),
+		)
+		.await?;
+	drop(plan.count);
+	Ok(())
 }
 
 #[implement(super::Service)]

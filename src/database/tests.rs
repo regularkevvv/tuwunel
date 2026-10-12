@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::subscriber::NoSubscriber;
 use tuwunel_core::{
-	Result, Server,
+	Error, Result, Server,
 	arrayvec::ArrayVec,
 	config::{Config, Figment, Sources},
+	http,
 	log::{LogLevelReloadHandles, Logging, capture::State},
+	matrix::{PduCount, PduId, RawPduId},
 	metrics::Metrics,
 	ruma::{EventId, RoomId, UserId, serde::Raw},
 };
@@ -323,8 +325,7 @@ fn ser_cbor_ruma_raw() {
 /// `ser_json_raw_field_roundtrip` below) when a value contains a `Raw<T>`
 /// field.
 #[test]
-#[should_panic(expected = "expected any valid JSON value")]
-fn ser_cbor_raw_field_roundtrip() {
+fn ser_cbor_raw_field_refuses() {
 	#[derive(Debug, Serialize, Deserialize)]
 	struct Entry {
 		key: Raw<serde_json::Value>,
@@ -332,16 +333,30 @@ fn ser_cbor_raw_field_roundtrip() {
 	}
 
 	let entry = Entry {
-		key: Raw::from_json_string(r#"{"hello":"world","n":42}"#.to_owned())
+		key: Raw::from_json_string(r#"{"hello":"disposable-cbor-raw-marker","n":42}"#.to_owned())
 			.expect("construct Raw"),
 		used: false,
 	};
 
 	let serialized = serialize_to_vec(Cbor(&entry)).expect("serialize cbor");
 
-	let _: Entry = from_slice::<Cbor<_>>(&serialized)
-		.expect("deserialize cbor")
-		.0;
+	let error = from_slice::<Cbor<Entry>>(&serialized)
+		.expect_err("raw JSON field is unsupported in CBOR records");
+	assert!(
+		matches!(&error, Error::SerdeDe(message) if message.as_ref() == "Invalid CBOR database record"),
+		"unsupported CBOR raw field must return the exact stored-record refusal"
+	);
+	assert_eq!(
+		error.status_code(),
+		http::StatusCode::INTERNAL_SERVER_ERROR,
+		"invalid stored CBOR record is a server failure"
+	);
+	assert!(
+		!error
+			.to_string()
+			.contains("disposable-cbor-raw-marker"),
+		"stored CBOR raw field cannot leak through the error"
+	);
 }
 
 /// Round-trip the same `Raw<T>`-bearing struct through `Json`. This is the
@@ -600,19 +615,119 @@ fn de_tuple_incomplete_with_sep() {
 }
 
 #[test]
-#[cfg_attr(
-	debug_assertions,
-	should_panic(expected = "deserialization failed to consume trailing bytes")
-)]
-fn de_tuple_unfinished() {
-	let user_id: &UserId = "@user:example.com".try_into().unwrap();
-	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
-
+fn de_record_trailing_tuple() {
 	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFF@user:example.com";
-	let (a, b): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
+	let error = from_slice::<(&UserId, &RoomId)>(raw).expect_err("trailing records must refuse");
+	assert!(!error.to_string().contains("example.com"), "record bytes must not enter errors");
+}
 
-	assert_eq!(a, user_id, "deserialized user_id does not match");
-	assert_eq!(b, room_id, "deserialized room_id does not match");
+#[test]
+fn de_record_invalid_numeric_boundaries() {
+	let good = serialize_to_vec(&(42_u64, 93_u64)).expect("serialize numeric tuple");
+	assert_eq!(from_slice::<(u64, u64)>(&good).expect("valid numeric tuple"), (42, 93));
+	let mut missing = 42_u64.to_be_bytes().to_vec();
+	missing.extend_from_slice(&93_u64.to_be_bytes());
+	assert!(from_slice::<(u64, u64)>(&missing).is_err(), "missing separator must refuse");
+	let mut wrong = good.clone();
+	wrong[8] = 0;
+	assert!(from_slice::<(u64, u64)>(&wrong).is_err(), "wrong separator must refuse");
+	for len in 0..8 {
+		assert!(from_slice::<u64>(&good[..len]).is_err(), "short integer must refuse");
+	}
+	let mut trailing = 42_u64.to_be_bytes().to_vec();
+	trailing.push(0);
+	assert!(from_slice::<u64>(&trailing).is_err(), "unexpected numeric tail must refuse");
+}
+
+#[test]
+fn de_record_compatible_tails_and_ignore() {
+	let raw: &[u8] = b"@user:example.com";
+	let (user, empty): (&UserId, &str) = from_slice(raw).expect("legacy empty tail");
+	assert_eq!(user.as_str(), "@user:example.com");
+	assert_eq!(empty, "");
+	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFFextra";
+	let (user, _): (&UserId, crate::de::IgnoreAll) =
+		from_slice(raw).expect("explicit tail ignore");
+	assert_eq!(user.as_str(), "@user:example.com");
+	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFF";
+	let (user, room): (&UserId, &RoomId) = from_slice(raw).expect("legacy trailing separator");
+	assert_eq!(user.as_str(), "@user:example.com");
+	assert_eq!(room.as_str(), "!room:example.com");
+}
+
+#[test]
+fn de_record_nested_sequence_refusal() {
+	from_slice::<((u64, u64), u64)>(&[0_u8; 24])
+		.expect_err("nested record sequences must refuse");
+}
+
+#[test]
+fn de_record_json_trailing() {
+	for (good, bad) in [
+		(b"{\"key\":42}".as_slice(), b"{\"key\":42}trailing".as_slice()),
+		(b"[1,2,3]".as_slice(), b"[1,2,3]trailing".as_slice()),
+	] {
+		assert!(from_slice::<serde_json::Value>(good).is_ok(), "valid JSON record");
+		assert!(from_slice::<serde_json::Value>(bad).is_err(), "JSON record trailing bytes");
+		assert!(from_slice::<Json<serde_json::Value>>(good).is_ok(), "valid JSON directive");
+		assert!(
+			from_slice::<Json<serde_json::Value>>(bad).is_err(),
+			"JSON directive trailing bytes"
+		);
+	}
+}
+
+#[test]
+fn de_record_cbor_trailing() {
+	let expected = vec![42_u64, 93_u64];
+	let good = serialize_to_vec(Cbor(&expected)).expect("serialize valid CBOR record");
+	let actual = from_slice::<Cbor<Vec<u64>>>(&good).expect("valid CBOR record");
+	assert_eq!(actual.0, expected);
+	let secret = "disposable-cbor-record-marker";
+	let extra = serialize_to_vec(Cbor(secret)).expect("serialize trailing CBOR value");
+	let error =
+		from_slice::<Cbor<Vec<u64>>>(&extra).expect_err("wrong CBOR value type must refuse");
+	assert!(!error.to_string().contains(secret), "CBOR type errors cannot expose values");
+	for tail in [vec![0_u8], vec![0xFF_u8], extra] {
+		let mut invalid = good.clone();
+		invalid.extend_from_slice(&tail);
+		let error =
+			from_slice::<Cbor<Vec<u64>>>(&invalid).expect_err("CBOR trailing bytes must refuse");
+		assert!(!error.to_string().contains(secret), "CBOR record bytes cannot enter errors");
+	}
+	for len in 0..good.len() {
+		assert!(
+			from_slice::<Cbor<Vec<u64>>>(&good[..len]).is_err(),
+			"truncated CBOR record must refuse"
+		);
+	}
+}
+
+#[test]
+fn de_record_raw_pdu_ids() {
+	for count in [PduCount::Normal(42), PduCount::Backfilled(-42)] {
+		let expected: RawPduId = PduId { shortroomid: 7, count }.into();
+		let actual: RawPduId = from_slice(expected.as_ref()).expect("valid raw PDU key");
+		assert_eq!(actual, expected);
+	}
+	for len in [0, 1, 8, 15, 17, 23, 25, 32] {
+		assert!(from_slice::<RawPduId>(&vec![0_u8; len]).is_err(), "invalid key width {len}");
+	}
+	let mut invalid = [0_u8; 24];
+	invalid[8] = 1;
+	assert!(from_slice::<RawPduId>(&invalid).is_err(), "nonzero backfill marker must refuse");
+	let mut negative_normal = [0_u8; 16];
+	negative_normal[8] = 0x80;
+	assert!(
+		from_slice::<RawPduId>(&negative_normal).is_err(),
+		"negative normal count must refuse"
+	);
+	let mut positive_backfill = [0_u8; 24];
+	positive_backfill[23] = 1;
+	assert!(
+		from_slice::<RawPduId>(&positive_backfill).is_err(),
+		"positive backfill count must refuse"
+	);
 }
 
 #[test]
@@ -1126,6 +1241,80 @@ fn lazy_media_outlives_url_preview() {
 		descriptor("mediaid_lazy").ttl >= descriptor("url_preview").ttl,
 		"a served preview's mxc must still resolve while the preview is cached"
 	);
+}
+
+#[tokio::test]
+async fn prefix_key_pages_resume_after_deleted_binary_keys() -> Result {
+	let fixture = new_test_database("prefix-keys-page").await?;
+	let map = fixture.database.get("global")?;
+	let keys: &[&[u8]] = &[b"o\xff", b"p\0", b"p\0\0", b"p\0\xff", b"p\xff", b"q\0"];
+	let mut txn = fixture.database.txn();
+	for key in keys {
+		txn.insert_raw(map, key, b"opaque value is unnecessary for a key page");
+	}
+	txn.execute().await?;
+	assert!(
+		map.raw_keys_prefix_after(b"p\0", None, 0)
+			.await?
+			.is_empty()
+	);
+	let first = map.raw_keys_prefix_after(b"p\0", None, 2).await?;
+	assert_eq!(first, [b"p\0".to_vec(), b"p\0\0".to_vec()]);
+	let mut txn = fixture.database.txn();
+	for key in &first {
+		txn.del_raw(map, key);
+	}
+	txn.execute().await?;
+	let next = map
+		.raw_keys_prefix_after(b"p\0", first.last().map(Vec::as_slice), 2)
+		.await?;
+	assert_eq!(next, [b"p\0\xff".to_vec()]);
+	assert!(
+		map.raw_keys_prefix_after(b"p\0", next.last().map(Vec::as_slice), 2)
+			.await?
+			.is_empty()
+	);
+	assert!(
+		map.raw_keys_prefix_after(b"p\0", Some(b"q"), 2)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(map.get(b"q\0").await?.as_ref(), b"opaque value is unnecessary for a key page");
+	Ok(())
+}
+
+#[tokio::test]
+async fn reverse_prefix_key_pages_are_inclusive_bounded_and_isolated() -> Result {
+	let fixture = new_test_database("reverse-prefix-keys-page").await?;
+	let map = fixture.database.get("global")?;
+	let keys: &[&[u8]] = &[b"o\xff", b"p\0", b"p\0\0", b"p\0\xff", b"p\xff", b"q\0"];
+	let mut txn = fixture.database.txn();
+	for key in keys {
+		txn.insert_raw(map, key, b"opaque");
+	}
+	txn.execute().await?;
+	assert!(
+		map.raw_keys_prefix_reverse(b"p\0", b"p\0\xff", 0)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(
+		map.raw_keys_prefix_reverse(b"p\0", b"p\0\xff", 2)
+			.await?,
+		[b"p\0\xff".to_vec(), b"p\0\0".to_vec()]
+	);
+	assert_eq!(
+		map.raw_keys_prefix_reverse(b"p\0", b"p\0\xfe", 5)
+			.await?,
+		[b"p\0\0".to_vec(), b"p\0".to_vec()]
+	);
+	assert!(
+		map.raw_keys_prefix_reverse(b"p\0", b"o\xff", 2)
+			.await?
+			.is_empty()
+	);
+	assert_eq!(map.get(b"q\0").await?.as_ref(), b"opaque");
+	Ok(())
 }
 
 #[tokio::test]

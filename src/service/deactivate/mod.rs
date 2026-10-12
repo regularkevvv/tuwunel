@@ -34,17 +34,20 @@ impl Service {
 	/// When `erase` is `true`, additionally erase non-event data per
 	/// MSC4025: all global and per-room account data for the user.
 	pub async fn full_deactivate(&self, user_id: &UserId, erase: bool) -> Result {
-		self.services
+		let services_guard = self.services.get();
+		let services_root = services_guard.as_ref();
+
+		services_root
 			.users
 			.deactivate_account(user_id)
 			.await?;
 
-		self.services
+		services_root
 			.profile
 			.clear_profile_keys(user_id)
 			.await?;
 
-		self.services
+		services_root
 			.profile
 			.update_all_rooms(
 				user_id,
@@ -53,8 +56,7 @@ impl Service {
 			)
 			.await;
 
-		let all_joined_rooms: Vec<OwnedRoomId> = self
-			.services
+		let all_joined_rooms: Vec<OwnedRoomId> = services_root
 			.state_cache
 			.rooms_joined(user_id)
 			.map(Into::into)
@@ -62,10 +64,9 @@ impl Service {
 			.await;
 
 		for room_id in all_joined_rooms {
-			let state_lock = self.services.state.mutex.lock(&room_id).await;
+			let state_lock = services_root.state.mutex.lock(&room_id).await;
 
-			let room_power_levels = self
-				.services
+			let room_power_levels = services_root
 				.state_accessor
 				.get_power_levels(&room_id)
 				.await
@@ -78,8 +79,7 @@ impl Service {
 				});
 
 			let user_can_demote_self = user_can_change_self
-				|| self
-					.services
+				|| services_root
 					.state_accessor
 					.room_state_get(&room_id, &StateEventType::RoomCreate, "")
 					.await
@@ -94,8 +94,7 @@ impl Service {
 				power_levels_content.users.remove(user_id);
 
 				// ignore errors so deactivation doesn't fail
-				match self
-					.services
+				match services_root
 					.timeline
 					.build_and_append_pdu(
 						PduBuilder::state(String::new(), &power_levels_content),
@@ -115,20 +114,17 @@ impl Service {
 			}
 		}
 
-		let rooms_joined = self
-			.services
+		let rooms_joined = services_root
 			.state_cache
 			.rooms_joined(user_id)
 			.map(ToOwned::to_owned);
 
-		let rooms_invited = self
-			.services
+		let rooms_invited = services_root
 			.state_cache
 			.rooms_invited(user_id)
 			.map(ToOwned::to_owned);
 
-		let rooms_knocked = self
-			.services
+		let rooms_knocked = services_root
 			.state_cache
 			.rooms_knocked(user_id)
 			.map(ToOwned::to_owned);
@@ -142,15 +138,14 @@ impl Service {
 		// MSC4025: erase non-event data when the user requested it, and mark
 		// the user so their events serve as pruned copies (phase B).
 		if erase {
-			self.services.users.set_erased(user_id).await?;
+			services_root.users.set_erased(user_id).await?;
 
-			self.services
+			services_root
 				.account_data
 				.erase_user(user_id, None)
 				.await;
 
-			let rooms_left: Vec<OwnedRoomId> = self
-				.services
+			let rooms_left: Vec<OwnedRoomId> = services_root
 				.state_cache
 				.rooms_left(user_id)
 				.map(ToOwned::to_owned)
@@ -158,7 +153,7 @@ impl Service {
 				.await;
 
 			for room_id in all_rooms.iter().chain(rooms_left.iter()) {
-				self.services
+				services_root
 					.account_data
 					.erase_user(user_id, Some(room_id))
 					.await;
@@ -166,11 +161,10 @@ impl Service {
 		}
 
 		for room_id in all_rooms {
-			let state_lock = self.services.state.mutex.lock(&room_id).await;
+			let state_lock = services_root.state.mutex.lock(&room_id).await;
 
 			// ignore errors
-			if let Err(e) = self
-				.services
+			if let Err(e) = services_root
 				.membership
 				.leave(user_id, &room_id, None, false, &state_lock)
 				.await
@@ -180,7 +174,7 @@ impl Service {
 
 			drop(state_lock);
 
-			self.services
+			services_root
 				.state_cache
 				.forget(&room_id, user_id)
 				.await?;

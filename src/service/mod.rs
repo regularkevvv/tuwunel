@@ -1,5 +1,9 @@
 #![expect(refining_impl_trait)]
 
+#[cfg(test)]
+#[path = "../database/backend/remote/fixture.rs"]
+pub mod bridge_fixture;
+
 mod manager;
 pub(crate) mod migrations;
 mod once_services;
@@ -45,6 +49,8 @@ pub(crate) type SelfServices = std::sync::Arc<OnceServices>;
 
 use log as _;
 
+#[cfg(all(feature = "notification_recovery_tests", debug_assertions))]
+pub use self::migrations::NotificationIndexMigrationPause;
 pub use crate::services::Services;
 
 tuwunel_core::mod_ctor! {}

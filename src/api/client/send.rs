@@ -202,7 +202,7 @@ async fn check_duplicate_reaction(
 			None,
 			Some(&content.relates_to.key),
 		)
-		.await
+		.await?
 	{
 		return Ok(());
 	}

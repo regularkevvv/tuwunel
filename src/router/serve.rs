@@ -1,4 +1,5 @@
 mod plain;
+mod tasks;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "direct_tls")]
@@ -14,7 +15,6 @@ use std::{
 	sync::{Arc, atomic::Ordering},
 };
 
-use tokio::task::JoinSet;
 use tuwunel_core::{Err, Result, debug_info, error, info};
 #[cfg(unix)]
 use tuwunel_core::{itertools::Itertools, utils::sys::is_ipv6_only};
@@ -30,7 +30,7 @@ pub(super) async fn serve(services: Arc<Services>, handle: ServerHandle) -> Resu
 
 	let (app, _guard) = layers::build(&services)?;
 
-	let mut join_set = JoinSet::new();
+	let mut listeners = tasks::Listeners::new(server.clone());
 
 	let socket_path = &config.unix_socket_path;
 
@@ -124,21 +124,16 @@ pub(super) async fn serve(services: Arc<Services>, handle: ServerHandle) -> Resu
 	}
 
 	for future in futures {
-		join_set.spawn_on(future, server.runtime());
+		listeners.tasks.spawn_on(future, server.runtime());
 	}
 
-	if join_set.is_empty() {
+	if listeners.tasks.is_empty() {
 		return Err!("at least one listener should be installed");
 	}
 
 	info!("Listening on {log_addrs:?}");
 
-	join_set
-		.join_all()
-		.await
-		.into_iter()
-		.filter_map(Result::err)
-		.for_each(|e| error!("Listener stopped: {e}"));
+	let result = listeners.finish(&handle).await;
 
 	let handle_active = server
 		.metrics
@@ -160,7 +155,7 @@ pub(super) async fn serve(services: Arc<Services>, handle: ServerHandle) -> Resu
 
 	debug_assert_eq!(0, handle_active, "active request handles still pending");
 
-	Ok(())
+	result
 }
 
 /// Addresses the service manager already listens on for us.

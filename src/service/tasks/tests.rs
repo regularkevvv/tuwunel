@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{CAPACITY, RETENTION_MS, Status, Task, TaskId, matches_nonterminal, prune_tasks};
+use super::{CAPACITY, RETENTION_MS, Status, Task, TaskId, matches_nonterminal, prune_ids};
 
 fn key(s: &str) -> TaskId { TaskId::from(s).expect("id fits") }
 
@@ -14,7 +14,7 @@ fn task_for(action: &'static str, resource_id: &str, status: Status, timestamp_m
 		timestamp_ms,
 		result: None,
 		error: None,
-		handle: None,
+		parameters: serde_json::json!({}),
 	}
 }
 
@@ -43,6 +43,44 @@ fn nonterminal_match_requires_action_resource_and_nonterminal_status() {
 }
 
 #[test]
+fn restore_allows_old_cross_action_interruptions_but_not_duplicates() {
+	let room = "!room:example.com";
+	let purge = task_for("purge_history", room, Status::Active, 0);
+	let shutdown = task_for("shutdown_and_purge_room", room, Status::Scheduled, 0);
+	assert!(
+		matches_nonterminal(&shutdown, purge.action, room),
+		"new admission stays excluded"
+	);
+	assert!(!super::history::conflicts_on_restore(&purge, &shutdown));
+	assert!(!super::history::conflicts_on_restore(&shutdown, &purge));
+	let duplicate = task_for("purge_history", room, Status::Scheduled, 0);
+	assert!(super::history::conflicts_on_restore(&purge, &duplicate));
+	let complete = task_for("purge_history", room, Status::Complete, 0);
+	assert!(!super::history::conflicts_on_restore(&purge, &complete));
+	assert!(!super::history::conflicts_on_restore(&complete, &purge));
+}
+
+#[test]
+fn restore_keeps_exclusion_for_resumable_history() {
+	let room = "!room:example.com";
+	let mut purge = task_for("purge_history", room, Status::Active, 0);
+	purge.parameters = serde_json::json!({
+		"executor":"history-v1", "boundary":1, "delete_local_events":true,
+		"shortroomid":1, "after":null, "purged":0, "current":null, "done":false,
+	});
+	assert!(
+		super::history::History::decode(&purge.parameters)
+			.expect("valid progress")
+			.is_some()
+	);
+	let shutdown = task_for("shutdown_and_purge_room", room, Status::Scheduled, 0);
+	assert!(super::history::conflicts_on_restore(&purge, &shutdown));
+	assert!(super::history::conflicts_on_restore(&shutdown, &purge));
+	let duplicate = task_for("purge_history", room, Status::Scheduled, 0);
+	assert!(super::history::conflicts_on_restore(&purge, &duplicate));
+}
+
+#[test]
 fn prune_keeps_active_and_recent() {
 	let now = RETENTION_MS.saturating_mul(10);
 	let mut tasks = BTreeMap::from([
@@ -51,7 +89,9 @@ fn prune_keeps_active_and_recent() {
 		(key("fresh_done"), task(Status::Complete, now)),
 	]);
 
-	prune_tasks(&mut tasks, now);
+	for id in prune_ids(&tasks, now, 0) {
+		tasks.remove(&id);
+	}
 
 	assert!(tasks.contains_key("stale_active"), "non-terminal survives any age");
 	assert!(!tasks.contains_key("stale_done"), "terminal past retention is pruned");
@@ -68,8 +108,25 @@ fn prune_caps_terminal_tasks() {
 		tasks.insert(key(&format!("t{i}")), task(Status::Complete, ts));
 	}
 
-	prune_tasks(&mut tasks, now);
+	for id in prune_ids(&tasks, now, 0) {
+		tasks.remove(&id);
+	}
 
 	assert!(tasks.len() <= CAPACITY, "terminal tasks capped");
 	assert!(tasks.contains_key("t0"), "the newest survivor is kept");
+}
+
+#[test]
+fn prune_caps_identical_timestamps_and_reserves_admission() {
+	let now = 100_000;
+	let mut tasks = BTreeMap::new();
+	for i in 0..CAPACITY + 50 {
+		tasks.insert(key(&format!("t{i:06}")), task(Status::Complete, now));
+	}
+	for id in prune_ids(&tasks, now, 1) {
+		tasks.remove(&id);
+	}
+	assert_eq!(tasks.len(), CAPACITY - 1);
+	assert!(!tasks.contains_key("t000000"));
+	assert!(tasks.contains_key("t001073"));
 }

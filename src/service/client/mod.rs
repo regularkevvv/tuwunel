@@ -62,7 +62,7 @@ impl crate::Service for Service {
 			clients: LazyLock::new(Box::new({
 				let services = args.services.clone();
 
-				move || make_clients(&services).expect("failed to construct clients")
+				move || make_clients(&services.get()).expect("failed to construct clients")
 			})),
 
 			proxy,

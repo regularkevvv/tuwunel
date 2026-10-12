@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use clap::{CommandFactory, FromArgMatches, Parser};
-use tuwunel_core::Result;
+use tuwunel_core::{Err, Result};
 
 use crate::{
 	Context,
@@ -78,6 +78,7 @@ pub(super) enum AdminCommand {
 pub(super) async fn process(command: AdminCommand, context: &Context<'_>) -> Result {
 	use AdminCommand::*;
 
+	check_remote_scan_command(&command, context.services.db.backend() == "d1")?;
 	match command {
 		| Appservices(command) => appservice::process(command, context).await,
 		| Media(command) => media::process(command, context).await,
@@ -89,4 +90,25 @@ pub(super) async fn process(command: AdminCommand, context: &Context<'_>) -> Res
 		| Query(command) => query::process(command, context).await,
 		| Token(command) => token::process(command, context).await,
 	}
+}
+
+/// This check runs before handler execution and before output formatting.
+/// RocksDB remains available for reference-only database diagnostics.
+pub(super) fn check_remote_scan_command(command: &AdminCommand, remote: bool) -> Result {
+	if !remote {
+		return Ok(());
+	}
+	let allowed = match command {
+		| AdminCommand::Query(command) => query::remote_scan_allowed(command),
+		| AdminCommand::Rooms(RoomCommand::ListJoinedMembers { .. })
+		| AdminCommand::Users(UserCommand::ListJoinedRooms { .. }) => false,
+		| _ => true,
+	};
+	if !allowed {
+		return Err!(
+			"This diagnostic has no audited finite source on D1; use a bounded supported \
+			 command or an offline reference database."
+		);
+	}
+	Ok(())
 }

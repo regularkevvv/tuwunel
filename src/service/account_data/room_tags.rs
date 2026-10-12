@@ -39,7 +39,10 @@ pub async fn set_room_tag(
 /// read naming the content type here fails on every record.
 #[implement(super::Service)]
 pub async fn get_room_tags(&self, user_id: &UserId, room_id: &RoomId) -> Result<Tags> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.account_data
 		.get_room(room_id, user_id, RoomAccountDataEventType::Tag)
 		.map_ok(|event: TagEvent| event.content.tags)

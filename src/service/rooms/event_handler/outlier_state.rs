@@ -19,6 +19,9 @@ type StateIds = HashMap<u64, OwnedEventId>;
 /// Missing cache data remains a miss; materialization failures remain errors.
 #[implement(super::Service)]
 pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<Option<StateIds>> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(shortstatehash): Option<ShortStateHash> = optional_lookup(
 		self.db
 			.eventid_resolvedstate
@@ -30,8 +33,7 @@ pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<O
 		return Ok(None);
 	};
 
-	let state: StateIds = self
-		.services
+	let state: StateIds = services_root
 		.state_accessor
 		.state_full_ids_strict(shortstatehash)
 		.try_collect()
@@ -40,7 +42,7 @@ pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<O
 	// A room purge drops the events this map names; the create event goes only in
 	// a full purge, so reject the hit when it is gone and let the caller refetch.
 	let Some(create_shortstatekey) = optional_lookup(
-		self.services
+		services_root
 			.short
 			.get_shortstatekey(&StateEventType::RoomCreate, "")
 			.await,
@@ -53,8 +55,7 @@ pub(super) async fn cached_resolved_state(&self, event_id: &EventId) -> Result<O
 		return Ok(None);
 	};
 
-	let create_present = self
-		.services
+	let create_present = services_root
 		.timeline
 		.pdu_exists(create_event_id)
 		.await;
@@ -84,8 +85,10 @@ pub(super) async fn cache_resolved_state(
 ) {
 	const BUFSIZE: usize = size_of::<ShortStateHash>();
 
-	let Ok(saved) = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let Ok(saved) = services_root
 		.state_compressor
 		.save_state(room_id, state)
 		.await

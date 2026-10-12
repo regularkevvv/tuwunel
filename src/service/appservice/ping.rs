@@ -10,7 +10,7 @@ use tuwunel_core::{
 	Error, Result, err, http::StatusCode, implement, utils::string_from_bytes, warn,
 };
 
-use super::request::add_access_token_query;
+use super::request::{add_access_token_query, execute_request};
 use crate::client::read_response_capped;
 
 /// Pings an appservice per MSC2659, surfacing the spec's failure error codes.
@@ -22,6 +22,9 @@ pub async fn ping(
 	registration: Registration,
 	request: send_ping::v1::Request,
 ) -> Result<()> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Some(dest) = registration.url else {
 		return Ok(());
 	};
@@ -47,11 +50,7 @@ pub async fn ping(
 
 	let reqwest_request = Request::try_from(http_request)?;
 
-	let response = self
-		.services
-		.client
-		.appservice
-		.execute(reqwest_request)
+	let response = execute_request(&services_root.client.appservice, reqwest_request)
 		.await
 		.map_err(|e| {
 			if e.is_timeout() {
@@ -76,7 +75,7 @@ pub async fn ping(
 		return Ok(());
 	}
 
-	let limit = self.services.config.max_response_size;
+	let limit = services_root.config.max_response_size;
 	let body = read_response_capped(response, limit)
 		.await
 		.ok()

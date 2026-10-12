@@ -23,6 +23,9 @@ use crate::rooms::state::RoomMutexGuard;
 /// This is equivalent to granting server admin privileges.
 #[implement(super::Service)]
 pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Ok(room_id) = self.get_admin_room().await else {
 		debug_warn!(
 			"make_user_admin was called without an admin room being available or created"
@@ -30,16 +33,14 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 		return Ok(());
 	};
 
-	let state_lock = self.services.state.mutex.lock(&room_id).await;
+	let state_lock = services_root.state.mutex.lock(&room_id).await;
 
-	let is_joined = self
-		.services
+	let is_joined = services_root
 		.state_cache
 		.is_joined(user_id, &room_id)
 		.await;
 
-	let is_invited = self
-		.services
+	let is_invited = services_root
 		.state_cache
 		.is_invited(user_id, &room_id)
 		.await;
@@ -51,10 +52,9 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 			.await?;
 	}
 
-	let server_user: &UserId = self.services.globals.server_user.as_ref();
+	let server_user: &UserId = services_root.globals.server_user.as_ref();
 
-	let mut room_power_levels = self
-		.services
+	let mut room_power_levels = services_root
 		.state_accessor
 		.room_state_get_content::<RoomPowerLevelsEventContent>(
 			&room_id,
@@ -77,7 +77,7 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 			.users
 			.insert(user_id.into(), admin_level);
 
-		self.services
+		services_root
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::state(String::new(), &room_power_levels),
@@ -89,8 +89,7 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 	}
 
 	// Set room tag
-	let room_tag = self
-		.services
+	let room_tag = services_root
 		.server
 		.config
 		.admin_room_tag
@@ -98,8 +97,7 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 
 	if !already_granted
 		&& !room_tag.is_empty()
-		&& let Err(e) = self
-			.services
+		&& let Err(e) = services_root
 			.account_data
 			.set_room_tag(user_id, &room_id, room_tag.into(), None)
 			.await
@@ -107,13 +105,13 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 		error!(?room_id, ?user_id, ?room_tag, "Failed to set tag for admin grant: {e}");
 	}
 
-	if !already_member && self.services.server.config.admin_room_notices {
+	if !already_member && services_root.server.config.admin_room_notices {
 		let welcome_message = String::from(
 			"## Thank you for trying out tuwunel!\n\nTuwunel is a continuation of conduwuit which was technically a hard fork of Conduit.\n\nHelpful links:\n> GitHub Repo: https://github.com/matrix-construct/tuwunel\n> Documentation: https://matrix-construct.github.io/tuwunel\n> Report issues: https://github.com/matrix-construct/tuwunel/issues\n\nFor a list of available commands, send the following message in this room: `!admin --help`",
 		);
 
 		// Send welcome message
-		self.services
+		services_root
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::timeline(&RoomMessageEventContent::text_markdown(welcome_message)),
@@ -136,16 +134,17 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 /// target is neither joined nor invited, the target is invited first.
 #[implement(super::Service)]
 pub async fn make_room_admin(&self, room_id: &RoomId, target: &UserId) -> Result {
-	let state_lock = self.services.state.mutex.lock(room_id).await;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
 
-	let power_levels = self
-		.services
+	let state_lock = services_root.state.mutex.lock(room_id).await;
+
+	let power_levels = services_root
 		.state_accessor
 		.get_power_levels(room_id)
 		.await?;
 
-	let sender = self
-		.services
+	let sender = services_root
 		.state_cache
 		.local_users_in_room(room_id)
 		.ready_fold(None, |best: Option<(OwnedUserId, UserPowerLevel)>, user| {
@@ -172,17 +171,15 @@ pub async fn make_room_admin(&self, room_id: &RoomId, target: &UserId) -> Result
 		| UserPowerLevel::Int(level) => level,
 	};
 
-	let is_joined = self
-		.services
+	let is_joined = services_root
 		.state_cache
 		.is_joined(target, room_id);
 
-	let is_invited = self
-		.services
+	let is_invited = services_root
 		.state_cache
 		.is_invited(target, room_id);
 
-	let is_public = self.services.metadata.is_public(room_id);
+	let is_public = services_root.metadata.is_public(room_id);
 
 	// The membership probes lead; the public check is the multi-read leg.
 	let needs_invite = is_joined
@@ -190,14 +187,13 @@ pub async fn make_room_admin(&self, room_id: &RoomId, target: &UserId) -> Result
 		.and2(is_invited.is_false(), is_public.is_false());
 
 	if needs_invite.await {
-		self.services
+		services_root
 			.membership
 			.invite(&sender, target, room_id, None, false)
 			.await?;
 	}
 
-	let mut content = self
-		.services
+	let mut content = services_root
 		.state_accessor
 		.room_state_get_content::<RoomPowerLevelsEventContent>(
 			room_id,
@@ -209,7 +205,7 @@ pub async fn make_room_admin(&self, room_id: &RoomId, target: &UserId) -> Result
 
 	content.users.insert(target.into(), grant_level);
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(String::new(), &content),
@@ -228,13 +224,16 @@ async fn invite_new_admin(
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
-	let server_user = self.services.globals.server_user.as_ref();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let server_user = services_root.globals.server_user.as_ref();
 
 	// if this is our local user, just forcefully join them in the room. otherwise,
 	// invite the remote user.
-	if self.services.globals.user_is_local(user_id) {
+	if services_root.globals.user_is_local(user_id) {
 		debug_info!("Inviting local user {user_id} to admin room {room_id}");
-		self.services
+		services_root
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::state(
@@ -248,7 +247,7 @@ async fn invite_new_admin(
 			.await?;
 
 		debug_info!("Force joining local user {user_id} to admin room {room_id}");
-		self.services
+		services_root
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::state(
@@ -262,7 +261,7 @@ async fn invite_new_admin(
 			.await?;
 	} else {
 		debug_info!("Inviting remote user {user_id} to admin room {room_id}");
-		self.services
+		services_root
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::state(
@@ -284,14 +283,16 @@ async fn invite_new_admin(
 pub async fn revoke_admin(&self, user_id: &UserId) -> Result {
 	use MembershipState::{Invite, Join, Knock, Leave};
 
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let Ok(room_id) = self.get_admin_room().await else {
 		return Err!(error!("No admin room available or created."));
 	};
 
-	let state_lock = self.services.state.mutex.lock(&room_id).await;
+	let state_lock = services_root.state.mutex.lock(&room_id).await;
 
-	let event = match self
-		.services
+	let event = match services_root
 		.state_accessor
 		.get_member(&room_id, user_id)
 		.await
@@ -314,7 +315,7 @@ pub async fn revoke_admin(&self, user_id: &UserId) -> Result {
 		},
 	};
 
-	self.services
+	services_root
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
@@ -325,7 +326,7 @@ pub async fn revoke_admin(&self, user_id: &UserId) -> Result {
 				third_party_invite: None,
 				..event
 			}),
-			self.services.globals.server_user.as_ref(),
+			services_root.globals.server_user.as_ref(),
 			&room_id,
 			&state_lock,
 		)

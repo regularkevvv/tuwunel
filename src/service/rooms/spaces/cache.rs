@@ -86,8 +86,11 @@ impl From<Cached> for Option<SpaceHierarchyRoomsChunk> {
 #[implement(super::Service)]
 #[inline]
 fn generate_ttl(&self) -> SystemTime {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	time_from_now_secs(
-		self.services.config.spacehierarchy_cache_ttl_min
-			..self.services.config.spacehierarchy_cache_ttl_max,
+		services_root.config.spacehierarchy_cache_ttl_min
+			..services_root.config.spacehierarchy_cache_ttl_max,
 	)
 }

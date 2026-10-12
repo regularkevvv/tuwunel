@@ -13,7 +13,7 @@ use rocksdb::WriteBatch;
 use serde::Serialize;
 use serde_bytes::ByteBuf;
 use tuwunel_bridge::Mutation;
-use tuwunel_core::{Result, implement};
+use tuwunel_core::{Result, err, implement};
 
 use crate::{
 	Engine, Map,
@@ -52,6 +52,41 @@ pub fn new(engine: &Arc<Engine>) -> Self {
 		ops: Vec::new(),
 		sink: Sink::Rocks(engine.clone()),
 	}
+}
+
+/// Checks this entire mixed-map transaction against the bridge's count,
+/// key/value and encoded-request limits without copying its queued inputs.
+///
+/// Remote checks use the current writable lease. Native/model checks use the
+/// minimum envelope, matching direct put admission; they do not claim byte
+/// parity with an arbitrary provider identity. An empty transaction is a no-op.
+/// This opt-in check neither executes nor splits the transaction. Execution
+/// still validates the remote fence and can fail after admission.
+#[implement(Txn)]
+pub fn check_bridge_admission(&self) -> Result<usize> {
+	if self.is_empty() {
+		return Ok(0);
+	}
+	let lease = match &self.sink {
+		| Sink::Remote(backend) => backend.writable_lease()?,
+		| Sink::Rocks(_) | Sink::Mem(_) =>
+			tuwunel_bridge::Lease { holder: String::new(), epoch: 0 },
+	};
+	let mut budget = tuwunel_bridge::request::CommitBudget::new(&lease)
+		.map_err(|error| err!(Database("Commit admission: {error}")))?;
+	for (map, operation) in &self.ops {
+		let map = map
+			.id()
+			.ok_or_else(|| err!(Database("Commit admission requires catalog maps")))?;
+		match operation {
+			| Op::Put { key, val } => budget.try_put(map.0, key, val),
+			| Op::Delete { key } => budget.try_delete(map.0, key),
+		}
+		.map_err(|error| err!(Database("Commit admission: {error}")))?;
+	}
+	budget
+		.encoded_size()
+		.map_err(|error| err!(Database("Commit admission: {error}")))
 }
 
 /// Creates an empty transaction addressed to an explicit backend sink.
@@ -342,6 +377,35 @@ where
 	});
 }
 
+/// Whether the last queued operation for this raw key deletes it.
+///
+/// This inspects only the pending batch; it neither reads storage nor executes
+/// a mutation. A later insertion supersedes an earlier deletion. Map ownership
+/// is checked as for mutation methods.
+///
+/// # Panics
+///
+/// Panics when the map belongs to another database backend.
+#[implement(Txn)]
+#[must_use]
+pub fn is_deleted_raw(&self, map: &Map, key: &[u8]) -> bool {
+	self.assert_map(map);
+	self.ops
+		.iter()
+		.rev()
+		.find_map(|(pending, op)| {
+			if pending.name() != map.name() {
+				return None;
+			}
+			match op {
+				| Op::Delete { key: pending } if pending.as_ref() == key => Some(true),
+				| Op::Put { key: pending, .. } if pending.as_ref() == key => Some(false),
+				| _ => None,
+			}
+		})
+		.unwrap_or(false)
+}
+
 /// Commits the batch atomically, flushes unless corked, and notifies
 /// matching watchers.
 ///
@@ -351,6 +415,19 @@ where
 /// is dropped unapplied or, on a flush failure, applied but unnotified only
 /// after the backend has already accepted it durably into its write path.
 #[implement(Txn)]
+pub async fn execute(self) -> Result { self.execute_with_flush(false).await }
+
+/// Commit and flush the native WAL to the OS before returning or notifying,
+/// even inside an enclosing cork. Use for durable ownership transfers before
+/// acknowledgement or external delivery. This protects against process crash;
+/// it does not fsync for power-loss durability. Model and remote commits keep
+/// their existing atomic/fenced acknowledgement semantics. Empty batches are
+/// still no-ops, and an uncertain write/flush failure is returned to the
+/// caller.
+#[implement(Txn)]
+pub async fn execute_flushed(self) -> Result { self.execute_with_flush(true).await }
+
+#[implement(Txn)]
 #[tracing::instrument(
 	level = "trace",
 	skip_all,
@@ -359,13 +436,15 @@ where
 		bytes = self.size_in_bytes(),
 	)
 )]
-pub async fn execute(self) -> Result {
+async fn execute_with_flush(self, force_wal_flush: bool) -> Result {
 	if self.is_empty() {
 		return Ok(());
 	}
 
 	#[cfg(feature = "commit_refusals")]
 	crate::refusal::check(self.ops.iter().map(|(map, _)| map.name()))?;
+	#[cfg(feature = "commit_refusals")]
+	crate::refusal::pause_before_dispatch(self.ops.iter().map(|(map, _)| map.name())).await;
 
 	STATS.txn_ops.record(self.len());
 	STATS.txn_bytes.record(self.size_in_bytes());
@@ -385,7 +464,7 @@ pub async fn execute(self) -> Result {
 				.write_opt(&batch, &engine.write_options)
 				.or_else(or_else)?;
 
-			if !engine.corked() {
+			if force_wal_flush || !engine.corked() {
 				engine.flush()?;
 			}
 		},

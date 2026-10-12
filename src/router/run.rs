@@ -1,77 +1,108 @@
 use std::{
+	panic::AssertUnwindSafe,
 	sync::{Arc, Weak, atomic::Ordering},
 	time::Duration,
 };
 
-use futures::{FutureExt, future::join, pin_mut};
+use futures::{FutureExt, TryFutureExt};
 #[cfg(all(feature = "systemd", target_os = "linux"))]
 use sd_notify::{NotifyState, notify, notify_and_unset_env, watchdog_enabled};
-use tuwunel_core::{
-	Error, Result, Server, debug, debug_error, debug_info, error, info, utils::BoolExt,
-};
+use tokio::{sync::oneshot, task::AbortHandle};
+use tuwunel_core::{Error, Result, Server, debug, debug_error, debug_info, err, error, info};
 use tuwunel_service::Services;
 
 use crate::{handle::ServerHandle, serve};
 
-/// Main loop base
+mod ownership;
+
+use ownership::{Resources, join_listener};
+
+struct CancelRun {
+	server: Arc<Server>,
+	task: Option<AbortHandle>,
+}
+
+impl Drop for CancelRun {
+	fn drop(&mut self) {
+		if let Some(task) = self.task.take() {
+			self.server.shutdown().ok();
+			task.abort();
+		}
+	}
+}
+
+/// Main loop base. The registry retains the driver until its resources are
+/// joined.
 #[tracing::instrument(skip_all)]
 pub(crate) async fn run(services: Arc<Services>) -> Result {
+	let server = services.server.clone();
+	let (sender, receiver) = oneshot::channel();
+	let task = server
+		.cleanup
+		.spawn(server.runtime(), async move {
+			let result = AssertUnwindSafe(run_inner(services))
+				.catch_unwind()
+				.map_err(Error::from_panic)
+				.unwrap_or_else(Err)
+				.await;
+			sender.send(result).ok();
+		});
+	let mut cancel = CancelRun { server: server.clone(), task: Some(task) };
+	let result = receiver
+		.await
+		.map_err(|_| err!("Router task closed without a result"))?;
+	cancel.task.take();
+	let joined = server.cleanup.join().await;
+	result.and(joined)
+}
+
+#[tracing::instrument(skip_all)]
+async fn run_inner(services: Arc<Services>) -> Result {
 	let server = &services.server;
+	let mut resources = Resources::new(server.clone());
+	resources.services = Some(services.clone());
 	debug!("Start");
-
-	// Install the admin command root here for now
+	// Install ownership before any startup await or command-root mutation.
+	resources.admin = true;
 	tuwunel_admin::init(&services.admin);
-
-	// Execute configured startup commands.
 	services.admin.startup_execute().await?;
 
-	// Setup shutdown/signal handling
-	let handle = ServerHandle::new();
-	let sigs = server
-		.runtime()
-		.spawn(signal(server.clone(), handle.clone()));
+	resources
+		.auxiliary
+		.spawn_on(signal(server.clone(), resources.handle.clone()), server.runtime());
 	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	let watchdog = server.runtime().spawn(start_systemd_watchdog());
+	resources
+		.auxiliary
+		.spawn_on(start_systemd_watchdog(), server.runtime());
+	if services.config.listening {
+		resources.listener = Some(
+			server
+				.runtime()
+				.spawn(serve::serve(services.clone(), resources.handle.clone())),
+		);
+	}
 
-	let non_listener = services
-		.config
-		.listening
-		.is_false()
-		.then_async(|| server.until_shutdown().map(Ok));
-
-	let listener = services.config.listening.then_async(|| {
-		server
-			.runtime()
-			.spawn(serve::serve(services.clone(), handle))
-			.map(|res| res.map_err(Error::from).unwrap_or_else(Err))
-	});
-
-	// Focal point
 	debug!("Running");
-	pin_mut!(listener, non_listener);
-	let res = tokio::select! {
-		res = join(&mut listener, &mut non_listener) => {
-			res.0.unwrap_or(res.1.unwrap_or(Ok(())))
-		},
-		res = services.poll() => {
-			server.until_shutdown().await;
-			handle_services_finish(server, res, listener.await)
-		},
+	let res = {
+		let listener = async {
+			if resources.listener.is_some() {
+				join_listener(&mut resources.listener).await
+			} else {
+				server.until_shutdown().await;
+				Ok(())
+			}
+		};
+		tokio::pin!(listener);
+		tokio::select! {
+			res = &mut listener => res,
+			res = services.poll() => {
+				server.shutdown().ok();
+				handle_services_finish(server, res, Some(listener.await))
+			},
+		}
 	};
-
-	// Join watchdog and the signal handler before we leave.
-	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	{
-		watchdog.abort();
-		_ = watchdog.await;
-	};
-
-	sigs.abort();
-	_ = sigs.await;
-
-	// Remove the admin command root
-	tuwunel_admin::fini(&services.admin);
-
+	resources.finish_auxiliary().await;
+	resources.disarm();
 	debug_info!("Finish");
 	res
 }
@@ -81,18 +112,16 @@ pub(crate) async fn run(services: Arc<Services>) -> Result {
 pub(crate) async fn start(server: Arc<Server>) -> Result<Arc<Services>> {
 	debug!("Starting...");
 
+	let mut resources = Resources::new(server.clone());
 	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	let keepalive = server.runtime().spawn(extend_systemd_startup());
+	resources
+		.auxiliary
+		.spawn_on(extend_systemd_startup(), server.runtime());
 
-	let services = async move { Services::build(server).await?.start().await }.await;
-
-	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	{
-		keepalive.abort();
-		_ = keepalive.await;
-	};
-
-	let services = services?;
+	let services = Services::build(server).await?;
+	resources.services = Some(services.clone());
+	let services = services.start().await?;
+	resources.finish_auxiliary().await;
 
 	// The status is set here so it reads as a baseline rather than staying blank
 	// until the first reload replaces it.
@@ -100,47 +129,56 @@ pub(crate) async fn start(server: Arc<Server>) -> Result<Arc<Services>> {
 	notify(&[NotifyState::Ready, NotifyState::Status("Running")])
 		.expect("failed to notify systemd of ready state");
 
+	resources.disarm();
 	debug!("Started");
 	Ok(services)
 }
 
 /// Async destructions
 #[tracing::instrument(skip_all)]
-pub(crate) async fn stop(services: Arc<Services>) -> Result {
-	debug!("Shutting down...");
+pub(crate) fn stop(services: Arc<Services>) -> impl Future<Output = Result> + Send {
+	let mut resources = Resources::new(services.server.clone());
+	resources.services = Some(services.clone());
+	async move {
+		debug!("Shutting down...");
 
-	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	notify_systemd_shutdown(&services.server);
+		#[cfg(all(feature = "systemd", target_os = "linux"))]
+		notify_systemd_shutdown(&services.server);
 
-	// Wait for all completions before dropping or we'll lose them to the module
-	// unload and explode.
-	services.stop().await;
+		services.server.shutdown().ok();
+		let cleanup = services.server.cleanup.join().await;
 
-	// Dangling references below can keep Database alive past process exit, so
-	// flush the backend operation metrics explicitly rather than from drop.
-	services.db.dump_operation_metrics();
+		// Wait for all completions before dropping or we'll lose them to the module
+		// unload and explode.
+		services.stop().await;
 
-	// Check that Services and Database will drop as expected, The complex of Arc's
-	// used for various components can easily lead to references being held
-	// somewhere improperly; this can hang shutdowns.
-	debug!("Cleaning up...");
-	let db = Arc::downgrade(&services.db);
-	if let Err(services) = Arc::try_unwrap(services) {
-		debug_error!(
-			"{} dangling references to Services after shutdown",
-			Arc::strong_count(&services)
-		);
+		// Dangling references below can keep Database alive past process exit, so
+		// flush the backend operation metrics explicitly rather than from drop.
+		services.db.dump_operation_metrics();
+		resources.disarm();
+
+		// Check that Services and Database will drop as expected, The complex of Arc's
+		// used for various components can easily lead to references being held
+		// somewhere improperly; this can hang shutdowns.
+		debug!("Cleaning up...");
+		let db = Arc::downgrade(&services.db);
+		if let Err(services) = Arc::try_unwrap(services) {
+			debug_error!(
+				"{} dangling references to Services after shutdown",
+				Arc::strong_count(&services)
+			);
+		}
+
+		if Weak::strong_count(&db) > 0 {
+			debug_error!(
+				"{} dangling references to Database after shutdown",
+				Weak::strong_count(&db)
+			);
+		}
+
+		info!("Shutdown complete.");
+		cleanup
 	}
-
-	if Weak::strong_count(&db) > 0 {
-		debug_error!(
-			"{} dangling references to Database after shutdown",
-			Weak::strong_count(&db)
-		);
-	}
-
-	info!("Shutdown complete.");
-	Ok(())
 }
 
 #[cfg(all(feature = "systemd", target_os = "linux"))]
@@ -196,11 +234,11 @@ fn handle_services_finish(
 		error!("Failed to send shutdown signal: {e}");
 	}
 
-	if let Some(Err(e)) = listener {
+	if let Some(Err(e)) = &listener {
 		error!("Client listener task finished with error: {e}");
 	}
 
-	result
+	result.and(listener.unwrap_or(Ok(())))
 }
 
 #[cfg(all(feature = "systemd", target_os = "linux"))]

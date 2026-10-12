@@ -28,11 +28,14 @@ fn gen_id_hash_and_sign_event_v1(
 	object: &mut CanonicalJsonObject,
 	room_version_id: &RoomVersionId,
 ) -> Result<OwnedEventId> {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let event_id = gen_event_id(object, room_version_id)?;
 
 	object.insert("event_id".into(), CanonicalJsonValue::String(event_id.clone().into()));
 
-	self.services
+	services_root
 		.server_keys
 		.hash_and_sign_event(object, room_version_id)?;
 
@@ -45,7 +48,10 @@ fn gen_id_hash_and_sign_event_v3(
 	object: &mut CanonicalJsonObject,
 	room_version_id: &RoomVersionId,
 ) -> Result<OwnedEventId> {
-	self.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	services_root
 		.server_keys
 		.hash_and_sign_event(object, room_version_id)?;
 
@@ -64,7 +70,10 @@ pub fn hash_and_sign_event(
 ) -> Result {
 	use ruma::signatures::{add_content_hash_to_event, sign_event};
 
-	let server_name = &self.services.server.name;
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let server_name = &services_root.server.name;
 	let room_version_rules = room_version::rules(room_version_id)?;
 
 	let map_err = |e: ruma::signatures::JsonError| {
@@ -86,7 +95,10 @@ pub fn hash_and_sign_event(
 pub fn sign_json(&self, object: &mut CanonicalJsonObject) -> Result {
 	use ruma::signatures::sign_json;
 
-	let server_name = self.services.globals.server_name().as_str();
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let server_name = services_root.globals.server_name().as_str();
 
 	sign_json(server_name, self.keypair(), object).map_err(Into::into)
 }

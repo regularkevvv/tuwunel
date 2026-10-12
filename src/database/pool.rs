@@ -1,9 +1,15 @@
 mod configure;
+#[cfg(test)]
+mod owner_teardown_tests;
+#[cfg(test)]
+#[path = "pool/startup_tests.rs"]
+pub(crate) mod startup_tests;
+mod worker;
 
 use std::{
 	mem::take,
 	sync::{
-		Arc, Mutex,
+		Arc, Mutex, PoisonError,
 		atomic::{AtomicUsize, Ordering},
 	},
 	thread,
@@ -14,6 +20,7 @@ use async_channel::{QueueStrategy, Receiver, RecvError, Sender};
 use futures::{TryFutureExt, channel::oneshot};
 use oneshot::Sender as ResultSender;
 use rocksdb::Direction;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tuwunel_core::{
 	Error, Result, Server, debug, err, error, implement,
 	result::DebugInspect,
@@ -32,11 +39,25 @@ use crate::{Handle, Map, keyval::KeyBuf, stream};
 /// occupying Tokio workers.
 pub(crate) struct Pool {
 	server: Arc<Server>,
-	queues: Vec<Sender<Cmd>>,
+	queues: Vec<Sender<Accepted>>,
 	workers: Mutex<Vec<JoinHandle<()>>>,
+	admission: Arc<RwLock<()>>,
+	#[cfg(test)]
+	audit: Mutex<Option<Arc<owner_teardown_tests::Audit>>>,
 	topology: Vec<usize>,
 	busy: AtomicUsize,
 	queued_max: AtomicUsize,
+}
+
+/// Owns rollback until every worker group has started successfully.
+struct Startup(Option<Arc<Pool>>);
+
+impl Drop for Startup {
+	fn drop(&mut self) {
+		if let Some(pool) = self.0.take() {
+			pool.close();
+		}
+	}
 }
 
 /// Represents work accepted by the database thread pool.
@@ -46,6 +67,14 @@ pub(crate) struct Pool {
 pub(crate) enum Cmd {
 	Get(Get),
 	Iter(Seek),
+}
+
+/// Retains admission until the worker releases the command, even when its
+/// requesting future has been cancelled. Drop the command's native assets
+/// before releasing admission to a waiting drain.
+struct Accepted {
+	cmd: Cmd,
+	_admission: OwnedRwLockReadGuard<()>,
 }
 
 /// Carries a batched point query to a pool worker.
@@ -64,8 +93,10 @@ pub(crate) struct Get {
 /// to keep later cursor movements nonblocking. The worker returns the
 /// positioned iterator state through the response sender.
 pub(crate) struct Seek {
-	pub(crate) map: Arc<Map>,
+	// The iterator borrows the native database. Rust drops fields in declaration
+	// order, so release it before the map that can own the final engine reference.
 	pub(crate) state: stream::State<'static>,
+	pub(crate) map: Arc<Map>,
 	pub(crate) dir: Direction,
 	pub(crate) key: Option<KeyBuf>,
 	pub(crate) res: Option<ResultSender<stream::State<'static>>>,
@@ -113,20 +144,24 @@ pub(crate) fn new(server: &Arc<Server>) -> Result<Arc<Self>> {
 		.map(|cap| async_channel::bounded_with_queue_strategy(cap, CHAN_SCHED))
 		.unzip();
 
-	let pool = Arc::new(Self {
+	let mut startup = Startup(Some(Arc::new(Self {
 		server: server.clone(),
 		queues: senders,
 		workers: Vec::new().into(),
+		admission: Arc::new(RwLock::new(())),
+		#[cfg(test)]
+		audit: Mutex::new(None),
 		topology,
 		busy: AtomicUsize::default(),
 		queued_max: AtomicUsize::default(),
-	});
+	})));
+	let pool = startup.0.as_ref().expect("startup owns pool");
 
 	for (chan_id, &count) in workers.iter().enumerate() {
 		pool.spawn_group(&receivers, chan_id, count)?;
 	}
 
-	Ok(pool)
+	Ok(startup.0.take().expect("startup owns pool"))
 }
 
 impl Drop for Pool {
@@ -147,7 +182,14 @@ impl Drop for Pool {
 #[implement(Pool)]
 #[tracing::instrument(skip_all)]
 pub(crate) fn close(&self) {
-	let workers = take(&mut *self.workers.lock().expect("locked"));
+	// Retain the inventory lock through all joins: a simultaneous closer must
+	// wait for their completion, not mistake a drained inventory for shutdown.
+	// A spawn panic may poison this lock while startup rollback still needs it.
+	let mut inventory = self
+		.workers
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner);
+	let workers = take(&mut *inventory);
 
 	let senders = self
 		.queues
@@ -186,10 +228,16 @@ pub(crate) fn close(&self) {
 			| Ok(()) => trace!(?id, "worker joined"),
 			| Err(error) => error!(?id, "worker joined with error: {error}"),
 		});
+	drop(inventory);
 }
 
 #[implement(Pool)]
-fn spawn_group(self: &Arc<Self>, recv: &[Receiver<Cmd>], chan_id: usize, count: usize) -> Result {
+fn spawn_group(
+	self: &Arc<Self>,
+	recv: &[Receiver<Accepted>],
+	chan_id: usize,
+	count: usize,
+) -> Result {
 	let mut workers = self.workers.lock().expect("locked");
 	for _ in 0..count {
 		self.clone()
@@ -209,13 +257,15 @@ fn spawn_group(self: &Arc<Self>, recv: &[Receiver<Cmd>], chan_id: usize, count: 
 fn spawn_one(
 	self: Arc<Self>,
 	workers: &mut Vec<JoinHandle<()>>,
-	recv: &[Receiver<Cmd>],
+	recv: &[Receiver<Accepted>],
 	chan_id: usize,
 ) -> Result {
 	debug_assert!(!self.queues.is_empty(), "Must have at least one queue");
 	debug_assert!(!recv.is_empty(), "Must have at least one receiver");
 
 	let id = workers.len();
+	#[cfg(test)]
+	startup_tests::before_spawn(&self, id)?;
 	let recv = recv[chan_id].clone();
 
 	let handle = thread::Builder::new()
@@ -267,7 +317,7 @@ pub(crate) async fn execute_iter(self: &Arc<Self>, mut cmd: Seek) -> Result<stre
 ///
 /// Panics if the current thread has no available CPU affinity entry.
 #[implement(Pool)]
-fn select_queue(&self) -> &Sender<Cmd> {
+fn select_queue(&self) -> &Sender<Accepted> {
 	let core_id = get_affinity()
 		.next()
 		.expect("Affinity mask should be available.");
@@ -291,17 +341,26 @@ fn select_queue(&self) -> &Sender<Cmd> {
 		queued_max = self.queued_max.load(Ordering::Relaxed),
 	),
 )]
-async fn execute(&self, queue: &Sender<Cmd>, cmd: Cmd) -> Result {
+async fn execute(&self, queue: &Sender<Accepted>, cmd: Cmd) -> Result {
+	let admission = self.admission.clone().read_owned().await;
+	#[cfg(test)]
+	owner_teardown_tests::after_admission(self);
 	if cfg!(debug_assertions) {
 		self.queued_max
 			.fetch_max(queue.len(), Ordering::Relaxed);
 	}
 
 	queue
-		.send(cmd)
+		.send(Accepted { cmd, _admission: admission })
 		.await
 		.map_err(|e| err!(error!("send failed {e:?}")))
 }
+
+/// Waits for submitted commands to release their native assets. Writer
+/// precedence fences later admissions while draining, but keeps the pool open
+/// for lazy queries owned by callers after the service graph stops.
+#[implement(Pool)]
+pub(crate) async fn drain(&self) { let _drained = self.admission.write().await; }
 
 #[implement(Pool)]
 #[tracing::instrument(
@@ -314,7 +373,10 @@ async fn execute(&self, queue: &Sender<Cmd>, cmd: Cmd) -> Result {
 		thread_id = ?thread::current().id(),
 	),
 )]
-fn worker(self: Arc<Self>, id: usize, chan_id: usize, recv: &Receiver<Cmd>) {
+fn worker(self: Arc<Self>, id: usize, chan_id: usize, recv: &Receiver<Accepted>) {
+	let _worker = worker::Current::enter(&self);
+	#[cfg(test)]
+	let _audit = owner_teardown_tests::WorkerAudit(&self);
 	self.worker_init(id, chan_id);
 	self.worker_loop(recv);
 }
@@ -340,12 +402,16 @@ fn worker_init(&self, id: usize, chan_id: usize) {
 }
 
 #[implement(Pool)]
-fn worker_loop(self: &Arc<Self>, recv: &Receiver<Cmd>) {
+fn worker_loop(self: &Arc<Self>, recv: &Receiver<Accepted>) {
 	// initial +1 needed prior to entering wait
 	self.busy.fetch_add(1, Ordering::Relaxed);
 
-	while let Ok(cmd) = self.worker_wait(recv) {
-		worker_handle(cmd);
+	while let Ok(accepted) = self.worker_wait(recv) {
+		#[cfg(test)]
+		owner_teardown_tests::before_command(self);
+		worker_handle(accepted.cmd);
+		#[cfg(test)]
+		owner_teardown_tests::after_command(self);
 	}
 }
 
@@ -360,7 +426,7 @@ fn worker_loop(self: &Arc<Self>, recv: &Receiver<Cmd>) {
 		busy = self.busy.fetch_sub(1, Ordering::AcqRel) - 1,
 	),
 )]
-fn worker_wait(self: &Arc<Self>, recv: &Receiver<Cmd>) -> Result<Cmd, RecvError> {
+fn worker_wait(self: &Arc<Self>, recv: &Receiver<Accepted>) -> Result<Accepted, RecvError> {
 	recv.recv_blocking().debug_inspect(|_| {
 		self.busy.fetch_add(1, Ordering::Relaxed);
 	})

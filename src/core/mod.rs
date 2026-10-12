@@ -18,6 +18,7 @@ pub mod matrix;
 pub mod metrics;
 pub mod mods;
 pub mod server;
+pub mod tasks;
 pub mod utils;
 
 pub use ::arrayvec;

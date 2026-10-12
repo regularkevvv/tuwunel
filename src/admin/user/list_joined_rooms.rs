@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use ruma::OwnedRoomId;
 use tuwunel_core::{Err, Result};
 
@@ -14,8 +14,8 @@ pub(super) async fn list_joined_rooms(&self, user_id: String) -> Result {
 		.state_cache
 		.rooms_joined(&user_id)
 		.then(|room_id| get_room_info(self.services, room_id))
-		.collect()
-		.await;
+		.try_collect()
+		.await?;
 
 	if rooms.is_empty() {
 		return Err!("User is not in any rooms.");

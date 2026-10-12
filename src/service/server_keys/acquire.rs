@@ -78,18 +78,18 @@ where
 	S: Iterator<Item = (&'a ServerName, K)> + Send + Clone,
 	K: Iterator<Item = &'a ServerSigningKeyId> + Send + Clone,
 {
-	let notary_only = self
-		.services
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
+	let notary_only = services_root
 		.config
 		.only_query_trusted_key_servers;
 
-	let notary_first_always = self
-		.services
+	let notary_first_always = services_root
 		.config
 		.query_trusted_key_servers_first;
 
-	let notary_first_on_join = self
-		.services
+	let notary_first_on_join = services_root
 		.config
 		.query_trusted_key_servers_first_on_join;
 
@@ -238,8 +238,11 @@ async fn acquire_notary<I>(&self, batch: I) -> Batch
 where
 	I: Iterator<Item = (OwnedServerName, Vec<OwnedServerSigningKeyId>)> + Send,
 {
+	let services_guard = self.services.get();
+	let services_root = services_guard.as_ref();
+
 	let mut missing: Batch = batch.collect();
-	for notary in &self.services.config.trusted_servers {
+	for notary in &services_root.config.trusted_servers {
 		let missing_keys = keys_count(&missing);
 		let missing_servers = missing.len();
 		debug!(
